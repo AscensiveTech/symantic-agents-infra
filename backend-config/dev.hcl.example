@@ -1,0 +1,9 @@
+# Copy to backend-config/dev.hcl after bootstrap apply.
+# Init with:
+#   terraform init -backend-config=backend-config/dev.hcl
+bucket       = "symantic-tfstate-883155611064-us-east-1"
+key          = "symantic-agents-infra/dev/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
+profile      = "ascensiveAdmin"

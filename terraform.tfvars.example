@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars (gitignored) and fill the GitHub PAT.
+# Or export: set TF_VAR_amplify_github_access_token=ghp_...
+
+aws_region     = "us-east-1"
+aws_profile    = "ascensiveAdmin"
+aws_account_id = "883155611064"
+project        = "Symantic"
+environment    = "dev"
+company        = "AscensiveTech"
+
+amplify_repository_url = "https://github.com/AscensiveTech/symantic-agents-frontend"
+amplify_branch         = "main"
+# amplify_github_access_token = "ghp_..."   # prefer TF_VAR_
+
+app_url          = "https://agents.symantic.ai"
+domain_root_zone = "symantic.ai"
+
+github_owner_repo           = "AscensiveTech/symantic-agents-frontend"
+# Org enables unique-ID OIDC subjects (CloudTrail userName).
+github_org_id               = "212477424"
+github_repo_id              = "1315122090"
+create_github_oidc_provider = false

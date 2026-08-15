@@ -1,0 +1,27 @@
+# Local secrets / overrides
+*.tfvars
+!*.tfvars.example
+.env
+.env.*
+
+# Backend configs with real account values
+backend-config/*.hcl
+!backend-config/*.hcl.example
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
