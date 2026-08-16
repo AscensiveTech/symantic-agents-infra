@@ -382,6 +382,60 @@ test("google callback preserves an existing refresh token when Google omits one"
   });
 });
 
+test("callback redirects post-consume failures to the app instead of JSON", async () => {
+  const stateStore = createInMemoryStateStore();
+  await stateStore.put({
+    state: "fail-state",
+    workspaceId,
+    userId: "person@example.com",
+    provider: "google-calendar",
+    redirectUri,
+    returnTo: "/agents/new/connections",
+    expiresAt: 1_900_000_000,
+  });
+  const handler = createHandler({
+    getStateStore: async () => stateStore,
+    getConnectionStore: async () => createInMemoryConnectionStore(),
+    getOAuthSecret: async () => ({ clientId: "client-id", clientSecret: "client-secret" }),
+    getTokenCrypto: async () => ({
+      encryptToken: async () => {
+        throw new Error("missing refresh token must not be encrypted");
+      },
+      decryptToken: async () => "unused",
+    }),
+    getProviderClient: () => ({
+      exchangeCode: async () => ({
+        accessToken: "access-token",
+        refreshToken: null,
+        scopes: ["new-scope"],
+      }),
+      listCalendars: async () => [{
+        id: "primary-calendar",
+        timezone: "UTC",
+        primary: true,
+      }],
+    }),
+    redirectBaseUrl: "https://api.example.com",
+    appUrl: "https://agents.example.com",
+    now: () => 1_800_000_000_000,
+  });
+
+  const response = await handler(event(
+    "GET",
+    "/oauth/google-calendar/callback",
+    undefined,
+    { code: "authorization-code", state: "fail-state" },
+  ));
+
+  assert.equal(response.statusCode, 302);
+  assert.equal(
+    response.headers.location,
+    "https://agents.example.com/agents/new/connections?calendar=error&reason=missing_refresh_token",
+  );
+  assert.equal(response.body, "");
+  assert.equal(response.headers["content-type"], undefined);
+});
+
 test("calendar adapter exports the Task 7 surface as not implemented", async () => {
   for (const operation of [
     getAvailability,

@@ -361,83 +361,95 @@ export function createHandler(options = {}) {
           stateStore,
           now,
         });
-        if (event?.queryStringParameters?.error) {
-          return redirect(buildAppRedirect(appUrl, stateRecord.returnTo, {
-            calendar: "error",
-            reason: "authorization_denied",
-          }));
-        }
-        const code = event?.queryStringParameters?.code;
-        if (typeof code !== "string" || code.length === 0) {
-          throw new OAuthRequestError(
-            "Authorization code is required",
-            400,
-            "missing_code",
-          );
-        }
+        try {
+          if (event?.queryStringParameters?.error) {
+            return redirect(buildAppRedirect(appUrl, stateRecord.returnTo, {
+              calendar: "error",
+              reason: "authorization_denied",
+            }));
+          }
+          const code = event?.queryStringParameters?.code;
+          if (typeof code !== "string" || code.length === 0) {
+            throw new OAuthRequestError(
+              "Authorization code is required",
+              400,
+              "missing_code",
+            );
+          }
 
-        const secret = normalizeSecret(await getOAuthSecret(provider));
-        const providerClient = getProviderClient(provider);
-        const tokens = await providerClient.exchangeCode({
-          code,
-          clientId: secret.clientId,
-          clientSecret: secret.clientSecret,
-          redirectUri: callbackUri,
-        });
-        const calendars = await providerClient.listCalendars({
-          accessToken: tokens.accessToken,
-        });
-        const selected = selectDefaultCalendar(calendars);
-        const connectionStore = await getConnectionStore();
-        const existing = await connectionStore.get(stateRecord.workspaceId);
-        const tokenCrypto = await getTokenCrypto();
+          const secret = normalizeSecret(await getOAuthSecret(provider));
+          const providerClient = getProviderClient(provider);
+          const tokens = await providerClient.exchangeCode({
+            code,
+            clientId: secret.clientId,
+            clientSecret: secret.clientSecret,
+            redirectUri: callbackUri,
+          });
+          const calendars = await providerClient.listCalendars({
+            accessToken: tokens.accessToken,
+          });
+          const selected = selectDefaultCalendar(calendars);
+          const connectionStore = await getConnectionStore();
+          const existing = await connectionStore.get(stateRecord.workspaceId);
+          const tokenCrypto = await getTokenCrypto();
 
-        let encryptedRefreshToken;
-        let tokenVersion;
-        if (tokens.refreshToken) {
-          encryptedRefreshToken = await tokenCrypto.encryptToken({
-            token: tokens.refreshToken,
+          let encryptedRefreshToken;
+          let tokenVersion;
+          if (tokens.refreshToken) {
+            encryptedRefreshToken = await tokenCrypto.encryptToken({
+              token: tokens.refreshToken,
+              workspaceId: stateRecord.workspaceId,
+              provider,
+            });
+            tokenVersion = existing?.provider === provider
+              ? existing.tokenVersion + 1
+              : 1;
+          } else if (
+            provider === "google-calendar" &&
+            existing?.provider === provider &&
+            existing.encryptedRefreshToken
+          ) {
+            encryptedRefreshToken = existing.encryptedRefreshToken;
+            tokenVersion = existing.tokenVersion;
+          } else {
+            throw new OAuthRequestError(
+              "Provider did not return a refresh token",
+              502,
+              "missing_refresh_token",
+            );
+          }
+
+          const connection = {
             workspaceId: stateRecord.workspaceId,
             provider,
+            selectedCalendarId: selected.id,
+            calendarTimezone: selected.timezone || "UTC",
+            encryptedRefreshToken,
+            tokenVersion,
+            scopes: tokens.scopes.length > 0
+              ? tokens.scopes
+              : [...PROVIDERS[provider].scopes],
+            connectionState: "connected",
+            ...(provider === "microsoft-365-calendar" && tokens.tid
+              ? { tid: tokens.tid }
+              : {}),
+          };
+          await connectionStore.save(connection);
+          return redirect(buildAppRedirect(appUrl, stateRecord.returnTo, {
+            calendar: "connected",
+            provider,
+          }));
+        } catch (error) {
+          console.error("Calendar OAuth callback failed after state consume", {
+            name: error?.name,
+            message: error?.message,
+            code: error?.code,
           });
-          tokenVersion = existing?.provider === provider
-            ? existing.tokenVersion + 1
-            : 1;
-        } else if (
-          provider === "google-calendar" &&
-          existing?.provider === provider &&
-          existing.encryptedRefreshToken
-        ) {
-          encryptedRefreshToken = existing.encryptedRefreshToken;
-          tokenVersion = existing.tokenVersion;
-        } else {
-          throw new OAuthRequestError(
-            "Provider did not return a refresh token",
-            502,
-            "missing_refresh_token",
-          );
+          return redirect(buildAppRedirect(appUrl, stateRecord.returnTo, {
+            calendar: "error",
+            reason: error instanceof OAuthRequestError ? error.code : "oauth_failed",
+          }));
         }
-
-        const connection = {
-          workspaceId: stateRecord.workspaceId,
-          provider,
-          selectedCalendarId: selected.id,
-          calendarTimezone: selected.timezone || "UTC",
-          encryptedRefreshToken,
-          tokenVersion,
-          scopes: tokens.scopes.length > 0
-            ? tokens.scopes
-            : [...PROVIDERS[provider].scopes],
-          connectionState: "connected",
-          ...(provider === "microsoft-365-calendar" && tokens.tid
-            ? { tid: tokens.tid }
-            : {}),
-        };
-        await connectionStore.save(connection);
-        return redirect(buildAppRedirect(appUrl, stateRecord.returnTo, {
-          calendar: "connected",
-          provider,
-        }));
       }
 
       if (path === "/calendars/connection" && method === "GET") {
