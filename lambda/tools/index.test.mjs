@@ -403,6 +403,39 @@ test("every tool rejects a missing workspaceId, callId, or idempotencyKey", asyn
   }
 });
 
+test("Retell wrapped custom-function payload uses args and the signed call id", async () => {
+  let captured;
+  const handler = toolHandler({
+    store: createStore({
+      async putLead(record) {
+        captured = record;
+        return clone(record);
+      },
+    }),
+  });
+  const response = await handler(event("/retell/tools/lead.capture", {
+    name: "lead_capture",
+    args: requiredBody({
+      callId: "spoofed-call",
+      idempotencyKey: "{{call_id}}-lead_capture",
+      name: "Jordan Miles",
+      phone: "+17035550123",
+      interest: "Emergency exam",
+    }),
+    call: {
+      call_id: "call-from-retell",
+      metadata: {
+        workspaceId,
+        agentId: "agent-123",
+      },
+    },
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(captured.callId, "call-from-retell");
+  assert.equal(captured.workspaceId, workspaceId);
+});
+
 test("lead.capture and message.take return their original records for duplicate keys", async () => {
   const leads = new Map();
   const messages = new Map();

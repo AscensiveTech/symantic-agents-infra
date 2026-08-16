@@ -55,3 +55,33 @@ Push to `main` in `AscensiveTech/symantic-agents-frontend`. The deploy workflow 
 - `AGENT_REGISTRY_SECRET` is generated in Terraform and set on the Amplify branch (sensitive; lives in encrypted state).
 - Future backend code can live under `backend/` in the app repo without changing Amplify `appRoot` (frontend stays at repo root).
 - Shell conventions for AWS CLI in this org: `--profile ascensiveAdmin`, `--region us-east-1`.
+
+## Telnyx to Retell SIP mapping
+
+This stack intentionally does not create or mutate a live Telnyx SIP trunk. Before using agent activation, create the connection manually and store only credentials/configuration in the existing placeholders:
+
+`symantic/{env}/telnyx`:
+
+```json
+{ "apiKey": "...", "connectionId": "pre-created-telnyx-connection-id" }
+```
+
+`symantic/{env}/retell`:
+
+```json
+{
+  "apiKey": "...",
+  "defaultVoiceId": "retell-provider-voice-id",
+  "voiceIds": { "product voice label": "retell-provider-voice-id" }
+}
+```
+
+Intended production mapping:
+
+1. Create a Telnyx FQDN SIP connection to `sip.retellai.com` using SRV, `+E.164` inbound number format, `G722`/`G711U`/`G711A`, and TCP.
+2. Configure the Telnyx outbound voice profile and Retell-required SIP authentication/header settings.
+3. Activation orders the DID onto that existing `connectionId`; it does not create the trunk.
+4. Import the DID into Retell as a custom-telephony number and bind the Retell agent named `Symantic <agentId> · <name>`.
+5. Route signed DID configuration requests to `POST /retell/inbound-lookup`; the response contains the current prompt, tools, voice, transfer numbers, and booking flag.
+
+Do not put API keys or SIP credentials in Terraform variables, source files, or committed examples. See the current Retell Telnyx/custom-telephony guides before live setup because SIP IP allowlists and provider settings can change.

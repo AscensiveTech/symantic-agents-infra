@@ -6,6 +6,8 @@ locals {
     "POST /workspaces/me/agents",
     "GET /workspaces/me/agents/{agentId}",
     "PUT /workspaces/me/agents/{agentId}",
+    "POST /workspaces/me/agents/{agentId}/activate",
+    "POST /workspaces/me/agents/{agentId}/start-test-call",
   ])
 }
 
@@ -15,7 +17,7 @@ resource "aws_apigatewayv2_api" "bff" {
 
   cors_configuration {
     allow_credentials = false
-    allow_headers     = ["authorization", "content-type"]
+    allow_headers     = ["authorization", "content-type", "x-retell-signature"]
     allow_methods     = ["DELETE", "GET", "POST", "PUT", "OPTIONS"]
     allow_origins     = distinct(compact(["http://localhost:3000", var.app_url]))
     max_age           = 300
@@ -54,6 +56,13 @@ resource "aws_apigatewayv2_route" "bff" {
   route_key          = each.value
   authorization_type = "JWT"
   authorizer_id      = aws_apigatewayv2_authorizer.bff_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.bff.id}"
+}
+
+resource "aws_apigatewayv2_route" "retell_inbound_lookup" {
+  api_id             = aws_apigatewayv2_api.bff.id
+  route_key          = "POST /retell/inbound-lookup"
+  authorization_type = "NONE"
   target             = "integrations/${aws_apigatewayv2_integration.bff.id}"
 }
 

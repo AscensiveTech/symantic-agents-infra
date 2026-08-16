@@ -98,7 +98,7 @@ export function createHandler({
 
     let input;
     try {
-      input = JSON.parse(rawBody);
+      input = normalizeToolInput(JSON.parse(rawBody));
     } catch {
       return json(400, {
         ok: false,
@@ -190,6 +190,28 @@ export function createHandler({
         message: "The request could not be completed.",
       });
     }
+  };
+}
+
+function normalizeToolInput(payload) {
+  if (
+    !payload?.args ||
+    typeof payload.args !== "object" ||
+    Array.isArray(payload.args)
+  ) {
+    return payload;
+  }
+  const metadata = payload?.call?.metadata ?? {};
+  const dynamicVariables = payload?.call?.retell_llm_dynamic_variables ?? {};
+  return {
+    ...payload.args,
+    workspaceId: payload.args.workspaceId ??
+      metadata.workspaceId ??
+      dynamicVariables.workspaceId,
+    agentId: payload.args.agentId ??
+      metadata.agentId ??
+      dynamicVariables.agentId,
+    callId: payload?.call?.call_id ?? payload.args.callId,
   };
 }
 

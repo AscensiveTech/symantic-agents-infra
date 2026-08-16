@@ -1,7 +1,12 @@
 data "archive_file" "bff" {
   type        = "zip"
-  source_file = "${path.module}/lambda/bff/index.mjs"
+  source_dir  = "${path.module}/lambda/bff"
   output_path = "${path.module}/.terraform/bff.zip"
+  excludes = [
+    "index.test.mjs",
+    "providers.test.mjs",
+    "receptionist.test.mjs",
+  ]
 }
 
 resource "aws_iam_role" "bff_lambda" {
@@ -53,7 +58,34 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.control_plane["agents"].arn
       },
+      {
+        Sid    = "ManagePhoneNumbers"
+        Effect = "Allow"
+        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
+        Resource = [
+          aws_dynamodb_table.control_plane["phone_numbers"].arn,
+          "${aws_dynamodb_table.control_plane["phone_numbers"].arn}/index/*",
+        ]
+      },
     ]
+  })
+}
+
+resource "aws_iam_role_policy" "bff_provider_secrets" {
+  name = "${local.name_prefix}-bff-provider-secrets"
+  role = aws_iam_role.bff_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ReadTelephonyProviderSecrets"
+      Effect = "Allow"
+      Action = ["secretsmanager:GetSecretValue"]
+      Resource = [
+        aws_secretsmanager_secret.providers["retell"].arn,
+        aws_secretsmanager_secret.providers["telnyx"].arn,
+      ]
+    }]
   })
 }
 
@@ -68,13 +100,13 @@ resource "aws_cloudwatch_log_group" "bff_lambda" {
 
 resource "aws_lambda_function" "bff" {
   function_name = "${local.name_prefix}-bff"
-  description   = "Authenticated BFF for Symantic workspace profiles and agents."
+  description   = "Workspace BFF for profiles, agents, telephony activation, and signed inbound lookup."
   role          = aws_iam_role.bff_lambda.arn
   runtime       = "nodejs20.x"
   handler       = "index.handler"
   architectures = ["arm64"]
   memory_size   = 256
-  timeout       = 10
+  timeout       = 30
 
   filename         = data.archive_file.bff.output_path
   source_code_hash = data.archive_file.bff.output_base64sha256
@@ -84,12 +116,17 @@ resource "aws_lambda_function" "bff" {
       WORKSPACES_TABLE        = aws_dynamodb_table.control_plane["workspaces"].name
       BUSINESS_PROFILES_TABLE = aws_dynamodb_table.control_plane["business_profiles"].name
       AGENTS_TABLE            = aws_dynamodb_table.control_plane["agents"].name
+      PHONE_NUMBERS_TABLE     = aws_dynamodb_table.control_plane["phone_numbers"].name
+      RETELL_SECRET_ARN       = aws_secretsmanager_secret.providers["retell"].arn
+      TELNYX_SECRET_ARN       = aws_secretsmanager_secret.providers["telnyx"].arn
+      PUBLIC_API_BASE_URL     = aws_apigatewayv2_api.bff.api_endpoint
     }
   }
 
   depends_on = [
     aws_cloudwatch_log_group.bff_lambda,
     aws_iam_role_policy.bff_dynamodb,
+    aws_iam_role_policy.bff_provider_secrets,
     aws_iam_role_policy_attachment.bff_lambda_logs,
   ]
 

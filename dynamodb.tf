@@ -48,11 +48,25 @@ resource "aws_dynamodb_table" "control_plane" {
   range_key    = each.value.range_key
 
   dynamic "attribute" {
-    for_each = toset(compact(["workspaceId", each.value.range_key]))
+    for_each = toset(compact([
+      "workspaceId",
+      each.value.range_key,
+      each.key == "phone_numbers" ? "telnyxPhoneNumber" : null,
+    ]))
 
     content {
       name = attribute.value
       type = "S"
+    }
+  }
+
+  dynamic "global_secondary_index" {
+    for_each = each.key == "phone_numbers" ? [1] : []
+
+    content {
+      name            = "telnyxPhoneNumber-index"
+      hash_key        = "telnyxPhoneNumber"
+      projection_type = "ALL"
     }
   }
 
