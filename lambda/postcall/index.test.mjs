@@ -95,6 +95,72 @@ test("valid call_ended persists a normalized call and marks a test agent tested"
   });
 });
 
+test("failed test call_ended persists the call without marking the agent tested", async () => {
+  let persistedCall;
+  let testedAgent;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async putCall(record) {
+        persistedCall = structuredClone(record);
+      },
+      async markAgentTested(workspaceId, agentId, testedAt) {
+        testedAgent = { workspaceId, agentId, testedAt };
+      },
+    }),
+    now: () => new Date("2026-08-16T14:00:00.000Z"),
+  });
+
+  const response = await handler(callEndedEvent({
+    call_id: "retell-call-failed",
+    call_status: "error",
+    disconnection_reason: "error",
+    metadata: {
+      workspaceId: "workspace-123",
+      agentId: "agent-123",
+      kind: "test",
+    },
+  }));
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(persistedCall.outcome, "failed");
+  assert.equal(testedAgent, undefined);
+});
+
+test("abandoned test call_ended persists the call without marking the agent tested", async () => {
+  let persistedCall;
+  let testedAgent;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async putCall(record) {
+        persistedCall = structuredClone(record);
+      },
+      async markAgentTested(workspaceId, agentId, testedAt) {
+        testedAgent = { workspaceId, agentId, testedAt };
+      },
+    }),
+    now: () => new Date("2026-08-16T14:00:00.000Z"),
+  });
+
+  const response = await handler(callEndedEvent({
+    call_id: "retell-call-abandoned",
+    call_status: "ended",
+    disconnection_reason: "no_answer",
+    metadata: {
+      workspaceId: "workspace-123",
+      agentId: "agent-123",
+      kind: "test",
+    },
+  }));
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(persistedCall.outcome, "abandoned");
+  assert.equal(testedAgent, undefined);
+});
+
 test("call_ended resolves workspace from the Retell agent FK when metadata is absent", async () => {
   let persistedCall;
   const store = {
@@ -359,7 +425,8 @@ test("Dynamo store synchronously writes calls, conditional backfills, and tested
   }
   assert.equal(sent[4].input.TableName, "agents-table");
   assert.equal(sent[4].input.ConditionExpression, "attribute_exists(agentId)");
-  assert.match(sent[4].input.UpdateExpression, /testedAt/);
+  assert.match(sent[4].input.UpdateExpression, /tested = :tested/);
+  assert.match(sent[4].input.UpdateExpression, /testedAt = :testedAt/);
 });
 
 function callEndedEvent(call) {

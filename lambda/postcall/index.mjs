@@ -127,6 +127,7 @@ export function createHandler({
       if (
         call?.metadata?.kind === "test" &&
         agentId &&
+        isSuccessfulTestOutcome(record.outcome) &&
         typeof store.markAgentTested === "function"
       ) {
         await store.markAgentTested(workspaceId, agentId, timestamp);
@@ -343,6 +344,10 @@ function durationMs(call) {
     : undefined;
 }
 
+function isSuccessfulTestOutcome(outcome) {
+  return outcome !== "failed" && outcome !== "abandoned";
+}
+
 function inferOutcome(call, toolLog) {
   const successfulTools = new Set(
     toolActions(toolLog)
@@ -516,9 +521,11 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
       await client.send(new commands.UpdateItemCommand({
         TableName: requiredTable(tableNames.agents),
         Key: marshall({ workspaceId, agentId }),
-        UpdateExpression: "SET testedAt = :testedAt, updatedAt = :updatedAt",
+        UpdateExpression:
+          "SET tested = :tested, testedAt = :testedAt, updatedAt = :updatedAt",
         ConditionExpression: "attribute_exists(agentId)",
         ExpressionAttributeValues: marshall({
+          ":tested": true,
           ":testedAt": testedAt,
           ":updatedAt": testedAt,
         }),
