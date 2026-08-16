@@ -1,4 +1,6 @@
 const API_BASE = "https://graph.microsoft.com/v1.0";
+const IDEMPOTENCY_PROPERTY_ID =
+  "String {7c4e2a91-3b5d-4f8e-9a16-2d8c0b5e4f73} Name SymanticIdempotencyKey";
 
 export function createMicrosoftCalendarClient({
   fetchImpl = globalThis.fetch,
@@ -65,6 +67,10 @@ export function createMicrosoftCalendarClient({
               type: "required",
             }] : undefined,
             transactionId: providerId,
+            singleValueExtendedProperties: [{
+              id: IDEMPOTENCY_PROPERTY_ID,
+              value: providerId,
+            }],
           },
         });
         return normalizeEvent(result);
@@ -72,14 +78,17 @@ export function createMicrosoftCalendarClient({
         if (!isDuplicateTransaction(error)) throw error;
         const url = new URL(eventsUrl);
         const escapedProviderId = providerId.replaceAll("'", "''");
-        url.searchParams.set("$filter", `transactionId eq '${escapedProviderId}'`);
-        url.searchParams.set("$select", "id,webLink,transactionId");
+        url.searchParams.set(
+          "$filter",
+          "singleValueExtendedProperties/any(" +
+            `ep: ep/id eq '${IDEMPOTENCY_PROPERTY_ID}' ` +
+            `and ep/value eq '${escapedProviderId}')`,
+        );
+        url.searchParams.set("$select", "id,webLink");
         const existing = await requestJson(fetchImpl, url.toString(), {
           accessToken,
         });
-        const event = existing?.value?.find(
-          ({ transactionId }) => transactionId === providerId,
-        );
+        const event = existing?.value?.[0];
         if (!event) throw error;
         return normalizeEvent(event);
       }

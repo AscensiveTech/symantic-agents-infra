@@ -754,6 +754,10 @@ test("Microsoft adapter sends UTC event times and transaction id", async () => {
     timeZone: "UTC",
   });
   assert.equal(body.transactionId, "11111111-1111-4111-a111-111111111111");
+  assert.deepEqual(body.singleValueExtendedProperties, [{
+    id: "String {7c4e2a91-3b5d-4f8e-9a16-2d8c0b5e4f73} Name SymanticIdempotencyKey",
+    value: "11111111-1111-4111-a111-111111111111",
+  }]);
 });
 
 test("Microsoft createBooking reads back an existing duplicate transaction", async () => {
@@ -773,7 +777,6 @@ test("Microsoft createBooking reads back an existing duplicate transaction", asy
       return jsonResponse({
         value: [{
           id: "graph-event-existing",
-          transactionId,
           webLink: "https://outlook.office.com/event/existing",
         }],
       });
@@ -792,10 +795,17 @@ test("Microsoft createBooking reads back an existing duplicate transaction", asy
 
   assert.equal(booking.providerEventId, "graph-event-existing");
   assert.equal(requests.length, 2);
+  const recoveryUrl = decodeURIComponent(requests[1].url.replaceAll("+", " "));
   assert.match(
-    requests[1].url,
-    /%24filter=transactionId(\+|%20)eq(\+|%20)%2711111111/,
+    recoveryUrl,
+    /\$filter=singleValueExtendedProperties\/any\(/i,
   );
+  assert.match(recoveryUrl, /Name SymanticIdempotencyKey/);
+  assert.match(
+    recoveryUrl,
+    /ep\/value eq '11111111-1111-4111-a111-111111111111'/,
+  );
+  assert.doesNotMatch(recoveryUrl, /transactionId eq/);
 });
 
 test("Google cancelBooking treats a 410 gone response as success", async () => {
