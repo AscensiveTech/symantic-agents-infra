@@ -5,6 +5,7 @@ import { handleAvailability } from "./handlers/availability.mjs";
 import {
   handleCancelBooking,
   handleCreateBooking,
+  handleFindAppointment,
   handleRescheduleBooking,
 } from "./handlers/booking.mjs";
 import { ToolRequestError } from "./handlers/errors.mjs";
@@ -14,6 +15,7 @@ import { handleTransfer } from "./handlers/transfer.mjs";
 import { createDynamoToolsStore } from "./store.mjs";
 
 const ROUTES = new Set([
+  "/retell/tools/calendar.findAppointment",
   "/retell/tools/calendar.getAvailability",
   "/retell/tools/calendar.createBooking",
   "/retell/tools/calendar.rescheduleBooking",
@@ -132,7 +134,9 @@ export function createHandler({
       } else {
         const calendar = await getCalendar();
         const calendarContext = { ...context, calendar };
-        if (path === "/retell/tools/calendar.getAvailability") {
+        if (path === "/retell/tools/calendar.findAppointment") {
+          result = await handleFindAppointment(input, calendarContext);
+        } else if (path === "/retell/tools/calendar.getAvailability") {
           result = await handleAvailability(input, calendarContext);
         } else if (path === "/retell/tools/calendar.createBooking") {
           result = await handleCreateBooking(input, calendarContext);
@@ -203,6 +207,15 @@ function normalizeToolInput(payload) {
   }
   const metadata = payload?.call?.metadata ?? {};
   const dynamicVariables = payload?.call?.retell_llm_dynamic_variables ?? {};
+  const callId = payload?.call?.call_id ?? payload.args.callId;
+  const invocation = Array.isArray(payload?.call?.transcript_with_tool_calls)
+    ? [...payload.call.transcript_with_tool_calls].reverse().find((entry) =>
+      entry?.role === "tool_call_invocation" &&
+      entry?.name === payload.name &&
+      typeof entry?.tool_call_id === "string" &&
+      entry.tool_call_id
+    )
+    : null;
   return {
     ...payload.args,
     workspaceId: payload.args.workspaceId ??
@@ -211,7 +224,10 @@ function normalizeToolInput(payload) {
     agentId: payload.args.agentId ??
       metadata.agentId ??
       dynamicVariables.agentId,
-    callId: payload?.call?.call_id ?? payload.args.callId,
+    callId,
+    idempotencyKey: invocation
+      ? `${callId}:${invocation.tool_call_id}`
+      : payload.args.idempotencyKey,
   };
 }
 

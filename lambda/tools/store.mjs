@@ -58,6 +58,18 @@ export function createDynamoToolsStore(client, commands, tableNames) {
       });
     },
 
+    async listAppointments(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.appointments,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({
+          ":workspaceId": workspaceId,
+        }),
+        ConsistentRead: true,
+      }));
+      return (result.Items ?? []).map(unmarshall);
+    },
+
     async putAppointment(record) {
       await putOnce(
         client,

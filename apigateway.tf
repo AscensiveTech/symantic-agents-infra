@@ -48,7 +48,7 @@ resource "aws_apigatewayv2_integration" "bff" {
   integration_uri        = aws_lambda_function.bff.invoke_arn
   integration_method     = "POST"
   payload_format_version = "2.0"
-  timeout_milliseconds   = 10000
+  timeout_milliseconds   = 29000
 }
 
 resource "aws_apigatewayv2_route" "bff" {

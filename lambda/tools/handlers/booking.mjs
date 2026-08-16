@@ -7,6 +7,51 @@ import {
 } from "./records.mjs";
 import { resolveTimeRange } from "./time.mjs";
 
+export async function handleFindAppointment(input, { store }) {
+  const callerPhone = normalizePhone(
+    requireString(input.callerPhone, "callerPhone"),
+  );
+  const start = optionalTimestamp(input.startTime, "startTime");
+  const end = optionalTimestamp(input.endTime, "endTime");
+  if (start && end && end <= start) {
+    throw new ToolRequestError("endTime must be after startTime", {
+      statusCode: 400,
+      code: "invalid_request",
+    });
+  }
+  const appointments = await store.listAppointments(input.workspaceId);
+  const matches = appointments
+    .filter((appointment) => {
+      if (appointment.status === "cancelled") return false;
+      if (normalizePhone(appointment?.customer?.phone) !== callerPhone) {
+        return false;
+      }
+      const appointmentStart = Date.parse(appointment.startTimeUtc ?? "");
+      if (Number.isNaN(appointmentStart)) return false;
+      return (!start || appointmentStart >= start) &&
+        (!end || appointmentStart < end);
+    })
+    .sort((left, right) =>
+      Date.parse(left.startTimeUtc) - Date.parse(right.startTimeUtc)
+    )
+    .slice(0, 5)
+    .map((appointment) => ({
+      appointmentId: appointment.appointmentId,
+      callerName: stringOrUndefined(appointment?.customer?.name),
+      service: stringOrUndefined(appointment.service) || "Appointment",
+      startTimeUtc: appointment.startTimeUtc,
+      endTimeUtc: appointment.endTimeUtc,
+      status: appointment.status,
+    }));
+  if (!matches.length) {
+    throw new ToolRequestError(
+      "I couldn't find an upcoming appointment for that phone number.",
+      { statusCode: 404, code: "appointment_not_found" },
+    );
+  }
+  return { ok: true, appointments: matches };
+}
+
 export async function handleCreateBooking(input, {
   store,
   calendar,
@@ -211,6 +256,25 @@ function stringOrUndefined(value) {
   return typeof value === "string" && value.trim()
     ? value.trim()
     : undefined;
+}
+
+function normalizePhone(value) {
+  if (typeof value !== "string") return "";
+  const digits = value.replace(/\D/g, "");
+  if (digits.length === 10) return `1${digits}`;
+  return digits;
+}
+
+function optionalTimestamp(value, field) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const timestamp = Date.parse(requireString(value, field));
+  if (Number.isNaN(timestamp)) {
+    throw new ToolRequestError(`${field} must be an ISO 8601 date-time`, {
+      statusCode: 400,
+      code: "invalid_request",
+    });
+  }
+  return timestamp;
 }
 
 function requireAvailable(availability) {

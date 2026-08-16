@@ -86,7 +86,7 @@ resource "aws_lambda_function" "postcall" {
   handler       = "index.handler"
   architectures = ["arm64"]
   memory_size   = 256
-  timeout       = 30
+  timeout       = 29
 
   filename         = data.archive_file.postcall.output_path
   source_code_hash = data.archive_file.postcall.output_base64sha256
@@ -119,7 +119,7 @@ resource "aws_apigatewayv2_integration" "postcall" {
   integration_uri        = aws_lambda_function.postcall.invoke_arn
   integration_method     = "POST"
   payload_format_version = "2.0"
-  timeout_milliseconds   = 10000
+  timeout_milliseconds   = 29000
 }
 
 resource "aws_apigatewayv2_route" "postcall" {

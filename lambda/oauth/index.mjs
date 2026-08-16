@@ -182,6 +182,7 @@ export function createInMemoryConnectionStore(initialRecords = []) {
         selectedCalendarId: calendarId,
         calendarTimezone,
         connectionState: "connected",
+        updatedAt: new Date().toISOString(),
       };
       records.set(workspaceId, next);
       return cloneRecord(next);
@@ -388,7 +389,8 @@ export function createHandler(options = {}) {
           const calendars = await providerClient.listCalendars({
             accessToken: tokens.accessToken,
           });
-          const selected = selectDefaultCalendar(calendars);
+          const selected = calendars.length === 1 ? calendars[0] : null;
+          if (calendars.length === 0) selectDefaultCalendar(calendars);
           const connectionStore = await getConnectionStore();
           const existing = await connectionStore.get(stateRecord.workspaceId);
           const tokenCrypto = await getTokenCrypto();
@@ -422,14 +424,16 @@ export function createHandler(options = {}) {
           const connection = {
             workspaceId: stateRecord.workspaceId,
             provider,
-            selectedCalendarId: selected.id,
-            calendarTimezone: selected.timezone || "UTC",
+            selectedCalendarId: selected?.id ?? null,
+            calendarTimezone: selected?.timezone || "UTC",
+            availableCalendars: calendars.map(toPublicCalendar),
             encryptedRefreshToken,
             tokenVersion,
             scopes: tokens.scopes.length > 0
               ? tokens.scopes
               : [...PROVIDERS[provider].scopes],
             connectionState: "connected",
+            updatedAt: new Date(now()).toISOString(),
             ...(provider === "microsoft-365-calendar" && tokens.tid
               ? { tid: tokens.tid }
               : {}),
@@ -787,6 +791,15 @@ function toPublicConnection(connection) {
   return value;
 }
 
+function toPublicCalendar(calendar) {
+  return {
+    id: calendar.id,
+    name: calendar.name ?? calendar.id,
+    timezone: calendar.timezone || "UTC",
+    primary: calendar.primary === true,
+  };
+}
+
 function json(statusCode, body) {
   return {
     statusCode,
@@ -813,6 +826,9 @@ function cloneRecord(record) {
   return {
     ...record,
     scopes: Array.isArray(record.scopes) ? [...record.scopes] : record.scopes,
+    availableCalendars: Array.isArray(record.availableCalendars)
+      ? record.availableCalendars.map((calendar) => ({ ...calendar }))
+      : record.availableCalendars,
   };
 }
 
@@ -907,13 +923,15 @@ export function createDynamoConnectionStore(client, commands, tableName) {
         Key: marshall({ workspaceId }),
         UpdateExpression:
           "SET selectedCalendarId = :calendarId, " +
-          "calendarTimezone = :timezone, connectionState = :connected",
+          "calendarTimezone = :timezone, connectionState = :connected, " +
+          "updatedAt = :updatedAt",
         ConditionExpression: "provider = :provider AND connectionState = :connected",
         ExpressionAttributeValues: marshall({
           ":calendarId": calendarId,
           ":timezone": calendarTimezone,
           ":connected": "connected",
           ":provider": provider,
+          ":updatedAt": new Date().toISOString(),
         }),
         ReturnValues: "ALL_NEW",
       }));

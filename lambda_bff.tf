@@ -53,6 +53,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["business_profiles"].arn
       },
       {
+        Sid      = "ReadCalendarConnection"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["calendar_connections"].arn
+      },
+      {
         Sid      = "ManageAgents"
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
@@ -112,21 +118,22 @@ resource "aws_lambda_function" "bff" {
   handler       = "index.handler"
   architectures = ["arm64"]
   memory_size   = 256
-  timeout       = 30
+  timeout       = 29
 
   filename         = data.archive_file.bff.output_path
   source_code_hash = data.archive_file.bff.output_base64sha256
 
   environment {
     variables = {
-      WORKSPACES_TABLE        = aws_dynamodb_table.control_plane["workspaces"].name
-      BUSINESS_PROFILES_TABLE = aws_dynamodb_table.control_plane["business_profiles"].name
-      AGENTS_TABLE            = aws_dynamodb_table.control_plane["agents"].name
-      PHONE_NUMBERS_TABLE     = aws_dynamodb_table.control_plane["phone_numbers"].name
-      CALLS_TABLE             = aws_dynamodb_table.control_plane["calls"].name
-      RETELL_SECRET_ARN       = aws_secretsmanager_secret.providers["retell"].arn
-      TELNYX_SECRET_ARN       = aws_secretsmanager_secret.providers["telnyx"].arn
-      PUBLIC_API_BASE_URL     = aws_apigatewayv2_api.bff.api_endpoint
+      WORKSPACES_TABLE           = aws_dynamodb_table.control_plane["workspaces"].name
+      BUSINESS_PROFILES_TABLE    = aws_dynamodb_table.control_plane["business_profiles"].name
+      AGENTS_TABLE               = aws_dynamodb_table.control_plane["agents"].name
+      PHONE_NUMBERS_TABLE        = aws_dynamodb_table.control_plane["phone_numbers"].name
+      CALENDAR_CONNECTIONS_TABLE = aws_dynamodb_table.control_plane["calendar_connections"].name
+      CALLS_TABLE                = aws_dynamodb_table.control_plane["calls"].name
+      RETELL_SECRET_ARN          = aws_secretsmanager_secret.providers["retell"].arn
+      TELNYX_SECRET_ARN          = aws_secretsmanager_secret.providers["telnyx"].arn
+      PUBLIC_API_BASE_URL        = aws_apigatewayv2_api.bff.api_endpoint
     }
   }
 

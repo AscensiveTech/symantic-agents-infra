@@ -375,10 +375,91 @@ test("google callback preserves an existing refresh token when Google omits one"
     provider: "google-calendar",
     selectedCalendarId: "primary-calendar",
     calendarTimezone: "America/New_York",
+    availableCalendars: [{
+      id: "primary-calendar",
+      name: "primary-calendar",
+      timezone: "America/New_York",
+      primary: true,
+    }],
     encryptedRefreshToken: "encrypted:keep-me",
     tokenVersion: 4,
     scopes: ["new-scope"],
     connectionState: "connected",
+    updatedAt: "2027-01-15T08:00:00.000Z",
+  });
+});
+
+test("callback leaves multiple calendars unselected and exposes them for explicit selection", async () => {
+  const stateStore = createInMemoryStateStore();
+  await stateStore.put({
+    state: "multi-calendar-state",
+    workspaceId,
+    userId: "person@example.com",
+    provider: "google-calendar",
+    redirectUri,
+    returnTo: "/agents/new/connections",
+    expiresAt: 1_900_000_000,
+  });
+  const connections = createInMemoryConnectionStore();
+  const calendars = [
+    {
+      id: "calendar-a",
+      name: "Front desk",
+      timezone: "America/New_York",
+      primary: true,
+    },
+    {
+      id: "calendar-b",
+      name: "Appointments",
+      timezone: "America/Chicago",
+      primary: false,
+    },
+  ];
+  const handler = createHandler({
+    getStateStore: async () => stateStore,
+    getConnectionStore: async () => connections,
+    getOAuthSecret: async () => ({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+    }),
+    getTokenCrypto: async () => ({
+      encryptToken: async () => "encrypted-token",
+      decryptToken: async () => "refresh-token",
+    }),
+    getProviderClient: () => ({
+      exchangeCode: async () => ({
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        scopes: ["calendar"],
+      }),
+      listCalendars: async () => calendars,
+    }),
+    redirectBaseUrl: "https://api.example.com",
+    appUrl: "https://agents.example.com",
+    now: () => 1_800_000_000_000,
+  });
+
+  const callback = await handler(event(
+    "GET",
+    "/oauth/google-calendar/callback",
+    undefined,
+    { code: "authorization-code", state: "multi-calendar-state" },
+  ));
+  const connection = await handler(authenticatedEvent(
+    "GET",
+    "/calendars/connection",
+  ));
+
+  assert.equal(callback.statusCode, 302);
+  assert.deepEqual(JSON.parse(connection.body), {
+    provider: "google-calendar",
+    selectedCalendarId: null,
+    calendarTimezone: "UTC",
+    tokenVersion: 1,
+    scopes: ["calendar"],
+    connectionState: "connected",
+    updatedAt: "2027-01-15T08:00:00.000Z",
+    availableCalendars: calendars,
   });
 });
 

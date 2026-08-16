@@ -143,6 +143,47 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
   assert.equal(calls[2][1].headers.Authorization, "Bearer retell-key");
 });
 
+test("Retell imports a Telnyx DID and binds it to the synced agent", async () => {
+  const calls = [];
+  const client = createRetellClient({
+    apiKey: "retell-key",
+    terminationUri: "sip.telnyx.com",
+    sipTrunkAuthUsername: "telnyx-user",
+    sipTrunkAuthPassword: "telnyx-password",
+    fetchImpl: async (url, init) => {
+      calls.push([String(url), init]);
+      return response({
+        phone_number: "+17035550177",
+        phone_number_type: "custom",
+        last_modification_timestamp: 1_800_000_000_000,
+      }, 201);
+    },
+  });
+
+  const result = await client.importPhoneNumber({
+    phoneNumber: "+17035550177",
+    retellAgentId: "retell-agent-123",
+    nickname: "Symantic workspace-123 agent-123",
+    inboundWebhookUrl: "https://api.example.com/retell/inbound-lookup",
+  });
+
+  assert.deepEqual(result, {
+    retellPhoneNumberId: "+17035550177",
+  });
+  assert.equal(calls[0][0], "https://api.retellai.com/import-phone-number");
+  assert.deepEqual(JSON.parse(calls[0][1].body), {
+    phone_number: "+17035550177",
+    termination_uri: "sip.telnyx.com",
+    sip_trunk_auth_username: "telnyx-user",
+    sip_trunk_auth_password: "telnyx-password",
+    transport: "TCP",
+    inbound_agents: [{ agent_id: "retell-agent-123", weight: 1 }],
+    outbound_agents: [{ agent_id: "retell-agent-123", weight: 1 }],
+    nickname: "Symantic workspace-123 agent-123",
+    inbound_webhook_url: "https://api.example.com/retell/inbound-lookup",
+  });
+});
+
 test("Retell upsert reuses a Symantic-named agent instead of creating another", async () => {
   const calls = [];
   const fetchImpl = async (url, init = {}) => {

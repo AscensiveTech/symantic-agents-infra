@@ -1,5 +1,26 @@
 const CALENDAR_TOOLS = [
   {
+    name: "calendar_find_appointment",
+    path: "/retell/tools/calendar.findAppointment",
+    description:
+      "Find the caller's existing appointment by caller phone and an optional date window before rescheduling or cancelling.",
+    properties: {
+      callerPhone: {
+        type: "string",
+        description: "Caller's phone number. Use the number on the call when available.",
+      },
+      startTime: {
+        type: "string",
+        description: "Optional start of the appointment search window.",
+      },
+      endTime: {
+        type: "string",
+        description: "Optional end of the appointment search window.",
+      },
+    },
+    required: ["callerPhone"],
+  },
+  {
     name: "calendar_get_availability",
     path: "/retell/tools/calendar.getAvailability",
     description:
@@ -63,7 +84,7 @@ const CALENDAR_TOOLS = [
     name: "calendar_reschedule_booking",
     path: "/retell/tools/calendar.rescheduleBooking",
     description:
-      "Move an existing appointment after confirming its appointment ID and a new time with the caller.",
+      "Move an appointment returned by calendar_find_appointment after confirming the appointment and new time with the caller.",
     properties: {
       appointmentId: {
         type: "string",
@@ -88,7 +109,7 @@ const CALENDAR_TOOLS = [
     name: "calendar_cancel_booking",
     path: "/retell/tools/calendar.cancelBooking",
     description:
-      "Cancel an existing appointment only after the caller confirms cancellation.",
+      "Cancel an appointment returned by calendar_find_appointment only after the caller confirms cancellation.",
     properties: {
       appointmentId: {
         type: "string",
@@ -131,19 +152,6 @@ const CORE_TOOLS = [
       },
     },
     required: ["name", "phone", "message"],
-  },
-  {
-    name: "call_transfer",
-    path: "/retell/tools/call.transfer",
-    description:
-      "Resolve the approved transfer destination for emergencies, escalations, or a caller asking for a person.",
-    properties: {
-      reason: {
-        type: "string",
-        description: "Why the caller needs a transfer.",
-      },
-    },
-    required: ["reason"],
   },
 ];
 
@@ -192,7 +200,7 @@ export function buildReceptionistPrompt(agent, profile) {
       formatEmergencyRules(behavior.emergencyRules),
       text(behavior.escalation),
     ].filter(Boolean).join("\n") ||
-      "For emergencies or requests for a person, use call_transfer. If transfer is unavailable, use message_take.",
+      "For emergencies or requests for a person, use the matching transfer_call tool. If transfer is unavailable, use message_take.",
     "",
     "Operating rules",
     "- Never invent business facts, prices, availability, medical advice, or policy.",
@@ -220,21 +228,23 @@ export function buildReceptionistConfig({
   const definitions = bookingEnabled
     ? [...CALENDAR_TOOLS, ...CORE_TOOLS]
     : CORE_TOOLS;
+  const transferDefinitions = buildTransferTools(agent, profile);
   return {
     prompt: buildReceptionistPrompt(agent, profile),
-    tools: definitions.map((definition) =>
-      toRetellTool(definition, {
-        workspaceId,
-        agentId,
-        toolBaseUrl,
-      })
-    ),
+    tools: [
+      ...definitions.map((definition) =>
+        toRetellTool(definition, {
+          workspaceId,
+          agentId,
+          toolBaseUrl,
+        })
+      ),
+      ...transferDefinitions,
+    ],
     voice: voiceId,
-    transferNumbers: unique([
-      profile?.escalationContact,
-      profile?.ownerPhone,
-      profile?.fallbackPhone,
-    ]),
+    transferNumbers: transferDefinitions.map(
+      ({ transfer_destination }) => transfer_destination.number,
+    ),
     bookingEnabled,
   };
 }
@@ -257,10 +267,6 @@ function toRetellTool(definition, {
       type: "string",
       const: "{{call_id}}",
     },
-    idempotencyKey: {
-      type: "string",
-      const: `{{call_id}}-${definition.name}`,
-    },
   };
   return {
     type: "custom",
@@ -278,7 +284,6 @@ function toRetellTool(definition, {
         "workspaceId",
         "agentId",
         "callId",
-        "idempotencyKey",
         ...definition.required,
       ],
     },
@@ -287,6 +292,57 @@ function toRetellTool(definition, {
     timeout_ms: 10_000,
     max_retry: 1,
   };
+}
+
+function buildTransferTools(agent, profile) {
+  const rules = Array.isArray(agent?.configuration?.emergencyRules)
+    ? agent.configuration.emergencyRules
+    : [];
+  const destinations = [
+    ...rules.flatMap((rule) => {
+      const number = toE164(rule?.transferTarget);
+      if (!number) return [];
+      const phrases = Array.isArray(rule?.phrases)
+        ? rule.phrases.map(text).filter(Boolean)
+        : [];
+      return [{
+        number,
+        description: phrases.length
+          ? `Warm transfer when the caller mentions ${phrases.join(", ")}.`
+          : "Warm transfer for this configured emergency rule.",
+      }];
+    }),
+    ...[
+      profile?.escalationContact,
+      profile?.ownerPhone,
+      profile?.fallbackPhone,
+    ].flatMap((value) => {
+      const number = toE164(value);
+      return number
+        ? [{ number, description: "Warm transfer for escalation or a request for a person." }]
+        : [];
+    }),
+  ];
+  const uniqueDestinations = destinations.filter(
+    ({ number }, index) =>
+      destinations.findIndex((candidate) => candidate.number === number) === index,
+  );
+  return uniqueDestinations.map(({ number, description }, index) => ({
+    type: "transfer_call",
+    name: `transfer_call_${index + 1}`,
+    description,
+    transfer_destination: {
+      type: "predefined",
+      number,
+    },
+    transfer_option: {
+      type: "warm_transfer",
+      show_transferee_as_caller: false,
+    },
+    speak_during_execution: true,
+    execution_message_type: "static_text",
+    execution_message_description: "Please hold while I connect you.",
+  }));
 }
 
 export function resolveConfiguredVoiceId(configuration, resolveVoiceId) {
@@ -321,6 +377,11 @@ function list(value) {
     : "";
 }
 
-function unique(values) {
-  return [...new Set(values.map(text).filter(Boolean))];
+function toE164(value) {
+  const raw = text(value);
+  if (/^\+[1-9]\d{7,14}$/.test(raw)) return raw;
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return null;
 }

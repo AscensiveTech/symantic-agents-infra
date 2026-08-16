@@ -167,6 +167,7 @@ resource "aws_apigatewayv2_integration" "tools" {
 
 locals {
   retell_tool_routes = toset([
+    "POST /retell/tools/calendar.findAppointment",
     "POST /retell/tools/calendar.getAvailability",
     "POST /retell/tools/calendar.createBooking",
     "POST /retell/tools/calendar.rescheduleBooking",

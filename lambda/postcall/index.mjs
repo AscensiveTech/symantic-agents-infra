@@ -1,6 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 const ROUTE = "/retell/webhooks/call-ended";
+const MAX_CALL_CONTENT_BYTES = 340 * 1024;
 
 export function verifyRetellSignature(
   rawBody,
@@ -100,6 +101,10 @@ export function createHandler({
     const timestamp = new Date(now()).toISOString();
     const callId = stableId("call", workspaceId, retellCallId);
     const summary = summarizeCall(call, toolLog);
+    const content = truncateCallContent(
+      normalizeTranscript(call.transcript_object, call.transcript),
+      toolLog,
+    );
     const record = {
       workspaceId,
       callId,
@@ -114,8 +119,15 @@ export function createHandler({
       durationMs: durationMs(call),
       recordingUrl: stringValue(call.recording_url),
       disconnectionReason: stringValue(call.disconnection_reason),
-      transcript: normalizeTranscript(call.transcript_object, call.transcript),
-      toolLog,
+      transcript: content.transcript,
+      toolLog: content.toolLog,
+      ...(content.truncated
+        ? {
+          transcriptTruncated: true,
+          transcriptNote:
+            "Transcript and tool log were truncated to stay within the Calls item size limit.",
+        }
+        : {}),
       outcome: inferOutcome(call, toolLog),
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -123,7 +135,7 @@ export function createHandler({
     try {
       store ??= await getStore();
       await store.putCall(record);
-      await backfillToolRecords(store, record);
+      await backfillToolRecords(store, { ...record, toolLog });
       if (
         call?.metadata?.kind === "test" &&
         agentId &&
@@ -153,6 +165,49 @@ function normalizeToolLog(value) {
       ["tool_call_invocation", "tool_call_result"].includes(entry.role)
     )
     : [];
+}
+
+function truncateCallContent(transcript, toolLog) {
+  if (callContentBytes(transcript, toolLog) <= MAX_CALL_CONTENT_BYTES) {
+    return { transcript, toolLog, truncated: false };
+  }
+  const limitedTranscript = transcript.map((entry) => ({
+    ...entry,
+    text: truncateString(entry.text, 16_000),
+  }));
+  const limitedToolLog = toolLog.map((entry) =>
+    Object.fromEntries(Object.entries(entry).map(([key, value]) => [
+      key,
+      typeof value === "string" ? truncateString(value, 16_000) : value,
+    ]))
+  );
+  while (
+    limitedTranscript.length &&
+    callContentBytes(limitedTranscript, limitedToolLog) > MAX_CALL_CONTENT_BYTES
+  ) {
+    limitedTranscript.pop();
+  }
+  while (
+    limitedToolLog.length &&
+    callContentBytes(limitedTranscript, limitedToolLog) > MAX_CALL_CONTENT_BYTES
+  ) {
+    limitedToolLog.pop();
+  }
+  return {
+    transcript: limitedTranscript,
+    toolLog: limitedToolLog,
+    truncated: true,
+  };
+}
+
+function callContentBytes(transcript, toolLog) {
+  return Buffer.byteLength(JSON.stringify({ transcript, toolLog }), "utf8");
+}
+
+function truncateString(value, maxLength) {
+  return typeof value === "string" && value.length > maxLength
+    ? `${value.slice(0, maxLength)}…`
+    : value;
 }
 
 function toolActions(toolLog) {
@@ -355,7 +410,12 @@ function inferOutcome(call, toolLog) {
       .map(({ name }) => name),
   );
   if (successfulTools.has("calendar_create_booking")) return "booked";
-  if (successfulTools.has("call_transfer")) return "escalated";
+  if (
+    successfulTools.has("call_transfer") ||
+    [...successfulTools].some((name) => name.startsWith("transfer_call"))
+  ) {
+    return "escalated";
+  }
   if (successfulTools.has("message_take")) return "message";
   if (successfulTools.has("lead_capture")) return "lead";
   const failure = [

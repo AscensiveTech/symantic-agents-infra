@@ -192,7 +192,13 @@ export function createHandler({
       }
 
       if (path === "/workspaces/me/agents" && method === "POST") {
-        const agent = pickAgent(readBody(event));
+        const candidate = pickAgent(readBody(event));
+        const agent = candidate
+          ? {
+            ...candidate,
+            status: candidate.status === "active" ? "draft" : candidate.status,
+          }
+          : null;
         if (!agent) return json(400, { message: "Invalid agent" });
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
@@ -223,62 +229,23 @@ export function createHandler({
         const agent = await store.getAgent(workspaceId, agentAction.agentId);
         if (!agent) return json(404, { message: "Agent not found" });
         const profile = await store.getProfile(workspaceId);
-        if (!profile) {
-          return json(409, {
-            message: "Complete the business profile before activation",
-          });
-        }
+        const calendar = agent?.configuration?.booking === true &&
+            typeof store.getCalendarConnection === "function"
+          ? await store.getCalendarConnection(workspaceId)
+          : null;
+        const launchIssue = launchReadinessIssue(agent, profile, calendar);
+        if (launchIssue) return json(409, { message: launchIssue });
         const providers = await getProviders();
-        let phoneNumber = await store.getPhoneNumberForAgent(
+        const runtime = await syncReceptionistRuntime({
           workspaceId,
-          agentAction.agentId,
-        );
-        if (!phoneNumber) {
-          const provisioned = await providers.telnyx.ensureNumber({
-            workspaceId,
-            agentId: agentAction.agentId,
-            preferredPhone: agent?.configuration?.phone ?? profile.phone,
-          });
-          phoneNumber = {
-            workspaceId,
-            phoneNumberId: `phone-${agentAction.agentId}`,
-            agentId: agentAction.agentId,
-            ...provisioned,
-            status: "active",
-            createdAt: new Date().toISOString(),
-          };
-          await store.putPhoneNumber(phoneNumber);
-        }
-        const voiceId = resolveConfiguredVoiceId(
-          agent?.configuration,
-          providers.resolveVoiceId,
-        );
-        const config = buildReceptionistConfig({
-          workspaceId,
+          agentId: agentAction.agentId,
           agent,
           profile,
+          store,
+          providers,
           toolBaseUrl,
-          voiceId,
+          phoneStatus: "active",
         });
-        const synced = await providers.retell.upsertAgent({
-          retellAgentId: agent.retellAgentId,
-          symanticAgentId: agentAction.agentId,
-          agentName: agent?.configuration?.name ?? agent.name,
-          greeting: agent?.configuration?.greeting ?? "",
-          config,
-        });
-        try {
-          await store.updateAgentRuntime(
-            workspaceId,
-            agentAction.agentId,
-            { retellAgentId: synced.retellAgentId },
-          );
-        } catch (error) {
-          if (isConditionalCheckFailed(error)) {
-            return json(404, { message: "Agent not found" });
-          }
-          console.error("Failed to persist retellAgentId after Retell upsert", error);
-        }
         const activatedAt = new Date().toISOString();
         let updatedAgent;
         try {
@@ -287,7 +254,7 @@ export function createHandler({
             agentAction.agentId,
             {
               status: "active",
-              retellAgentId: synced.retellAgentId,
+              retellAgentId: runtime.retellAgentId,
               activatedAt,
               updatedAt: activatedAt,
             },
@@ -300,7 +267,7 @@ export function createHandler({
         }
         return json(200, {
           agent: toPublicAgent(updatedAgent),
-          phoneNumber: toPublicPhoneNumber(phoneNumber),
+          phoneNumber: toPublicPhoneNumber(runtime.phoneNumber),
         });
       }
 
@@ -316,24 +283,34 @@ export function createHandler({
         await store.ensureWorkspace(workspaceId);
         const agent = await store.getAgent(workspaceId, agentAction.agentId);
         if (!agent) return json(404, { message: "Agent not found" });
-        const phoneNumber = await store.getPhoneNumberForAgent(
-          workspaceId,
-          agentAction.agentId,
-        );
-        if (!agent.retellAgentId || !phoneNumber?.telnyxPhoneNumber) {
+        const profile = await store.getProfile(workspaceId);
+        if (!profile) {
           return json(409, {
-            message: "Activate the agent before starting a test call",
+            message: "Complete the business profile before starting a test call",
           });
         }
         const providers = await getProviders();
+        const runtime = await syncReceptionistRuntime({
+          workspaceId,
+          agentId: agentAction.agentId,
+          agent,
+          profile,
+          store,
+          providers,
+          toolBaseUrl,
+          phoneStatus: agent.status === "active" ? "active" : "draft",
+        });
         const call = await providers.retell.startPhoneCall({
-          fromNumber: phoneNumber.telnyxPhoneNumber,
+          fromNumber: runtime.phoneNumber.retellPhoneNumberId,
           toNumber,
-          retellAgentId: agent.retellAgentId,
+          retellAgentId: runtime.retellAgentId,
           workspaceId,
           agentId: agentAction.agentId,
         });
-        return json(202, call);
+        return json(202, {
+          ...call,
+          phoneNumber: toPublicPhoneNumber(runtime.phoneNumber),
+        });
       }
 
       const agentId = getAgentId(event, path);
@@ -352,7 +329,32 @@ export function createHandler({
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         try {
-          return json(200, await store.putAgent(workspaceId, agentId, agent));
+          const existing = typeof store.getAgent === "function"
+            ? await store.getAgent(workspaceId, agentId)
+            : null;
+          const invalidateTest = Boolean(
+            existing &&
+            !sameLaunchConfiguration(existing.configuration, agent.configuration),
+          );
+          const saved = {
+            ...agent,
+            status: invalidateTest
+              ? "draft"
+              : existing?.status === "active"
+                ? "active"
+                : agent.status === "active"
+                  ? "draft"
+                  : agent.status,
+          };
+          return json(
+            200,
+            await store.putAgent(
+              workspaceId,
+              agentId,
+              saved,
+              { invalidateTest },
+            ),
+          );
         } catch (error) {
           if (isConditionalCheckFailed(error)) {
             return json(404, { message: "Agent not found" });
@@ -402,11 +404,15 @@ async function handleInboundLookup(event, {
   } catch {
     return json(400, { message: "Invalid JSON body" });
   }
-  const did = input?.to_number ??
-    input?.toNumber ??
-    input?.did ??
-    input?.phone_number ??
-    input?.phoneNumber;
+  if (
+    input?.event !== "call_inbound" ||
+    !input.call_inbound ||
+    typeof input.call_inbound !== "object" ||
+    Array.isArray(input.call_inbound)
+  ) {
+    return json(400, { message: "A call_inbound payload is required" });
+  }
+  const did = input.call_inbound.to_number;
   if (!isE164(did)) {
     return json(400, { message: "An E.164 destination DID is required" });
   }
@@ -421,18 +427,209 @@ async function handleInboundLookup(event, {
   if (!agent || !profile) {
     return json(404, { message: "Receptionist configuration not found" });
   }
-  const providers = await getProviders();
+  if (agent.status !== "active" || !agent.retellAgentId) {
+    return json(200, { call_inbound: { reject: true } });
+  }
+  return json(200, {
+    call_inbound: {
+      override_agent_id: agent.retellAgentId,
+      dynamic_variables: {
+        workspaceId: phoneNumber.workspaceId,
+        agentId: phoneNumber.agentId,
+      },
+      metadata: {
+        workspaceId: phoneNumber.workspaceId,
+        agentId: phoneNumber.agentId,
+      },
+    },
+  });
+}
+
+async function syncReceptionistRuntime({
+  workspaceId,
+  agentId,
+  agent,
+  profile,
+  store,
+  providers,
+  toolBaseUrl,
+  phoneStatus,
+}) {
+  let phoneNumber = await store.getPhoneNumberForAgent(workspaceId, agentId);
+  if (!phoneNumber) {
+    const provisioned = await providers.telnyx.ensureNumber({
+      workspaceId,
+      agentId,
+      preferredPhone: agent?.configuration?.phone ?? profile.phone,
+    });
+    phoneNumber = {
+      workspaceId,
+      phoneNumberId: `phone-${agentId}`,
+      agentId,
+      ...provisioned,
+      status: phoneStatus,
+      createdAt: new Date().toISOString(),
+    };
+  }
+  const voiceId = resolveConfiguredVoiceId(
+    agent?.configuration,
+    providers.resolveVoiceId,
+  );
   const config = buildReceptionistConfig({
-    workspaceId: phoneNumber.workspaceId,
+    workspaceId,
     agent,
     profile,
     toolBaseUrl,
-    voiceId: resolveConfiguredVoiceId(
-      agent?.configuration,
-      providers.resolveVoiceId,
-    ),
+    voiceId,
   });
-  return json(200, config);
+  const synced = await providers.retell.upsertAgent({
+    retellAgentId: agent.retellAgentId,
+    symanticAgentId: agentId,
+    agentName: agent?.configuration?.name ?? agent.name,
+    greeting: agent?.configuration?.greeting ?? "",
+    config,
+  });
+  try {
+    await store.updateAgentRuntime(
+      workspaceId,
+      agentId,
+      { retellAgentId: synced.retellAgentId },
+    );
+  } catch (error) {
+    if (isConditionalCheckFailed(error)) throw error;
+    console.error("Failed to persist retellAgentId after Retell upsert", error);
+  }
+  if (!phoneNumber.retellPhoneNumberId) {
+    const imported = await providers.retell.importPhoneNumber({
+      phoneNumber: phoneNumber.telnyxPhoneNumber,
+      retellAgentId: synced.retellAgentId,
+      nickname: `Symantic ${workspaceId} ${agentId}`,
+      inboundWebhookUrl:
+        `${String(toolBaseUrl).replace(/\/+$/, "")}/retell/inbound-lookup`,
+    });
+    phoneNumber = { ...phoneNumber, ...imported };
+  }
+  phoneNumber = {
+    ...phoneNumber,
+    status: phoneStatus,
+    updatedAt: new Date().toISOString(),
+  };
+  await store.putPhoneNumber(phoneNumber);
+  return {
+    phoneNumber,
+    retellAgentId: synced.retellAgentId,
+  };
+}
+
+function launchReadinessIssue(agent, profile, calendar) {
+  const requiredProfileFields = [
+    "businessName",
+    "businessType",
+    "timezone",
+    "hours",
+    "ownerPhone",
+    "fallbackPhone",
+    "phone",
+  ];
+  if (
+    !profile ||
+    requiredProfileFields.some(
+      (field) => typeof profile[field] !== "string" || !profile[field].trim(),
+    )
+  ) {
+    return "Complete the business profile before activation";
+  }
+  if (
+    !agent?.configuration ||
+    !agent.configuration.template ||
+    agent.configuration.businessConfirmed !== true ||
+    !agent.configuration.name?.trim() ||
+    !agent.configuration.guidance?.trim() ||
+    !agent.configuration.escalation?.trim()
+  ) {
+    return "Complete the agent details and behavior before activation";
+  }
+  const phoneValues = [
+    profile.phone,
+    profile.ownerPhone,
+    profile.fallbackPhone,
+    agent?.configuration?.phone,
+    ...(typeof profile.escalationContact === "string" &&
+        profile.escalationContact.trim()
+      ? [profile.escalationContact]
+      : []),
+    ...(Array.isArray(agent?.configuration?.emergencyRules)
+      ? agent.configuration.emergencyRules.map(({ transferTarget }) =>
+        transferTarget
+      )
+      : []),
+  ];
+  if (phoneValues.some((value) => !isValidPhone(value))) {
+    return "Configure valid business, owner, fallback, and transfer phone numbers before activation";
+  }
+  if (
+    agent?.configuration?.booking === true &&
+    (
+      calendar?.connectionState !== "connected" ||
+      typeof calendar?.selectedCalendarId !== "string" ||
+      !calendar.selectedCalendarId
+    )
+  ) {
+    return "Connect and select a booking calendar before activation";
+  }
+  if (
+    agent?.tested !== true ||
+    typeof agent?.testedAt !== "string" ||
+    Number.isNaN(Date.parse(agent.testedAt))
+  ) {
+    return "Run a successful current-config test before activation";
+  }
+  if (
+    agent.configuration?.booking === true &&
+    agent.configuration?.calendarSelectionId !== calendar.selectedCalendarId
+  ) {
+    return "Run a successful current-config test after selecting the booking calendar";
+  }
+  const testedAt = Date.parse(agent.testedAt);
+  if (
+    isTimestampAfter(profile?.updatedAt, testedAt) ||
+    isTimestampAfter(calendar?.updatedAt, testedAt)
+  ) {
+    return "Run a successful current-config test after profile or calendar changes";
+  }
+  return null;
+}
+
+function sameLaunchConfiguration(left, right) {
+  return JSON.stringify(canonicalLaunchConfiguration(left)) ===
+    JSON.stringify(canonicalLaunchConfiguration(right));
+}
+
+function canonicalLaunchConfiguration(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const {
+    tested: _tested,
+    testRunCount: _testRunCount,
+    platformDid: _platformDid,
+    completedSteps: _completedSteps,
+    ...configuration
+  } = value;
+  return configuration;
+}
+
+function isValidPhone(value) {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (/^\+[1-9]\d{7,14}$/.test(trimmed)) return true;
+  const digits = trimmed.replace(/\D/g, "");
+  return digits.length === 10 ||
+    (digits.length === 11 && digits.startsWith("1"));
+}
+
+function isTimestampAfter(value, timestamp) {
+  if (typeof value !== "string") return false;
+  const parsed = Date.parse(value);
+  return !Number.isNaN(parsed) && parsed > timestamp;
 }
 
 export function verifyRetellSignature(
@@ -605,9 +802,10 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async putProfile(workspaceId, profile) {
+      const updatedAt = new Date().toISOString();
       await client.send(new commands.PutItemCommand({
         TableName: tableNames.businessProfiles,
-        Item: marshall({ workspaceId, ...profile }),
+        Item: marshall({ workspaceId, ...profile, updatedAt }),
       }));
       return profile;
     },
@@ -662,8 +860,17 @@ export function createDynamoStore(client, commands, tableNames) {
       return agent;
     },
 
-    async putAgent(workspaceId, agentId, agent) {
+    async putAgent(
+      workspaceId,
+      agentId,
+      agent,
+      { invalidateTest = false } = {},
+    ) {
       const { id: _id, ...record } = agent;
+      if (invalidateTest) {
+        record.tested = false;
+        record.updatedAt = new Date().toISOString();
+      }
       const entries = Object.entries(record)
         .filter(([, value]) => value !== undefined);
       const names = Object.fromEntries(
@@ -679,12 +886,21 @@ export function createDynamoStore(client, commands, tableNames) {
           entries.map(
             (_entry, index) => `#field${index} = :value${index}`,
           ).join(", ")
-        }`,
+        }${invalidateTest ? " REMOVE #testedAt, #testCallId" : ""}`,
         ConditionExpression: "attribute_exists(agentId)",
-        ExpressionAttributeNames: names,
+        ExpressionAttributeNames: invalidateTest
+          ? {
+            ...names,
+            "#testedAt": "testedAt",
+            "#testCallId": "testCallId",
+          }
+          : names,
         ExpressionAttributeValues: marshall(values),
       }));
-      return agent;
+      return {
+        ...agent,
+        ...(invalidateTest ? { tested: false } : {}),
+      };
     },
 
     async updateAgentRuntime(workspaceId, agentId, updates) {
@@ -724,6 +940,15 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    async getCalendarConnection(workspaceId) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.calendarConnections,
+        Key: marshall({ workspaceId }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
     async putPhoneNumber(record) {
       await client.send(new commands.PutItemCommand({
         TableName: tableNames.phoneNumbers,
@@ -756,6 +981,7 @@ async function getDefaultStore() {
       businessProfiles: process.env.BUSINESS_PROFILES_TABLE,
       agents: process.env.AGENTS_TABLE,
       phoneNumbers: process.env.PHONE_NUMBERS_TABLE,
+      calendarConnections: process.env.CALENDAR_CONNECTIONS_TABLE,
       calls: process.env.CALLS_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
@@ -823,6 +1049,16 @@ async function getDefaultProviders() {
   ]).then(([retellSecret, telnyxSecret]) => ({
     retell: createRetellClient({
       apiKey: readApiKey(retellSecret, "Retell"),
+      terminationUri: telnyxSecret.terminationUri ??
+        telnyxSecret.termination_uri ??
+        telnyxSecret.telnyxTerminationUri,
+      sipTrunkAuthUsername: telnyxSecret.sipTrunkAuthUsername ??
+        telnyxSecret.sip_trunk_auth_username ??
+        telnyxSecret.username,
+      sipTrunkAuthPassword: telnyxSecret.sipTrunkAuthPassword ??
+        telnyxSecret.sip_trunk_auth_password ??
+        telnyxSecret.password,
+      transport: telnyxSecret.transport ?? "TCP",
     }),
     telnyx: createTelnyxClient({
       apiKey: readApiKey(telnyxSecret, "Telnyx"),

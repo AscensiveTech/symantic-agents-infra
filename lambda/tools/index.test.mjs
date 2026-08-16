@@ -383,6 +383,7 @@ test("invalid signature returns 401 before body validation or persistence", asyn
 test("every tool rejects a missing workspaceId, callId, or idempotencyKey", async () => {
   const handler = toolHandler();
   const paths = [
+    "/retell/tools/calendar.findAppointment",
     "/retell/tools/calendar.getAvailability",
     "/retell/tools/calendar.createBooking",
     "/retell/tools/calendar.rescheduleBooking",
@@ -428,12 +429,106 @@ test("Retell wrapped custom-function payload uses args and the signed call id", 
         workspaceId,
         agentId: "agent-123",
       },
+      transcript_with_tool_calls: [{
+        role: "tool_call_invocation",
+        tool_call_id: "tool-call-1",
+        name: "lead_capture",
+      }],
     },
   }));
 
   assert.equal(response.statusCode, 200);
   assert.equal(captured.callId, "call-from-retell");
   assert.equal(captured.workspaceId, workspaceId);
+  assert.equal(captured.idempotencyKey, "call-from-retell:tool-call-1");
+});
+
+test("distinct Retell tool-call ids create distinct bookings while retries stay idempotent", async () => {
+  const records = new Map();
+  const store = createStore({
+    getAppointment: async (_workspaceId, appointmentId) =>
+      clone(records.get(appointmentId)),
+    putAppointment: async (record) => putOnce(
+      records,
+      record.appointmentId,
+      record,
+    ),
+  });
+  const handler = toolHandler({ store });
+  const wrapped = (toolCallId) => ({
+    name: "calendar_create_booking",
+    args: bookingBody({ idempotencyKey: "llm-supplied-value" }),
+    call: {
+      call_id: "call-from-retell",
+      metadata: { workspaceId, agentId: "agent-1" },
+      transcript_with_tool_calls: [{
+        role: "tool_call_invocation",
+        tool_call_id: toolCallId,
+        name: "calendar_create_booking",
+      }],
+    },
+  });
+
+  const first = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    wrapped("tool-call-1"),
+  ));
+  const retry = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    wrapped("tool-call-1"),
+  ));
+  const second = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    wrapped("tool-call-2"),
+  ));
+
+  assert.equal(JSON.parse(first.body).appointmentId, JSON.parse(retry.body).appointmentId);
+  assert.notEqual(JSON.parse(first.body).appointmentId, JSON.parse(second.body).appointmentId);
+  assert.equal(records.size, 2);
+});
+
+test("calendar.findAppointment resolves appointments by caller phone and date window", async () => {
+  const handler = toolHandler({
+    store: createStore({
+      async listAppointments() {
+        return [
+          {
+            appointmentId: "apt-matching",
+            customer: { phone: "(703) 555-0123", name: "Jordan Miles" },
+            startTimeUtc: "2026-08-17T18:00:00.000Z",
+            endTimeUtc: "2026-08-17T18:30:00.000Z",
+            status: "confirmed",
+            service: "Consultation",
+          },
+          {
+            appointmentId: "apt-other",
+            customer: { phone: "+17035550999" },
+            startTimeUtc: "2026-08-17T18:00:00.000Z",
+            status: "confirmed",
+          },
+        ];
+      },
+    }),
+  });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.findAppointment",
+    requiredBody({
+      callerPhone: "+17035550123",
+      startTime: "2026-08-17T00:00:00.000Z",
+      endTime: "2026-08-18T00:00:00.000Z",
+    }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body).appointments, [{
+    appointmentId: "apt-matching",
+    callerName: "Jordan Miles",
+    service: "Consultation",
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T18:30:00.000Z",
+    status: "confirmed",
+  }]);
 });
 
 test("lead.capture and message.take return their original records for duplicate keys", async () => {
@@ -947,6 +1042,9 @@ function createStore(overrides = {}) {
     },
     async getAppointment() {
       return null;
+    },
+    async listAppointments() {
+      return [];
     },
     async putAppointment(record) {
       return clone(record);

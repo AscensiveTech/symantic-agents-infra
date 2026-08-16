@@ -146,6 +146,10 @@ export function createTelnyxClient({
 
 export function createRetellClient({
   apiKey,
+  terminationUri,
+  sipTrunkAuthUsername,
+  sipTrunkAuthPassword,
+  transport = "TCP",
   fetchImpl = globalThis.fetch,
 }) {
   requireCredential(apiKey, "Retell API key");
@@ -263,6 +267,49 @@ export function createRetellClient({
       });
       return {
         retellAgentId: required(created?.agent_id, "Retell agent_id"),
+      };
+    },
+
+    async importPhoneNumber({
+      phoneNumber,
+      retellAgentId,
+      nickname,
+      inboundWebhookUrl,
+    }) {
+      const result = await retellRequest("/import-phone-number", {
+        method: "POST",
+        body: {
+          phone_number: required(phoneNumber, "phoneNumber"),
+          termination_uri: required(
+            terminationUri,
+            "Telnyx termination URI",
+          ),
+          ...(sipTrunkAuthUsername
+            ? { sip_trunk_auth_username: sipTrunkAuthUsername }
+            : {}),
+          ...(sipTrunkAuthPassword
+            ? { sip_trunk_auth_password: sipTrunkAuthPassword }
+            : {}),
+          transport,
+          inbound_agents: [{
+            agent_id: required(retellAgentId, "retellAgentId"),
+            weight: 1,
+          }],
+          outbound_agents: [{
+            agent_id: required(retellAgentId, "retellAgentId"),
+            weight: 1,
+          }],
+          ...(nickname ? { nickname } : {}),
+          ...(inboundWebhookUrl
+            ? { inbound_webhook_url: inboundWebhookUrl }
+            : {}),
+        },
+      });
+      return {
+        retellPhoneNumberId: required(
+          result?.phone_number,
+          "Retell phone_number",
+        ),
       };
     },
 

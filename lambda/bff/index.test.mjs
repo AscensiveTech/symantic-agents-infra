@@ -149,9 +149,10 @@ test("POST and GET agents preserve product agent ids", async () => {
   const listed = await handler(authenticatedEvent("GET", "/workspaces/me/agents"));
 
   assert.equal(created.statusCode, 201);
-  assert.deepEqual(JSON.parse(created.body), agent);
+  const savedAgent = { ...agent, status: "draft" };
+  assert.deepEqual(JSON.parse(created.body), savedAgent);
   assert.equal(listed.statusCode, 200);
-  assert.deepEqual(JSON.parse(listed.body), [agent]);
+  assert.deepEqual(JSON.parse(listed.body), [savedAgent]);
 });
 
 test("POST agent returns 409 when the agent already exists", async () => {
@@ -257,8 +258,44 @@ test("PUT agent uses the route id and returns the updated agent", async () => {
   ));
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(JSON.parse(response.body), agent);
-  assert.deepEqual(calls, [["user-123", "agent-123", agent]]);
+  const savedAgent = { ...agent, status: "draft" };
+  assert.deepEqual(JSON.parse(response.body), savedAgent);
+  assert.deepEqual(calls, [["user-123", "agent-123", savedAgent]]);
+});
+
+test("PUT agent invalidates a successful test when launch configuration changes", async () => {
+  let saved;
+  const existing = receptionistAgent();
+  const changed = {
+    ...existing,
+    configuration: {
+      ...existing.configuration,
+      guidance: "Updated answering restrictions.",
+      tested: false,
+    },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return existing;
+    },
+    async putAgent(_workspaceId, _agentId, agent, options) {
+      saved = { agent, options };
+      return agent;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    changed,
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.options.invalidateTest, true);
+  assert.equal(saved.agent.status, "draft");
 });
 
 test("GET calls lists workspace calls without exposing Retell identifiers", async () => {
@@ -389,6 +426,13 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
       events.push(["getProfile", workspaceId]);
       return profile;
     },
+    async getCalendarConnection() {
+      return {
+        provider: "google-calendar",
+        selectedCalendarId: "primary",
+        connectionState: "connected",
+      };
+    },
     async getPhoneNumberForAgent() {
       return null;
     },
@@ -417,6 +461,10 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
         events.push(["retell", input]);
         return { retellAgentId: "retell-agent-123" };
       },
+      async importPhoneNumber(input) {
+        events.push(["importPhoneNumber", input]);
+        return { retellPhoneNumberId: input.phoneNumber };
+      },
     },
     resolveVoiceId(requestedVoice) {
       events.push(["voice", requestedVoice]);
@@ -444,15 +492,90 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   assert.equal(body.phoneNumber.phoneNumber, "+17035550177");
   assert.equal(body.phoneNumber.telnyxNumberId, undefined);
   assert.ok(
-    events.findIndex(([name]) => name === "putPhoneNumber") <
-      events.findIndex(([name]) => name === "retell"),
+    events.findIndex(([name]) => name === "retell") <
+      events.findIndex(([name]) => name === "importPhoneNumber") &&
+      events.findIndex(([name]) => name === "importPhoneNumber") <
+        events.findIndex(([name]) => name === "putPhoneNumber"),
   );
   const retellInput = events.find(([name]) => name === "retell")[1];
   assert.equal(retellInput.symanticAgentId, "agent-123");
   assert.match(retellInput.config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
-  assert.ok(retellInput.config.tools.every(({ url }) =>
+  assert.ok(retellInput.config.tools.filter(({ type }) => type === "custom").every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")
   ));
+  const importInput = events.find(([name]) => name === "importPhoneNumber")[1];
+  assert.equal(importInput.phoneNumber, "+17035550177");
+  assert.equal(importInput.retellAgentId, "retell-agent-123");
+  assert.equal(
+    importInput.inboundWebhookUrl,
+    "https://api.example.com/retell/inbound-lookup",
+  );
+  const persistedPhone = events.find(([name]) => name === "putPhoneNumber")[1];
+  assert.equal(persistedPhone.phoneNumberId, "phone-agent-123");
+  assert.equal(persistedPhone.retellPhoneNumberId, "+17035550177");
+});
+
+test("POST activate rejects an untested current configuration", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => ({
+      async ensureWorkspace() {},
+      async getAgent() {
+        const agent = receptionistAgent();
+        delete agent.tested;
+        delete agent.testedAt;
+        return agent;
+      },
+      async getProfile() {
+        return receptionistProfile();
+      },
+      async getCalendarConnection() {
+        return {
+          provider: "google-calendar",
+          selectedCalendarId: "primary",
+          connectionState: "connected",
+        };
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/activate",
+  ));
+
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /successful current-config test/i);
+});
+
+test("POST activate rejects booking without a connected selected calendar", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => ({
+      async ensureWorkspace() {},
+      async getAgent() {
+        return receptionistAgent();
+      },
+      async getProfile() {
+        return receptionistProfile();
+      },
+      async getCalendarConnection() {
+        return {
+          provider: "google-calendar",
+          selectedCalendarId: null,
+          connectionState: "connected",
+        };
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/activate",
+  ));
+
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /select a booking calendar/i);
 });
 
 test("POST activate persists retellAgentId before the rest of the runtime update", async () => {
@@ -466,6 +589,13 @@ test("POST activate persists retellAgentId before the rest of the runtime update
     async getProfile() {
       return receptionistProfile();
     },
+    async getCalendarConnection() {
+      return {
+        provider: "google-calendar",
+        selectedCalendarId: "primary",
+        connectionState: "connected",
+      };
+    },
     async getPhoneNumberForAgent() {
       return {
         workspaceId: "user-123",
@@ -473,6 +603,7 @@ test("POST activate persists retellAgentId before the rest of the runtime update
         agentId: "agent-123",
         telnyxNumberId: "telnyx-number-123",
         telnyxPhoneNumber: "+17035550177",
+        retellPhoneNumberId: "+17035550177",
       };
     },
     async updateAgentRuntime(_workspaceId, _agentId, updates) {
@@ -481,6 +612,9 @@ test("POST activate persists retellAgentId before the rest of the runtime update
         return { ...agent, ...updates };
       }
       throw new Error("status update failed");
+    },
+    async putPhoneNumber(record) {
+      return record;
     },
   };
   const { createHandler } = await loadBff();
@@ -527,6 +661,13 @@ test("POST activate reuses the linked DID and upserts the existing Retell agent"
     async getProfile() {
       return receptionistProfile();
     },
+    async getCalendarConnection() {
+      return {
+        provider: "google-calendar",
+        selectedCalendarId: "primary",
+        connectionState: "connected",
+      };
+    },
     async getPhoneNumberForAgent() {
       return {
         workspaceId: "user-123",
@@ -534,10 +675,14 @@ test("POST activate reuses the linked DID and upserts the existing Retell agent"
         agentId: "agent-123",
         telnyxNumberId: "telnyx-number-existing",
         telnyxPhoneNumber: "+17035550166",
+        retellPhoneNumberId: "+17035550166",
       };
     },
     async updateAgentRuntime(_workspaceId, _agentId, updates) {
       return { ...agent, ...updates };
+    },
+    async putPhoneNumber(record) {
+      return record;
     },
   };
   const { createHandler } = await loadBff();
@@ -580,14 +725,24 @@ test("POST start-test-call creates a Retell phone call without marking the draft
     async getAgent() {
       return agent;
     },
+    async getProfile() {
+      return receptionistProfile();
+    },
     async getPhoneNumberForAgent() {
       return {
         phoneNumberId: "phone-agent-123",
+        agentId: "agent-123",
         telnyxPhoneNumber: "+17035550177",
+        retellPhoneNumberId: "+17035550177",
+        status: "draft",
       };
     },
-    async updateAgentRuntime() {
-      assert.fail("start-test-call must not update tested or testedAt");
+    async updateAgentRuntime(_workspaceId, _agentId, updates) {
+      assert.deepEqual(updates, { retellAgentId: "retell-agent-123" });
+      return { ...agent, ...updates };
+    },
+    async putPhoneNumber() {
+      return undefined;
     },
   };
   let phoneCallInput;
@@ -596,12 +751,22 @@ test("POST start-test-call creates a Retell phone call without marking the draft
     getStore: async () => store,
     getProviders: async () => ({
       retell: {
+        async upsertAgent() {
+          return { retellAgentId: "retell-agent-123" };
+        },
         async startPhoneCall(input) {
           phoneCallInput = input;
           return { callId: "call-123", status: "registered" };
         },
       },
+      telnyx: {
+        async ensureNumber() {
+          assert.fail("existing DID must be reused");
+        },
+      },
+      resolveVoiceId: () => "retell-Cimo",
     }),
+    toolBaseUrl: "https://api.example.com",
   });
 
   const response = await handler(authenticatedEvent(
@@ -614,6 +779,12 @@ test("POST start-test-call creates a Retell phone call without marking the draft
   assert.deepEqual(JSON.parse(response.body), {
     callId: "call-123",
     status: "registered",
+    phoneNumber: {
+      id: "phone-agent-123",
+      agentId: "agent-123",
+      phoneNumber: "+17035550177",
+      status: "draft",
+    },
   });
   assert.deepEqual(phoneCallInput, {
     fromNumber: "+17035550177",
@@ -626,8 +797,16 @@ test("POST start-test-call creates a Retell phone call without marking the draft
   assert.equal(agent.configuration.testedAt, undefined);
 });
 
-test("POST inbound lookup verifies Retell signature and resolves DID to live config", async () => {
-  const rawBody = JSON.stringify({ to_number: "+17035550177" });
+test("POST inbound lookup uses Retell's call_inbound request and response contract", async () => {
+  const rawBody = JSON.stringify({
+    event: "call_inbound",
+    call_inbound: {
+      agent_id: "retell-default",
+      agent_version: 1,
+      from_number: "+17035550100",
+      to_number: "+17035550177",
+    },
+  });
   const calls = [];
   const store = {
     async getPhoneNumberByDid(did) {
@@ -641,7 +820,11 @@ test("POST inbound lookup verifies Retell signature and resolves DID to live con
     },
     async getAgent(workspaceId, agentId) {
       calls.push(["getAgent", workspaceId, agentId]);
-      return receptionistAgent();
+      return {
+        ...receptionistAgent(),
+        status: "active",
+        retellAgentId: "retell-agent-123",
+      };
     },
     async getProfile(workspaceId) {
       calls.push(["getProfile", workspaceId]);
@@ -681,23 +864,61 @@ test("POST inbound lookup verifies Retell signature and resolves DID to live con
     "retell-key",
     "signature-123",
   ]);
-  const body = JSON.parse(response.body);
-  assert.match(body.prompt, /Arc Dental/);
-  assert.equal(body.voice, "retell-Cimo");
-  assert.equal(body.bookingEnabled, true);
-  assert.deepEqual(body.transferNumbers, [
-    "+17035550199",
-    "+17035550100",
-    "+17035550188",
-  ]);
-  assert.equal(body.tools.length, 7);
-  assert.deepEqual(Object.keys(body).sort(), [
-    "bookingEnabled",
-    "prompt",
-    "tools",
-    "transferNumbers",
-    "voice",
-  ]);
+  assert.deepEqual(JSON.parse(response.body), {
+    call_inbound: {
+      override_agent_id: "retell-agent-123",
+      dynamic_variables: {
+        workspaceId: "workspace-123",
+        agentId: "agent-123",
+      },
+      metadata: {
+        workspaceId: "workspace-123",
+        agentId: "agent-123",
+      },
+    },
+  });
+});
+
+test("POST inbound lookup rejects calls for a draft agent", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getRetellApiKey: async () => "retell-key",
+    verifySignature: () => true,
+    getStore: async () => ({
+      async getPhoneNumberByDid() {
+        return {
+          workspaceId: "workspace-123",
+          agentId: "agent-123",
+        };
+      },
+      async getAgent() {
+        return receptionistAgent();
+      },
+      async getProfile() {
+        return receptionistProfile();
+      },
+    }),
+  });
+
+  const response = await handler({
+    requestContext: {
+      http: { method: "POST", path: "/retell/inbound-lookup" },
+    },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "valid" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: {
+        from_number: "+17035550100",
+        to_number: "+17035550177",
+      },
+    }),
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    call_inbound: { reject: true },
+  });
 });
 
 test("POST inbound lookup rejects an invalid signature before DynamoDB", async () => {
@@ -719,7 +940,13 @@ test("POST inbound lookup rejects an invalid signature before DynamoDB", async (
     },
     rawPath: "/retell/inbound-lookup",
     headers: { "x-retell-signature": "invalid" },
-    body: JSON.stringify({ to_number: "+17035550177" }),
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: {
+        from_number: "+17035550100",
+        to_number: "+17035550177",
+      },
+    }),
   });
 
   assert.equal(response.statusCode, 401);
@@ -743,8 +970,12 @@ function receptionistAgent() {
     role: "Phone operations",
     description: "Answers calls",
     status: "draft",
+    tested: true,
+    testedAt: "2026-08-16T13:00:00.000Z",
     capabilities: ["Inbound calls", "Calendar"],
     configuration: {
+      template: "receptionist",
+      businessConfirmed: true,
       name: "Maya",
       voice: "Calm and natural",
       tone: "Warm and concise",
@@ -752,6 +983,9 @@ function receptionistAgent() {
       guidance: "Never provide a diagnosis.",
       intents: ["Scheduling", "Insurance"],
       booking: true,
+      connections: ["google-calendar"],
+      calendarSelectionId: "primary",
+      phone: "+17035550133",
       escalation: "Transfer emergencies to the office.",
       tested: false,
     },
@@ -766,6 +1000,7 @@ function receptionistProfile() {
     address: "123 Main Street",
     timezone: "America/New_York",
     hours: "Mon-Fri, 8:00 AM-5:00 PM",
+    phone: "+17035550133",
     services: ["Cleanings"],
     faqs: [{
       question: "Do you accept insurance?",

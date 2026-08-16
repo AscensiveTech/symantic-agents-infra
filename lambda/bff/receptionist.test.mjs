@@ -84,7 +84,7 @@ test("cloned voice mode uses the stored voiceId instead of the catalog map", () 
   );
 });
 
-test("receptionist config exposes every Task 7 tool URL and transfer policy", () => {
+test("receptionist config exposes lookup tools, invocation-safe functions, and native warm transfer", () => {
   const config = buildReceptionistConfig({
     workspaceId: "workspace-123",
     agent,
@@ -96,30 +96,40 @@ test("receptionist config exposes every Task 7 tool URL and transfer policy", ()
   assert.equal(config.voice, "retell-voice-1");
   assert.equal(config.bookingEnabled, true);
   assert.deepEqual(config.transferNumbers, [
+    "+17035550102",
     "+17035550199",
     "+17035550100",
     "+17035550188",
   ]);
+  const customTools = config.tools.filter(({ type }) => type === "custom");
   assert.deepEqual(
-    config.tools.map(({ url }) => url),
+    customTools.map(({ url }) => url),
     [
+      "https://api.example.com/retell/tools/calendar.findAppointment",
       "https://api.example.com/retell/tools/calendar.getAvailability",
       "https://api.example.com/retell/tools/calendar.createBooking",
       "https://api.example.com/retell/tools/calendar.rescheduleBooking",
       "https://api.example.com/retell/tools/calendar.cancelBooking",
       "https://api.example.com/retell/tools/lead.capture",
       "https://api.example.com/retell/tools/message.take",
-      "https://api.example.com/retell/tools/call.transfer",
     ],
   );
-  for (const tool of config.tools) {
+  for (const tool of customTools) {
     assert.equal(tool.parameters.properties.workspaceId.const, "workspace-123");
     assert.equal(tool.parameters.properties.callId.const, "{{call_id}}");
-    assert.match(
-      tool.parameters.properties.idempotencyKey.const,
-      /^\{\{call_id\}\}-/,
-    );
+    assert.equal(tool.parameters.properties.idempotencyKey, undefined);
+    assert.ok(!tool.parameters.required.includes("idempotencyKey"));
   }
+  const transferTools = config.tools.filter(({ type }) => type === "transfer_call");
+  assert.equal(transferTools.length, 4);
+  assert.deepEqual(transferTools[0].transfer_destination, {
+    type: "predefined",
+    number: "+17035550102",
+  });
+  assert.deepEqual(transferTools[0].transfer_option, {
+    type: "warm_transfer",
+    show_transferee_as_caller: false,
+  });
 });
 
 test("booking-disabled agents omit calendar tools", () => {
@@ -135,8 +145,7 @@ test("booking-disabled agents omit calendar tools", () => {
   });
 
   assert.equal(config.bookingEnabled, false);
-  assert.deepEqual(
-    config.tools.map(({ name }) => name),
-    ["lead_capture", "message_take", "call_transfer"],
-  );
+  assert.deepEqual(config.tools.filter(({ type }) => type === "custom")
+    .map(({ name }) => name), ["lead_capture", "message_take"]);
+  assert.ok(config.tools.some(({ type }) => type === "transfer_call"));
 });

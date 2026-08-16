@@ -193,6 +193,40 @@ test("call_ended resolves workspace from the Retell agent FK when metadata is ab
   assert.equal(persistedCall.agentId, "agent-123");
 });
 
+test("oversized transcript content is truncated instead of failing call ingest", async () => {
+  let persistedCall;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async putCall(record) {
+        persistedCall = structuredClone(record);
+      },
+    }),
+  });
+  const transcriptObject = Array.from({ length: 500 }, (_, index) => ({
+    role: index % 2 ? "user" : "agent",
+    content: `${index}:${"x".repeat(2_000)}`,
+  }));
+
+  const response = await handler(callEndedEvent({
+    call_id: "retell-call-large",
+    call_status: "ended",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    transcript_object: transcriptObject,
+    transcript_with_tool_calls: [],
+  }));
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(persistedCall.transcriptTruncated, true);
+  assert.match(persistedCall.transcriptNote, /truncated/i);
+  assert.ok(Buffer.byteLength(JSON.stringify({
+    transcript: persistedCall.transcript,
+    toolLog: persistedCall.toolLog,
+  }), "utf8") <= 350 * 1024);
+  assert.ok(persistedCall.transcript.length < transcriptObject.length);
+});
+
 test("successful booking tool output sets booked and backfills its appointment", async () => {
   let persistedCall;
   let appointment;
