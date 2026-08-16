@@ -188,7 +188,10 @@ export function buildReceptionistPrompt(agent, profile) {
     bookingInstruction,
     "",
     "Emergency and escalation rules",
-    text(behavior.escalation) ||
+    [
+      formatEmergencyRules(behavior.emergencyRules),
+      text(behavior.escalation),
+    ].filter(Boolean).join("\n") ||
       "For emergencies or requests for a person, use call_transfer. If transfer is unavailable, use message_take.",
     "",
     "Operating rules",
@@ -284,6 +287,28 @@ function toRetellTool(definition, {
     timeout_ms: 10_000,
     max_retry: 1,
   };
+}
+
+export function resolveConfiguredVoiceId(configuration, resolveVoiceId) {
+  if (configuration?.voiceMode === "cloned") {
+    const cloned = text(configuration.voiceId);
+    if (cloned) return cloned;
+  }
+  return resolveVoiceId(configuration?.voice);
+}
+
+function formatEmergencyRules(rules) {
+  if (!Array.isArray(rules) || !rules.length) return "";
+  return rules.flatMap((rule) => {
+    const phrases = Array.isArray(rule?.phrases)
+      ? rule.phrases.map(text).filter(Boolean)
+      : [];
+    const target = text(rule?.transferTarget);
+    if (!phrases.length || !target) return [];
+    return [
+      `- If the caller mentions ${phrases.map((phrase) => `"${phrase}"`).join(", ")}: transfer to ${target}.`,
+    ];
+  }).join("\n");
 }
 
 function text(value) {

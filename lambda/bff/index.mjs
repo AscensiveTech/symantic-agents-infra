@@ -6,7 +6,7 @@ import {
   ProviderRequestError,
   resolveRetellVoiceId,
 } from "./providers.mjs";
-import { buildReceptionistConfig } from "./receptionist.mjs";
+import { buildReceptionistConfig, resolveConfiguredVoiceId } from "./receptionist.mjs";
 
 const PROFILE_FIELDS = {
   businessType: "string",
@@ -249,8 +249,9 @@ export function createHandler({
           };
           await store.putPhoneNumber(phoneNumber);
         }
-        const voiceId = providers.resolveVoiceId(
-          agent?.configuration?.voice,
+        const voiceId = resolveConfiguredVoiceId(
+          agent?.configuration,
+          providers.resolveVoiceId,
         );
         const config = buildReceptionistConfig({
           workspaceId,
@@ -426,7 +427,10 @@ async function handleInboundLookup(event, {
     agent,
     profile,
     toolBaseUrl,
-    voiceId: providers.resolveVoiceId(agent?.configuration?.voice),
+    voiceId: resolveConfiguredVoiceId(
+      agent?.configuration,
+      providers.resolveVoiceId,
+    ),
   });
   return json(200, config);
 }

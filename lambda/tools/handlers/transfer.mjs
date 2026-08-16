@@ -5,9 +5,12 @@ export async function handleTransfer(input, { store }) {
   ]);
   const configuration = agent?.configuration ?? {};
   const reason = stringOrUndefined(input.reason) || "";
-  const emergency = /emergency|urgent|danger|life[- ]?threat/i.test(reason);
+  const matchedEmergency = matchEmergencyRule(configuration.emergencyRules, reason);
+  const emergency = Boolean(matchedEmergency) ||
+    /emergency|urgent|danger|life[- ]?threat/i.test(reason);
   const policyCandidates = emergency
     ? [
+      matchedEmergency,
       configuration.emergencyTransferTarget,
       configuration.emergencyPhone,
       configuration.escalationTransferTarget,
@@ -41,6 +44,21 @@ export async function handleTransfer(input, { store }) {
     transferTarget,
     message: "Please hold while I connect you.",
   };
+}
+
+function matchEmergencyRule(rules, reason) {
+  if (!Array.isArray(rules) || !reason) return undefined;
+  const haystack = reason.toLowerCase();
+  for (const rule of rules) {
+    const phrases = Array.isArray(rule?.phrases) ? rule.phrases : [];
+    if (phrases.some((phrase) => (
+      typeof phrase === "string" &&
+      phrase &&
+      haystack.includes(phrase.toLowerCase())
+    ))) {
+      return stringOrUndefined(rule.transferTarget);
+    }
+  }
 }
 
 function extractPhone(value) {

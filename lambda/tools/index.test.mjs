@@ -473,6 +473,36 @@ test("lead.capture and message.take return their original records for duplicate 
   assert.equal(JSON.parse(messageA.body).message, "We will notify the office.");
 });
 
+test("call.transfer matches emergencyRules phrases to a transfer target", async () => {
+  const store = createStore({
+    getAgent: async () => ({
+      configuration: {
+        emergencyRules: [
+          { phrases: ["chest pain", "can't breathe"], transferTarget: "+17035550111" },
+        ],
+        escalation: "For other transfers call +17035550177.",
+      },
+    }),
+    getBusinessProfile: async () => ({
+      ownerPhone: "+17035550100",
+    }),
+  });
+  const handler = toolHandler({ store });
+
+  const response = await handler(event(
+    "/retell/tools/call.transfer",
+    requiredBody({ agentId: "agent-1", reason: "Caller has chest pain" }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    ok: true,
+    action: "transfer",
+    transferTarget: "+17035550111",
+    message: "Please hold while I connect you.",
+  });
+});
+
 test("call.transfer reads agent emergency policy before profile fallbacks", async () => {
   const store = createStore({
     getAgent: async () => ({

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildReceptionistConfig,
   buildReceptionistPrompt,
+  resolveConfiguredVoiceId,
 } from "./receptionist.mjs";
 
 const profile = {
@@ -48,6 +49,9 @@ const agent = {
     booking: true,
     escalation:
       "For severe bleeding or trouble breathing, tell the caller to contact emergency services, then transfer to the office.",
+    emergencyRules: [
+      { phrases: ["chest pain", "can't breathe"], transferTarget: "+17035550102" },
+    ],
   },
 };
 
@@ -59,6 +63,25 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /Yes, most PPO plans\./);
   assert.match(prompt, /Do you see children\?/);
   assert.match(prompt, /severe bleeding or trouble breathing/);
+  assert.match(prompt, /chest pain/);
+  assert.match(prompt, /can't breathe/);
+  assert.match(prompt, /\+17035550102/);
+});
+
+test("cloned voice mode uses the stored voiceId instead of the catalog map", () => {
+  const resolveVoiceId = (requested) => `mapped:${requested}`;
+  assert.equal(
+    resolveConfiguredVoiceId({ voiceMode: "cloned", voiceId: "11labs-cloned-maya" }, resolveVoiceId),
+    "11labs-cloned-maya",
+  );
+  assert.equal(
+    resolveConfiguredVoiceId({ voiceMode: "platform", voice: "Calm and natural" }, resolveVoiceId),
+    "mapped:Calm and natural",
+  );
+  assert.equal(
+    resolveConfiguredVoiceId({ voiceMode: "cloned", voiceId: "  ", voice: "Calm and natural" }, resolveVoiceId),
+    "mapped:Calm and natural",
+  );
 });
 
 test("receptionist config exposes every Task 7 tool URL and transfer policy", () => {
