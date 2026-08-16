@@ -140,7 +140,7 @@ export function createHandler({ getStore }) {
         if (!agent) return json(400, { message: "Invalid agent" });
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
-        return json(201, await store.putAgent(workspaceId, agent.id, agent));
+        return json(201, await store.createAgent(workspaceId, agent.id, agent));
       }
 
       const agentId = getAgentId(event, path);
@@ -161,6 +161,9 @@ export function createHandler({ getStore }) {
 
       return json(404, { message: "Not found" });
     } catch (error) {
+      if (error?.name === "ConditionalCheckFailedException") {
+        return json(409, { message: "Agent already exists" });
+      }
       console.error("BFF request failed", error);
       return json(500, { message: "Internal server error" });
     }
@@ -266,6 +269,16 @@ export function createDynamoStore(client, commands, tableNames) {
         ConsistentRead: true,
       }));
       return result.Item ? toPublicAgent(unmarshall(result.Item)) : null;
+    },
+
+    async createAgent(workspaceId, agentId, agent) {
+      const { id: _id, ...record } = agent;
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.agents,
+        Item: marshall({ workspaceId, agentId, ...record }),
+        ConditionExpression: "attribute_not_exists(agentId)",
+      }));
+      return agent;
     },
 
     async putAgent(workspaceId, agentId, agent) {

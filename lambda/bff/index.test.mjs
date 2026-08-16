@@ -120,7 +120,7 @@ test("POST and GET agents preserve product agent ids", async () => {
   const agents = new Map();
   const store = {
     async ensureWorkspace() {},
-    async putAgent(workspaceId, agentId, agent) {
+    async createAgent(workspaceId, agentId, agent) {
       agents.set(`${workspaceId}:${agentId}`, agent);
       return agent;
     },
@@ -152,6 +152,35 @@ test("POST and GET agents preserve product agent ids", async () => {
   assert.deepEqual(JSON.parse(created.body), agent);
   assert.equal(listed.statusCode, 200);
   assert.deepEqual(JSON.parse(listed.body), [agent]);
+});
+
+test("POST agent returns 409 when the agent already exists", async () => {
+  const error = new Error("The conditional request failed");
+  error.name = "ConditionalCheckFailedException";
+  const store = {
+    async ensureWorkspace() {},
+    async createAgent() {
+      throw error;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents",
+    {
+      id: "agent-123",
+      name: "Maya",
+      role: "Phone operations",
+      description: "Answers calls",
+      status: "active",
+      capabilities: ["Inbound calls"],
+    },
+  ));
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(JSON.parse(response.body).message, "Agent already exists");
 });
 
 test("GET agent returns 404 when the workspace agent is missing", async () => {
