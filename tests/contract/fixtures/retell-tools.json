@@ -1,0 +1,89 @@
+{
+  "calendar.getAvailability": {
+    "path": "/retell/tools/calendar.getAvailability",
+    "request": {
+      "workspaceId": "workspace-123",
+      "callId": "call-123",
+      "idempotencyKey": "availability-1",
+      "startTime": "2026-08-17T14:00:00-04:00",
+      "endTime": "2026-08-17T14:30:00-04:00"
+    },
+    "responseKeys": ["ok", "available", "startTimeUtc", "endTimeUtc", "timezone"]
+  },
+  "calendar.createBooking": {
+    "path": "/retell/tools/calendar.createBooking",
+    "request": {
+      "workspaceId": "workspace-123",
+      "callId": "call-123",
+      "idempotencyKey": "booking-1",
+      "agentId": "agent-1",
+      "startTime": "2026-08-17T14:00:00-04:00",
+      "endTime": "2026-08-17T14:30:00-04:00",
+      "service": "Consultation",
+      "customer": {
+        "name": "Jordan Miles",
+        "phone": "+17035550123",
+        "email": "jordan@example.com"
+      }
+    },
+    "responseKeys": ["ok", "appointmentId", "status", "startTimeUtc", "endTimeUtc", "timezone", "message"]
+  },
+  "calendar.rescheduleBooking": {
+    "path": "/retell/tools/calendar.rescheduleBooking",
+    "request": {
+      "workspaceId": "workspace-123",
+      "callId": "call-123",
+      "idempotencyKey": "reschedule-1",
+      "appointmentId": "apt-existing",
+      "startTime": "2026-08-18T10:00:00-04:00",
+      "endTime": "2026-08-18T10:30:00-04:00"
+    },
+    "responseKeys": ["ok", "appointmentId", "status", "startTimeUtc", "endTimeUtc", "timezone", "message"]
+  },
+  "calendar.cancelBooking": {
+    "path": "/retell/tools/calendar.cancelBooking",
+    "request": {
+      "workspaceId": "workspace-123",
+      "callId": "call-123",
+      "idempotencyKey": "cancel-1",
+      "appointmentId": "apt-existing"
+    },
+    "responseKeys": ["ok", "appointmentId", "status", "message"]
+  },
+  "lead.capture": {
+    "path": "/retell/tools/lead.capture",
+    "request": {
+      "workspaceId": "workspace-123",
+      "callId": "call-123",
+      "idempotencyKey": "lead-1",
+      "name": "Jordan Miles",
+      "phone": "+17035550123",
+      "email": "jordan@example.com",
+      "interest": "Emergency exam"
+    },
+    "responseKeys": ["ok", "leadId", "status", "message"]
+  },
+  "message.take": {
+    "path": "/retell/tools/message.take",
+    "request": {
+      "workspaceId": "workspace-123",
+      "callId": "call-123",
+      "idempotencyKey": "message-1",
+      "name": "Jordan Miles",
+      "phone": "+17035550123",
+      "message": "Please call me after 4 PM."
+    },
+    "responseKeys": ["ok", "messageId", "status", "message"]
+  },
+  "call.transfer": {
+    "path": "/retell/tools/call.transfer",
+    "request": {
+      "workspaceId": "workspace-123",
+      "callId": "call-123",
+      "idempotencyKey": "transfer-1",
+      "agentId": "agent-1",
+      "reason": "medical emergency"
+    },
+    "responseKeys": ["ok", "action", "transferTarget", "message"]
+  }
+}

@@ -436,14 +436,14 @@ test("callback redirects post-consume failures to the app instead of JSON", asyn
   assert.equal(response.headers["content-type"], undefined);
 });
 
-test("calendar adapter exports the Task 7 surface as not implemented", async () => {
+test("calendar adapter preserves the Task 7 operation surface", () => {
   for (const operation of [
     getAvailability,
     createBooking,
     rescheduleBooking,
     cancelBooking,
   ]) {
-    await assert.rejects(operation({}), /not_implemented/);
+    assert.equal(typeof operation, "function");
   }
 });
 
