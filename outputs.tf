@@ -33,6 +33,11 @@ output "cognito_issuer" {
   value       = "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.frontend.id}"
 }
 
+output "bff_api_url" {
+  description = "Set NEXT_PUBLIC_API_URL to this authenticated HTTP API base URL."
+  value       = aws_apigatewayv2_api.bff.api_endpoint
+}
+
 output "ci_deploy_role_arn" {
   description = "Set this as the symantic-agents-frontend GitHub repository secret AWS_DEPLOY_ROLE_ARN."
   value       = aws_iam_role.ci_deploy.arn
