@@ -43,10 +43,10 @@ export function createMicrosoftCalendarClient({
       location,
       customer,
     }) {
-      const result = await requestJson(
-        fetchImpl,
-        `${API_BASE}/me/calendars/${encodeURIComponent(calendarId)}/events`,
-        {
+      const eventsUrl =
+        `${API_BASE}/me/calendars/${encodeURIComponent(calendarId)}/events`;
+      try {
+        const result = await requestJson(fetchImpl, eventsUrl, {
           method: "POST",
           accessToken,
           body: {
@@ -66,9 +66,23 @@ export function createMicrosoftCalendarClient({
             }] : undefined,
             transactionId: providerId,
           },
-        },
-      );
-      return normalizeEvent(result);
+        });
+        return normalizeEvent(result);
+      } catch (error) {
+        if (!isDuplicateTransaction(error)) throw error;
+        const url = new URL(eventsUrl);
+        const escapedProviderId = providerId.replaceAll("'", "''");
+        url.searchParams.set("$filter", `transactionId eq '${escapedProviderId}'`);
+        url.searchParams.set("$select", "id,webLink,transactionId");
+        const existing = await requestJson(fetchImpl, url.toString(), {
+          accessToken,
+        });
+        const event = existing?.value?.find(
+          ({ transactionId }) => transactionId === providerId,
+        );
+        if (!event) throw error;
+        return normalizeEvent(event);
+      }
     },
 
     async rescheduleBooking({
@@ -97,11 +111,15 @@ export function createMicrosoftCalendarClient({
       accessToken,
       providerEventId,
     }) {
-      await requestJson(
-        fetchImpl,
-        `${API_BASE}/me/events/${encodeURIComponent(providerEventId)}`,
-        { method: "DELETE", accessToken, allowEmpty: true },
-      );
+      try {
+        await requestJson(
+          fetchImpl,
+          `${API_BASE}/me/events/${encodeURIComponent(providerEventId)}`,
+          { method: "DELETE", accessToken, allowEmpty: true },
+        );
+      } catch (error) {
+        if (error?.statusCode !== 404) throw error;
+      }
       return {
         provider: "microsoft-365-calendar",
         providerEventId,
@@ -130,6 +148,11 @@ function normalizeEvent(event, fallbackId) {
     providerEventId: event?.id ?? fallbackId,
     htmlLink: event?.webLink,
   };
+}
+
+function isDuplicateTransaction(error) {
+  return error?.providerCode === "ErrorDuplicateTransactionId" ||
+    /duplicate.*transaction/i.test(error?.message ?? "");
 }
 
 async function requestJson(fetchImpl, url, {
@@ -169,6 +192,7 @@ async function requestJson(fetchImpl, url, {
       value?.error?.message || "Microsoft Graph request failed",
       response.status,
       code,
+      value?.error?.code,
     );
   }
   if (!text && !allowEmpty) {
@@ -181,10 +205,11 @@ async function requestJson(fetchImpl, url, {
   return value;
 }
 
-function providerError(message, statusCode, code) {
+function providerError(message, statusCode, code, providerCode) {
   const error = new Error(message);
   error.name = "CalendarProviderError";
   error.statusCode = statusCode;
   error.code = code;
+  error.providerCode = providerCode;
   return error;
 }

@@ -30,6 +30,8 @@ export function createCalendarAdapter({
   getOAuthSecret,
   fetchImpl = globalThis.fetch,
   providerClients = {},
+  now = Date.now,
+  tokenCacheSkewMs = 60_000,
 }) {
   if (!connectionStore?.get) {
     throw new TypeError("Calendar connection store is required");
@@ -41,6 +43,9 @@ export function createCalendarAdapter({
     "microsoft-365-calendar": providerClients["microsoft-365-calendar"] ??
       createMicrosoftCalendarClient({ fetchImpl }),
   };
+  const accessTokenCache = new Map();
+  const refreshPromises = new Map();
+  const invalidGrantFailures = new Map();
 
   async function invoke(operation, input) {
     const connection = await connectionStore.get(input.workspaceId);
@@ -62,14 +67,15 @@ export function createCalendarAdapter({
         ? input.googleEventId
         : input.microsoftTransactionId,
     };
-    let accessToken = await refreshAccessToken(connection);
+    let accessToken = await getAccessToken(connection);
     try {
       return await client[operation]({ ...providerInput, accessToken });
     } catch (error) {
       if (error?.statusCode !== 401) throw error;
     }
 
-    accessToken = await refreshAccessToken(connection);
+    accessTokenCache.delete(connection.workspaceId);
+    accessToken = await getAccessToken(connection, { forceRefresh: true });
     try {
       return await client[operation]({ ...providerInput, accessToken });
     } catch (error) {
@@ -79,7 +85,39 @@ export function createCalendarAdapter({
     }
   }
 
-  async function refreshAccessToken(connection) {
+  async function getAccessToken(connection, { forceRefresh = false } = {}) {
+    if (
+      connection.provider === "microsoft-365-calendar" &&
+      forceRefresh !== true
+    ) {
+      const cached = accessTokenCache.get(connection.workspaceId);
+      if (
+        cached?.provider === connection.provider &&
+        cached?.credentialFingerprints.has(
+          credentialFingerprint(connection),
+        ) &&
+        cached.expiresAt - tokenCacheSkewMs > Number(now())
+      ) {
+        return cached.accessToken;
+      }
+    }
+
+    const refreshKey = `${connection.provider}\0${connection.workspaceId}`;
+    const inFlight = refreshPromises.get(refreshKey);
+    if (inFlight) return inFlight;
+    const refresh = refreshAccessToken(connection)
+      .finally(() => {
+        if (refreshPromises.get(refreshKey) === refresh) {
+          refreshPromises.delete(refreshKey);
+        }
+      });
+    refreshPromises.set(refreshKey, refresh);
+    return refresh;
+  }
+
+  async function refreshAccessToken(connection, {
+    allowRaceRecovery = true,
+  } = {}) {
     if (typeof decryptToken !== "function") {
       throw new Error("Calendar token decryption is not configured");
     }
@@ -116,8 +154,41 @@ export function createCalendarAdapter({
     const value = await readJson(response);
     if (!response.ok) {
       if (value?.error === "invalid_grant" || response.status === 401) {
-        await markReauthRequired(connection.workspaceId, value?.error || "invalid_grant");
-        throw new CalendarReauthRequiredError(value?.error || "invalid_grant");
+        const reason = value?.error || "invalid_grant";
+        accessTokenCache.delete(connection.workspaceId);
+        if (connection.provider !== "microsoft-365-calendar") {
+          await markReauthRequired(connection.workspaceId, reason);
+          throw new CalendarReauthRequiredError(reason);
+        }
+        if (allowRaceRecovery) {
+          const latest = await connectionStore.get(connection.workspaceId);
+          if (
+            latest &&
+            credentialFingerprint(latest) !== credentialFingerprint(connection)
+          ) {
+            requireUsableConnection(latest);
+            invalidGrantFailures.delete(connection.workspaceId);
+            return refreshAccessToken(latest, { allowRaceRecovery: false });
+          }
+        }
+        const previous = invalidGrantFailures.get(connection.workspaceId);
+        const fingerprint = credentialFingerprint(connection);
+        const count = previous?.fingerprint === fingerprint
+          ? previous.count + 1
+          : 1;
+        invalidGrantFailures.set(connection.workspaceId, {
+          fingerprint,
+          count,
+        });
+        if (count >= 2) {
+          await markReauthRequired(connection.workspaceId, reason);
+          throw new CalendarReauthRequiredError(reason);
+        }
+        throw calendarError(
+          "Calendar token refresh failed",
+          "provider_token_error",
+          502,
+        );
       }
       throw calendarError(
         "Calendar token refresh failed",
@@ -132,7 +203,27 @@ export function createCalendarAdapter({
         502,
       );
     }
-    await persistRotatedToken(connection, value.refresh_token);
+    invalidGrantFailures.delete(connection.workspaceId);
+    const persistedConnection = await persistRotatedToken(
+      connection,
+      value.refresh_token,
+    );
+    const expiresInSeconds = Number(value.expires_in);
+    if (
+      connection.provider === "microsoft-365-calendar" &&
+      Number.isFinite(expiresInSeconds) &&
+      expiresInSeconds > 0
+    ) {
+      accessTokenCache.set(connection.workspaceId, {
+        provider: connection.provider,
+        credentialFingerprints: new Set([
+          credentialFingerprint(connection),
+          credentialFingerprint(persistedConnection ?? connection),
+        ]),
+        accessToken: value.access_token,
+        expiresAt: Number(now()) + expiresInSeconds * 1_000,
+      });
+    }
     return value.access_token;
   }
 
@@ -143,7 +234,7 @@ export function createCalendarAdapter({
       typeof encryptToken !== "function" ||
       typeof connectionStore.rotateToken !== "function"
     ) {
-      return;
+      return connection;
     }
     const encryptedRefreshToken = await encryptToken({
       token: rotatedToken,
@@ -151,7 +242,7 @@ export function createCalendarAdapter({
       provider: connection.provider,
     });
     try {
-      await connectionStore.rotateToken({
+      return await connectionStore.rotateToken({
         workspaceId: connection.workspaceId,
         provider: connection.provider,
         expectedVersion: connection.tokenVersion,
@@ -159,6 +250,7 @@ export function createCalendarAdapter({
       });
     } catch (error) {
       if (error?.name !== "ConditionalCheckFailedException") throw error;
+      return null;
     }
   }
 
@@ -174,6 +266,14 @@ export function createCalendarAdapter({
     rescheduleBooking: (input) => invoke("rescheduleBooking", input),
     cancelBooking: (input) => invoke("cancelBooking", input),
   };
+}
+
+function credentialFingerprint(connection) {
+  return [
+    connection?.provider,
+    connection?.tokenVersion,
+    connection?.encryptedRefreshToken,
+  ].join("\0");
 }
 
 function requireUsableConnection(connection) {

@@ -158,7 +158,11 @@ export function createHandler({
         });
       }
       if (error instanceof ToolRequestError) {
-        return json(error.statusCode, {
+        const statusCode = path.startsWith("/retell/tools/calendar.") &&
+            error.transportError !== true
+          ? 200
+          : error.statusCode;
+        return json(statusCode, {
           ok: false,
           code: error.code,
           message: error.message,
@@ -172,7 +176,7 @@ export function createHandler({
         code: error?.code,
       });
       if (path.startsWith("/retell/tools/calendar.")) {
-        return json(502, {
+        return json(200, {
           ok: false,
           code: "provider_error",
           message:

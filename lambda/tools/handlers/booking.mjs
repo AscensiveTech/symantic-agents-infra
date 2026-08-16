@@ -31,12 +31,7 @@ export async function handleCreateBooking(input, {
     workspaceId: input.workspaceId,
     ...range,
   });
-  if (availability.available !== true) {
-    throw new ToolRequestError(
-      "That time is no longer available. Please choose another time.",
-      { statusCode: 409, code: "slot_unavailable" },
-    );
-  }
+  requireAvailable(availability);
 
   const providerIds = providerIdempotencyIds(
     input.workspaceId,
@@ -122,11 +117,33 @@ export async function handleRescheduleBooking(input, {
   const profile = await store.getBusinessProfile(input.workspaceId);
   const timezone = profile?.timezone || appointment.timezone || "UTC";
   const range = resolveTimeRange(input, timezone, now);
-  await calendar.rescheduleBooking({
+  const availability = await calendar.getAvailability({
     workspaceId: input.workspaceId,
     providerEventId: appointment.providerEventId,
     ...range,
   });
+  requireAvailable(availability);
+  try {
+    await calendar.rescheduleBooking({
+      workspaceId: input.workspaceId,
+      providerEventId: appointment.providerEventId,
+      ...range,
+    });
+  } catch (error) {
+    if (!isAlreadyUpdatedError(error)) {
+      if (!isRecoverableRescheduleError(error)) throw error;
+      const recovered = await store.getAppointment(
+        input.workspaceId,
+        appointmentId,
+      );
+      if (
+        recovered?.lastRescheduleIdempotencyKey === input.idempotencyKey
+      ) {
+        return appointmentResponse(recovered);
+      }
+      throw error;
+    }
+  }
   const updated = await store.updateAppointment(
     input.workspaceId,
     appointmentId,
@@ -194,4 +211,27 @@ function stringOrUndefined(value) {
   return typeof value === "string" && value.trim()
     ? value.trim()
     : undefined;
+}
+
+function requireAvailable(availability) {
+  if (availability?.available === true) return;
+  throw new ToolRequestError(
+    "That time is no longer available. Please choose another time.",
+    { statusCode: 409, code: "slot_unavailable" },
+  );
+}
+
+function isRecoverableRescheduleError(error) {
+  if ([404, 409, 410, 412].includes(error?.statusCode)) return true;
+  const providerCode = String(error?.providerCode ?? error?.code ?? "");
+  return /itemnotfound|not.?found|gone/i.test(providerCode);
+}
+
+function isAlreadyUpdatedError(error) {
+  const details = [
+    error?.providerCode,
+    error?.code,
+    error?.message,
+  ].filter(Boolean).join(" ");
+  return /already.?updated/i.test(details);
 }

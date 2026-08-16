@@ -107,7 +107,7 @@ test("createBooking resolves relative time in the workspace timezone and persist
   assert.equal(providerInput.startTimeUtc, persisted.startTimeUtc);
 });
 
-test("createBooking never persists or confirms when provider write fails", async () => {
+test("createBooking returns a speakable 200 and never persists when provider write fails", async () => {
   let writes = 0;
   const store = createStore({
     putAppointment: async () => {
@@ -129,7 +129,7 @@ test("createBooking never persists or confirms when provider write fails", async
     bookingBody(),
   ));
 
-  assert.equal(response.statusCode, 502);
+  assert.equal(response.statusCode, 200);
   assert.equal(writes, 0);
   assert.deepEqual(JSON.parse(response.body), {
     ok: false,
@@ -137,6 +137,195 @@ test("createBooking never persists or confirms when provider write fails", async
     message: "I couldn't complete that calendar booking. I can take a message for the office.",
     action: "take_message",
   });
+});
+
+test("slot_unavailable is a speakable 200 response", async () => {
+  const handler = toolHandler({
+    calendar: {
+      async getAvailability() {
+        return { available: false, busy: [] };
+      },
+    },
+  });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody(),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    ok: false,
+    code: "slot_unavailable",
+    message: "That time is no longer available. Please choose another time.",
+  });
+});
+
+test("missing booking fields remain HTTP 400", async () => {
+  const handler = toolHandler();
+
+  const response = await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({
+      startTime: "2026-08-17T14:00:00-04:00",
+      endTime: "2026-08-17T14:30:00-04:00",
+    }),
+  ));
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(JSON.parse(response.body).code, "invalid_request");
+});
+
+test("rescheduleBooking rechecks availability before writing", async () => {
+  const appointment = {
+    workspaceId,
+    appointmentId: "apt-existing",
+    provider: "google-calendar",
+    providerEventId: "provider-event-existing",
+    status: "confirmed",
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T18:30:00.000Z",
+    timezone: "America/New_York",
+  };
+  let providerWrites = 0;
+  let storeWrites = 0;
+  const handler = toolHandler({
+    store: createStore({
+      getAppointment: async () => clone(appointment),
+      updateAppointment: async () => {
+        storeWrites += 1;
+      },
+    }),
+    calendar: {
+      async getAvailability() {
+        return { available: false, busy: [] };
+      },
+      async rescheduleBooking() {
+        providerWrites += 1;
+      },
+    },
+  });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({
+      appointmentId: "apt-existing",
+      startTime: "2026-08-18T10:00:00-04:00",
+      endTime: "2026-08-18T10:30:00-04:00",
+    }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).code, "slot_unavailable");
+  assert.equal(providerWrites, 0);
+  assert.equal(storeWrites, 0);
+});
+
+test("rescheduleBooking recovers a concurrent already-applied provider 404", async () => {
+  const original = {
+    workspaceId,
+    appointmentId: "apt-existing",
+    provider: "microsoft-365-calendar",
+    providerEventId: "provider-event-existing",
+    status: "confirmed",
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T18:30:00.000Z",
+    timezone: "America/New_York",
+  };
+  const concurrentlyUpdated = {
+    ...original,
+    status: "rescheduled",
+    startTimeUtc: "2026-08-18T14:00:00.000Z",
+    endTimeUtc: "2026-08-18T14:30:00.000Z",
+    lastRescheduleIdempotencyKey: "idempotency-key",
+  };
+  let reads = 0;
+  let storeWrites = 0;
+  const handler = toolHandler({
+    store: createStore({
+      getAppointment: async () => clone(
+        reads++ === 0 ? original : concurrentlyUpdated
+      ),
+      updateAppointment: async () => {
+        storeWrites += 1;
+      },
+    }),
+    calendar: {
+      async getAvailability() {
+        return { available: true, busy: [] };
+      },
+      async rescheduleBooking() {
+        const error = new Error("The event is already gone");
+        error.statusCode = 404;
+        error.providerCode = "ErrorItemNotFound";
+        throw error;
+      },
+    },
+  });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({
+      appointmentId: "apt-existing",
+      startTime: "2026-08-18T10:00:00-04:00",
+      endTime: "2026-08-18T10:30:00-04:00",
+    }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).status, "rescheduled");
+  assert.equal(reads, 2);
+  assert.equal(storeWrites, 0);
+});
+
+test("rescheduleBooking persists when the provider reports already updated", async () => {
+  const appointment = {
+    workspaceId,
+    appointmentId: "apt-existing",
+    provider: "google-calendar",
+    providerEventId: "provider-event-existing",
+    status: "confirmed",
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T18:30:00.000Z",
+    timezone: "America/New_York",
+  };
+  let persistedUpdates;
+  const handler = toolHandler({
+    store: createStore({
+      getAppointment: async () => clone(appointment),
+      updateAppointment: async (_workspaceId, _appointmentId, updates) => {
+        persistedUpdates = clone(updates);
+        return { ...appointment, ...clone(updates) };
+      },
+    }),
+    calendar: {
+      async getAvailability() {
+        return { available: true, busy: [] };
+      },
+      async rescheduleBooking() {
+        const error = new Error("The requested change was already updated");
+        error.statusCode = 409;
+        error.providerCode = "already_updated";
+        throw error;
+      },
+    },
+  });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({
+      appointmentId: "apt-existing",
+      startTime: "2026-08-18T10:00:00-04:00",
+      endTime: "2026-08-18T10:30:00-04:00",
+    }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).status, "rescheduled");
+  assert.equal(
+    persistedUpdates.lastRescheduleIdempotencyKey,
+    "idempotency-key",
+  );
 });
 
 test("calendar reauthorization returns a speakable take-message response", async () => {
@@ -308,14 +497,14 @@ test("Retell verifier checks timestamped HMAC and rejects stale signatures", asy
   );
 });
 
-test("adapter marks the calendar reauth_required on invalid_grant", async () => {
+test("adapter requires two consecutive invalid_grant failures before reauth", async () => {
   let reauth;
   const adapter = createCalendarAdapter({
     connectionStore: {
       async get() {
         return {
           workspaceId,
-          provider: "google-calendar",
+          provider: "microsoft-365-calendar",
           selectedCalendarId: "calendar-a",
           calendarTimezone: "America/New_York",
           encryptedRefreshToken: "encrypted-token",
@@ -347,9 +536,145 @@ test("adapter marks the calendar reauth_required on invalid_grant", async () => 
       endTimeUtc: "2026-08-17T18:30:00.000Z",
       timezone: "America/New_York",
     }),
+    (error) => error.code === "provider_token_error",
+  );
+  assert.equal(reauth, undefined);
+
+  await assert.rejects(
+    adapter.getAvailability({
+      workspaceId,
+      startTimeUtc: "2026-08-17T18:00:00.000Z",
+      endTimeUtc: "2026-08-17T18:30:00.000Z",
+      timezone: "America/New_York",
+    }),
     (error) => error.code === "calendar_reauth_required",
   );
   assert.deepEqual(reauth, { id: workspaceId, reason: "invalid_grant" });
+});
+
+test("Microsoft adapter reuses a still-valid access token per workspace", async () => {
+  let refreshes = 0;
+  const providerTokens = [];
+  const adapter = createCalendarAdapter({
+    connectionStore: {
+      async get() {
+        return {
+          workspaceId,
+          provider: "microsoft-365-calendar",
+          selectedCalendarId: "calendar-a",
+          calendarTimezone: "America/New_York",
+          encryptedRefreshToken: "encrypted-token",
+          tokenVersion: 1,
+          connectionState: "connected",
+        };
+      },
+      async rotateToken() {
+        return {
+          workspaceId,
+          provider: "microsoft-365-calendar",
+          encryptedRefreshToken: "rotated-encrypted-token",
+          tokenVersion: 2,
+          connectionState: "connected",
+        };
+      },
+    },
+    decryptToken: async () => "refresh-token",
+    encryptToken: async () => "rotated-encrypted-token",
+    getOAuthSecret: async () => ({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+    }),
+    fetchImpl: async () => {
+      refreshes += 1;
+      return jsonResponse({
+        access_token: "cached-access-token",
+        expires_in: 3600,
+        refresh_token: "rotated-refresh-token",
+      });
+    },
+    providerClients: {
+      "microsoft-365-calendar": {
+        async getAvailability({ accessToken }) {
+          providerTokens.push(accessToken);
+          return { available: true, busy: [] };
+        },
+      },
+    },
+  });
+  const input = {
+    workspaceId,
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T18:30:00.000Z",
+    timezone: "America/New_York",
+  };
+
+  await adapter.getAvailability(input);
+  await adapter.getAvailability(input);
+
+  assert.equal(refreshes, 1);
+  assert.deepEqual(providerTokens, [
+    "cached-access-token",
+    "cached-access-token",
+  ]);
+});
+
+test("Microsoft adapter deduplicates concurrent token refreshes", async () => {
+  let refreshes = 0;
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const adapter = createCalendarAdapter({
+    connectionStore: {
+      async get() {
+        return {
+          workspaceId,
+          provider: "microsoft-365-calendar",
+          selectedCalendarId: "calendar-a",
+          calendarTimezone: "America/New_York",
+          encryptedRefreshToken: "encrypted-token",
+          tokenVersion: 1,
+          connectionState: "connected",
+        };
+      },
+    },
+    decryptToken: async () => "refresh-token",
+    getOAuthSecret: async () => ({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+    }),
+    fetchImpl: async () => {
+      refreshes += 1;
+      await refreshGate;
+      return jsonResponse({
+        access_token: "shared-access-token",
+        expires_in: 3600,
+      });
+    },
+    providerClients: {
+      "microsoft-365-calendar": {
+        async getAvailability() {
+          return { available: true, busy: [] };
+        },
+      },
+    },
+  });
+  const input = {
+    workspaceId,
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T18:30:00.000Z",
+    timezone: "America/New_York",
+  };
+
+  const operations = [
+    adapter.getAvailability(input),
+    adapter.getAvailability(input),
+  ];
+  await Promise.resolve();
+  releaseRefresh();
+  await Promise.all(operations);
+
+  assert.equal(refreshes, 1);
 });
 
 test("Google adapter sends free/busy and creates an event with a stable provider id", async () => {
@@ -429,6 +754,82 @@ test("Microsoft adapter sends UTC event times and transaction id", async () => {
     timeZone: "UTC",
   });
   assert.equal(body.transactionId, "11111111-1111-4111-a111-111111111111");
+});
+
+test("Microsoft createBooking reads back an existing duplicate transaction", async () => {
+  const requests = [];
+  const transactionId = "11111111-1111-4111-a111-111111111111";
+  const client = createMicrosoftCalendarClient({
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      if (options.method === "POST") {
+        return jsonResponse({
+          error: {
+            code: "ErrorDuplicateTransactionId",
+            message: "The transaction ID has already been used.",
+          },
+        }, 409);
+      }
+      return jsonResponse({
+        value: [{
+          id: "graph-event-existing",
+          transactionId,
+          webLink: "https://outlook.office.com/event/existing",
+        }],
+      });
+    },
+  });
+
+  const booking = await client.createBooking({
+    accessToken: "access-token",
+    calendarId: "calendar-a",
+    providerId: transactionId,
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T18:30:00.000Z",
+    timezone: "America/New_York",
+    service: "Consultation",
+  });
+
+  assert.equal(booking.providerEventId, "graph-event-existing");
+  assert.equal(requests.length, 2);
+  assert.match(
+    requests[1].url,
+    /%24filter=transactionId(\+|%20)eq(\+|%20)%2711111111/,
+  );
+});
+
+test("Google cancelBooking treats a 410 gone response as success", async () => {
+  const client = createGoogleCalendarClient({
+    fetchImpl: async () => jsonResponse({
+      error: { message: "Resource has been deleted" },
+    }, 410),
+  });
+
+  const result = await client.cancelBooking({
+    accessToken: "access-token",
+    calendarId: "calendar-a",
+    providerEventId: "event-gone",
+  });
+
+  assert.equal(result.providerEventId, "event-gone");
+});
+
+test("Microsoft cancelBooking treats a 404 response as success", async () => {
+  const client = createMicrosoftCalendarClient({
+    fetchImpl: async () => jsonResponse({
+      error: {
+        code: "ErrorItemNotFound",
+        message: "The specified object was not found.",
+      },
+    }, 404),
+  });
+
+  const result = await client.cancelBooking({
+    accessToken: "access-token",
+    providerEventId: "event-gone",
+  });
+
+  assert.equal(result.providerEventId, "event-gone");
 });
 
 test("provider idempotency ids satisfy Google and Microsoft formats", () => {

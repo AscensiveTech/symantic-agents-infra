@@ -115,12 +115,16 @@ export function createGoogleCalendarClient({
       calendarId,
       providerEventId,
     }) {
-      await requestJson(
-        fetchImpl,
-        `${API_BASE}/calendars/${encodeURIComponent(calendarId)}` +
-          `/events/${encodeURIComponent(providerEventId)}?sendUpdates=all`,
-        { method: "DELETE", accessToken, allowEmpty: true },
-      );
+      try {
+        await requestJson(
+          fetchImpl,
+          `${API_BASE}/calendars/${encodeURIComponent(calendarId)}` +
+            `/events/${encodeURIComponent(providerEventId)}?sendUpdates=all`,
+          { method: "DELETE", accessToken, allowEmpty: true },
+        );
+      } catch (error) {
+        if (error?.statusCode !== 410) throw error;
+      }
       return {
         provider: "google-calendar",
         providerEventId,
