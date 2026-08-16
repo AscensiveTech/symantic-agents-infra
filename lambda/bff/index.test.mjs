@@ -261,6 +261,82 @@ test("PUT agent uses the route id and returns the updated agent", async () => {
   assert.deepEqual(calls, [["user-123", "agent-123", agent]]);
 });
 
+test("GET calls lists workspace calls without exposing Retell identifiers", async () => {
+  const calls = [{
+    workspaceId: "user-123",
+    callId: "call-123",
+    retellCallId: "retell-call-secret",
+    callerNumber: "+17035550123",
+    outcome: "answered",
+    startedAt: "2026-08-16T14:00:00.000Z",
+    recordingUrl: "https://retell.example/recording.wav",
+    transcript: [{ speaker: "Caller", text: "Hello" }],
+    toolLog: [{ role: "tool_call_result", tool_call_id: "retell-tool-1" }],
+  }];
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls(workspaceId) {
+      assert.equal(workspaceId, "user-123");
+      return calls;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "GET",
+    "/workspaces/me/calls",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.deepEqual(body, [{
+    callId: "call-123",
+    callerNumber: "+17035550123",
+    outcome: "answered",
+    startedAt: "2026-08-16T14:00:00.000Z",
+  }]);
+  assert.doesNotMatch(response.body, /retell-call-secret/);
+});
+
+test("GET call detail uses the product call id and hides provider keys", async () => {
+  let requested;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall(workspaceId, callId) {
+      requested = { workspaceId, callId };
+      return {
+        workspaceId,
+        callId,
+        retellCallId: "retell-call-secret",
+        transcript: [{ speaker: "Caller", text: "Hello" }],
+        recordingUrl: "https://retell.example/recording.wav",
+        outcome: "answered",
+      };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "GET",
+    "/workspaces/me/calls/call-123",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(requested, {
+    workspaceId: "user-123",
+    callId: "call-123",
+  });
+  assert.deepEqual(JSON.parse(response.body), {
+    callId: "call-123",
+    transcript: [{ speaker: "Caller", text: "Hello" }],
+    recordingUrl: "https://retell.example/recording.wav",
+    outcome: "answered",
+  });
+  assert.doesNotMatch(response.body, /retell-call-secret/);
+});
+
 test("Dynamo agent updates preserve provider foreign keys", async () => {
   class UpdateItemCommand {
     constructor(input) {

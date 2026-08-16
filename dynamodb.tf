@@ -52,6 +52,7 @@ resource "aws_dynamodb_table" "control_plane" {
       "workspaceId",
       each.value.range_key,
       each.key == "phone_numbers" ? "telnyxPhoneNumber" : null,
+      each.key == "agents" ? "retellAgentId" : null,
     ]))
 
     content {
@@ -66,6 +67,16 @@ resource "aws_dynamodb_table" "control_plane" {
     content {
       name            = "telnyxPhoneNumber-index"
       hash_key        = "telnyxPhoneNumber"
+      projection_type = "ALL"
+    }
+  }
+
+  dynamic "global_secondary_index" {
+    for_each = each.key == "agents" ? [1] : []
+
+    content {
+      name            = "retellAgentId-index"
+      hash_key        = "retellAgentId"
       projection_type = "ALL"
     }
   }

@@ -59,6 +59,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["agents"].arn
       },
       {
+        Sid      = "ReadCalls"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["calls"].arn
+      },
+      {
         Sid    = "ManagePhoneNumbers"
         Effect = "Allow"
         Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
@@ -117,6 +123,7 @@ resource "aws_lambda_function" "bff" {
       BUSINESS_PROFILES_TABLE = aws_dynamodb_table.control_plane["business_profiles"].name
       AGENTS_TABLE            = aws_dynamodb_table.control_plane["agents"].name
       PHONE_NUMBERS_TABLE     = aws_dynamodb_table.control_plane["phone_numbers"].name
+      CALLS_TABLE             = aws_dynamodb_table.control_plane["calls"].name
       RETELL_SECRET_ARN       = aws_secretsmanager_secret.providers["retell"].arn
       TELNYX_SECRET_ARN       = aws_secretsmanager_secret.providers["telnyx"].arn
       PUBLIC_API_BASE_URL     = aws_apigatewayv2_api.bff.api_endpoint

@@ -8,6 +8,8 @@ locals {
     "PUT /workspaces/me/agents/{agentId}",
     "POST /workspaces/me/agents/{agentId}/activate",
     "POST /workspaces/me/agents/{agentId}/start-test-call",
+    "GET /workspaces/me/calls",
+    "GET /workspaces/me/calls/{callId}",
   ])
 }
 

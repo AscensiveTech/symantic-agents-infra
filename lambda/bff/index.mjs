@@ -27,6 +27,7 @@ const PROFILE_FIELDS = {
 
 const AGENT_STATUSES = new Set(["active", "draft", "preview", "planned"]);
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
 
 function json(statusCode, body) {
   return {
@@ -130,6 +131,18 @@ function getAgentAction(event, path) {
   }
 }
 
+function getCallId(event, path) {
+  const value = event?.pathParameters?.callId ??
+    path.match(/^\/workspaces\/me\/calls\/([^/]+)$/)?.[1];
+  if (!value) return null;
+  try {
+    const decoded = decodeURIComponent(value);
+    return CALL_ID_PATTERN.test(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createHandler({
   getStore = getDefaultStore,
   getProviders = getDefaultProviders,
@@ -184,6 +197,23 @@ export function createHandler({
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         return json(201, await store.createAgent(workspaceId, agent.id, agent));
+      }
+
+      if (path === "/workspaces/me/calls" && method === "GET") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const calls = await store.listCalls(workspaceId);
+        return json(200, calls.map(toPublicCallSummary));
+      }
+
+      const callId = getCallId(event, path);
+      if (callId && method === "GET") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const call = await store.getCall(workspaceId, callId);
+        return call
+          ? json(200, toPublicCall(call))
+          : json(404, { message: "Call not found" });
       }
 
       const agentAction = getAgentAction(event, path);
@@ -529,6 +559,25 @@ function toPublicPhoneNumber(item) {
   };
 }
 
+function toPublicCall(item) {
+  const {
+    workspaceId: _workspaceId,
+    retellCallId: _retellCallId,
+    ...call
+  } = item;
+  return call;
+}
+
+function toPublicCallSummary(item) {
+  const {
+    transcript: _transcript,
+    toolLog: _toolLog,
+    recordingUrl: _recordingUrl,
+    ...summary
+  } = toPublicCall(item);
+  return summary;
+}
+
 export function createDynamoStore(client, commands, tableNames) {
   return {
     async ensureWorkspace(workspaceId) {
@@ -557,6 +606,27 @@ export function createDynamoStore(client, commands, tableNames) {
         Item: marshall({ workspaceId, ...profile }),
       }));
       return profile;
+    },
+
+    async listCalls(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.calls,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ConsistentRead: true,
+      }));
+      return (result.Items ?? [])
+        .map((item) => unmarshall(item))
+        .sort((left, right) => callTimestamp(right) - callTimestamp(left));
+    },
+
+    async getCall(workspaceId, callId) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
     },
 
     async listAgents(workspaceId) {
@@ -682,6 +752,7 @@ async function getDefaultStore() {
       businessProfiles: process.env.BUSINESS_PROFILES_TABLE,
       agents: process.env.AGENTS_TABLE,
       phoneNumbers: process.env.PHONE_NUMBERS_TABLE,
+      calls: process.env.CALLS_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");
@@ -689,6 +760,11 @@ async function getDefaultStore() {
     return createDynamoStore(new commands.DynamoDBClient({}), commands, tableNames);
   });
   return storePromise;
+}
+
+function callTimestamp(call) {
+  const value = Date.parse(call?.startedAt ?? call?.createdAt ?? "");
+  return Number.isNaN(value) ? 0 : value;
 }
 
 const secretPromises = new Map();
