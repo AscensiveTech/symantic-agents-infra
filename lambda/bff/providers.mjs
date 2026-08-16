@@ -210,17 +210,25 @@ export function createRetellClient({
       config,
     }) {
       let existing = null;
-      if (retellAgentId) {
+      let resolvedId = typeof retellAgentId === "string" && retellAgentId
+        ? retellAgentId
+        : null;
+      if (resolvedId) {
         try {
           existing = await retellRequest(
-            `/get-agent/${encodeURIComponent(retellAgentId)}`,
+            `/get-agent/${encodeURIComponent(resolvedId)}`,
           );
         } catch (error) {
           if (error?.providerStatus !== 404) throw error;
         }
       }
+      if (!existing) {
+        existing = await findAgentBySymanticId(retellRequest, symanticAgentId);
+        const listedId = existing?.agent_id ?? existing?.agentId;
+        resolvedId = typeof listedId === "string" && listedId ? listedId : null;
+      }
 
-      if (existing) {
+      if (existing && resolvedId) {
         const existingLlmId = existing?.response_engine?.type === "retell-llm"
           ? existing.response_engine.llm_id
           : null;
@@ -229,7 +237,7 @@ export function createRetellClient({
           : await createLlm({ greeting, config });
         if (existingLlmId) await updateLlm(llmId, { greeting, config });
         await retellRequest(
-          `/update-agent/${encodeURIComponent(retellAgentId)}`,
+          `/update-agent/${encodeURIComponent(resolvedId)}`,
           {
             method: "PATCH",
             body: agentBody({
@@ -240,7 +248,7 @@ export function createRetellClient({
             }),
           },
         );
-        return { retellAgentId };
+        return { retellAgentId: resolvedId };
       }
 
       const llmId = await createLlm({ greeting, config });
@@ -379,4 +387,18 @@ function requireCredential(value, label) {
 
 function stringOrUndefined(value) {
   return typeof value === "string" && value ? value : undefined;
+}
+
+function isSymanticAgentName(agentName, symanticAgentId) {
+  if (typeof agentName !== "string" || !agentName) return false;
+  return agentName === `Symantic ${symanticAgentId}` ||
+    agentName.startsWith(`Symantic ${symanticAgentId} ·`);
+}
+
+async function findAgentBySymanticId(retellRequest, symanticAgentId) {
+  const listed = await retellRequest("/list-agents");
+  const agents = Array.isArray(listed) ? listed : listed?.agents ?? [];
+  return agents.find((candidate) =>
+    isSymanticAgentName(candidate?.agent_name, symanticAgentId)
+  ) ?? null;
 }

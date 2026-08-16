@@ -55,7 +55,7 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid      = "ManageAgents"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.control_plane["agents"].arn
       },
       {

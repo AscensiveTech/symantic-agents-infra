@@ -236,17 +236,37 @@ export function createHandler({
           greeting: agent?.configuration?.greeting ?? "",
           config,
         });
+        try {
+          await store.updateAgentRuntime(
+            workspaceId,
+            agentAction.agentId,
+            { retellAgentId: synced.retellAgentId },
+          );
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          console.error("Failed to persist retellAgentId after Retell upsert", error);
+        }
         const activatedAt = new Date().toISOString();
-        const updatedAgent = await store.updateAgentRuntime(
-          workspaceId,
-          agentAction.agentId,
-          {
-            status: "active",
-            retellAgentId: synced.retellAgentId,
-            activatedAt,
-            updatedAt: activatedAt,
-          },
-        );
+        let updatedAgent;
+        try {
+          updatedAgent = await store.updateAgentRuntime(
+            workspaceId,
+            agentAction.agentId,
+            {
+              status: "active",
+              retellAgentId: synced.retellAgentId,
+              activatedAt,
+              updatedAt: activatedAt,
+            },
+          );
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
         return json(200, {
           agent: toPublicAgent(updatedAgent),
           phoneNumber: toPublicPhoneNumber(phoneNumber),
@@ -300,12 +320,19 @@ export function createHandler({
         if (!agent) return json(400, { message: "Invalid agent" });
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
-        return json(200, await store.putAgent(workspaceId, agentId, agent));
+        try {
+          return json(200, await store.putAgent(workspaceId, agentId, agent));
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
       }
 
       return json(404, { message: "Not found" });
     } catch (error) {
-      if (error?.name === "ConditionalCheckFailedException") {
+      if (isConditionalCheckFailed(error)) {
         return json(409, { message: "Agent already exists" });
       }
       if (error instanceof ProviderRequestError) {
@@ -421,6 +448,10 @@ function readHeader(headers, name) {
 
 function isE164(value) {
   return typeof value === "string" && /^\+[1-9]\d{7,14}$/.test(value);
+}
+
+function isConditionalCheckFailed(error) {
+  return error?.name === "ConditionalCheckFailedException";
 }
 
 function toAttributeValue(value) {

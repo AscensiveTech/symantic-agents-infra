@@ -201,6 +201,35 @@ test("GET agent returns 404 when the workspace agent is missing", async () => {
   assert.equal(response.statusCode, 404);
 });
 
+test("PUT agent returns 404 when the agent is missing", async () => {
+  const error = new Error("The conditional request failed");
+  error.name = "ConditionalCheckFailedException";
+  const store = {
+    async ensureWorkspace() {},
+    async putAgent() {
+      throw error;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-404",
+    {
+      id: "agent-404",
+      name: "Maya",
+      role: "Phone operations",
+      description: "Answers calls",
+      status: "draft",
+      capabilities: ["Inbound calls"],
+    },
+  ));
+
+  assert.equal(response.statusCode, 404);
+  assert.equal(JSON.parse(response.body).message, "Agent not found");
+});
+
 test("PUT agent uses the route id and returns the updated agent", async () => {
   const calls = [];
   const store = {
@@ -348,6 +377,63 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   assert.ok(retellInput.config.tools.every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")
   ));
+});
+
+test("POST activate persists retellAgentId before the rest of the runtime update", async () => {
+  const runtimeUpdates = [];
+  const agent = receptionistAgent();
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return agent;
+    },
+    async getProfile() {
+      return receptionistProfile();
+    },
+    async getPhoneNumberForAgent() {
+      return {
+        workspaceId: "user-123",
+        phoneNumberId: "phone-agent-123",
+        agentId: "agent-123",
+        telnyxNumberId: "telnyx-number-123",
+        telnyxPhoneNumber: "+17035550177",
+      };
+    },
+    async updateAgentRuntime(_workspaceId, _agentId, updates) {
+      runtimeUpdates.push(updates);
+      if (runtimeUpdates.length === 1) {
+        return { ...agent, ...updates };
+      }
+      throw new Error("status update failed");
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      telnyx: {
+        async ensureNumber() {
+          assert.fail("existing DID must be reused");
+        },
+      },
+      retell: {
+        async upsertAgent() {
+          return { retellAgentId: "retell-agent-123" };
+        },
+      },
+      resolveVoiceId: () => "retell-Cimo",
+    }),
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/activate",
+  ));
+
+  assert.equal(response.statusCode, 500);
+  assert.deepEqual(runtimeUpdates[0], { retellAgentId: "retell-agent-123" });
+  assert.equal(runtimeUpdates.length, 2);
 });
 
 test("POST activate reuses the linked DID and upserts the existing Retell agent", async () => {

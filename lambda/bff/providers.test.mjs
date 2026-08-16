@@ -94,6 +94,9 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push([String(url), init]);
+    if (String(url).endsWith("/list-agents")) {
+      return response([]);
+    }
     if (String(url).endsWith("/create-retell-llm")) {
       return response({ llm_id: "llm-123" }, 201);
     }
@@ -121,14 +124,15 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
   assert.deepEqual(result, {
     retellAgentId: "retell-agent-123",
   });
-  assert.equal(calls[0][0], "https://api.retellai.com/create-retell-llm");
-  assert.deepEqual(JSON.parse(calls[0][1].body), {
+  assert.equal(calls[0][0], "https://api.retellai.com/list-agents");
+  assert.equal(calls[1][0], "https://api.retellai.com/create-retell-llm");
+  assert.deepEqual(JSON.parse(calls[1][1].body), {
     begin_message: "Thanks for calling.",
     general_prompt: "Compiled prompt",
     general_tools: config.tools,
   });
-  assert.equal(calls[1][0], "https://api.retellai.com/create-agent");
-  assert.deepEqual(JSON.parse(calls[1][1].body), {
+  assert.equal(calls[2][0], "https://api.retellai.com/create-agent");
+  assert.deepEqual(JSON.parse(calls[2][1].body), {
     response_engine: {
       type: "retell-llm",
       llm_id: "llm-123",
@@ -136,7 +140,103 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
     voice_id: "retell-Cimo",
     agent_name: "Symantic agent-123 · Maya",
   });
-  assert.equal(calls[1][1].headers.Authorization, "Bearer retell-key");
+  assert.equal(calls[2][1].headers.Authorization, "Bearer retell-key");
+});
+
+test("Retell upsert reuses a Symantic-named agent instead of creating another", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (String(url).endsWith("/list-agents")) {
+      return response([{
+        agent_id: "retell-existing",
+        agent_name: "Symantic agent-123 · Maya",
+        response_engine: {
+          type: "retell-llm",
+          llm_id: "llm-existing",
+        },
+      }]);
+    }
+    return response({ ok: true });
+  };
+  const client = createRetellClient({
+    apiKey: "retell-key",
+    fetchImpl,
+  });
+
+  const result = await client.upsertAgent({
+    symanticAgentId: "agent-123",
+    agentName: "Maya",
+    greeting: "Hello.",
+    config: {
+      prompt: "Updated prompt",
+      tools: [],
+      voice: "retell-Cimo",
+    },
+  });
+
+  assert.deepEqual(result, {
+    retellAgentId: "retell-existing",
+  });
+  assert.equal(calls[0][0], "https://api.retellai.com/list-agents");
+  assert.equal(
+    calls[1][0],
+    "https://api.retellai.com/update-retell-llm/llm-existing",
+  );
+  assert.equal(
+    calls[2][0],
+    "https://api.retellai.com/update-agent/retell-existing",
+  );
+  assert.ok(!calls.some(([url]) => url.endsWith("/create-agent")));
+});
+
+test("Retell upsert looks up by Symantic name after a stored agent id 404s", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (String(url).includes("/get-agent/")) {
+      return response({ message: "not found" }, 404);
+    }
+    if (String(url).endsWith("/list-agents")) {
+      return response({
+        agents: [{
+          agent_id: "retell-recovered",
+          agent_name: "Symantic agent-123 · Maya",
+          response_engine: {
+            type: "retell-llm",
+            llm_id: "llm-recovered",
+          },
+        }],
+      });
+    }
+    return response({ ok: true });
+  };
+  const client = createRetellClient({
+    apiKey: "retell-key",
+    fetchImpl,
+  });
+
+  const result = await client.upsertAgent({
+    retellAgentId: "retell-stale",
+    symanticAgentId: "agent-123",
+    agentName: "Maya",
+    greeting: "Hello.",
+    config: {
+      prompt: "Updated prompt",
+      tools: [],
+      voice: "retell-Cimo",
+    },
+  });
+
+  assert.deepEqual(result, {
+    retellAgentId: "retell-recovered",
+  });
+  assert.equal(
+    calls[0][0],
+    "https://api.retellai.com/get-agent/retell-stale",
+  );
+  assert.equal(calls[1][0], "https://api.retellai.com/list-agents");
+  assert.ok(!calls.some(([url]) => url.endsWith("/create-agent")));
 });
 
 test("Retell upsert updates the existing LLM and agent", async () => {
