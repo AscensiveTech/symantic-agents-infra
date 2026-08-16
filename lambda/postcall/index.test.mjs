@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createDynamoPostcallStore, createHandler } from "./index.mjs";
+import {
+  MAX_MARSHALLED_CALL_ITEM_BYTES,
+  createDynamoPostcallStore,
+  createHandler,
+  marshalledCallItemBytes,
+} from "./index.mjs";
 
 test("invalid signature returns 401 without persisting the call", async () => {
   let storeLoads = 0;
@@ -220,10 +225,9 @@ test("oversized transcript content is truncated instead of failing call ingest",
   assert.equal(response.statusCode, 204);
   assert.equal(persistedCall.transcriptTruncated, true);
   assert.match(persistedCall.transcriptNote, /truncated/i);
-  assert.ok(Buffer.byteLength(JSON.stringify({
-    transcript: persistedCall.transcript,
-    toolLog: persistedCall.toolLog,
-  }), "utf8") <= 350 * 1024);
+  assert.ok(
+    marshalledCallItemBytes(persistedCall) <= MAX_MARSHALLED_CALL_ITEM_BYTES,
+  );
   assert.ok(persistedCall.transcript.length < transcriptObject.length);
 });
 

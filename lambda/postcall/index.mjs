@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 const ROUTE = "/retell/webhooks/call-ended";
-const MAX_CALL_CONTENT_BYTES = 340 * 1024;
+export const MAX_MARSHALLED_CALL_ITEM_BYTES = 380 * 1024;
 
 export function verifyRetellSignature(
   rawBody,
@@ -101,11 +101,7 @@ export function createHandler({
     const timestamp = new Date(now()).toISOString();
     const callId = stableId("call", workspaceId, retellCallId);
     const summary = summarizeCall(call, toolLog);
-    const content = truncateCallContent(
-      normalizeTranscript(call.transcript_object, call.transcript),
-      toolLog,
-    );
-    const record = {
+    const buildCallRecord = (transcript, storedToolLog, truncated) => ({
       workspaceId,
       callId,
       retellCallId,
@@ -119,9 +115,9 @@ export function createHandler({
       durationMs: durationMs(call),
       recordingUrl: stringValue(call.recording_url),
       disconnectionReason: stringValue(call.disconnection_reason),
-      transcript: content.transcript,
-      toolLog: content.toolLog,
-      ...(content.truncated
+      transcript,
+      toolLog: storedToolLog,
+      ...(truncated
         ? {
           transcriptTruncated: true,
           transcriptNote:
@@ -131,7 +127,17 @@ export function createHandler({
       outcome: inferOutcome(call, toolLog),
       createdAt: timestamp,
       updatedAt: timestamp,
-    };
+    });
+    const content = truncateCallContent(
+      normalizeTranscript(call.transcript_object, call.transcript),
+      toolLog,
+      buildCallRecord,
+    );
+    const record = buildCallRecord(
+      content.transcript,
+      content.toolLog,
+      content.truncated,
+    );
     try {
       store ??= await getStore();
       await store.putCall(record);
@@ -167,8 +173,11 @@ function normalizeToolLog(value) {
     : [];
 }
 
-function truncateCallContent(transcript, toolLog) {
-  if (callContentBytes(transcript, toolLog) <= MAX_CALL_CONTENT_BYTES) {
+function truncateCallContent(transcript, toolLog, buildCallRecord) {
+  if (
+    marshalledCallItemBytes(buildCallRecord(transcript, toolLog, false)) <=
+    MAX_MARSHALLED_CALL_ITEM_BYTES
+  ) {
     return { transcript, toolLog, truncated: false };
   }
   const limitedTranscript = transcript.map((entry) => ({
@@ -183,13 +192,17 @@ function truncateCallContent(transcript, toolLog) {
   );
   while (
     limitedTranscript.length &&
-    callContentBytes(limitedTranscript, limitedToolLog) > MAX_CALL_CONTENT_BYTES
+    marshalledCallItemBytes(
+      buildCallRecord(limitedTranscript, limitedToolLog, true),
+    ) > MAX_MARSHALLED_CALL_ITEM_BYTES
   ) {
     limitedTranscript.pop();
   }
   while (
     limitedToolLog.length &&
-    callContentBytes(limitedTranscript, limitedToolLog) > MAX_CALL_CONTENT_BYTES
+    marshalledCallItemBytes(
+      buildCallRecord(limitedTranscript, limitedToolLog, true),
+    ) > MAX_MARSHALLED_CALL_ITEM_BYTES
   ) {
     limitedToolLog.pop();
   }
@@ -200,8 +213,8 @@ function truncateCallContent(transcript, toolLog) {
   };
 }
 
-function callContentBytes(transcript, toolLog) {
-  return Buffer.byteLength(JSON.stringify({ transcript, toolLog }), "utf8");
+export function marshalledCallItemBytes(record) {
+  return Buffer.byteLength(JSON.stringify(marshall(record)), "utf8");
 }
 
 function truncateString(value, maxLength) {
