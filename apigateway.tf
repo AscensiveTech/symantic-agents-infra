@@ -16,7 +16,7 @@ resource "aws_apigatewayv2_api" "bff" {
   cors_configuration {
     allow_credentials = false
     allow_headers     = ["authorization", "content-type"]
-    allow_methods     = ["GET", "POST", "PUT", "OPTIONS"]
+    allow_methods     = ["DELETE", "GET", "POST", "PUT", "OPTIONS"]
     allow_origins     = distinct(compact(["http://localhost:3000", var.app_url]))
     max_age           = 300
   }
