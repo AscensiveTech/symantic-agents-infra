@@ -6,4 +6,9 @@ locals {
 
   # Public app URL: custom domain if provided, else Amplify default.
   app_url = var.app_url != "" ? var.app_url : "https://${var.amplify_branch}.${aws_amplify_app.frontend.default_domain}"
+
+  cognito_callback_urls = distinct(compact([
+    "http://localhost:3000",
+    var.app_url,
+  ]))
 }

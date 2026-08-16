@@ -18,6 +18,21 @@ output "app_url" {
   value       = local.app_url
 }
 
+output "cognito_user_pool_id" {
+  description = "Cognito user pool ID for the Symantic frontend."
+  value       = aws_cognito_user_pool.frontend.id
+}
+
+output "cognito_client_id" {
+  description = "Cognito SPA app client ID."
+  value       = aws_cognito_user_pool_client.frontend.id
+}
+
+output "cognito_issuer" {
+  description = "OIDC issuer URL for the Cognito user pool."
+  value       = "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.frontend.id}"
+}
+
 output "ci_deploy_role_arn" {
   description = "Set this as the symantic-agents-frontend GitHub repository secret AWS_DEPLOY_ROLE_ARN."
   value       = aws_iam_role.ci_deploy.arn
