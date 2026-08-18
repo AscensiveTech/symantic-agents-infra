@@ -32,6 +32,10 @@ locals {
       name_suffix = "leads"
       range_key   = "leadId"
     }
+    messages = {
+      name_suffix = "messages"
+      range_key   = "messageId"
+    }
     proposals = {
       name_suffix = "proposals"
       range_key   = "proposalId"
