@@ -32,9 +32,17 @@ locals {
       name_suffix = "leads"
       range_key   = "leadId"
     }
-    messages = {
-      name_suffix = "messages"
-      range_key   = "messageId"
+    proposals = {
+      name_suffix = "proposals"
+      range_key   = "proposalId"
+    }
+    proposal_parts = {
+      name_suffix = "proposal-parts"
+      range_key   = "partId"
+    }
+    proposal_templates = {
+      name_suffix = "proposal-templates"
+      range_key   = "templateId"
     }
   }
 }

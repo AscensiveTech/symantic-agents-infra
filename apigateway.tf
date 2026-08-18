@@ -10,6 +10,24 @@ locals {
     "POST /workspaces/me/agents/{agentId}/start-test-call",
     "GET /workspaces/me/calls",
     "GET /workspaces/me/calls/{callId}",
+    "GET /workspaces/me/proposals",
+    "POST /workspaces/me/proposals",
+    "GET /workspaces/me/proposals/{proposalId}",
+    "PATCH /workspaces/me/proposals/{proposalId}",
+    "DELETE /workspaces/me/proposals/{proposalId}",
+    "POST /workspaces/me/proposals/{proposalId}/duplicate",
+    "GET /workspaces/me/proposal-templates",
+    "POST /workspaces/me/proposal-templates",
+    "GET /workspaces/me/proposal-templates/{templateId}",
+    "PATCH /workspaces/me/proposal-templates/{templateId}",
+    "DELETE /workspaces/me/proposal-templates/{templateId}",
+    "GET /workspaces/me/parts",
+    "POST /workspaces/me/parts",
+    "PATCH /workspaces/me/parts/{partId}",
+    "DELETE /workspaces/me/parts/{partId}",
+    "POST /workspaces/me/parts/bulk",
+    "POST /workspaces/me/proposal-assets/upload-url",
+    "POST /workspaces/me/proposal-assets/download-url",
   ])
 }
 
@@ -20,7 +38,7 @@ resource "aws_apigatewayv2_api" "bff" {
   cors_configuration {
     allow_credentials = false
     allow_headers     = ["authorization", "content-type", "x-retell-signature"]
-    allow_methods     = ["DELETE", "GET", "POST", "PUT", "OPTIONS"]
+    allow_methods     = ["DELETE", "GET", "PATCH", "POST", "PUT", "OPTIONS"]
     allow_origins     = distinct(compact(["http://localhost:3000", var.app_url]))
     max_age           = 300
   }

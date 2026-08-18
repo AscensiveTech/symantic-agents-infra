@@ -6,6 +6,7 @@ data "archive_file" "bff" {
     "index.test.mjs",
     "providers.test.mjs",
     "receptionist.test.mjs",
+    "proposals.test.mjs",
   ]
 }
 
@@ -79,6 +80,30 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
           "${aws_dynamodb_table.control_plane["phone_numbers"].arn}/index/*",
         ]
       },
+      {
+        Sid      = "ManageProposals"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["proposals"].arn
+      },
+      {
+        Sid      = "ManageProposalParts"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["proposal_parts"].arn
+      },
+      {
+        Sid      = "ManageProposalTemplates"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["proposal_templates"].arn
+      },
+      {
+        Sid      = "ManageProposalAssets"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.proposal_assets.arn}/*"
+      },
     ]
   })
 }
@@ -131,6 +156,10 @@ resource "aws_lambda_function" "bff" {
       PHONE_NUMBERS_TABLE        = aws_dynamodb_table.control_plane["phone_numbers"].name
       CALENDAR_CONNECTIONS_TABLE = aws_dynamodb_table.control_plane["calendar_connections"].name
       CALLS_TABLE                = aws_dynamodb_table.control_plane["calls"].name
+      PROPOSALS_TABLE            = aws_dynamodb_table.control_plane["proposals"].name
+      PROPOSAL_PARTS_TABLE       = aws_dynamodb_table.control_plane["proposal_parts"].name
+      PROPOSAL_TEMPLATES_TABLE   = aws_dynamodb_table.control_plane["proposal_templates"].name
+      PROPOSAL_ASSETS_BUCKET     = aws_s3_bucket.proposal_assets.bucket
       RETELL_SECRET_ARN          = aws_secretsmanager_secret.providers["retell"].arn
       TELNYX_SECRET_ARN          = aws_secretsmanager_secret.providers["telnyx"].arn
       PUBLIC_API_BASE_URL        = aws_apigatewayv2_api.bff.api_endpoint
