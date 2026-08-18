@@ -56,6 +56,11 @@ at `/auth/callback`; no Cognito client secret is created or exposed to the
 browser. Apply this stack before releasing a frontend build that enables remote
 API mode.
 
+The BFF persists proposals, proposal templates, and parts in their DynamoDB
+tables and signs PDF uploads/downloads against the private proposal-assets
+bucket. Records and object keys are partitioned by the authenticated Cognito
+`sub`, so one user cannot address another user's proposal data.
+
 ## Notes
 
 - `AGENT_REGISTRY_SECRET` is generated in Terraform and set on the Amplify branch (sensitive; lives in encrypted state).

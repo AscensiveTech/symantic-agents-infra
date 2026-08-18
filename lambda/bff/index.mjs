@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 import {
   createRetellClient,
@@ -28,6 +28,9 @@ const PROFILE_FIELDS = {
 const AGENT_STATUSES = new Set(["active", "draft", "preview", "planned"]);
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
+const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const PROPOSAL_ASSET_KEY_PATTERN = /^(templates|proposals|exports)\/[A-Za-z0-9_./-]+\.pdf$/;
+const MAX_DYNAMO_RECORD_BYTES = 350 * 1024;
 
 function json(statusCode, body) {
   return {
@@ -143,8 +146,49 @@ function getCallId(event, path) {
   }
 }
 
+function getEntityId(event, path, collection, parameterName) {
+  const pattern = new RegExp(`^/workspaces/me/${collection}/([^/]+)$`);
+  const value = event?.pathParameters?.[parameterName] ?? path.match(pattern)?.[1];
+  if (!value) return null;
+  try {
+    const decoded = decodeURIComponent(value);
+    return ENTITY_ID_PATTERN.test(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function pickEntity(value, idField, routeId) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = routeId ?? value[idField];
+  if (
+    typeof id !== "string" ||
+    !ENTITY_ID_PATTERN.test(id) ||
+    (value[idField] !== undefined && value[idField] !== id)
+  ) return null;
+  const { workspaceId: _workspaceId, ...record } = value;
+  const normalized = { ...record, [idField]: id };
+  return Buffer.byteLength(JSON.stringify(normalized), "utf8") <= MAX_DYNAMO_RECORD_BYTES
+    ? normalized
+    : null;
+}
+
+function pickEntityArray(value, idField) {
+  if (!Array.isArray(value)) return null;
+  const records = value.map((item) => pickEntity(item, idField));
+  return records.every(Boolean) ? records : null;
+}
+
+function validAssetKey(value) {
+  return typeof value === "string" &&
+    value.length <= 512 &&
+    !value.includes("..") &&
+    PROPOSAL_ASSET_KEY_PATTERN.test(value);
+}
+
 export function createHandler({
   getStore = getDefaultStore,
+  getAssetSigner = getDefaultAssetSigner,
   getProviders = getDefaultProviders,
   getRetellApiKey = getDefaultRetellApiKey,
   verifySignature = verifyRetellSignature,
@@ -168,6 +212,15 @@ export function createHandler({
       if (typeof workspaceId !== "string" || workspaceId.length === 0) {
         return json(401, { message: "Unauthorized" });
       }
+
+      const proposalResponse = await handleProposalApi(event, {
+        method,
+        path,
+        workspaceId,
+        getStore,
+        getAssetSigner,
+      });
+      if (proposalResponse) return proposalResponse;
 
       if (path === "/workspaces/me/profile" && method === "PUT") {
         const body = readBody(event);
@@ -380,6 +433,185 @@ export function createHandler({
       return json(500, { message: "Internal server error" });
     }
   };
+}
+
+async function handleProposalApi(event, {
+  method,
+  path,
+  workspaceId,
+  getStore,
+  getAssetSigner,
+}) {
+  if (typeof path !== "string" || ![
+    "/workspaces/me/proposals",
+    "/workspaces/me/proposal-templates",
+    "/workspaces/me/parts",
+    "/workspaces/me/proposal-assets",
+  ].some((prefix) => path.startsWith(prefix))) return null;
+
+  const store = await getStore();
+  await store.ensureWorkspace(workspaceId);
+
+  if (path === "/workspaces/me/proposals") {
+    if (method === "GET") return json(200, await store.listProposals(workspaceId));
+    if (method === "POST") {
+      const proposal = pickEntity(readBody(event), "id");
+      if (!proposal) return json(400, { message: "Invalid proposal" });
+      try {
+        return json(201, await store.createProposal(workspaceId, proposal));
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return json(409, { message: "Proposal already exists" });
+        throw error;
+      }
+    }
+  }
+
+  const duplicateMatch = path.match(/^\/workspaces\/me\/proposals\/([^/]+)\/duplicate$/);
+  if (duplicateMatch && method === "POST") {
+    const proposalId = decodeEntityId(event?.pathParameters?.proposalId ?? duplicateMatch[1]);
+    if (!proposalId) return json(400, { message: "Invalid proposal ID" });
+    const source = await store.getProposal(workspaceId, proposalId);
+    if (!source) return json(404, { message: "Proposal not found" });
+    const now = new Date().toISOString();
+    const copy = {
+      ...structuredClone(source),
+      id: `prp-${randomUUID()}`,
+      name: `${source.name || "Proposal"} copy`,
+      status: "draft",
+      lastExportedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    return json(201, await store.createProposal(workspaceId, copy));
+  }
+
+  const proposalId = getEntityId(event, path, "proposals", "proposalId");
+  if (proposalId) {
+    if (method === "GET") {
+      const proposal = await store.getProposal(workspaceId, proposalId);
+      return proposal ? json(200, proposal) : json(404, { message: "Proposal not found" });
+    }
+    if (method === "PATCH") {
+      const proposal = pickEntity(readBody(event), "id", proposalId);
+      if (!proposal) return json(400, { message: "Invalid proposal" });
+      try {
+        return json(200, await store.putProposal(workspaceId, proposal));
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return json(404, { message: "Proposal not found" });
+        throw error;
+      }
+    }
+    if (method === "DELETE") {
+      await store.deleteProposal(workspaceId, proposalId);
+      return json(200, { ok: true });
+    }
+  }
+
+  if (path === "/workspaces/me/proposal-templates") {
+    if (method === "GET") return json(200, await store.listProposalTemplates(workspaceId));
+    if (method === "POST") {
+      const template = pickEntity(readBody(event), "id");
+      if (!template) return json(400, { message: "Invalid proposal template" });
+      try {
+        return json(201, await store.createProposalTemplate(workspaceId, template));
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return json(409, { message: "Proposal template already exists" });
+        throw error;
+      }
+    }
+  }
+
+  const templateId = getEntityId(event, path, "proposal-templates", "templateId");
+  if (templateId) {
+    if (method === "GET") {
+      const template = await store.getProposalTemplate(workspaceId, templateId);
+      return template ? json(200, template) : json(404, { message: "Proposal template not found" });
+    }
+    if (method === "PATCH") {
+      const template = pickEntity(readBody(event), "id", templateId);
+      if (!template) return json(400, { message: "Invalid proposal template" });
+      try {
+        return json(200, await store.putProposalTemplate(workspaceId, template));
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return json(404, { message: "Proposal template not found" });
+        throw error;
+      }
+    }
+    if (method === "DELETE") {
+      await store.deleteProposalTemplate(workspaceId, templateId);
+      return json(200, { ok: true });
+    }
+  }
+
+  if (path === "/workspaces/me/parts") {
+    if (method === "GET") return json(200, await store.listParts(workspaceId));
+    if (method === "POST") {
+      const part = pickEntity(readBody(event), "id");
+      if (!part) return json(400, { message: "Invalid part" });
+      try {
+        return json(201, await store.createPart(workspaceId, part));
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return json(409, { message: "Part already exists" });
+        throw error;
+      }
+    }
+  }
+
+  if (path === "/workspaces/me/parts/bulk" && method === "POST") {
+    const parts = pickEntityArray(readBody(event)?.parts, "id");
+    if (!parts) return json(400, { message: "Invalid parts" });
+    return json(200, await store.putParts(workspaceId, parts));
+  }
+
+  const partId = getEntityId(event, path, "parts", "partId");
+  if (partId) {
+    if (method === "PATCH") {
+      const part = pickEntity(readBody(event), "id", partId);
+      if (!part) return json(400, { message: "Invalid part" });
+      try {
+        return json(200, await store.putPart(workspaceId, part));
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return json(404, { message: "Part not found" });
+        throw error;
+      }
+    }
+    if (method === "DELETE") {
+      await store.deletePart(workspaceId, partId);
+      return json(200, { ok: true });
+    }
+  }
+
+  if (
+    (path === "/workspaces/me/proposal-assets/upload-url" ||
+      path === "/workspaces/me/proposal-assets/download-url") &&
+    method === "POST"
+  ) {
+    const body = readBody(event);
+    if (!validAssetKey(body?.key)) return json(400, { message: "Invalid proposal asset key" });
+    const signer = await getAssetSigner();
+    if (path.endsWith("/upload-url")) {
+      if (body.contentType !== undefined && body.contentType !== "application/pdf") {
+        return json(400, { message: "Only PDF proposal assets are supported" });
+      }
+      return json(200, {
+        url: await signer.createUploadUrl(workspaceId, body.key, "application/pdf"),
+        key: body.key,
+      });
+    }
+    return json(200, { url: await signer.createDownloadUrl(workspaceId, body.key) });
+  }
+
+  return json(404, { message: "Not found" });
+}
+
+function decodeEntityId(value) {
+  if (!value) return null;
+  try {
+    const decoded = decodeURIComponent(value);
+    return ENTITY_ID_PATTERN.test(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
 }
 
 async function handleInboundLookup(event, {
@@ -779,7 +1011,48 @@ function toPublicCallSummary(item) {
   return summary;
 }
 
+function toPublicEntity(item, keyField) {
+  const { workspaceId: _workspaceId, [keyField]: id, ...value } = item;
+  return { id, ...value };
+}
+
 export function createDynamoStore(client, commands, tableNames) {
+  async function listRecords(tableName, keyField, workspaceId) {
+    const result = await client.send(new commands.QueryCommand({
+      TableName: tableName,
+      KeyConditionExpression: "workspaceId = :workspaceId",
+      ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+      ConsistentRead: true,
+    }));
+    return (result.Items ?? []).map((item) => toPublicEntity(unmarshall(item), keyField));
+  }
+
+  async function getRecord(tableName, keyField, workspaceId, id) {
+    const result = await client.send(new commands.GetItemCommand({
+      TableName: tableName,
+      Key: marshall({ workspaceId, [keyField]: id }),
+      ConsistentRead: true,
+    }));
+    return result.Item ? toPublicEntity(unmarshall(result.Item), keyField) : null;
+  }
+
+  async function putRecord(tableName, keyField, workspaceId, record, conditionExpression) {
+    const { id, workspaceId: _workspaceId, ...value } = record;
+    await client.send(new commands.PutItemCommand({
+      TableName: tableName,
+      Item: marshall({ workspaceId, [keyField]: id, ...value }),
+      ...(conditionExpression ? { ConditionExpression: conditionExpression } : {}),
+    }));
+    return record;
+  }
+
+  async function deleteRecord(tableName, keyField, workspaceId, id) {
+    await client.send(new commands.DeleteItemCommand({
+      TableName: tableName,
+      Key: marshall({ workspaceId, [keyField]: id }),
+    }));
+  }
+
   return {
     async ensureWorkspace(workspaceId) {
       await client.send(new commands.UpdateItemCommand({
@@ -949,6 +1222,121 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    async listProposals(workspaceId) {
+      const records = await listRecords(tableNames.proposals, "proposalId", workspaceId);
+      return records.sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""));
+    },
+
+    getProposal(workspaceId, proposalId) {
+      return getRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
+    },
+
+    createProposal(workspaceId, proposal) {
+      return putRecord(
+        tableNames.proposals,
+        "proposalId",
+        workspaceId,
+        proposal,
+        "attribute_not_exists(proposalId)",
+      );
+    },
+
+    putProposal(workspaceId, proposal) {
+      return putRecord(
+        tableNames.proposals,
+        "proposalId",
+        workspaceId,
+        proposal,
+        "attribute_exists(proposalId)",
+      );
+    },
+
+    deleteProposal(workspaceId, proposalId) {
+      return deleteRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
+    },
+
+    async listProposalTemplates(workspaceId) {
+      const records = await listRecords(
+        tableNames.proposalTemplates,
+        "templateId",
+        workspaceId,
+      );
+      return records.sort((left, right) => Number(right.isDefault) - Number(left.isDefault));
+    },
+
+    getProposalTemplate(workspaceId, templateId) {
+      return getRecord(
+        tableNames.proposalTemplates,
+        "templateId",
+        workspaceId,
+        templateId,
+      );
+    },
+
+    createProposalTemplate(workspaceId, template) {
+      return putRecord(
+        tableNames.proposalTemplates,
+        "templateId",
+        workspaceId,
+        template,
+        "attribute_not_exists(templateId)",
+      );
+    },
+
+    putProposalTemplate(workspaceId, template) {
+      return putRecord(
+        tableNames.proposalTemplates,
+        "templateId",
+        workspaceId,
+        template,
+        "attribute_exists(templateId)",
+      );
+    },
+
+    deleteProposalTemplate(workspaceId, templateId) {
+      return deleteRecord(
+        tableNames.proposalTemplates,
+        "templateId",
+        workspaceId,
+        templateId,
+      );
+    },
+
+    listParts(workspaceId) {
+      return listRecords(tableNames.proposalParts, "partId", workspaceId);
+    },
+
+    createPart(workspaceId, part) {
+      return putRecord(
+        tableNames.proposalParts,
+        "partId",
+        workspaceId,
+        part,
+        "attribute_not_exists(partId)",
+      );
+    },
+
+    putPart(workspaceId, part) {
+      return putRecord(
+        tableNames.proposalParts,
+        "partId",
+        workspaceId,
+        part,
+        "attribute_exists(partId)",
+      );
+    },
+
+    async putParts(workspaceId, parts) {
+      for (const part of parts) {
+        await putRecord(tableNames.proposalParts, "partId", workspaceId, part);
+      }
+      return parts;
+    },
+
+    deletePart(workspaceId, partId) {
+      return deleteRecord(tableNames.proposalParts, "partId", workspaceId, partId);
+    },
+
     async putPhoneNumber(record) {
       await client.send(new commands.PutItemCommand({
         TableName: tableNames.phoneNumbers,
@@ -983,6 +1371,9 @@ async function getDefaultStore() {
       phoneNumbers: process.env.PHONE_NUMBERS_TABLE,
       calendarConnections: process.env.CALENDAR_CONNECTIONS_TABLE,
       calls: process.env.CALLS_TABLE,
+      proposals: process.env.PROPOSALS_TABLE,
+      proposalParts: process.env.PROPOSAL_PARTS_TABLE,
+      proposalTemplates: process.env.PROPOSAL_TEMPLATES_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");
@@ -990,6 +1381,113 @@ async function getDefaultStore() {
     return createDynamoStore(new commands.DynamoDBClient({}), commands, tableNames);
   });
   return storePromise;
+}
+
+let assetSignerPromise;
+
+async function getDefaultAssetSigner() {
+  const bucket = process.env.PROPOSAL_ASSETS_BUCKET;
+  if (!bucket) throw new Error("PROPOSAL_ASSETS_BUCKET is required");
+  assetSignerPromise ??= Promise.resolve(createS3AssetSigner({
+    bucket,
+    region: process.env.AWS_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      sessionToken: process.env.AWS_SESSION_TOKEN,
+    },
+  }));
+  return assetSignerPromise;
+}
+
+export function createS3AssetSigner({ bucket, region, credentials, now = () => new Date() }) {
+  if (!bucket || !region || !credentials?.accessKeyId || !credentials?.secretAccessKey) {
+    throw new Error("S3 presigning requires a bucket, region, and AWS credentials");
+  }
+  const objectKey = (workspaceId, key) => `workspaces/${workspaceId}/${key}`;
+  return {
+    createUploadUrl(workspaceId, key, contentType) {
+      return createPresignedS3Url({
+        method: "PUT",
+        bucket,
+        region,
+        key: objectKey(workspaceId, key),
+        credentials,
+        contentType,
+        now: now(),
+      });
+    },
+    createDownloadUrl(workspaceId, key) {
+      return createPresignedS3Url({
+        method: "GET",
+        bucket,
+        region,
+        key: objectKey(workspaceId, key),
+        credentials,
+        now: now(),
+      });
+    },
+  };
+}
+
+function createPresignedS3Url({
+  method,
+  bucket,
+  region,
+  key,
+  credentials,
+  contentType,
+  now,
+  expiresIn = 900,
+}) {
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const date = amzDate.slice(0, 8);
+  const scope = `${date}/${region}/s3/aws4_request`;
+  const host = `${bucket}.s3.${region}.amazonaws.com`;
+  const signedHeaders = contentType ? "content-type;host" : "host";
+  const query = {
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+    "X-Amz-Credential": `${credentials.accessKeyId}/${scope}`,
+    "X-Amz-Date": amzDate,
+    "X-Amz-Expires": String(expiresIn),
+    "X-Amz-SignedHeaders": signedHeaders,
+    ...(credentials.sessionToken ? { "X-Amz-Security-Token": credentials.sessionToken } : {}),
+  };
+  const canonicalQuery = Object.entries(query)
+    .map(([name, value]) => [awsPercentEncode(name), awsPercentEncode(value)])
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([name, value]) => `${name}=${value}`)
+    .join("&");
+  const canonicalUri = `/${key.split("/").map(awsPercentEncode).join("/")}`;
+  const canonicalHeaders = contentType
+    ? `content-type:${contentType}\nhost:${host}\n`
+    : `host:${host}\n`;
+  const canonicalRequest = [
+    method,
+    canonicalUri,
+    canonicalQuery,
+    canonicalHeaders,
+    signedHeaders,
+    "UNSIGNED-PAYLOAD",
+  ].join("\n");
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    scope,
+    createHash("sha256").update(canonicalRequest).digest("hex"),
+  ].join("\n");
+  const dateKey = createHmac("sha256", `AWS4${credentials.secretAccessKey}`).update(date).digest();
+  const regionKey = createHmac("sha256", dateKey).update(region).digest();
+  const serviceKey = createHmac("sha256", regionKey).update("s3").digest();
+  const signingKey = createHmac("sha256", serviceKey).update("aws4_request").digest();
+  const signature = createHmac("sha256", signingKey).update(stringToSign).digest("hex");
+  return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+}
+
+function awsPercentEncode(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
 function callTimestamp(call) {
