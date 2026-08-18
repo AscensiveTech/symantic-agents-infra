@@ -34,8 +34,18 @@ resource "aws_cognito_user_pool_client" "frontend" {
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["email", "openid", "profile"]
   callback_urls                        = local.cognito_callback_urls
-  logout_urls                          = local.cognito_callback_urls
+  logout_urls                          = local.cognito_logout_urls
   supported_identity_providers         = ["COGNITO"]
+
+  access_token_validity  = 60
+  id_token_validity      = 60
+  refresh_token_validity = 30
+
+  token_validity_units {
+    access_token  = "minutes"
+    id_token      = "minutes"
+    refresh_token = "days"
+  }
 
   enable_token_revocation       = true
   prevent_user_existence_errors = "ENABLED"

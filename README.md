@@ -48,7 +48,13 @@ From `terraform output`:
 1. Repository **secret** `AWS_DEPLOY_ROLE_ARN` = `ci_deploy_role_arn`
 2. Repository **variable** `AMPLIFY_APP_ID` = `amplify_app_id`
 
-Push to `main` in `AscensiveTech/symantic-agents-frontend`. The deploy workflow runs `npm run check`, assumes the OIDC role, and calls Amplify `StartJob(RELEASE)`. Amplify **auto-build is disabled**.
+Push to `main` in `AscensiveTech/symantic-agents-frontend`. The deploy workflow runs lint, type checks, unit tests, and an authenticated production build; then it assumes the OIDC role and calls Amplify `StartJob(RELEASE)`. Amplify **auto-build is disabled**.
+
+Terraform also writes the BFF URL and Cognito Hosted UI configuration directly
+to the Amplify production branch. The frontend uses Authorization Code + PKCE
+at `/auth/callback`; no Cognito client secret is created or exposed to the
+browser. Apply this stack before releasing a frontend build that enables remote
+API mode.
 
 ## Notes
 
