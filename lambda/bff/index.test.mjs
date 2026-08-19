@@ -1200,6 +1200,50 @@ test("company administrators can provision quotation builders", async () => {
   ]);
 });
 
+test("Cognito directory rejects an existing email regardless of capitalization", async () => {
+  class ListUsersCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  class AdminCreateUserCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  const calls = [];
+  const client = {
+    async send(command) {
+      calls.push(command);
+      if (command instanceof ListUsersCommand) {
+        return {
+          Users: [{
+            Username: "existing-user",
+            Attributes: [{ Name: "email", Value: "AJM@technovate.design" }],
+          }],
+        };
+      }
+      throw new Error("AdminCreateUser must not be called for a duplicate email");
+    },
+  };
+  const { createCognitoDirectory } = await loadBff();
+  const directory = createCognitoDirectory(client, {
+    ListUsersCommand,
+    AdminCreateUserCommand,
+  }, "pool-123");
+
+  await assert.rejects(
+    directory.createUser({
+      email: "ajm@technovate.design",
+      name: "Duplicate",
+      temporaryPassword: "Temporary123!",
+    }),
+    { name: "UsernameExistsException" },
+  );
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0] instanceof ListUsersCommand);
+});
+
 test("S3 asset signer matches the AWS Signature Version 4 reference output", async () => {
   const { createS3AssetSigner } = await loadBff();
   const signer = createS3AssetSigner({

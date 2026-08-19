@@ -1607,8 +1607,33 @@ async function getDefaultUserDirectory() {
 
 export function createCognitoDirectory(client, commands, userPoolId) {
   const managedGroups = ["super-admin", "company-admin", "quotation-builder"];
+
+  async function findUserByEmail(email) {
+    let paginationToken;
+    do {
+      const result = await client.send(new commands.ListUsersCommand({
+        UserPoolId: userPoolId,
+        Limit: 60,
+        ...(paginationToken ? { PaginationToken: paginationToken } : {}),
+      }));
+      const existing = (result.Users ?? []).find((user) =>
+        user.Attributes?.some((attribute) =>
+          attribute.Name === "email" && attribute.Value?.toLowerCase() === email.toLowerCase()
+        )
+      );
+      if (existing) return existing;
+      paginationToken = result.PaginationToken;
+    } while (paginationToken);
+    return null;
+  }
+
   return {
     async createUser({ email, name, temporaryPassword }) {
+      if (await findUserByEmail(email)) {
+        const error = new Error("A user with that email already exists");
+        error.name = "UsernameExistsException";
+        throw error;
+      }
       const attributes = [
         { Name: "email", Value: email },
         { Name: "email_verified", Value: "true" },
