@@ -1111,6 +1111,95 @@ test("proposal asset routes issue workspace-scoped PDF URLs and reject traversal
   ]);
 });
 
+test("workspace membership shares proposal data across Cognito users", async () => {
+  const store = {
+    async getMembership(userId) {
+      return {
+        userId,
+        workspaceId: "workspace-technovate",
+        role: "quotation-builder",
+        status: "active",
+      };
+    },
+    async ensureWorkspace() {},
+    async listProposals(workspaceId) {
+      assert.equal(workspaceId, "workspace-technovate");
+      return [{ id: "prp-shared", name: "Shared proposal" }];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/proposals");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"quotation-builder\"]";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body)[0].id, "prp-shared");
+});
+
+test("quotation builders cannot access non-proposal workspace APIs", async () => {
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-123", role: "quotation-builder", status: "active" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/agents");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("company administrators can provision quotation builders", async () => {
+  const memberships = [];
+  const directoryCalls = [];
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" };
+    },
+    async putMembership(membership) {
+      memberships.push(membership);
+      return membership;
+    },
+  };
+  const directory = {
+    async createUser(input) {
+      directoryCalls.push(["create", input.email]);
+      return { userId: "member-123", username: "cognito-member-123" };
+    },
+    async setRole(username, role) {
+      directoryCalls.push(["role", username, role]);
+    },
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getUserDirectory: async () => directory,
+  });
+  const event = authenticatedEvent("POST", "/workspaces/me/users", {
+    email: "builder@example.com",
+    name: "Proposal Builder",
+    role: "quotation-builder",
+    temporaryPassword: "Temporary123!",
+  });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(memberships[0].workspaceId, "workspace-123");
+  assert.equal(memberships[0].role, "quotation-builder");
+  assert.deepEqual(directoryCalls, [
+    ["create", "builder@example.com"],
+    ["role", "cognito-member-123", "quotation-builder"],
+  ]);
+});
+
 test("S3 asset signer matches the AWS Signature Version 4 reference output", async () => {
   const { createS3AssetSigner } = await loadBff();
   const signer = createS3AssetSigner({

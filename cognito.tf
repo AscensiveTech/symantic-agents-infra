@@ -25,6 +25,32 @@ resource "aws_cognito_user_pool" "frontend" {
   }
 }
 
+locals {
+  frontend_role_groups = {
+    super-admin = {
+      description = "Symantic.ai platform operators"
+      precedence  = 0
+    }
+    company-admin = {
+      description = "Customer company administrators"
+      precedence  = 10
+    }
+    quotation-builder = {
+      description = "Company users permitted to build quotations"
+      precedence  = 20
+    }
+  }
+}
+
+resource "aws_cognito_user_group" "frontend_roles" {
+  for_each = local.frontend_role_groups
+
+  user_pool_id = aws_cognito_user_pool.frontend.id
+  name         = each.key
+  description  = each.value.description
+  precedence   = each.value.precedence
+}
+
 resource "aws_cognito_user_pool_client" "frontend" {
   name         = "${local.name_prefix}-web"
   user_pool_id = aws_cognito_user_pool.frontend.id

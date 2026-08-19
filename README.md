@@ -56,10 +56,14 @@ at `/auth/callback`; no Cognito client secret is created or exposed to the
 browser. Apply this stack before releasing a frontend build that enables remote
 API mode.
 
-The BFF persists proposals, proposal templates, and parts in their DynamoDB
-tables and signs PDF uploads/downloads against the private proposal-assets
-bucket. Records and object keys are partitioned by the authenticated Cognito
-`sub`, so one user cannot address another user's proposal data.
+The BFF persists proposals, proposal templates, and parts in DynamoDB and signs
+PDF uploads/downloads against the private proposal-assets bucket. A dedicated
+workspace-membership table maps each Cognito `sub` to a company workspace, so
+company users share proposal data without sharing credentials. Cognito groups
+define `super-admin`, `company-admin`, and `quotation-builder` roles; the BFF
+checks the group claim and membership on every authenticated request. Company
+administrators can provision and revoke quotation-builder accounts from the
+Agents UI without storing passwords in DynamoDB.
 
 ## Notes
 

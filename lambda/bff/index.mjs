@@ -31,6 +31,8 @@ const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PROPOSAL_ASSET_KEY_PATTERN = /^(templates|proposals|exports)\/[A-Za-z0-9_./-]+\.pdf$/;
 const MAX_DYNAMO_RECORD_BYTES = 350 * 1024;
+const WORKSPACE_ROLES = new Set(["super-admin", "company-admin", "quotation-builder"]);
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function json(statusCode, body) {
   return {
@@ -186,8 +188,54 @@ function validAssetKey(value) {
     PROPOSAL_ASSET_KEY_PATTERN.test(value);
 }
 
+function claimGroups(value) {
+  if (Array.isArray(value)) return value.filter((group) => typeof group === "string");
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return parsed.filter((group) => typeof group === "string");
+  } catch {
+    // API Gateway can expose a comma-delimited claim instead of a JSON array.
+  }
+  return value.replace(/^\[|\]$/g, "").split(",")
+    .map((group) => group.trim().replace(/^['\"]|['\"]$/g, ""))
+    .filter(Boolean);
+}
+
+async function resolveActor(event, store) {
+  const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+  const userId = claims.sub;
+  if (typeof userId !== "string" || userId.length === 0) return null;
+
+  // Unit-test stores written before shared workspaces intentionally omit membership methods.
+  if (typeof store.getMembership !== "function") {
+    return { userId, workspaceId: userId, roles: ["company-admin"] };
+  }
+
+  const membership = await store.getMembership(userId);
+  if (!membership || membership.status === "disabled") return null;
+  const roles = claimGroups(claims["cognito:groups"])
+    .filter((group) => WORKSPACE_ROLES.has(group));
+  if (!roles.includes(membership.role) && !roles.includes("super-admin")) return null;
+  return { userId, workspaceId: membership.workspaceId, roles, membership };
+}
+
+function isWorkspaceAdmin(actor) {
+  return actor.roles.includes("company-admin") || actor.roles.includes("super-admin");
+}
+
+function isProposalPath(path) {
+  return typeof path === "string" && [
+    "/workspaces/me/proposals",
+    "/workspaces/me/proposal-templates",
+    "/workspaces/me/parts",
+    "/workspaces/me/proposal-assets",
+  ].some((prefix) => path.startsWith(prefix));
+}
+
 export function createHandler({
   getStore = getDefaultStore,
+  getUserDirectory = getDefaultUserDirectory,
   getAssetSigner = getDefaultAssetSigner,
   getProviders = getDefaultProviders,
   getRetellApiKey = getDefaultRetellApiKey,
@@ -208,16 +256,39 @@ export function createHandler({
         });
       }
 
-      const workspaceId = event?.requestContext?.authorizer?.jwt?.claims?.sub;
-      if (typeof workspaceId !== "string" || workspaceId.length === 0) {
+      const subject = event?.requestContext?.authorizer?.jwt?.claims?.sub;
+      if (typeof subject !== "string" || subject.length === 0) {
         return json(401, { message: "Unauthorized" });
+      }
+      if (path === "/workspaces/me/profile" && method === "PUT" && !isProfile(readBody(event))) {
+        return json(400, { message: "Invalid profile" });
+      }
+
+      const store = await getStore();
+      const actor = await resolveActor(event, store);
+      if (!actor) {
+        return json(401, { message: "Unauthorized" });
+      }
+      const { workspaceId } = actor;
+
+      const usersResponse = await handleWorkspaceUsers(event, {
+        method,
+        path,
+        actor,
+        store,
+        getUserDirectory,
+      });
+      if (usersResponse) return usersResponse;
+
+      if (actor.roles.includes("quotation-builder") && !isWorkspaceAdmin(actor) && !isProposalPath(path)) {
+        return json(403, { message: "Quotation builders can only access proposal features" });
       }
 
       const proposalResponse = await handleProposalApi(event, {
         method,
         path,
         workspaceId,
-        getStore,
+        getStore: async () => store,
         getAssetSigner,
       });
       if (proposalResponse) return proposalResponse;
@@ -226,20 +297,17 @@ export function createHandler({
         const body = readBody(event);
         if (!isProfile(body)) return json(400, { message: "Invalid profile" });
         const profile = pickProfile(body);
-        const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         const saved = await store.putProfile(workspaceId, profile);
         return json(200, saved);
       }
 
       if (path === "/workspaces/me/profile" && method === "GET") {
-        const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         return json(200, await store.getProfile(workspaceId));
       }
 
       if (path === "/workspaces/me/agents" && method === "GET") {
-        const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         return json(200, await store.listAgents(workspaceId));
       }
@@ -253,7 +321,6 @@ export function createHandler({
           }
           : null;
         if (!agent) return json(400, { message: "Invalid agent" });
-        const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         return json(201, await store.createAgent(workspaceId, agent.id, agent));
       }
@@ -433,6 +500,110 @@ export function createHandler({
       return json(500, { message: "Internal server error" });
     }
   };
+}
+
+async function handleWorkspaceUsers(event, {
+  method,
+  path,
+  actor,
+  store,
+  getUserDirectory,
+}) {
+  if (typeof path !== "string" || !path.startsWith("/workspaces/me/users")) return null;
+  if (!isWorkspaceAdmin(actor)) return json(403, { message: "Company administrator access is required" });
+
+  if (path === "/workspaces/me/users" && method === "GET") {
+    return json(200, await store.listMemberships(actor.workspaceId));
+  }
+
+  if (path === "/workspaces/me/users" && method === "POST") {
+    const body = readBody(event);
+    const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
+    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    const role = body?.role === "company-admin" ? "company-admin" : "quotation-builder";
+    const temporaryPassword = body?.temporaryPassword;
+    if (
+      !EMAIL_PATTERN.test(email) ||
+      email.length > 320 ||
+      name.length > 120 ||
+      typeof temporaryPassword !== "string" ||
+      temporaryPassword.length < 12 ||
+      (!actor.roles.includes("super-admin") && role !== "quotation-builder")
+    ) {
+      return json(400, { message: "Invalid workspace user" });
+    }
+
+    const directory = await getUserDirectory();
+    let created;
+    try {
+      created = await directory.createUser({ email, name, temporaryPassword });
+      await directory.setRole(created.username, role);
+      const membership = {
+        userId: created.userId,
+        cognitoUsername: created.username,
+        workspaceId: actor.workspaceId,
+        email,
+        name,
+        role,
+        status: "active",
+        createdAt: new Date().toISOString(),
+        createdBy: actor.userId,
+      };
+      await store.putMembership(membership);
+      return json(201, membership);
+    } catch (error) {
+      if (created?.username) await directory.deleteUser(created.username).catch(() => {});
+      if (error?.name === "UsernameExistsException") {
+        return json(409, { message: "A user with that email already exists" });
+      }
+      throw error;
+    }
+  }
+
+  const userId = getEntityId(event, path, "users", "userId");
+  if (!userId) return json(404, { message: "Not found" });
+  const target = await store.getMembership(userId);
+  if (!target || target.workspaceId !== actor.workspaceId) {
+    return json(404, { message: "Workspace user not found" });
+  }
+
+  if (method === "PATCH") {
+    const body = readBody(event);
+    const role = body?.role;
+    if (
+      !["company-admin", "quotation-builder"].includes(role) ||
+      (!actor.roles.includes("super-admin") && role !== "quotation-builder")
+    ) {
+      return json(400, { message: "Invalid workspace role" });
+    }
+    if (target.role === "company-admin" && role !== "company-admin") {
+      const members = await store.listMemberships(actor.workspaceId);
+      if (members.filter((member) => member.role === "company-admin" && member.status !== "disabled").length <= 1) {
+        return json(409, { message: "Promote another company administrator first" });
+      }
+    }
+    const directory = await getUserDirectory();
+    await directory.setRole(target.cognitoUsername ?? target.email, role);
+    const updated = { ...target, role, updatedAt: new Date().toISOString() };
+    await store.putMembership(updated);
+    return json(200, updated);
+  }
+
+  if (method === "DELETE") {
+    if (userId === actor.userId) return json(409, { message: "You cannot remove your own account" });
+    if (target.role === "company-admin") {
+      const members = await store.listMemberships(actor.workspaceId);
+      if (members.filter((member) => member.role === "company-admin" && member.status !== "disabled").length <= 1) {
+        return json(409, { message: "Promote another company administrator first" });
+      }
+    }
+    const directory = await getUserDirectory();
+    await directory.deleteUser(target.cognitoUsername ?? target.email);
+    await store.deleteMembership(userId);
+    return json(200, { ok: true });
+  }
+
+  return json(404, { message: "Not found" });
 }
 
 async function handleProposalApi(event, {
@@ -1054,6 +1225,42 @@ export function createDynamoStore(client, commands, tableNames) {
   }
 
   return {
+    async getMembership(userId) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.workspaceMemberships,
+        Key: marshall({ userId }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    async listMemberships(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.workspaceMemberships,
+        IndexName: "workspaceId-index",
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+      }));
+      return (result.Items ?? [])
+        .map((item) => unmarshall(item))
+        .sort((left, right) => String(left.email).localeCompare(String(right.email)));
+    },
+
+    async putMembership(membership) {
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.workspaceMemberships,
+        Item: marshall(membership, { removeUndefinedValues: true }),
+      }));
+      return membership;
+    },
+
+    async deleteMembership(userId) {
+      await client.send(new commands.DeleteItemCommand({
+        TableName: tableNames.workspaceMemberships,
+        Key: marshall({ userId }),
+      }));
+    },
+
     async ensureWorkspace(workspaceId) {
       await client.send(new commands.UpdateItemCommand({
         TableName: tableNames.workspaces,
@@ -1374,6 +1581,7 @@ async function getDefaultStore() {
       proposals: process.env.PROPOSALS_TABLE,
       proposalParts: process.env.PROPOSAL_PARTS_TABLE,
       proposalTemplates: process.env.PROPOSAL_TEMPLATES_TABLE,
+      workspaceMemberships: process.env.WORKSPACE_MEMBERSHIPS_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");
@@ -1381,6 +1589,72 @@ async function getDefaultStore() {
     return createDynamoStore(new commands.DynamoDBClient({}), commands, tableNames);
   });
   return storePromise;
+}
+
+let userDirectoryPromise;
+
+async function getDefaultUserDirectory() {
+  const userPoolId = process.env.COGNITO_USER_POOL_ID;
+  if (!userPoolId) throw new Error("COGNITO_USER_POOL_ID is required");
+  userDirectoryPromise ??= import("@aws-sdk/client-cognito-identity-provider")
+    .then((commands) => createCognitoDirectory(
+      new commands.CognitoIdentityProviderClient({}),
+      commands,
+      userPoolId,
+    ));
+  return userDirectoryPromise;
+}
+
+export function createCognitoDirectory(client, commands, userPoolId) {
+  const managedGroups = ["super-admin", "company-admin", "quotation-builder"];
+  return {
+    async createUser({ email, name, temporaryPassword }) {
+      const attributes = [
+        { Name: "email", Value: email },
+        { Name: "email_verified", Value: "true" },
+        ...(name ? [{ Name: "name", Value: name }] : []),
+      ];
+      const result = await client.send(new commands.AdminCreateUserCommand({
+        UserPoolId: userPoolId,
+        Username: email,
+        TemporaryPassword: temporaryPassword,
+        MessageAction: "SUPPRESS",
+        UserAttributes: attributes,
+      }));
+      const userId = result.User?.Attributes?.find((attribute) => attribute.Name === "sub")?.Value;
+      const username = result.User?.Username;
+      if (!userId || !username) throw new Error("Cognito did not return the created user identity");
+      return { userId, username };
+    },
+
+    async setRole(username, role) {
+      const current = await client.send(new commands.AdminListGroupsForUserCommand({
+        UserPoolId: userPoolId,
+        Username: username,
+      }));
+      for (const group of current.Groups ?? []) {
+        if (managedGroups.includes(group.GroupName) && group.GroupName !== role) {
+          await client.send(new commands.AdminRemoveUserFromGroupCommand({
+            UserPoolId: userPoolId,
+            Username: username,
+            GroupName: group.GroupName,
+          }));
+        }
+      }
+      await client.send(new commands.AdminAddUserToGroupCommand({
+        UserPoolId: userPoolId,
+        Username: username,
+        GroupName: role,
+      }));
+    },
+
+    async deleteUser(username) {
+      await client.send(new commands.AdminDeleteUserCommand({
+        UserPoolId: userPoolId,
+        Username: username,
+      }));
+    },
+  };
 }
 
 let assetSignerPromise;

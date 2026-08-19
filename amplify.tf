@@ -66,6 +66,7 @@ resource "aws_amplify_app" "frontend" {
             - node -v
             - npm ci
             - echo "AGENT_REGISTRY_SECRET=$AGENT_REGISTRY_SECRET" >> .env.production
+            - env | grep -e NEXT_PUBLIC_ >> .env.production
         build:
           commands:
             - npm run build
@@ -86,6 +87,13 @@ resource "aws_amplify_app" "frontend" {
       type    = "nvm"
       version = "20.19.0"
     }])
+  }
+
+  # The GitHub connection token and console-normalized build-spec line endings are
+  # write-only/provider-managed after app creation. The repository's amplify.yml
+  # remains the production build source of truth.
+  lifecycle {
+    ignore_changes = [access_token, build_spec]
   }
 
   tags = {
