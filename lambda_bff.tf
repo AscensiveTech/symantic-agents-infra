@@ -99,12 +99,42 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["proposal_templates"].arn
       },
       {
+        Sid    = "ManageWorkspaceMemberships"
+        Effect = "Allow"
+        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Resource = [
+          aws_dynamodb_table.workspace_memberships.arn,
+          "${aws_dynamodb_table.workspace_memberships.arn}/index/*",
+        ]
+      },
+      {
         Sid      = "ManageProposalAssets"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
         Resource = "${aws_s3_bucket.proposal_assets.arn}/*"
       },
     ]
+  })
+}
+
+resource "aws_iam_role_policy" "bff_cognito_admin" {
+  name = "${local.name_prefix}-bff-cognito-admin"
+  role = aws_iam_role.bff_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ManageWorkspaceUsers"
+      Effect = "Allow"
+      Action = [
+        "cognito-idp:AdminAddUserToGroup",
+        "cognito-idp:AdminCreateUser",
+        "cognito-idp:AdminDeleteUser",
+        "cognito-idp:AdminListGroupsForUser",
+        "cognito-idp:AdminRemoveUserFromGroup",
+      ]
+      Resource = aws_cognito_user_pool.frontend.arn
+    }]
   })
 }
 
@@ -150,19 +180,21 @@ resource "aws_lambda_function" "bff" {
 
   environment {
     variables = {
-      WORKSPACES_TABLE           = aws_dynamodb_table.control_plane["workspaces"].name
-      BUSINESS_PROFILES_TABLE    = aws_dynamodb_table.control_plane["business_profiles"].name
-      AGENTS_TABLE               = aws_dynamodb_table.control_plane["agents"].name
-      PHONE_NUMBERS_TABLE        = aws_dynamodb_table.control_plane["phone_numbers"].name
-      CALENDAR_CONNECTIONS_TABLE = aws_dynamodb_table.control_plane["calendar_connections"].name
-      CALLS_TABLE                = aws_dynamodb_table.control_plane["calls"].name
-      PROPOSALS_TABLE            = aws_dynamodb_table.control_plane["proposals"].name
-      PROPOSAL_PARTS_TABLE       = aws_dynamodb_table.control_plane["proposal_parts"].name
-      PROPOSAL_TEMPLATES_TABLE   = aws_dynamodb_table.control_plane["proposal_templates"].name
-      PROPOSAL_ASSETS_BUCKET     = aws_s3_bucket.proposal_assets.bucket
-      RETELL_SECRET_ARN          = aws_secretsmanager_secret.providers["retell"].arn
-      TELNYX_SECRET_ARN          = aws_secretsmanager_secret.providers["telnyx"].arn
-      PUBLIC_API_BASE_URL        = aws_apigatewayv2_api.bff.api_endpoint
+      WORKSPACES_TABLE            = aws_dynamodb_table.control_plane["workspaces"].name
+      BUSINESS_PROFILES_TABLE     = aws_dynamodb_table.control_plane["business_profiles"].name
+      AGENTS_TABLE                = aws_dynamodb_table.control_plane["agents"].name
+      PHONE_NUMBERS_TABLE         = aws_dynamodb_table.control_plane["phone_numbers"].name
+      CALENDAR_CONNECTIONS_TABLE  = aws_dynamodb_table.control_plane["calendar_connections"].name
+      CALLS_TABLE                 = aws_dynamodb_table.control_plane["calls"].name
+      PROPOSALS_TABLE             = aws_dynamodb_table.control_plane["proposals"].name
+      PROPOSAL_PARTS_TABLE        = aws_dynamodb_table.control_plane["proposal_parts"].name
+      PROPOSAL_TEMPLATES_TABLE    = aws_dynamodb_table.control_plane["proposal_templates"].name
+      WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
+      COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
+      PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
+      RETELL_SECRET_ARN           = aws_secretsmanager_secret.providers["retell"].arn
+      TELNYX_SECRET_ARN           = aws_secretsmanager_secret.providers["telnyx"].arn
+      PUBLIC_API_BASE_URL         = aws_apigatewayv2_api.bff.api_endpoint
     }
   }
 
@@ -170,6 +202,7 @@ resource "aws_lambda_function" "bff" {
     aws_cloudwatch_log_group.bff_lambda,
     aws_iam_role_policy.bff_dynamodb,
     aws_iam_role_policy.bff_provider_secrets,
+    aws_iam_role_policy.bff_cognito_admin,
     aws_iam_role_policy_attachment.bff_lambda_logs,
   ]
 

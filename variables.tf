@@ -62,10 +62,6 @@ variable "amplify_github_access_token" {
   default     = ""
   sensitive   = true
 
-  validation {
-    condition     = length(var.amplify_github_access_token) >= 20
-    error_message = "amplify_github_access_token is empty. Amplify got a 404 last time because the token never reached CreateApp. In cmd.exe: set TF_VAR_amplify_github_access_token=ghp_...  In PowerShell: $env:TF_VAR_amplify_github_access_token=\"ghp_...\"  Or set it in terraform.tfvars (gitignored). Token must have repo + admin:repo_hook."
-  }
 }
 
 variable "amplify_branch" {

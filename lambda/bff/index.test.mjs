@@ -952,6 +952,281 @@ test("POST inbound lookup rejects an invalid signature before DynamoDB", async (
   assert.equal(response.statusCode, 401);
 });
 
+test("proposal routes persist, update, duplicate, and isolate workspace records", async () => {
+  const records = new Map();
+  const key = (workspaceId, proposalId) => `${workspaceId}:${proposalId}`;
+  const store = {
+    async ensureWorkspace() {},
+    async listProposals(workspaceId) {
+      return [...records.entries()]
+        .filter(([recordKey]) => recordKey.startsWith(`${workspaceId}:`))
+        .map(([, value]) => value);
+    },
+    async createProposal(workspaceId, proposal) {
+      records.set(key(workspaceId, proposal.id), structuredClone(proposal));
+      return proposal;
+    },
+    async getProposal(workspaceId, proposalId) {
+      return records.get(key(workspaceId, proposalId)) ?? null;
+    },
+    async putProposal(workspaceId, proposal) {
+      records.set(key(workspaceId, proposal.id), structuredClone(proposal));
+      return proposal;
+    },
+    async deleteProposal(workspaceId, proposalId) {
+      records.delete(key(workspaceId, proposalId));
+    },
+  };
+  const proposal = {
+    id: "prp-123",
+    name: "Dental modernization",
+    status: "draft",
+    documentItems: [],
+    createdAt: "2026-08-18T00:00:00.000Z",
+    updatedAt: "2026-08-18T00:00:00.000Z",
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const created = await handler(authenticatedEvent("POST", "/workspaces/me/proposals", proposal));
+  const listed = await handler(authenticatedEvent("GET", "/workspaces/me/proposals"));
+  const updated = await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/proposals/prp-123",
+    { ...proposal, name: "Updated proposal" },
+  ));
+  const duplicated = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-123/duplicate",
+  ));
+  const removed = await handler(authenticatedEvent("DELETE", "/workspaces/me/proposals/prp-123"));
+
+  assert.equal(created.statusCode, 201);
+  assert.deepEqual(JSON.parse(listed.body), [proposal]);
+  assert.equal(JSON.parse(updated.body).name, "Updated proposal");
+  const copy = JSON.parse(duplicated.body);
+  assert.equal(duplicated.statusCode, 201);
+  assert.match(copy.id, /^prp-/);
+  assert.equal(copy.name, "Updated proposal copy");
+  assert.equal(removed.statusCode, 200);
+  assert.equal(records.has(key("user-123", "prp-123")), false);
+  assert.equal([...records.keys()].every((recordKey) => recordKey.startsWith("user-123:")), true);
+});
+
+test("proposal template and part routes match the frontend API contract", async () => {
+  const templates = new Map();
+  const parts = new Map();
+  const store = {
+    async ensureWorkspace() {},
+    async listProposalTemplates() { return [...templates.values()]; },
+    async createProposalTemplate(_workspaceId, template) {
+      templates.set(template.id, template);
+      return template;
+    },
+    async getProposalTemplate(_workspaceId, templateId) { return templates.get(templateId) ?? null; },
+    async putProposalTemplate(_workspaceId, template) {
+      templates.set(template.id, template);
+      return template;
+    },
+    async deleteProposalTemplate(_workspaceId, templateId) { templates.delete(templateId); },
+    async listParts() { return [...parts.values()]; },
+    async createPart(_workspaceId, part) { parts.set(part.id, part); return part; },
+    async putPart(_workspaceId, part) { parts.set(part.id, part); return part; },
+    async putParts(_workspaceId, values) {
+      values.forEach((part) => parts.set(part.id, part));
+      return values;
+    },
+    async deletePart(_workspaceId, partId) { parts.delete(partId); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const template = { id: "tpl-123", name: "Default", isDefault: true, items: [] };
+  const part = { id: "part-123", name: "Display", msrpPrice: 1000 };
+
+  assert.equal((await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposal-templates",
+    template,
+  ))).statusCode, 201);
+  assert.equal((await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/proposal-templates/tpl-123",
+    { ...template, name: "Updated" },
+  ))).statusCode, 200);
+  assert.equal((await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/parts",
+    part,
+  ))).statusCode, 201);
+  const bulk = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/parts/bulk",
+    { parts: [{ ...part, msrpPrice: 1200 }, { id: "part-456", name: "Mount" }] },
+  ));
+
+  assert.equal(bulk.statusCode, 200);
+  assert.equal(parts.size, 2);
+  assert.equal(parts.get("part-123").msrpPrice, 1200);
+  assert.equal(JSON.parse((await handler(authenticatedEvent(
+    "GET",
+    "/workspaces/me/proposal-templates/tpl-123",
+  ))).body).name, "Updated");
+});
+
+test("proposal asset routes issue workspace-scoped PDF URLs and reject traversal", async () => {
+  const calls = [];
+  const signer = {
+    async createUploadUrl(...args) { calls.push(["upload", ...args]); return "https://upload.example.com"; },
+    async createDownloadUrl(...args) { calls.push(["download", ...args]); return "https://download.example.com"; },
+  };
+  const store = { async ensureWorkspace() {} };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getAssetSigner: async () => signer,
+  });
+
+  const uploaded = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposal-assets/upload-url",
+    { key: "proposals/prp-123/cover.pdf", contentType: "application/pdf" },
+  ));
+  const downloaded = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposal-assets/download-url",
+    { key: "proposals/prp-123/cover.pdf" },
+  ));
+  const invalid = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposal-assets/download-url",
+    { key: "../another-workspace/private.pdf" },
+  ));
+
+  assert.equal(uploaded.statusCode, 200);
+  assert.equal(downloaded.statusCode, 200);
+  assert.equal(invalid.statusCode, 400);
+  assert.deepEqual(calls, [
+    ["upload", "user-123", "proposals/prp-123/cover.pdf", "application/pdf"],
+    ["download", "user-123", "proposals/prp-123/cover.pdf"],
+  ]);
+});
+
+test("workspace membership shares proposal data across Cognito users", async () => {
+  const store = {
+    async getMembership(userId) {
+      return {
+        userId,
+        workspaceId: "workspace-technovate",
+        role: "quotation-builder",
+        status: "active",
+      };
+    },
+    async ensureWorkspace() {},
+    async listProposals(workspaceId) {
+      assert.equal(workspaceId, "workspace-technovate");
+      return [{ id: "prp-shared", name: "Shared proposal" }];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/proposals");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"quotation-builder\"]";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body)[0].id, "prp-shared");
+});
+
+test("quotation builders cannot access non-proposal workspace APIs", async () => {
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-123", role: "quotation-builder", status: "active" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/agents");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("company administrators can provision quotation builders", async () => {
+  const memberships = [];
+  const directoryCalls = [];
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" };
+    },
+    async putMembership(membership) {
+      memberships.push(membership);
+      return membership;
+    },
+  };
+  const directory = {
+    async createUser(input) {
+      directoryCalls.push(["create", input.email]);
+      return { userId: "member-123", username: "cognito-member-123" };
+    },
+    async setRole(username, role) {
+      directoryCalls.push(["role", username, role]);
+    },
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getUserDirectory: async () => directory,
+  });
+  const event = authenticatedEvent("POST", "/workspaces/me/users", {
+    email: "builder@example.com",
+    name: "Proposal Builder",
+    role: "quotation-builder",
+    temporaryPassword: "Temporary123!",
+  });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(memberships[0].workspaceId, "workspace-123");
+  assert.equal(memberships[0].role, "quotation-builder");
+  assert.deepEqual(directoryCalls, [
+    ["create", "builder@example.com"],
+    ["role", "cognito-member-123", "quotation-builder"],
+  ]);
+});
+
+test("S3 asset signer matches the AWS Signature Version 4 reference output", async () => {
+  const { createS3AssetSigner } = await loadBff();
+  const signer = createS3AssetSigner({
+    bucket: "proposal-bucket",
+    region: "us-east-1",
+    credentials: {
+      accessKeyId: "AKIDEXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      sessionToken: "session-token",
+    },
+    now: () => new Date("2026-08-18T12:34:56.000Z"),
+  });
+
+  assert.equal(
+    signer.createDownloadUrl("user-123", "proposals/proposal.pdf"),
+    "https://proposal-bucket.s3.us-east-1.amazonaws.com/workspaces/user-123/proposals/proposal.pdf" +
+      "?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+      "&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD" +
+      "&X-Amz-Credential=AKIDEXAMPLE%2F20260818%2Fus-east-1%2Fs3%2Faws4_request" +
+      "&X-Amz-Date=20260818T123456Z" +
+      "&X-Amz-Expires=900" +
+      "&X-Amz-Security-Token=session-token" +
+      "&X-Amz-SignedHeaders=host" +
+      "&X-Amz-Signature=c72ec1c4f6b4255b22156aaf66639ef6ac9eb1f9e818360811a01255a608380a",
+  );
+});
+
 function authenticatedEvent(method, path, body) {
   return {
     requestContext: {

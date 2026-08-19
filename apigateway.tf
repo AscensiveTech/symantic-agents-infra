@@ -28,6 +28,10 @@ locals {
     "POST /workspaces/me/parts/bulk",
     "POST /workspaces/me/proposal-assets/upload-url",
     "POST /workspaces/me/proposal-assets/download-url",
+    "GET /workspaces/me/users",
+    "POST /workspaces/me/users",
+    "PATCH /workspaces/me/users/{userId}",
+    "DELETE /workspaces/me/users/{userId}",
   ])
 }
 
