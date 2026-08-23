@@ -111,6 +111,7 @@ resource "aws_amplify_branch" "main" {
   environment_variables = {
     AGENT_REGISTRY_SECRET            = random_password.agent_registry_secret.result
     NEXT_PUBLIC_API_URL              = aws_apigatewayv2_api.bff.api_endpoint
+    NEXT_PUBLIC_COGNITO_USER_POOL_ID = aws_cognito_user_pool.frontend.id
     NEXT_PUBLIC_COGNITO_DOMAIN       = "https://${aws_cognito_user_pool_domain.frontend.domain}.auth.${var.aws_region}.amazoncognito.com"
     NEXT_PUBLIC_COGNITO_CLIENT_ID    = aws_cognito_user_pool_client.frontend.id
     NEXT_PUBLIC_COGNITO_REDIRECT_URI = "${trimsuffix(local.app_url, "/")}/auth/callback"
