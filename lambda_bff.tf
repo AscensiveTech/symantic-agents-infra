@@ -42,9 +42,9 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "EnsureWorkspace"
+        Sid      = "ManageWorkspaces"
         Effect   = "Allow"
-        Action   = ["dynamodb:UpdateItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Scan"]
         Resource = aws_dynamodb_table.control_plane["workspaces"].arn
       },
       {
@@ -105,6 +105,16 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = [
           aws_dynamodb_table.workspace_memberships.arn,
           "${aws_dynamodb_table.workspace_memberships.arn}/index/*",
+        ]
+      },
+      {
+        Sid    = "OnboardCompanyAtomically"
+        Effect = "Allow"
+        Action = ["dynamodb:TransactWriteItems"]
+        Resource = [
+          aws_dynamodb_table.control_plane["workspaces"].arn,
+          aws_dynamodb_table.control_plane["proposal_templates"].arn,
+          aws_dynamodb_table.workspace_memberships.arn,
         ]
       },
       {

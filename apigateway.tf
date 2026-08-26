@@ -1,5 +1,8 @@
 locals {
   bff_routes = toset([
+    "GET /platform/companies",
+    "POST /platform/companies",
+    "GET /workspaces/me/proposal-settings",
     "GET /workspaces/me/profile",
     "PUT /workspaces/me/profile",
     "GET /workspaces/me/agents",
