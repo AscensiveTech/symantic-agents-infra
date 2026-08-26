@@ -1200,6 +1200,173 @@ test("company administrators can provision quotation builders", async () => {
   ]);
 });
 
+test("company administrators can provision another company administrator", async () => {
+  const memberships = [];
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" };
+    },
+    async putMembership(membership) {
+      memberships.push(membership);
+      return membership;
+    },
+  };
+  const directory = {
+    async createUser() {
+      return { userId: "admin-456", username: "cognito-admin-456" };
+    },
+    async setRole(_username, role) {
+      assert.equal(role, "company-admin");
+    },
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getUserDirectory: async () => directory,
+  });
+  const event = authenticatedEvent("POST", "/workspaces/me/users", {
+    email: "ADMIN2@EXAMPLE.COM",
+    name: "Second Admin",
+    role: "company-admin",
+    temporaryPassword: "Temporary123!",
+  });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(memberships[0].email, "admin2@example.com");
+  assert.equal(memberships[0].role, "company-admin");
+});
+
+test("company administrators cannot change a super administrator", async () => {
+  const store = {
+    async getMembership(userId) {
+      if (userId === "platform-user") {
+        return {
+          userId,
+          cognitoUsername: "platform-user@example.com",
+          workspaceId: "workspace-123",
+          role: "company-admin",
+          status: "active",
+        };
+      }
+      return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" };
+    },
+  };
+  const directory = {
+    async getRoles() { return ["super-admin"]; },
+    async setRole() { assert.fail("protected roles must not be changed"); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getUserDirectory: async () => directory,
+  });
+  const event = authenticatedEvent("PATCH", "/workspaces/me/users/platform-user", {
+    role: "quotation-builder",
+  });
+  event.pathParameters = { userId: "platform-user" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("super administrators onboard a company with an isolated default template", async () => {
+  let bundle;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async createWorkspaceBundle(value) {
+      bundle = value;
+      return value;
+    },
+  };
+  const directoryCalls = [];
+  const directory = {
+    async createUser(input) {
+      directoryCalls.push(["create", input]);
+      return { userId: "company-admin-123", username: "cognito-company-admin-123" };
+    },
+    async setRole(username, role) {
+      directoryCalls.push(["role", username, role]);
+    },
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getUserDirectory: async () => directory,
+  });
+  const event = authenticatedEvent("POST", "/platform/companies", {
+    name: "Technovate Design",
+    adminEmail: "AJM@technovate.design",
+    adminName: "AJM",
+    temporaryPassword: "Temporary123!",
+    allowedProposalSections: ["cover", "agenda", "parts", "closing"],
+    defaultTemplateSections: ["cover", "agenda", "closing"],
+  });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"super-admin\"]";
+
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 201);
+  assert.match(body.workspaceId, /^workspace-/);
+  assert.equal(body.templateCount, 1);
+  assert.equal(bundle.workspace.name, "Technovate Design");
+  assert.deepEqual(bundle.workspace.allowedProposalSections, ["cover", "agenda", "parts", "closing"]);
+  assert.equal(bundle.membership.email, "ajm@technovate.design");
+  assert.equal(bundle.membership.role, "company-admin");
+  assert.equal(bundle.template.name, "Default");
+  assert.equal(bundle.template.isDefault, true);
+  assert.deepEqual(bundle.template.items.map((item) => item.kind), ["cover", "agenda", "closing"]);
+  assert.deepEqual(directoryCalls.map((call) => call[0]), ["create", "role"]);
+});
+
+test("only super administrators can access company onboarding", async () => {
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/platform/companies");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("company administrators receive their allowed proposal sections", async () => {
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      assert.equal(workspaceId, "workspace-123");
+      return { workspaceId, allowedProposalSections: ["cover", "parts", "closing"] };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/proposal-settings");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    allowedProposalSections: ["cover", "parts", "closing"],
+  });
+});
+
 test("Cognito directory rejects an existing email regardless of capitalization", async () => {
   class ListUsersCommand {
     constructor(input) {

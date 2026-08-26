@@ -33,6 +33,18 @@ const PROPOSAL_ASSET_KEY_PATTERN = /^(templates|proposals|exports)\/[A-Za-z0-9_.
 const MAX_DYNAMO_RECORD_BYTES = 350 * 1024;
 const WORKSPACE_ROLES = new Set(["super-admin", "company-admin", "quotation-builder"]);
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PROPOSAL_SECTION_KINDS = [
+  "cover",
+  "agenda",
+  "companyIntro",
+  "parts",
+  "summary",
+  "scope",
+  "agreement",
+  "payment",
+  "closing",
+];
+const PROPOSAL_SECTION_SET = new Set(PROPOSAL_SECTION_KINDS);
 
 function json(statusCode, body) {
   return {
@@ -271,6 +283,15 @@ export function createHandler({
       }
       const { workspaceId } = actor;
 
+      const platformResponse = await handlePlatformCompanies(event, {
+        method,
+        path,
+        actor,
+        store,
+        getUserDirectory,
+      });
+      if (platformResponse) return platformResponse;
+
       const usersResponse = await handleWorkspaceUsers(event, {
         method,
         path,
@@ -279,6 +300,19 @@ export function createHandler({
         getUserDirectory,
       });
       if (usersResponse) return usersResponse;
+
+      if (path === "/workspaces/me/proposal-settings" && method === "GET") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Company administrator access is required" });
+        }
+        const workspace = await store.getWorkspace(workspaceId);
+        return json(200, {
+          allowedProposalSections: normalizeProposalSections(
+            workspace?.allowedProposalSections,
+            PROPOSAL_SECTION_KINDS,
+          ),
+        });
+      }
 
       if (actor.roles.includes("quotation-builder") && !isWorkspaceAdmin(actor) && !isProposalPath(path)) {
         return json(403, { message: "Quotation builders can only access proposal features" });
@@ -502,6 +536,147 @@ export function createHandler({
   };
 }
 
+async function handlePlatformCompanies(event, {
+  method,
+  path,
+  actor,
+  store,
+  getUserDirectory,
+}) {
+  if (path !== "/platform/companies") return null;
+  if (!actor.roles.includes("super-admin")) {
+    return json(403, { message: "Super administrator access is required" });
+  }
+
+  if (method === "GET") {
+    const workspaces = await store.listWorkspaces();
+    const summaries = await Promise.all(workspaces.map(async (workspace) => {
+      const [members, proposals, templates] = await Promise.all([
+        store.listMemberships(workspace.workspaceId),
+        store.listProposals(workspace.workspaceId),
+        store.listProposalTemplates(workspace.workspaceId),
+      ]);
+      return {
+        workspaceId: workspace.workspaceId,
+        name: workspace.name || workspace.workspaceId,
+        createdAt: workspace.createdAt ?? null,
+        allowedProposalSections: normalizeProposalSections(
+          workspace.allowedProposalSections,
+          PROPOSAL_SECTION_KINDS,
+        ),
+        userCount: members.filter((member) => member.status !== "disabled").length,
+        proposalCount: proposals.length,
+        templateCount: templates.length,
+      };
+    }));
+    summaries.sort((left, right) => left.name.localeCompare(right.name));
+    return json(200, summaries);
+  }
+
+  if (method !== "POST") return json(404, { message: "Not found" });
+
+  const body = readBody(event);
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  const adminEmail = typeof body?.adminEmail === "string"
+    ? body.adminEmail.trim().toLowerCase()
+    : "";
+  const adminName = typeof body?.adminName === "string" ? body.adminName.trim() : "";
+  const temporaryPassword = body?.temporaryPassword;
+  const allowedSections = normalizeProposalSections(body?.allowedProposalSections);
+  const defaultSections = normalizeProposalSections(body?.defaultTemplateSections);
+  if (
+    name.length < 2 ||
+    name.length > 120 ||
+    !EMAIL_PATTERN.test(adminEmail) ||
+    adminEmail.length > 320 ||
+    adminName.length > 120 ||
+    typeof temporaryPassword !== "string" ||
+    temporaryPassword.length < 12 ||
+    !allowedSections ||
+    !defaultSections ||
+    defaultSections.some((section) => !allowedSections.includes(section))
+  ) {
+    return json(400, { message: "Invalid company setup" });
+  }
+
+  const now = new Date().toISOString();
+  const workspaceId = `workspace-${randomUUID()}`;
+  const workspace = {
+    workspaceId,
+    name,
+    allowedProposalSections: allowedSections,
+    createdAt: now,
+    createdBy: actor.userId,
+  };
+  const template = defaultProposalTemplate(defaultSections, now);
+  const directory = await getUserDirectory();
+  let created;
+  try {
+    created = await directory.createUser({
+      email: adminEmail,
+      name: adminName,
+      temporaryPassword,
+    });
+    await directory.setRole(created.username, "company-admin");
+    const membership = {
+      userId: created.userId,
+      cognitoUsername: created.username,
+      workspaceId,
+      email: adminEmail,
+      name: adminName,
+      role: "company-admin",
+      status: "active",
+      createdAt: now,
+      createdBy: actor.userId,
+    };
+    await store.createWorkspaceBundle({ workspace, membership, template });
+    return json(201, {
+      workspaceId,
+      name,
+      createdAt: now,
+      allowedProposalSections: allowedSections,
+      userCount: 1,
+      proposalCount: 0,
+      templateCount: 1,
+    });
+  } catch (error) {
+    if (created?.username) await directory.deleteUser(created.username).catch(() => {});
+    if (error?.name === "UsernameExistsException") {
+      return json(409, { message: "A user with that email already exists" });
+    }
+    if (error?.name === "ConditionalCheckFailedException" || error?.name === "TransactionCanceledException") {
+      return json(409, { message: "That company could not be created because its records already exist" });
+    }
+    throw error;
+  }
+}
+
+function normalizeProposalSections(value, fallback = null) {
+  if (value === undefined && fallback) return [...fallback];
+  if (!Array.isArray(value) || value.length === 0) return null;
+  if (!value.every((section) => typeof section === "string" && PROPOSAL_SECTION_SET.has(section))) {
+    return null;
+  }
+  return PROPOSAL_SECTION_KINDS.filter((section) => value.includes(section));
+}
+
+function defaultProposalTemplate(sections, now) {
+  return {
+    id: `tpl-${randomUUID()}`,
+    name: "Default",
+    isDefault: true,
+    items: sections.map((kind, order) => ({
+      id: `itm-${randomUUID()}`,
+      order,
+      kind,
+      fileKey: null,
+      label: null,
+    })),
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
 async function handleWorkspaceUsers(event, {
   method,
   path,
@@ -527,8 +702,7 @@ async function handleWorkspaceUsers(event, {
       email.length > 320 ||
       name.length > 120 ||
       typeof temporaryPassword !== "string" ||
-      temporaryPassword.length < 12 ||
-      (!actor.roles.includes("super-admin") && role !== "quotation-builder")
+      temporaryPassword.length < 12
     ) {
       return json(400, { message: "Invalid workspace user" });
     }
@@ -571,10 +745,17 @@ async function handleWorkspaceUsers(event, {
     const body = readBody(event);
     const role = body?.role;
     if (
-      !["company-admin", "quotation-builder"].includes(role) ||
-      (!actor.roles.includes("super-admin") && role !== "quotation-builder")
+      !["company-admin", "quotation-builder"].includes(role)
     ) {
       return json(400, { message: "Invalid workspace role" });
+    }
+    const directory = await getUserDirectory();
+    if (!actor.roles.includes("super-admin") && (
+      target.role === "super-admin" ||
+      (typeof directory.getRoles === "function" &&
+        (await directory.getRoles(target.cognitoUsername ?? target.email)).includes("super-admin"))
+    )) {
+      return json(403, { message: "A company administrator cannot change a super administrator" });
     }
     if (target.role === "company-admin" && role !== "company-admin") {
       const members = await store.listMemberships(actor.workspaceId);
@@ -582,7 +763,6 @@ async function handleWorkspaceUsers(event, {
         return json(409, { message: "Promote another company administrator first" });
       }
     }
-    const directory = await getUserDirectory();
     await directory.setRole(target.cognitoUsername ?? target.email, role);
     const updated = { ...target, role, updatedAt: new Date().toISOString() };
     await store.putMembership(updated);
@@ -591,13 +771,20 @@ async function handleWorkspaceUsers(event, {
 
   if (method === "DELETE") {
     if (userId === actor.userId) return json(409, { message: "You cannot remove your own account" });
+    const directory = await getUserDirectory();
+    if (!actor.roles.includes("super-admin") && (
+      target.role === "super-admin" ||
+      (typeof directory.getRoles === "function" &&
+        (await directory.getRoles(target.cognitoUsername ?? target.email)).includes("super-admin"))
+    )) {
+      return json(403, { message: "A company administrator cannot remove a super administrator" });
+    }
     if (target.role === "company-admin") {
       const members = await store.listMemberships(actor.workspaceId);
       if (members.filter((member) => member.role === "company-admin" && member.status !== "disabled").length <= 1) {
         return json(409, { message: "Promote another company administrator first" });
       }
     }
-    const directory = await getUserDirectory();
     await directory.deleteUser(target.cognitoUsername ?? target.email);
     await store.deleteMembership(userId);
     return json(200, { ok: true });
@@ -1225,6 +1412,63 @@ export function createDynamoStore(client, commands, tableNames) {
   }
 
   return {
+    async getWorkspace(workspaceId) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    async listWorkspaces() {
+      const workspaces = [];
+      let exclusiveStartKey;
+      do {
+        const result = await client.send(new commands.ScanCommand({
+          TableName: tableNames.workspaces,
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        }));
+        workspaces.push(...(result.Items ?? []).map((item) => unmarshall(item)));
+        exclusiveStartKey = result.LastEvaluatedKey;
+      } while (exclusiveStartKey);
+      return workspaces;
+    },
+
+    async createWorkspaceBundle({ workspace, membership, template }) {
+      const { id: templateId, ...templateValue } = template;
+      await client.send(new commands.TransactWriteItemsCommand({
+        TransactItems: [
+          {
+            Put: {
+              TableName: tableNames.workspaces,
+              Item: marshall(workspace),
+              ConditionExpression: "attribute_not_exists(workspaceId)",
+            },
+          },
+          {
+            Put: {
+              TableName: tableNames.workspaceMemberships,
+              Item: marshall(membership),
+              ConditionExpression: "attribute_not_exists(userId)",
+            },
+          },
+          {
+            Put: {
+              TableName: tableNames.proposalTemplates,
+              Item: marshall({
+                workspaceId: workspace.workspaceId,
+                templateId,
+                ...templateValue,
+              }),
+              ConditionExpression: "attribute_not_exists(templateId)",
+            },
+          },
+        ],
+      }));
+      return { workspace, membership, template };
+    },
+
     async getMembership(userId) {
       const result = await client.send(new commands.GetItemCommand({
         TableName: tableNames.workspaceMemberships,
@@ -1671,6 +1915,16 @@ export function createCognitoDirectory(client, commands, userPoolId) {
         Username: username,
         GroupName: role,
       }));
+    },
+
+    async getRoles(username) {
+      const current = await client.send(new commands.AdminListGroupsForUserCommand({
+        UserPoolId: userPoolId,
+        Username: username,
+      }));
+      return (current.Groups ?? [])
+        .map((group) => group.GroupName)
+        .filter((group) => typeof group === "string" && managedGroups.includes(group));
     },
 
     async deleteUser(username) {
