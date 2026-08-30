@@ -1307,6 +1307,7 @@ test("super administrators onboard a company with an isolated default template",
     adminEmail: "AJM@technovate.design",
     adminName: "AJM",
     temporaryPassword: "Temporary123!",
+    tier: "repository",
     allowedProposalSections: ["cover", "agenda", "parts", "closing"],
     defaultTemplateSections: ["cover", "agenda", "closing"],
   });
@@ -1319,6 +1320,7 @@ test("super administrators onboard a company with an isolated default template",
   assert.match(body.workspaceId, /^workspace-/);
   assert.equal(body.templateCount, 1);
   assert.equal(bundle.workspace.name, "Technovate Design");
+  assert.equal(bundle.workspace.tier, "repository");
   assert.deepEqual(bundle.workspace.allowedProposalSections, ["cover", "agenda", "parts", "closing"]);
   assert.equal(bundle.membership.email, "ajm@technovate.design");
   assert.equal(bundle.membership.role, "company-admin");
@@ -1344,6 +1346,189 @@ test("only super administrators can access company onboarding", async () => {
   assert.equal(response.statusCode, 403);
 });
 
+test("super administrators can list users in a company workspace", async () => {
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      assert.equal(workspaceId, "workspace-technovate");
+      return { workspaceId, name: "Technovate Design" };
+    },
+    async listMemberships(workspaceId) {
+      assert.equal(workspaceId, "workspace-technovate");
+      return [{
+        userId: "member-123",
+        workspaceId,
+        email: "ajm@technovate.design",
+        name: "AJM",
+        role: "company-admin",
+        status: "active",
+        createdAt: "2026-08-19T00:00:00.000Z",
+      }];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent(
+    "GET",
+    "/platform/companies/workspace-technovate/users",
+  );
+  event.pathParameters = { workspaceId: "workspace-technovate" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.length, 1);
+  assert.equal(body[0].email, "ajm@technovate.design");
+});
+
+test("super administrators can rename a company and change its plan", async () => {
+  let saved;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      return {
+        workspaceId,
+        name: "Old Company Name",
+        tier: "basic",
+        allowedProposalSections: ["cover", "closing"],
+        createdAt: "2026-08-19T00:00:00.000Z",
+      };
+    },
+    async putWorkspace(workspace) {
+      saved = workspace;
+      return workspace;
+    },
+    async listMemberships() { return []; },
+    async listProposals() { return []; },
+    async listProposalTemplates() { return []; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent(
+    "PATCH",
+    "/platform/companies/workspace-technovate",
+    { name: "Technovate Design", tier: "signing" },
+  );
+  event.pathParameters = { workspaceId: "workspace-technovate" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.name, "Technovate Design");
+  assert.equal(saved.tier, "signing");
+  assert.equal(body.name, "Technovate Design");
+  assert.equal(body.tier, "signing");
+});
+
+test("super administrators can update a company user's role", async () => {
+  let saved;
+  const directoryCalls = [];
+  const store = {
+    async getMembership(userId) {
+      if (userId === "user-123") {
+        return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+      }
+      return {
+        userId,
+        cognitoUsername: "member-cognito",
+        workspaceId: "workspace-technovate",
+        email: "member@technovate.design",
+        role: "quotation-builder",
+        status: "active",
+      };
+    },
+    async getWorkspace(workspaceId) {
+      return { workspaceId, name: "Technovate Design" };
+    },
+    async putMembership(membership) {
+      saved = membership;
+      return membership;
+    },
+  };
+  const directory = {
+    async getRoles(username) {
+      directoryCalls.push(["roles", username]);
+      return ["quotation-builder"];
+    },
+    async setRole(username, role) {
+      directoryCalls.push(["set", username, role]);
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getUserDirectory: async () => directory,
+  });
+  const event = authenticatedEvent(
+    "PATCH",
+    "/platform/companies/workspace-technovate/users/member-123",
+    { role: "company-admin" },
+  );
+  event.pathParameters = {
+    workspaceId: "workspace-technovate",
+    userId: "member-123",
+  };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.role, "company-admin");
+  assert.deepEqual(directoryCalls, [
+    ["roles", "member-cognito"],
+    ["set", "member-cognito", "company-admin"],
+  ]);
+});
+
+test("company profile APIs read and update the signed-in workspace name", async () => {
+  let workspace = {
+    workspaceId: "workspace-technovate",
+    name: "Technovate Design",
+    tier: "basic",
+  };
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: workspace.workspaceId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      assert.equal(workspaceId, workspace.workspaceId);
+      return workspace;
+    },
+    async putWorkspace(value) {
+      workspace = value;
+      return value;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const getEvent = authenticatedEvent("GET", "/workspaces/me/company");
+  getEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const getResponse = await handler(getEvent);
+
+  const patchEvent = authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/company",
+    { name: "Technovate Group" },
+  );
+  patchEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const patchResponse = await handler(patchEvent);
+
+  assert.equal(getResponse.statusCode, 200);
+  assert.deepEqual(JSON.parse(getResponse.body), { name: "Technovate Design" });
+  assert.equal(patchResponse.statusCode, 200);
+  assert.deepEqual(JSON.parse(patchResponse.body), { name: "Technovate Group" });
+  assert.equal(workspace.name, "Technovate Group");
+  assert.equal(workspace.tier, "basic");
+});
+
 test("company administrators receive their allowed proposal sections", async () => {
   const store = {
     async getMembership(userId) {
@@ -1351,7 +1536,11 @@ test("company administrators receive their allowed proposal sections", async () 
     },
     async getWorkspace(workspaceId) {
       assert.equal(workspaceId, "workspace-123");
-      return { workspaceId, allowedProposalSections: ["cover", "parts", "closing"] };
+      return {
+        workspaceId,
+        allowedProposalSections: ["cover", "parts", "closing"],
+        tier: "repository",
+      };
     },
   };
   const { createHandler } = await loadBff();
@@ -1364,6 +1553,7 @@ test("company administrators receive their allowed proposal sections", async () 
   assert.equal(response.statusCode, 200);
   assert.deepEqual(JSON.parse(response.body), {
     allowedProposalSections: ["cover", "parts", "closing"],
+    tier: "repository",
   });
 });
 
