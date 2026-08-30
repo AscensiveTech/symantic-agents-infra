@@ -224,6 +224,31 @@ export function createInMemoryConnectionStore(initialRecords = []) {
   };
 }
 
+export function createInMemoryMembershipStore(memberships = []) {
+  const byUser = new Map(
+    memberships.map((membership) => [membership.userId, { ...membership }]),
+  );
+  return {
+    async getMembership(userId) {
+      const membership = byUser.get(userId);
+      return membership ? { ...membership } : null;
+    },
+  };
+}
+
+export function createDynamoMembershipStore(client, commands, tableName) {
+  return {
+    async getMembership(userId) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableName,
+        Key: marshall({ userId }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+  };
+}
+
 let microsoftRotationDependencies;
 
 export function configureMicrosoftRotationForTests(dependencies) {
@@ -301,6 +326,7 @@ export function createHandler(options = {}) {
   const {
     getStateStore = getDefaultStateStore,
     getConnectionStore = getDefaultConnectionStore,
+    getMembershipStore = getDefaultMembershipStore,
     getOAuthSecret = getDefaultOAuthSecret,
     getTokenCrypto = getDefaultTokenCrypto,
     getProviderClient = (provider) => createProviderClient(provider),
@@ -321,7 +347,7 @@ export function createHandler(options = {}) {
     try {
       if (method === "GET" && startMatch) {
         const provider = requireProvider(startMatch[1]);
-        const identity = readIdentity(event);
+        const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
         const baseUrl = requireAbsoluteUrl(redirectBaseUrl, "OAuth redirect base URL");
         const callbackUri = `${baseUrl}/oauth/${provider}/callback`;
@@ -457,21 +483,21 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/connection" && method === "GET") {
-        const identity = readIdentity(event);
+        const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
         const store = await getConnectionStore();
         return json(200, toPublicConnection(await store.get(identity.workspaceId)));
       }
 
       if (path === "/calendars/connection" && method === "DELETE") {
-        const identity = readIdentity(event);
+        const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
         const store = await getConnectionStore();
         return json(200, toPublicConnection(await store.disconnect(identity.workspaceId)));
       }
 
       if (path === "/calendars/select" && method === "POST") {
-        const identity = readIdentity(event);
+        const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
         const body = readBody(event);
         const provider = requireProvider(body?.provider);
@@ -584,16 +610,30 @@ function requireProvider(provider) {
   return provider;
 }
 
-function readIdentity(event) {
+// The BFF resolves the caller's workspace through the workspace-memberships
+// table (keyed by the Cognito `sub`), so a shared workspace is not the same
+// string as the user id. This service must resolve it the same way, otherwise
+// calendar connections get written under the raw `sub` while the BFF looks for
+// them under the membership's workspaceId and never finds them.
+async function resolveIdentity(event, membershipStore) {
   const claims = event?.requestContext?.authorizer?.jwt?.claims;
-  const workspaceId = claims?.sub;
-  if (typeof workspaceId !== "string" || workspaceId.length === 0) return null;
+  const sub = claims?.sub;
+  if (typeof sub !== "string" || sub.length === 0) return null;
   const userId = claims?.username ??
     claims?.["cognito:username"] ??
     claims?.email ??
-    workspaceId;
+    sub;
   if (typeof userId !== "string" || userId.length === 0) return null;
-  return { workspaceId, userId };
+
+  if (!membershipStore || typeof membershipStore.getMembership !== "function") {
+    return { workspaceId: sub, userId };
+  }
+  const membership = await membershipStore.getMembership(sub);
+  if (!membership || membership.status === "disabled") return null;
+  if (typeof membership.workspaceId !== "string" || membership.workspaceId.length === 0) {
+    return null;
+  }
+  return { workspaceId: membership.workspaceId, userId };
 }
 
 function readBody(event) {
@@ -987,6 +1027,7 @@ export function createDynamoConnectionStore(client, commands, tableName) {
 let awsRuntimePromise;
 let stateStorePromise;
 let connectionStorePromise;
+let membershipStorePromise;
 let tokenCryptoPromise;
 const secretPromises = new Map();
 
@@ -1032,6 +1073,20 @@ async function getDefaultConnectionStore() {
     );
   });
   return connectionStorePromise;
+}
+
+// Returns null when the memberships table is not configured (e.g. unit tests),
+// which makes resolveIdentity fall back to the raw Cognito sub.
+async function getDefaultMembershipStore() {
+  if (!process.env.WORKSPACE_MEMBERSHIPS_TABLE) return null;
+  membershipStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) =>
+    createDynamoMembershipStore(
+      dynamoClient,
+      dynamodb,
+      process.env.WORKSPACE_MEMBERSHIPS_TABLE,
+    ),
+  );
+  return membershipStorePromise;
 }
 
 async function getDefaultTokenCrypto() {
