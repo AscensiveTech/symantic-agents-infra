@@ -45,6 +45,7 @@ const PROPOSAL_SECTION_KINDS = [
   "closing",
 ];
 const PROPOSAL_SECTION_SET = new Set(PROPOSAL_SECTION_KINDS);
+const COMPANY_TIERS = new Set(["basic", "repository", "signing"]);
 
 function json(statusCode, body) {
   return {
@@ -301,6 +302,14 @@ export function createHandler({
       });
       if (usersResponse) return usersResponse;
 
+      const companyResponse = await handleCompanyProfile(event, {
+        method,
+        path,
+        actor,
+        store,
+      });
+      if (companyResponse) return companyResponse;
+
       if (path === "/workspaces/me/proposal-settings" && method === "GET") {
         if (!isWorkspaceAdmin(actor)) {
           return json(403, { message: "Company administrator access is required" });
@@ -311,6 +320,7 @@ export function createHandler({
             workspace?.allowedProposalSections,
             PROPOSAL_SECTION_KINDS,
           ),
+          tier: normalizeCompanyTier(workspace?.tier),
         });
       }
 
@@ -543,34 +553,94 @@ async function handlePlatformCompanies(event, {
   store,
   getUserDirectory,
 }) {
-  if (path !== "/platform/companies") return null;
+  if (
+    typeof path !== "string" ||
+    (path !== "/platform/companies" && !path.startsWith("/platform/companies/"))
+  ) return null;
   if (!actor.roles.includes("super-admin")) {
     return json(403, { message: "Super administrator access is required" });
   }
 
-  if (method === "GET") {
+  if (path === "/platform/companies" && method === "GET") {
     const workspaces = await store.listWorkspaces();
-    const summaries = await Promise.all(workspaces.map(async (workspace) => {
-      const [members, proposals, templates] = await Promise.all([
-        store.listMemberships(workspace.workspaceId),
-        store.listProposals(workspace.workspaceId),
-        store.listProposalTemplates(workspace.workspaceId),
-      ]);
-      return {
-        workspaceId: workspace.workspaceId,
-        name: workspace.name || workspace.workspaceId,
-        createdAt: workspace.createdAt ?? null,
-        allowedProposalSections: normalizeProposalSections(
-          workspace.allowedProposalSections,
-          PROPOSAL_SECTION_KINDS,
-        ),
-        userCount: members.filter((member) => member.status !== "disabled").length,
-        proposalCount: proposals.length,
-        templateCount: templates.length,
-      };
-    }));
+    const summaries = await Promise.all(
+      workspaces.map((workspace) => platformCompanySummary(store, workspace)),
+    );
     summaries.sort((left, right) => left.name.localeCompare(right.name));
     return json(200, summaries);
+  }
+
+  if (path !== "/platform/companies") {
+    const target = getPlatformCompanyTarget(event, path);
+    if (!target) return json(404, { message: "Not found" });
+    const workspace = await store.getWorkspace(target.workspaceId);
+    if (!workspace) return json(404, { message: "Company workspace not found" });
+
+    if (target.kind === "company" && method === "PATCH") {
+      const body = readBody(event);
+      const hasName = body && Object.hasOwn(body, "name");
+      const hasTier = body && Object.hasOwn(body, "tier");
+      const name = typeof body?.name === "string" ? body.name.trim() : "";
+      if (
+        (!hasName && !hasTier) ||
+        (hasName && (name.length < 2 || name.length > 120)) ||
+        (hasTier && !COMPANY_TIERS.has(body?.tier))
+      ) {
+        return json(400, { message: "Invalid company update" });
+      }
+      const updated = {
+        ...workspace,
+        ...(hasName ? { name } : {}),
+        ...(hasTier ? { tier: body.tier } : {}),
+        updatedAt: new Date().toISOString(),
+        updatedBy: actor.userId,
+      };
+      await store.putWorkspace(updated);
+      return json(200, await platformCompanySummary(store, updated));
+    }
+
+    if (target.kind === "users" && method === "GET") {
+      return json(200, await store.listMemberships(target.workspaceId));
+    }
+
+    if (target.kind === "user" && method === "PATCH") {
+      const body = readBody(event);
+      const role = body?.role;
+      if (!["company-admin", "quotation-builder"].includes(role)) {
+        return json(400, { message: "Invalid workspace role" });
+      }
+      const membership = await store.getMembership(target.userId);
+      if (!membership || membership.workspaceId !== target.workspaceId) {
+        return json(404, { message: "Workspace user not found" });
+      }
+      const directory = await getUserDirectory();
+      const directoryRoles = typeof directory.getRoles === "function"
+        ? await directory.getRoles(membership.cognitoUsername ?? membership.email)
+        : [];
+      if (membership.role === "super-admin" || directoryRoles.includes("super-admin")) {
+        return json(403, { message: "A super administrator role cannot be changed here" });
+      }
+      if (membership.role === "company-admin" && role !== "company-admin") {
+        const members = await store.listMemberships(target.workspaceId);
+        const activeAdmins = members.filter((member) => (
+          member.role === "company-admin" && member.status !== "disabled"
+        ));
+        if (activeAdmins.length <= 1) {
+          return json(409, { message: "Promote another company administrator first" });
+        }
+      }
+      await directory.setRole(membership.cognitoUsername ?? membership.email, role);
+      const updated = {
+        ...membership,
+        role,
+        updatedAt: new Date().toISOString(),
+        updatedBy: actor.userId,
+      };
+      await store.putMembership(updated);
+      return json(200, updated);
+    }
+
+    return json(404, { message: "Not found" });
   }
 
   if (method !== "POST") return json(404, { message: "Not found" });
@@ -582,6 +652,7 @@ async function handlePlatformCompanies(event, {
     : "";
   const adminName = typeof body?.adminName === "string" ? body.adminName.trim() : "";
   const temporaryPassword = body?.temporaryPassword;
+  const tier = body?.tier ?? "basic";
   const allowedSections = normalizeProposalSections(body?.allowedProposalSections);
   const defaultSections = normalizeProposalSections(body?.defaultTemplateSections);
   if (
@@ -592,6 +663,7 @@ async function handlePlatformCompanies(event, {
     adminName.length > 120 ||
     typeof temporaryPassword !== "string" ||
     temporaryPassword.length < 12 ||
+    !COMPANY_TIERS.has(tier) ||
     !allowedSections ||
     !defaultSections ||
     defaultSections.some((section) => !allowedSections.includes(section))
@@ -604,6 +676,7 @@ async function handlePlatformCompanies(event, {
   const workspace = {
     workspaceId,
     name,
+    tier,
     allowedProposalSections: allowedSections,
     createdAt: now,
     createdBy: actor.userId,
@@ -635,6 +708,7 @@ async function handlePlatformCompanies(event, {
       name,
       createdAt: now,
       allowedProposalSections: allowedSections,
+      tier,
       userCount: 1,
       proposalCount: 0,
       templateCount: 1,
@@ -651,6 +725,55 @@ async function handlePlatformCompanies(event, {
   }
 }
 
+async function platformCompanySummary(store, workspace) {
+  const [members, proposals, templates] = await Promise.all([
+    store.listMemberships(workspace.workspaceId),
+    store.listProposals(workspace.workspaceId),
+    store.listProposalTemplates(workspace.workspaceId),
+  ]);
+  return {
+    workspaceId: workspace.workspaceId,
+    name: workspace.name || workspace.workspaceId,
+    createdAt: workspace.createdAt ?? null,
+    allowedProposalSections: normalizeProposalSections(
+      workspace.allowedProposalSections,
+      PROPOSAL_SECTION_KINDS,
+    ),
+    tier: normalizeCompanyTier(workspace.tier),
+    userCount: members.filter((member) => member.status !== "disabled").length,
+    proposalCount: proposals.length,
+    templateCount: templates.length,
+  };
+}
+
+function getPlatformCompanyTarget(event, path) {
+  const patterns = [
+    ["user", /^\/platform\/companies\/([^/]+)\/users\/([^/]+)$/],
+    ["users", /^\/platform\/companies\/([^/]+)\/users$/],
+    ["company", /^\/platform\/companies\/([^/]+)$/],
+  ];
+  for (const [kind, pattern] of patterns) {
+    const match = path.match(pattern);
+    if (!match) continue;
+    try {
+      const workspaceId = decodeURIComponent(
+        event?.pathParameters?.workspaceId ?? match[1],
+      );
+      const userId = kind === "user"
+        ? decodeURIComponent(event?.pathParameters?.userId ?? match[2])
+        : null;
+      if (
+        !ENTITY_ID_PATTERN.test(workspaceId) ||
+        (kind === "user" && !ENTITY_ID_PATTERN.test(userId))
+      ) return null;
+      return { kind, workspaceId, ...(userId ? { userId } : {}) };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function normalizeProposalSections(value, fallback = null) {
   if (value === undefined && fallback) return [...fallback];
   if (!Array.isArray(value) || value.length === 0) return null;
@@ -658,6 +781,10 @@ function normalizeProposalSections(value, fallback = null) {
     return null;
   }
   return PROPOSAL_SECTION_KINDS.filter((section) => value.includes(section));
+}
+
+function normalizeCompanyTier(value) {
+  return COMPANY_TIERS.has(value) ? value : "basic";
 }
 
 function defaultProposalTemplate(sections, now) {
@@ -790,6 +917,34 @@ async function handleWorkspaceUsers(event, {
     return json(200, { ok: true });
   }
 
+  return json(404, { message: "Not found" });
+}
+
+async function handleCompanyProfile(event, { method, path, actor, store }) {
+  if (path !== "/workspaces/me/company") return null;
+  if (!isWorkspaceAdmin(actor)) {
+    return json(403, { message: "Company administrator access is required" });
+  }
+  const workspace = await store.getWorkspace(actor.workspaceId);
+  if (!workspace) return json(404, { message: "Company workspace not found" });
+
+  if (method === "GET") {
+    return json(200, { name: workspace.name || "" });
+  }
+  if (method === "PATCH") {
+    const body = readBody(event);
+    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    if (name.length < 2 || name.length > 120) {
+      return json(400, { message: "Invalid company name" });
+    }
+    await store.putWorkspace({
+      ...workspace,
+      name,
+      updatedAt: new Date().toISOString(),
+      updatedBy: actor.userId,
+    });
+    return json(200, { name });
+  }
   return json(404, { message: "Not found" });
 }
 
@@ -1433,6 +1588,14 @@ export function createDynamoStore(client, commands, tableNames) {
         exclusiveStartKey = result.LastEvaluatedKey;
       } while (exclusiveStartKey);
       return workspaces;
+    },
+
+    async putWorkspace(workspace) {
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.workspaces,
+        Item: marshall(workspace),
+      }));
+      return workspace;
     },
 
     async createWorkspaceBundle({ workspace, membership, template }) {
