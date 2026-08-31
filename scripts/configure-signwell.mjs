@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const apiKey = process.env.SIGNWELL_API_KEY?.trim();
 if (!apiKey) {
@@ -86,16 +89,23 @@ async function main() {
     SecretId: secretId,
     SecretString: JSON.stringify({ apiKey, webhookId, testMode }),
   });
-  command("aws", [
-    "secretsmanager",
-    "put-secret-value",
-    "--profile",
-    profile,
-    "--region",
-    region,
-    "--cli-input-json",
-    "file:///dev/stdin",
-  ], { input: cliInput });
+  const tempDirectory = mkdtempSync(join(tmpdir(), "signwell-config-"));
+  const cliInputPath = join(tempDirectory, "secret.json");
+  try {
+    writeFileSync(cliInputPath, cliInput, { mode: 0o600 });
+    command("aws", [
+      "secretsmanager",
+      "put-secret-value",
+      "--profile",
+      profile,
+      "--region",
+      region,
+      "--cli-input-json",
+      `file://${cliInputPath}`,
+    ]);
+  } finally {
+    rmSync(tempDirectory, { recursive: true, force: true });
+  }
 
   console.log(`SignWell configured in ${testMode ? "test" : "live"} mode.`);
   console.log(`Webhook: ${callback}`);
