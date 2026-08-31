@@ -156,12 +156,13 @@ resource "aws_iam_role_policy" "bff_provider_secrets" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid    = "ReadTelephonyProviderSecrets"
+      Sid    = "ReadProviderSecrets"
       Effect = "Allow"
       Action = ["secretsmanager:GetSecretValue"]
       Resource = [
         aws_secretsmanager_secret.providers["retell"].arn,
         aws_secretsmanager_secret.providers["telnyx"].arn,
+        aws_secretsmanager_secret.providers["signwell"].arn,
       ]
     }]
   })
@@ -205,6 +206,7 @@ resource "aws_lambda_function" "bff" {
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
       RETELL_SECRET_ARN           = aws_secretsmanager_secret.providers["retell"].arn
       TELNYX_SECRET_ARN           = aws_secretsmanager_secret.providers["telnyx"].arn
+      SIGNWELL_SECRET_ARN         = aws_secretsmanager_secret.providers["signwell"].arn
       PUBLIC_API_BASE_URL         = aws_apigatewayv2_api.bff.api_endpoint
     }
   }

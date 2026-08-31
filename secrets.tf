@@ -12,6 +12,9 @@ locals {
     microsoft-oauth = {
       description = "Placeholder for Microsoft OAuth provider credentials"
     }
+    signwell = {
+      description = "SignWell API key, webhook ID, and test-mode configuration"
+    }
   }
 }
 

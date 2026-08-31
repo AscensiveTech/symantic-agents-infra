@@ -38,6 +38,16 @@ output "bff_api_url" {
   value       = aws_apigatewayv2_api.bff.api_endpoint
 }
 
+output "signwell_webhook_url" {
+  description = "Register this callback with SignWell for document events."
+  value       = "${aws_apigatewayv2_api.bff.api_endpoint}/webhooks/signwell"
+}
+
+output "signwell_secret_name" {
+  description = "Secrets Manager entry populated by scripts/configure-signwell.mjs."
+  value       = aws_secretsmanager_secret.providers["signwell"].name
+}
+
 output "ci_deploy_role_arn" {
   description = "Set this as the symantic-agents-frontend GitHub repository secret AWS_DEPLOY_ROLE_ARN."
   value       = aws_iam_role.ci_deploy.arn

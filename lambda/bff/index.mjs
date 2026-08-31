@@ -7,6 +7,11 @@ import {
   resolveRetellVoiceId,
 } from "./providers.mjs";
 import { buildReceptionistConfig, resolveConfiguredVoiceId } from "./receptionist.mjs";
+import {
+  createSignWellClient,
+  SignWellRequestError,
+  verifySignWellEvent,
+} from "./signwell.mjs";
 
 const PROFILE_FIELDS = {
   businessType: "string",
@@ -255,6 +260,7 @@ export function createHandler({
   getAssetSigner = getDefaultAssetSigner,
   getProviders = getDefaultProviders,
   getRetellApiKey = getDefaultRetellApiKey,
+  getSignWell = getDefaultSignWell,
   verifySignature = verifyRetellSignature,
   toolBaseUrl = process.env.PUBLIC_API_BASE_URL,
 } = {}) {
@@ -270,6 +276,10 @@ export function createHandler({
           verifySignature,
           toolBaseUrl,
         });
+      }
+
+      if (path === "/webhooks/signwell" && method === "POST") {
+        return await handleSignWellWebhook(event, { getStore, getSignWell });
       }
 
       const subject = event?.requestContext?.authorizer?.jwt?.claims?.sub;
@@ -339,6 +349,7 @@ export function createHandler({
         workspaceId,
         getStore: async () => store,
         getAssetSigner,
+        getSignWell,
       });
       if (proposalResponse) return proposalResponse;
 
@@ -541,6 +552,13 @@ export function createHandler({
         console.error("BFF provider request failed", {
           provider: error.provider,
           providerStatus: error.providerStatus,
+          message: error.message,
+        });
+        return json(502, { message: error.message });
+      }
+      if (error instanceof SignWellRequestError) {
+        console.error("SignWell request failed", {
+          providerStatus: error.status,
           message: error.message,
         });
         return json(502, { message: error.message });
@@ -1059,12 +1077,189 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
   return json(404, { message: "Not found" });
 }
 
+async function handleSignWellWebhook(event, { getStore, getSignWell }) {
+  const payload = readBody(event);
+  const signWell = await getSignWell();
+  if (!verifySignWellEvent(payload, signWell.webhookId)) {
+    return json(401, { message: "Invalid SignWell webhook signature" });
+  }
+
+  const document = payload?.data?.object;
+  const workspaceId = document?.metadata?.workspaceId;
+  const proposalId = document?.metadata?.proposalId;
+  if (
+    typeof document?.id !== "string" || !document.id ||
+    typeof workspaceId !== "string" || !ENTITY_ID_PATTERN.test(workspaceId) ||
+    typeof proposalId !== "string" || !ENTITY_ID_PATTERN.test(proposalId)
+  ) {
+    return json(200, { ok: true, ignored: true });
+  }
+
+  const store = await getStore();
+  const proposal = await store.getProposal(workspaceId, proposalId);
+  const current = proposal?.signatureRequest;
+  if (!current || current.provider !== "signwell" || current.documentId !== document.id) {
+    return json(200, { ok: true, ignored: true });
+  }
+
+  const eventType = payload.event.type;
+  const eventStatus = eventType.startsWith("document_")
+    ? normalizeSignWellStatus(eventType.slice("document_".length), current.status)
+    : normalizeSignWellStatus(document.status, current.status);
+  // Webhooks can be retried or arrive slightly out of order. A late viewed or
+  // signed event must never reopen a completed/declined/expired document.
+  const statusFromEvent = TERMINAL_SIGNATURE_STATUSES.has(current.status) &&
+    !TERMINAL_SIGNATURE_STATUSES.has(eventStatus)
+    ? current.status
+    : eventStatus;
+  const relatedSigner = payload.event.related_signer;
+  const relatedEmail = typeof relatedSigner?.email === "string"
+    ? relatedSigner.email.trim().toLowerCase()
+    : null;
+  const eventTimeNumber = Number(payload.event.time);
+  const eventAt = Number.isFinite(eventTimeNumber)
+    ? new Date(eventTimeNumber * 1000).toISOString()
+    : new Date().toISOString();
+  const recipientEventStatus = eventType === "document_signed"
+    ? "signed"
+    : eventType === "document_viewed"
+      ? "viewed"
+      : eventType === "document_declined"
+        ? "declined"
+        : null;
+  const recipients = Array.isArray(current.recipients)
+    ? current.recipients.map((recipient) => {
+      const documentRecipient = Array.isArray(document.recipients)
+        ? document.recipients.find((item) => item?.id === recipient.id)
+        : null;
+      const related = relatedEmail && recipient.email?.toLowerCase() === relatedEmail;
+      const completed = statusFromEvent === "completed";
+      return {
+        ...recipient,
+        ...(typeof documentRecipient?.name === "string" ? { name: documentRecipient.name } : {}),
+        ...(typeof documentRecipient?.email === "string" ? { email: documentRecipient.email.toLowerCase() } : {}),
+        ...(related && recipientEventStatus ? { status: recipientEventStatus } : {}),
+        ...(related && eventType === "document_signed" ? { signedAt: eventAt } : {}),
+        ...(related && eventType === "document_viewed" ? { viewedAt: eventAt } : {}),
+        ...(related && eventType === "document_declined" ? { declinedAt: eventAt } : {}),
+        ...(completed ? { status: "signed", signedAt: recipient.signedAt ?? eventAt } : {}),
+      };
+    })
+    : [];
+  const updated = {
+    ...current,
+    status: statusFromEvent,
+    recipients,
+    lastEvent: eventType,
+    lastEventAt: eventAt,
+    updatedAt: new Date().toISOString(),
+    ...(statusFromEvent === "completed" ? { completedAt: eventAt } : {}),
+  };
+  await store.updateProposalSignature(workspaceId, proposalId, updated);
+  return json(200, { ok: true });
+}
+
+const TERMINAL_SIGNATURE_STATUSES = new Set([
+  "completed",
+  "expired",
+  "canceled",
+  "declined",
+  "bounced",
+  "error",
+]);
+
+function normalizeSignWellStatus(value, fallback = "sent") {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "pending") return "in_progress";
+  if (normalized === "complete") return "completed";
+  return SIGNATURE_STATUSES.has(normalized) ? normalized : fallback;
+}
+
+const SIGNATURE_STATUSES = new Set([
+  "created",
+  "sent",
+  "viewed",
+  "in_progress",
+  "signed",
+  "completed",
+  "expired",
+  "canceled",
+  "declined",
+  "bounced",
+  "error",
+]);
+
+function isActiveSignatureRequest(request) {
+  return request?.provider === "signwell" &&
+    typeof request.documentId === "string" &&
+    !TERMINAL_SIGNATURE_STATUSES.has(request.status);
+}
+
+function proposalPdfFilename(name) {
+  const stem = typeof name === "string"
+    ? name.trim().replace(/[^A-Za-z0-9-]+/g, "-").replace(/^-+|-+$/g, "")
+    : "";
+  return `${stem || "proposal"}.pdf`;
+}
+
+function validSignatureRequest(value, proposalId) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.assetKey !== `exports/${proposalId}.pdf`) return null;
+  if (!Array.isArray(value.recipients) || value.recipients.length < 1 || value.recipients.length > 10) return null;
+  const seenEmails = new Set();
+  const recipients = [];
+  for (const item of value.recipients) {
+    const name = typeof item?.name === "string" ? item.name.trim() : "";
+    const email = typeof item?.email === "string" ? item.email.trim().toLowerCase() : "";
+    if (!name || name.length > 255 || !EMAIL_PATTERN.test(email) || seenEmails.has(email)) return null;
+    seenEmails.add(email);
+    recipients.push({ name, email });
+  }
+  const subject = typeof value.subject === "string" ? value.subject.trim() : "";
+  const message = typeof value.message === "string" ? value.message.trim() : "";
+  if (!subject || subject.length > 255 || !message || message.length > 4000) return null;
+  return {
+    assetKey: value.assetKey,
+    recipients,
+    subject,
+    message,
+    applySigningOrder: value.applySigningOrder === true,
+  };
+}
+
+function proposalSignerNames(proposal) {
+  if (Array.isArray(proposal?.signerNames)) {
+    return proposal.signerNames
+      .filter((name) => typeof name === "string")
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .slice(0, 10);
+  }
+  return [...new Set([proposal?.presentedBy, proposal?.clientName]
+    .filter((name) => typeof name === "string")
+    .map((name) => name.trim())
+    .filter(Boolean))]
+    .slice(0, 10);
+}
+
+function hasAgreementSigningFields(proposal, recipients) {
+  const agreementIncluded = Array.isArray(proposal?.documentItems) &&
+    proposal.documentItems.some((item) => item?.kind === "agreement" && item.hidden !== true);
+  if (!agreementIncluded) return false;
+  const names = proposalSignerNames(proposal);
+  return names.length === recipients.length && names.every(
+    (name, index) => name.toLocaleLowerCase() === recipients[index]?.name.toLocaleLowerCase(),
+  );
+}
+
 async function handleProposalApi(event, {
   method,
   path,
   workspaceId,
   getStore,
   getAssetSigner,
+  getSignWell,
 }) {
   if (typeof path !== "string" || ![
     "/workspaces/me/proposals",
@@ -1106,7 +1301,122 @@ async function handleProposalApi(event, {
       createdAt: now,
       updatedAt: now,
     };
+    delete copy.signatureRequest;
     return json(201, await store.createProposal(workspaceId, copy));
+  }
+
+  const signatureMatch = path.match(
+    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(remind|completed-pdf))?$/,
+  );
+  if (signatureMatch) {
+    const proposalId = decodeEntityId(
+      event?.pathParameters?.proposalId ?? signatureMatch[1],
+    );
+    if (!proposalId) return json(400, { message: "Invalid proposal ID" });
+    const proposal = await store.getProposal(workspaceId, proposalId);
+    if (!proposal) return json(404, { message: "Proposal not found" });
+    const action = signatureMatch[2] ?? "create";
+    const signWell = await getSignWell();
+
+    if (action === "create" && method === "POST") {
+      const input = validSignatureRequest(readBody(event), proposalId);
+      if (!input) {
+        return json(400, {
+          message: "Provide 1 to 10 unique signer names and email addresses for the generated proposal PDF",
+        });
+      }
+      if (isActiveSignatureRequest(proposal.signatureRequest)) {
+        return json(409, { message: "This proposal already has an active signature request" });
+      }
+      const agreementHasSigningFields = hasAgreementSigningFields(
+        proposal,
+        input.recipients,
+      );
+      if (proposal.documentItems?.some((item) => item?.kind === "agreement" && !item.hidden) && !agreementHasSigningFields) {
+        return json(409, {
+          message: "The generated PDF signer names do not match these recipients. Save the signer names and regenerate the PDF first.",
+        });
+      }
+      const signer = await getAssetSigner();
+      const fileUrl = await signer.createDownloadUrl(workspaceId, input.assetKey);
+      const created = await signWell.client.createDocument({
+        name: proposal.name || "Proposal",
+        subject: input.subject,
+        message: input.message,
+        draft: false,
+        reminders: true,
+        apply_signing_order: input.applySigningOrder,
+        allow_decline: true,
+        allow_reassign: true,
+        text_tags: agreementHasSigningFields,
+        with_signature_page: !agreementHasSigningFields,
+        files: [{
+          name: proposalPdfFilename(proposal.name),
+          file_url: fileUrl,
+        }],
+        recipients: input.recipients.map((recipient, index) => ({
+          id: String(index + 1),
+          name: recipient.name,
+          email: recipient.email,
+          delivery_method: "email",
+        })),
+        metadata: {
+          workspaceId,
+          proposalId,
+          source: "rapidproposal",
+        },
+      });
+      if (typeof created?.id !== "string" || !created.id) {
+        throw new SignWellRequestError("SignWell did not return a document ID");
+      }
+      const now = new Date().toISOString();
+      const signatureRequest = {
+        provider: "signwell",
+        documentId: created.id,
+        status: normalizeSignWellStatus(created.status, "sent"),
+        testMode: created.test_mode === true || signWell.client.testMode === true,
+        subject: input.subject,
+        message: input.message,
+        applySigningOrder: input.applySigningOrder,
+        recipients: input.recipients.map((recipient, index) => ({
+          id: String(index + 1),
+          name: recipient.name,
+          email: recipient.email,
+          status: "pending",
+        })),
+        sentAt: now,
+        updatedAt: now,
+      };
+      await store.updateProposalSignature(workspaceId, proposalId, signatureRequest);
+      return json(201, signatureRequest);
+    }
+
+    const current = proposal.signatureRequest;
+    if (!current || current.provider !== "signwell" || typeof current.documentId !== "string") {
+      return json(404, { message: "This proposal has no SignWell signature request" });
+    }
+    if (action === "remind" && method === "POST") {
+      if (!isActiveSignatureRequest(current)) {
+        return json(409, { message: "Only active signature requests can be reminded" });
+      }
+      await signWell.client.sendReminder(current.documentId);
+      const updated = {
+        ...current,
+        lastReminderAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      await store.updateProposalSignature(workspaceId, proposalId, updated);
+      return json(200, updated);
+    }
+    if (action === "completed-pdf" && method === "POST") {
+      if (current.status !== "completed") {
+        return json(409, { message: "The signed PDF is available after every signer completes the document" });
+      }
+      return json(200, {
+        url: await signWell.client.getCompletedPdfUrl(current.documentId),
+      });
+    }
+    return json(404, { message: "Not found" });
   }
 
   const proposalId = getEntityId(event, path, "proposals", "proposalId");
@@ -1119,7 +1429,14 @@ async function handleProposalApi(event, {
       const proposal = pickEntity(readBody(event), "id", proposalId);
       if (!proposal) return json(400, { message: "Invalid proposal" });
       try {
-        return json(200, await store.putProposal(workspaceId, proposal));
+        const current = await store.getProposal(workspaceId, proposalId);
+        if (!current) return json(404, { message: "Proposal not found" });
+        // Signature state is server-managed by SignWell webhooks. Preserve it
+        // when an editor saves an older browser copy of the proposal.
+        const updated = { ...proposal };
+        if (current.signatureRequest) updated.signatureRequest = current.signatureRequest;
+        else delete updated.signatureRequest;
+        return json(200, await store.putProposal(workspaceId, updated));
       } catch (error) {
         if (isConditionalCheckFailed(error)) return json(404, { message: "Proposal not found" });
         throw error;
@@ -1976,6 +2293,18 @@ export function createDynamoStore(client, commands, tableNames) {
       );
     },
 
+    async updateProposalSignature(workspaceId, proposalId, signatureRequest) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.proposals,
+        Key: marshall({ workspaceId, proposalId }),
+        UpdateExpression: "SET #signatureRequest = :signatureRequest",
+        ConditionExpression: "attribute_exists(proposalId)",
+        ExpressionAttributeNames: { "#signatureRequest": "signatureRequest" },
+        ExpressionAttributeValues: marshall({ ":signatureRequest": signatureRequest }),
+      }));
+      return signatureRequest;
+    },
+
     deleteProposal(workspaceId, proposalId) {
       return deleteRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
     },
@@ -2427,6 +2756,34 @@ async function getDefaultRetellApiKey() {
     "Retell",
   );
   return readApiKey(secret, "Retell");
+}
+
+let signWellPromise;
+async function getDefaultSignWell() {
+  signWellPromise ??= getProviderSecret(
+    process.env.SIGNWELL_SECRET_ARN,
+    "SignWell",
+  ).then((secret) => {
+    const webhookId = secret?.webhookId ?? secret?.webhook_id;
+    if (typeof webhookId !== "string" || !webhookId) {
+      throw new Error("SignWell secret must contain webhookId");
+    }
+    return {
+      webhookId,
+      client: createSignWellClient({
+        apiKey: readApiKey(secret, "SignWell"),
+        testMode: secret.testMode !== false,
+      }),
+    };
+  });
+  try {
+    return await signWellPromise;
+  } catch (error) {
+    // Allow a newly populated or rotated secret to be picked up without
+    // waiting for this Lambda execution environment to be replaced.
+    signWellPromise = undefined;
+    throw error;
+  }
 }
 
 let providersPromise;
