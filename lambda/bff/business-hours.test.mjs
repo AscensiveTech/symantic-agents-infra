@@ -5,46 +5,58 @@ import { formatBusinessHours, formatCurrentTime, isBusinessHours } from "./busin
 
 const WEEK = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
-function schedule(overrides = {}) {
-  const base = Object.fromEntries(
-    WEEK.map((key) => [key, { closed: false, open: "08:00", close: "17:00" }]),
-  );
-  return { ...base, ...overrides };
+function schedule(fn) {
+  return Object.fromEntries(WEEK.map((key) => [key, fn(key)]));
 }
 
+const singleBlock = () =>
+  schedule(() => ({ closed: false, intervals: [{ open: "08:00", close: "17:00" }] }));
+
 test("formatBusinessHours groups consecutive identical days", () => {
-  const hours = schedule({
-    sat: { closed: true, open: "09:00", close: "13:00" },
-    sun: { closed: true, open: "09:00", close: "13:00" },
-  });
-  assert.equal(formatBusinessHours(hours), "Mon–Fri 8:00 AM–5:00 PM, Sat–Sun closed");
+  const hours = schedule((key) =>
+    key === "sat" || key === "sun"
+      ? { closed: true, intervals: [{ open: "09:00", close: "13:00" }] }
+      : { closed: false, intervals: [{ open: "08:00", close: "17:00" }] },
+  );
+  assert.equal(formatBusinessHours(hours), "Mon–Fri 8:00 AM–5:00 PM; Sat–Sun closed");
 });
 
-test("formatBusinessHours renders a lone open day and all-closed", () => {
-  const soloSat = Object.fromEntries(
-    WEEK.map((key) => [key, { closed: key !== "sat", open: "09:00", close: "13:00" }]),
+test("formatBusinessHours renders split intervals and all-closed", () => {
+  const split = schedule((key) =>
+    key === "sun"
+      ? { closed: true, intervals: [{ open: "09:00", close: "13:00" }] }
+      : {
+          closed: false,
+          intervals: [
+            { open: "08:00", close: "12:00" },
+            { open: "13:00", close: "17:00" },
+          ],
+        },
   );
   assert.equal(
-    formatBusinessHours(soloSat),
-    "Mon–Fri closed, Sat 9:00 AM–1:00 PM, Sun closed",
+    formatBusinessHours(split),
+    "Mon–Sat 8:00 AM–12:00 PM, 1:00 PM–5:00 PM; Sun closed",
   );
 
-  const allClosed = Object.fromEntries(
-    WEEK.map((key) => [key, { closed: true, open: "09:00", close: "17:00" }]),
+  assert.equal(
+    formatBusinessHours(schedule(() => ({ closed: true, intervals: [{ open: "09:00", close: "17:00" }] }))),
+    "Closed",
   );
-  assert.equal(formatBusinessHours(allClosed), "Closed");
 });
 
 test("isBusinessHours accepts a full schedule and rejects malformed input", () => {
-  assert.equal(isBusinessHours(schedule()), true);
+  assert.equal(isBusinessHours(singleBlock()), true);
   assert.equal(isBusinessHours(null), false);
   assert.equal(isBusinessHours({}), false);
-  const missing = schedule();
+  const missing = singleBlock();
   delete missing.sun;
   assert.equal(isBusinessHours(missing), false);
-  assert.equal(isBusinessHours(schedule({ mon: { closed: false, open: "8", close: "17:00" } })), false);
   assert.equal(
-    isBusinessHours(schedule({ mon: { closed: "yes", open: "08:00", close: "17:00" } })),
+    isBusinessHours(schedule(() => ({ closed: false, intervals: [] }))),
+    false,
+  );
+  assert.equal(
+    isBusinessHours(schedule(() => ({ closed: false, intervals: [{ open: "8", close: "17:00" }] }))),
     false,
   );
 });

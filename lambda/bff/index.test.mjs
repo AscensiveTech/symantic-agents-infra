@@ -137,7 +137,10 @@ test("PUT profile round-trips valid structured business hours and rejects malfor
   const businessHours = Object.fromEntries(
     ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].map((key) => [
       key,
-      { closed: key === "sat" || key === "sun", open: "08:00", close: "17:00" },
+      {
+        closed: key === "sat" || key === "sun",
+        intervals: [{ open: "08:00", close: "17:00" }],
+      },
     ]),
   );
 
@@ -162,7 +165,7 @@ test("PUT profile round-trips valid structured business hours and rejects malfor
 
   const bad = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
     ...base,
-    businessHours: { mon: { closed: false, open: "8am", close: "5pm" } },
+    businessHours: { mon: { closed: false, intervals: [{ open: "8am", close: "5pm" }] } },
   }));
   assert.equal(bad.statusCode, 400);
   assert.equal(stored.length, 1);

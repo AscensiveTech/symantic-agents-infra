@@ -3,6 +3,9 @@
 // (same grouped output string). `profile.hours` (free text) stays the source of
 // truth; `profile.businessHours`, when present and valid, is preferred for the
 // generated agent prompt.
+//
+// Each day is either closed, or open for one or more time intervals (a second
+// interval covers lunch closures / restaurant lunch-then-dinner gaps).
 
 const WEEKDAYS = [
   { key: "mon", short: "Mon" },
@@ -16,15 +19,25 @@ const WEEKDAYS = [
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+function isInterval(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    typeof value.open === "string" &&
+    TIME_PATTERN.test(value.open) &&
+    typeof value.close === "string" &&
+    TIME_PATTERN.test(value.close)
+  );
+}
+
 function isDayHours(value) {
   return (
     value &&
     typeof value === "object" &&
     typeof value.closed === "boolean" &&
-    typeof value.open === "string" &&
-    TIME_PATTERN.test(value.open) &&
-    typeof value.close === "string" &&
-    TIME_PATTERN.test(value.close)
+    Array.isArray(value.intervals) &&
+    value.intervals.length >= 1 &&
+    value.intervals.every(isInterval)
   );
 }
 
@@ -45,7 +58,10 @@ function formatTime12h(hhmm) {
 }
 
 function daySummary(day) {
-  return day.closed ? "closed" : `${formatTime12h(day.open)}–${formatTime12h(day.close)}`;
+  if (day.closed) return "closed";
+  return day.intervals
+    .map(({ open, close }) => `${formatTime12h(open)}–${formatTime12h(close)}`)
+    .join(", ");
 }
 
 export function formatBusinessHours(hours) {
@@ -67,7 +83,7 @@ export function formatBusinessHours(hours) {
       const label = startShort === endShort ? startShort : `${startShort}–${endShort}`;
       return `${label} ${summary}`;
     })
-    .join(", ");
+    .join("; ");
 }
 
 // Business-local clock string for a call's dynamic variables — lets the agent
