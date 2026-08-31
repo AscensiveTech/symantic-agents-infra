@@ -30,6 +30,9 @@ const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PROPOSAL_ASSET_KEY_PATTERN = /^(templates|proposals|exports)\/[A-Za-z0-9_./-]+\.pdf$/;
+const COMPANY_LOGO_KEY_PATTERN = /^company\/logo-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const IMAGE_CONTENT_TYPE_PATTERN = /^image\/[A-Za-z0-9][A-Za-z0-9.+-]*$/;
+const MAX_COMPANY_LOGO_BYTES = 10 * 1024 * 1024;
 const MAX_DYNAMO_RECORD_BYTES = 350 * 1024;
 const WORKSPACE_ROLES = new Set(["super-admin", "company-admin", "quotation-builder"]);
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -290,6 +293,7 @@ export function createHandler({
         actor,
         store,
         getUserDirectory,
+        getAssetSigner,
       });
       if (platformResponse) return platformResponse;
 
@@ -307,6 +311,7 @@ export function createHandler({
         path,
         actor,
         store,
+        getAssetSigner,
       });
       if (companyResponse) return companyResponse;
 
@@ -552,6 +557,7 @@ async function handlePlatformCompanies(event, {
   actor,
   store,
   getUserDirectory,
+  getAssetSigner,
 }) {
   if (
     typeof path !== "string" ||
@@ -575,6 +581,25 @@ async function handlePlatformCompanies(event, {
     if (!target) return json(404, { message: "Not found" });
     const workspace = await store.getWorkspace(target.workspaceId);
     if (!workspace) return json(404, { message: "Company workspace not found" });
+
+    if (target.kind === "logo-upload" && method === "POST") {
+      const logo = validCompanyLogoRequest(readBody(event));
+      if (!logo) return json(400, { message: "Logo must be an image no larger than 10 MB" });
+      const key = `company/logo-${randomUUID()}`;
+      const signer = await getAssetSigner();
+      return json(200, {
+        ...(await signer.createImageUpload(target.workspaceId, key, logo.contentType, MAX_COMPANY_LOGO_BYTES)),
+        key,
+      });
+    }
+
+    if (target.kind === "logo-complete" && method === "POST") {
+      const logo = validCompanyLogoCompletion(readBody(event));
+      if (!logo) return json(400, { message: "Invalid company logo" });
+      const updated = withCompanyLogo(workspace, logo, actor.userId);
+      await store.putWorkspace(updated);
+      return json(200, companyLogoResponse(updated));
+    }
 
     if (target.kind === "company" && method === "PATCH") {
       const body = readBody(event);
@@ -748,6 +773,8 @@ async function platformCompanySummary(store, workspace) {
 
 function getPlatformCompanyTarget(event, path) {
   const patterns = [
+    ["logo-upload", /^\/platform\/companies\/([^/]+)\/logo\/upload-url$/],
+    ["logo-complete", /^\/platform\/companies\/([^/]+)\/logo\/complete$/],
     ["user", /^\/platform\/companies\/([^/]+)\/users\/([^/]+)$/],
     ["users", /^\/platform\/companies\/([^/]+)\/users$/],
     ["company", /^\/platform\/companies\/([^/]+)$/],
@@ -772,6 +799,54 @@ function getPlatformCompanyTarget(event, path) {
     }
   }
   return null;
+}
+
+function validCompanyLogoRequest(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const { contentType, bytes } = value;
+  if (
+    typeof contentType !== "string" ||
+    !IMAGE_CONTENT_TYPE_PATTERN.test(contentType) ||
+    !Number.isInteger(bytes) ||
+    bytes < 1 ||
+    bytes > MAX_COMPANY_LOGO_BYTES
+  ) return null;
+  return { contentType, bytes };
+}
+
+function validCompanyLogoCompletion(value) {
+  const logo = validCompanyLogoRequest(value);
+  if (!logo || typeof value.key !== "string" || !COMPANY_LOGO_KEY_PATTERN.test(value.key)) {
+    return null;
+  }
+  return { ...logo, key: value.key };
+}
+
+function withCompanyLogo(workspace, logo, userId) {
+  const now = new Date().toISOString();
+  return {
+    ...workspace,
+    companyLogo: { ...logo, updatedAt: now },
+    updatedAt: now,
+    updatedBy: userId,
+  };
+}
+
+function companyLogoResponse(workspace, url = null) {
+  const logo = workspace?.companyLogo;
+  if (
+    !logo ||
+    !COMPANY_LOGO_KEY_PATTERN.test(logo.key ?? "") ||
+    !validCompanyLogoRequest(logo)
+  ) return { logo: null };
+  return {
+    logo: {
+      key: logo.key,
+      contentType: logo.contentType,
+      bytes: logo.bytes,
+      ...(url ? { url } : {}),
+    },
+  };
 }
 
 function normalizeProposalSections(value, fallback = null) {
@@ -920,16 +995,52 @@ async function handleWorkspaceUsers(event, {
   return json(404, { message: "Not found" });
 }
 
-async function handleCompanyProfile(event, { method, path, actor, store }) {
-  if (path !== "/workspaces/me/company") return null;
+async function handleCompanyProfile(event, { method, path, actor, store, getAssetSigner }) {
+  if (typeof path !== "string" || !path.startsWith("/workspaces/me/company")) return null;
   if (!isWorkspaceAdmin(actor)) {
     return json(403, { message: "Company administrator access is required" });
   }
   const workspace = await store.getWorkspace(actor.workspaceId);
   if (!workspace) return json(404, { message: "Company workspace not found" });
 
+  if (path === "/workspaces/me/company/logo/upload-url" && method === "POST") {
+    const logo = validCompanyLogoRequest(readBody(event));
+    if (!logo) return json(400, { message: "Logo must be an image no larger than 10 MB" });
+    const key = `company/logo-${randomUUID()}`;
+    const signer = await getAssetSigner();
+    return json(200, {
+      ...(await signer.createImageUpload(actor.workspaceId, key, logo.contentType, MAX_COMPANY_LOGO_BYTES)),
+      key,
+    });
+  }
+  if (path === "/workspaces/me/company/logo/complete" && method === "POST") {
+    const logo = validCompanyLogoCompletion(readBody(event));
+    if (!logo) return json(400, { message: "Invalid company logo" });
+    const updated = withCompanyLogo(workspace, logo, actor.userId);
+    await store.putWorkspace(updated);
+    return json(200, companyLogoResponse(updated));
+  }
+  if (path === "/workspaces/me/company/logo" && method === "DELETE") {
+    const { companyLogo: _companyLogo, ...withoutLogo } = workspace;
+    await store.putWorkspace({
+      ...withoutLogo,
+      updatedAt: new Date().toISOString(),
+      updatedBy: actor.userId,
+    });
+    return json(200, { logo: null });
+  }
+  if (path !== "/workspaces/me/company") return json(404, { message: "Not found" });
+
   if (method === "GET") {
-    return json(200, { name: workspace.name || "" });
+    let logoUrl = null;
+    if (companyLogoResponse(workspace).logo) {
+      const signer = await getAssetSigner();
+      logoUrl = await signer.createDownloadUrl(actor.workspaceId, workspace.companyLogo.key);
+    }
+    return json(200, {
+      name: workspace.name || "",
+      ...companyLogoResponse(workspace, logoUrl),
+    });
   }
   if (method === "PATCH") {
     const body = readBody(event);
@@ -2142,6 +2253,69 @@ export function createS3AssetSigner({ bucket, region, credentials, now = () => n
         credentials,
         now: now(),
       });
+    },
+    createImageUpload(workspaceId, key, contentType, maxBytes) {
+      return createPresignedS3Post({
+        bucket,
+        region,
+        key: objectKey(workspaceId, key),
+        credentials,
+        contentType,
+        maxBytes,
+        now: now(),
+      });
+    },
+  };
+}
+
+function createPresignedS3Post({
+  bucket,
+  region,
+  key,
+  credentials,
+  contentType,
+  maxBytes,
+  now,
+  expiresIn = 900,
+}) {
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const date = amzDate.slice(0, 8);
+  const scope = `${date}/${region}/s3/aws4_request`;
+  const credential = `${credentials.accessKeyId}/${scope}`;
+  const expiration = new Date(now.getTime() + expiresIn * 1000).toISOString();
+  const fields = {
+    key,
+    "Content-Type": contentType,
+    success_action_status: "204",
+    "x-amz-algorithm": "AWS4-HMAC-SHA256",
+    "x-amz-credential": credential,
+    "x-amz-date": amzDate,
+    ...(credentials.sessionToken ? { "x-amz-security-token": credentials.sessionToken } : {}),
+  };
+  const conditions = [
+    { bucket },
+    { key },
+    { "Content-Type": contentType },
+    ["content-length-range", 1, maxBytes],
+    { success_action_status: "204" },
+    { "x-amz-algorithm": fields["x-amz-algorithm"] },
+    { "x-amz-credential": credential },
+    { "x-amz-date": amzDate },
+    ...(credentials.sessionToken
+      ? [{ "x-amz-security-token": credentials.sessionToken }]
+      : []),
+  ];
+  const policy = Buffer.from(JSON.stringify({ expiration, conditions })).toString("base64");
+  const dateKey = createHmac("sha256", `AWS4${credentials.secretAccessKey}`).update(date).digest();
+  const regionKey = createHmac("sha256", dateKey).update(region).digest();
+  const serviceKey = createHmac("sha256", regionKey).update("s3").digest();
+  const signingKey = createHmac("sha256", serviceKey).update("aws4_request").digest();
+  return {
+    url: `https://${bucket}.s3.${region}.amazonaws.com`,
+    fields: {
+      ...fields,
+      policy,
+      "x-amz-signature": createHmac("sha256", signingKey).update(policy).digest("hex"),
     },
   };
 }
