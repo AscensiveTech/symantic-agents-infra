@@ -35,7 +35,6 @@ test("PUT profile stores the authenticated workspace profile", async () => {
     phone: "(703) 555-0133",
     description: "Family dental care",
     hours: "Mon-Fri, 8:00 AM-5:00 PM",
-    services: ["Cleanings"],
     faqs: [{ question: "Do you accept insurance?", answer: "Yes." }],
     policies: "Call before cancelling.",
     escalationContact: "(703) 555-0199",
@@ -126,7 +125,6 @@ test("PUT profile round-trips valid structured business hours and rejects malfor
     phone: "(703) 555-0133",
     description: "Family dental care",
     hours: "Mon–Fri 8:00 AM–5:00 PM, Sat–Sun closed",
-    services: ["Cleanings"],
     faqs: [{ question: "Do you accept insurance?", answer: "Yes." }],
     policies: "Call before cancelling.",
     escalationContact: "(703) 555-0199",
@@ -2085,7 +2083,6 @@ function receptionistProfile() {
     timezone: "America/New_York",
     hours: "Mon-Fri, 8:00 AM-5:00 PM",
     phone: "+17035550133",
-    services: ["Cleanings"],
     faqs: [{
       question: "Do you accept insurance?",
       answer: "Yes.",

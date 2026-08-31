@@ -22,7 +22,6 @@ const PROFILE_FIELDS = {
   phone: "string",
   description: "string",
   hours: "string",
-  services: "string[]",
   faqs: "faq[]",
   policies: "string",
   escalationContact: "string",

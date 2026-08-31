@@ -164,7 +164,6 @@ export function buildReceptionistPrompt(agent, profile) {
       .map(({ question, answer }) => `- Q: ${question}\n  A: ${answer}`)
       .join("\n")
     : "- No approved FAQs are configured. Take a message instead of guessing.";
-  const services = list(profile?.services);
   const intents = list(behavior.intents);
   const bookingInstruction = behavior.booking === true
     ? "Booking is enabled. Check availability before offering a time, and create a booking only after explicit caller confirmation."
@@ -176,7 +175,7 @@ export function buildReceptionistPrompt(agent, profile) {
     "",
     "Business profile",
     `- Type: ${text(profile?.businessType) || "Not provided"}`,
-    `- Description: ${text(profile?.description) || "Not provided"}`,
+    `- Services and business overview: ${text(profile?.description) || "Not provided"}`,
     `- Address: ${text(profile?.address) || "Not provided"}`,
     `- Timezone: ${text(profile?.timezone) || "UTC"}`,
     `- Hours: ${isBusinessHours(profile?.businessHours)
@@ -184,7 +183,6 @@ export function buildReceptionistPrompt(agent, profile) {
       : (text(profile?.hours) || "Not provided")}`,
     "- Current local time at the start of this call: {{currentTime}} ({{timezone}}). "
       + "Treat this as the authoritative clock when the caller asks whether you are open right now.",
-    `- Services: ${services || "Not provided"}`,
     "",
     "Approved caller intents",
     intents || "Use the approved FAQs and take a message for anything else.",
