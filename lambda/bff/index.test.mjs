@@ -1346,6 +1346,93 @@ test("only super administrators can access company onboarding", async () => {
   assert.equal(response.statusCode, 403);
 });
 
+test("super administrators can attach a validated logo to an onboarded company", async () => {
+  let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design" };
+  const signerCalls = [];
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      assert.equal(workspaceId, workspace.workspaceId);
+      return workspace;
+    },
+    async putWorkspace(value) {
+      workspace = value;
+      return value;
+    },
+  };
+  const signer = {
+    async createImageUpload(...args) {
+      signerCalls.push(args);
+      return { url: "https://upload.example.com", fields: { policy: "signed-policy" } };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getAssetSigner: async () => signer,
+  });
+  const uploadEvent = authenticatedEvent(
+    "POST",
+    "/platform/companies/workspace-technovate/logo/upload-url",
+    { contentType: "image/webp", bytes: 512_000 },
+  );
+  uploadEvent.pathParameters = { workspaceId: "workspace-technovate" };
+  uploadEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const uploadResponse = await handler(uploadEvent);
+  const upload = JSON.parse(uploadResponse.body);
+
+  const completeEvent = authenticatedEvent(
+    "POST",
+    "/platform/companies/workspace-technovate/logo/complete",
+    { key: upload.key, contentType: "image/webp", bytes: 512_000 },
+  );
+  completeEvent.pathParameters = { workspaceId: "workspace-technovate" };
+  completeEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const completeResponse = await handler(completeEvent);
+
+  assert.equal(uploadResponse.statusCode, 200);
+  assert.match(upload.key, /^company\/logo-/);
+  assert.deepEqual(signerCalls, [[
+    "workspace-technovate",
+    upload.key,
+    "image/webp",
+    10 * 1024 * 1024,
+  ]]);
+  assert.equal(completeResponse.statusCode, 200);
+  assert.equal(workspace.companyLogo.key, upload.key);
+  assert.equal(workspace.companyLogo.contentType, "image/webp");
+});
+
+test("company logo upload rejects non-images and files larger than 10 MB", async () => {
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      return { workspaceId, name: "Technovate Design" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const requests = [
+    { contentType: "application/pdf", bytes: 100 },
+    { contentType: "image/png", bytes: 10 * 1024 * 1024 + 1 },
+  ];
+
+  for (const body of requests) {
+    const event = authenticatedEvent(
+      "POST",
+      "/platform/companies/workspace-technovate/logo/upload-url",
+      body,
+    );
+    event.pathParameters = { workspaceId: "workspace-technovate" };
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+    assert.equal((await handler(event)).statusCode, 400);
+  }
+});
+
 test("super administrators can list users in a company workspace", async () => {
   const store = {
     async getMembership(userId) {
@@ -1522,11 +1609,64 @@ test("company profile APIs read and update the signed-in workspace name", async 
   const patchResponse = await handler(patchEvent);
 
   assert.equal(getResponse.statusCode, 200);
-  assert.deepEqual(JSON.parse(getResponse.body), { name: "Technovate Design" });
+  assert.deepEqual(JSON.parse(getResponse.body), { name: "Technovate Design", logo: null });
   assert.equal(patchResponse.statusCode, 200);
   assert.deepEqual(JSON.parse(patchResponse.body), { name: "Technovate Group" });
   assert.equal(workspace.name, "Technovate Group");
   assert.equal(workspace.tier, "basic");
+});
+
+test("company administrators can upload, read, and remove their company logo", async () => {
+  let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design" };
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: workspace.workspaceId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return workspace; },
+    async putWorkspace(value) { workspace = value; return value; },
+  };
+  const signer = {
+    async createImageUpload() {
+      return { url: "https://upload.example.com", fields: { policy: "signed-policy" } };
+    },
+    async createDownloadUrl(workspaceId, key) {
+      return `https://download.example.com/${workspaceId}/${key}`;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getAssetSigner: async () => signer,
+  });
+  const withRole = (event) => {
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+    return event;
+  };
+  const uploadResponse = await handler(withRole(authenticatedEvent(
+    "POST",
+    "/workspaces/me/company/logo/upload-url",
+    { contentType: "image/png", bytes: 4096 },
+  )));
+  const upload = JSON.parse(uploadResponse.body);
+  const completeResponse = await handler(withRole(authenticatedEvent(
+    "POST",
+    "/workspaces/me/company/logo/complete",
+    { key: upload.key, contentType: "image/png", bytes: 4096 },
+  )));
+  const getResponse = await handler(withRole(authenticatedEvent(
+    "GET",
+    "/workspaces/me/company",
+  )));
+  const removeResponse = await handler(withRole(authenticatedEvent(
+    "DELETE",
+    "/workspaces/me/company/logo",
+  )));
+
+  assert.equal(uploadResponse.statusCode, 200);
+  assert.equal(completeResponse.statusCode, 200);
+  assert.match(JSON.parse(getResponse.body).logo.url, /^https:\/\/download\.example\.com/);
+  assert.equal(removeResponse.statusCode, 200);
+  assert.equal(workspace.companyLogo, undefined);
 });
 
 test("company administrators receive their allowed proposal sections", async () => {
@@ -1626,6 +1766,38 @@ test("S3 asset signer matches the AWS Signature Version 4 reference output", asy
       "&X-Amz-SignedHeaders=host" +
       "&X-Amz-Signature=c72ec1c4f6b4255b22156aaf66639ef6ac9eb1f9e818360811a01255a608380a",
   );
+});
+
+test("S3 image upload signer enforces content type and a 10 MB form limit", async () => {
+  const { createS3AssetSigner } = await loadBff();
+  const signer = createS3AssetSigner({
+    bucket: "proposal-bucket",
+    region: "us-east-1",
+    credentials: {
+      accessKeyId: "AKIDEXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      sessionToken: "session-token",
+    },
+    now: () => new Date("2026-08-18T12:34:56.000Z"),
+  });
+
+  const post = signer.createImageUpload(
+    "workspace-123",
+    "company/logo-12345678-1234-4123-8123-123456789abc",
+    "image/png",
+    10 * 1024 * 1024,
+  );
+  const policy = JSON.parse(Buffer.from(post.fields.policy, "base64").toString("utf8"));
+
+  assert.equal(post.url, "https://proposal-bucket.s3.us-east-1.amazonaws.com");
+  assert.equal(post.fields["Content-Type"], "image/png");
+  assert.equal(post.fields.key, "workspaces/workspace-123/company/logo-12345678-1234-4123-8123-123456789abc");
+  assert.ok(post.fields["x-amz-signature"]);
+  assert.deepEqual(
+    policy.conditions.find((condition) => Array.isArray(condition)),
+    ["content-length-range", 1, 10 * 1024 * 1024],
+  );
+  assert.ok(policy.conditions.some((condition) => condition["Content-Type"] === "image/png"));
 });
 
 function authenticatedEvent(method, path, body) {
