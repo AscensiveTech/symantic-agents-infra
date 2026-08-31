@@ -117,6 +117,57 @@ test("PUT profile rejects an invalid body before accessing DynamoDB", async () =
   assert.equal(response.statusCode, 400);
 });
 
+test("PUT profile round-trips valid structured business hours and rejects malformed ones", async () => {
+  const base = {
+    businessType: "dental",
+    businessName: "Arc Dental",
+    address: "123 Main Street",
+    timezone: "America/New_York",
+    phone: "(703) 555-0133",
+    description: "Family dental care",
+    hours: "Mon–Fri 8:00 AM–5:00 PM, Sat–Sun closed",
+    services: ["Cleanings"],
+    faqs: [{ question: "Do you accept insurance?", answer: "Yes." }],
+    policies: "Call before cancelling.",
+    escalationContact: "(703) 555-0199",
+    ownerPhone: "(703) 555-0100",
+    fallbackPhone: "(703) 555-0199",
+    communicationStyle: "Warm, concise, and professional",
+  };
+  const businessHours = Object.fromEntries(
+    ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].map((key) => [
+      key,
+      { closed: key === "sat" || key === "sun", open: "08:00", close: "17:00" },
+    ]),
+  );
+
+  const stored = [];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => ({
+      async ensureWorkspace() {},
+      async putProfile(_workspaceId, value) {
+        stored.push(value);
+        return value;
+      },
+    }),
+  });
+
+  const ok = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
+    ...base,
+    businessHours,
+  }));
+  assert.equal(ok.statusCode, 200);
+  assert.deepEqual(stored[0].businessHours, businessHours);
+
+  const bad = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
+    ...base,
+    businessHours: { mon: { closed: false, open: "8am", close: "5pm" } },
+  }));
+  assert.equal(bad.statusCode, 400);
+  assert.equal(stored.length, 1);
+});
+
 test("POST and GET agents preserve product agent ids", async () => {
   const agents = new Map();
   const store = {
@@ -787,12 +838,16 @@ test("POST start-test-call creates a Retell phone call without marking the draft
       status: "draft",
     },
   });
-  assert.deepEqual(phoneCallInput, {
+  const { currentTime, ...restCallInput } = phoneCallInput;
+  assert.equal(typeof currentTime, "string");
+  assert.ok(currentTime.length > 0);
+  assert.deepEqual(restCallInput, {
     fromNumber: "+17035550177",
     toNumber: "+17035550100",
     retellAgentId: "retell-agent-123",
     workspaceId: "user-123",
     agentId: "agent-123",
+    timezone: "America/New_York",
   });
   assert.equal(agent.configuration.tested, false);
   assert.equal(agent.configuration.testedAt, undefined);
@@ -865,18 +920,19 @@ test("POST inbound lookup uses Retell's call_inbound request and response contra
     "retell-key",
     "signature-123",
   ]);
-  assert.deepEqual(JSON.parse(response.body), {
-    call_inbound: {
-      override_agent_id: "retell-agent-123",
-      dynamic_variables: {
-        workspaceId: "workspace-123",
-        agentId: "agent-123",
-      },
-      metadata: {
-        workspaceId: "workspace-123",
-        agentId: "agent-123",
-      },
-    },
+  const body = JSON.parse(response.body);
+  const { currentTime, ...restVars } = body.call_inbound.dynamic_variables;
+  assert.equal(typeof currentTime, "string");
+  assert.ok(currentTime.length > 0);
+  assert.deepEqual(restVars, {
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    timezone: "America/New_York",
+  });
+  assert.deepEqual(body.call_inbound.override_agent_id, "retell-agent-123");
+  assert.deepEqual(body.call_inbound.metadata, {
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
   });
 });
 

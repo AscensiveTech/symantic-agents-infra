@@ -1,3 +1,5 @@
+import { formatBusinessHours, isBusinessHours } from "./business-hours.mjs";
+
 const CALENDAR_TOOLS = [
   {
     name: "calendar_find_appointment",
@@ -177,7 +179,11 @@ export function buildReceptionistPrompt(agent, profile) {
     `- Description: ${text(profile?.description) || "Not provided"}`,
     `- Address: ${text(profile?.address) || "Not provided"}`,
     `- Timezone: ${text(profile?.timezone) || "UTC"}`,
-    `- Hours: ${text(profile?.hours) || "Not provided"}`,
+    `- Hours: ${isBusinessHours(profile?.businessHours)
+      ? formatBusinessHours(profile.businessHours)
+      : (text(profile?.hours) || "Not provided")}`,
+    "- Current local time at the start of this call: {{currentTime}} ({{timezone}}). "
+      + "Treat this as the authoritative clock when the caller asks whether you are open right now.",
     `- Services: ${services || "Not provided"}`,
     "",
     "Approved caller intents",

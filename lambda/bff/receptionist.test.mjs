@@ -68,6 +68,30 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /\+17035550102/);
 });
 
+test("prompt prefers structured business hours and always carries the call clock", () => {
+  const structured = buildReceptionistPrompt(agent, {
+    ...profile,
+    hours: "ignored free text",
+    businessHours: {
+      mon: { closed: false, open: "08:00", close: "17:00" },
+      tue: { closed: false, open: "08:00", close: "17:00" },
+      wed: { closed: false, open: "08:00", close: "17:00" },
+      thu: { closed: false, open: "08:00", close: "17:00" },
+      fri: { closed: false, open: "08:00", close: "17:00" },
+      sat: { closed: false, open: "09:00", close: "13:00" },
+      sun: { closed: true, open: "09:00", close: "13:00" },
+    },
+  });
+
+  assert.match(structured, /Mon–Fri 8:00 AM–5:00 PM, Sat 9:00 AM–1:00 PM, Sun closed/);
+  assert.doesNotMatch(structured, /ignored free text/);
+  assert.match(structured, /\{\{currentTime\}\} \(\{\{timezone\}\}\)/);
+  assert.match(structured, /whether you are open right now/);
+
+  const fallback = buildReceptionistPrompt(agent, { ...profile, businessHours: { mon: "bad" } });
+  assert.match(fallback, /Mon-Fri, 8:00 AM-5:00 PM/);
+});
+
 test("cloned voice mode uses the stored voiceId instead of the catalog map", () => {
   const resolveVoiceId = (requested) => `mapped:${requested}`;
   assert.equal(
