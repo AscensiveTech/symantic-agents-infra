@@ -1339,6 +1339,7 @@ async function handleProposalApi(event, {
       }
       const signer = await getAssetSigner();
       const fileUrl = await signer.createDownloadUrl(workspaceId, input.assetKey);
+      const embeddedTestMode = signWell.client.testMode === true;
       const created = await signWell.client.createDocument({
         name: proposal.name || "Proposal",
         subject: input.subject,
@@ -1348,6 +1349,7 @@ async function handleProposalApi(event, {
         apply_signing_order: input.applySigningOrder,
         allow_decline: true,
         allow_reassign: true,
+        ...(embeddedTestMode ? { embedded_signing: true } : {}),
         text_tags: agreementHasSigningFields,
         with_signature_page: !agreementHasSigningFields,
         files: [{
@@ -1370,11 +1372,18 @@ async function handleProposalApi(event, {
         throw new SignWellRequestError("SignWell did not return a document ID");
       }
       const now = new Date().toISOString();
+      const createdStatus = normalizeSignWellStatus(created.status, "sent");
+      const testSigningUrl = embeddedTestMode && Array.isArray(created.recipients)
+        ? created.recipients.find((recipient) =>
+          typeof recipient?.embedded_signing_url === "string" && recipient.embedded_signing_url
+        )?.embedded_signing_url
+        : null;
       const signatureRequest = {
         provider: "signwell",
         documentId: created.id,
-        status: normalizeSignWellStatus(created.status, "sent"),
+        status: createdStatus === "created" ? "sent" : createdStatus,
         testMode: created.test_mode === true || signWell.client.testMode === true,
+        ...(testSigningUrl ? { testSigningUrl } : {}),
         subject: input.subject,
         message: input.message,
         applySigningOrder: input.applySigningOrder,
@@ -2758,32 +2767,25 @@ async function getDefaultRetellApiKey() {
   return readApiKey(secret, "Retell");
 }
 
-let signWellPromise;
 async function getDefaultSignWell() {
-  signWellPromise ??= getProviderSecret(
+  // Read this small configuration for every SignWell operation so key rotations
+  // and the test/live safety switch take effect immediately in warm Lambdas.
+  // SignWell operations are infrequent compared with ordinary API traffic.
+  const secret = await getProviderSecret(
     process.env.SIGNWELL_SECRET_ARN,
     "SignWell",
-  ).then((secret) => {
-    const webhookId = secret?.webhookId ?? secret?.webhook_id;
-    if (typeof webhookId !== "string" || !webhookId) {
-      throw new Error("SignWell secret must contain webhookId");
-    }
-    return {
-      webhookId,
-      client: createSignWellClient({
-        apiKey: readApiKey(secret, "SignWell"),
-        testMode: secret.testMode !== false,
-      }),
-    };
-  });
-  try {
-    return await signWellPromise;
-  } catch (error) {
-    // Allow a newly populated or rotated secret to be picked up without
-    // waiting for this Lambda execution environment to be replaced.
-    signWellPromise = undefined;
-    throw error;
+  );
+  const webhookId = secret?.webhookId ?? secret?.webhook_id;
+  if (typeof webhookId !== "string" || !webhookId) {
+    throw new Error("SignWell secret must contain webhookId");
   }
+  return {
+    webhookId,
+    client: createSignWellClient({
+      apiKey: readApiKey(secret, "SignWell"),
+      testMode: secret.testMode !== false,
+    }),
+  };
 }
 
 let providersPromise;

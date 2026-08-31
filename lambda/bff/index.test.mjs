@@ -1139,7 +1139,12 @@ test("proposal signature requests send the private PDF through SignWell and pers
       testMode: true,
       async createDocument(input) {
         signWellRequest = input;
-        return { id: "signwell-doc-123", status: "Sent", test_mode: true };
+        return {
+          id: "signwell-doc-123",
+          status: "Created",
+          test_mode: true,
+          recipients: [{ embedded_signing_url: "https://www.signwell.com/docs/test-signing/" }],
+        };
       },
     },
   };
@@ -1172,10 +1177,13 @@ test("proposal signature requests send the private PDF through SignWell and pers
   assert.equal(response.statusCode, 201);
   assert.equal(body.documentId, "signwell-doc-123");
   assert.equal(body.testMode, true);
+  assert.equal(body.status, "sent");
+  assert.equal(body.testSigningUrl, "https://www.signwell.com/docs/test-signing/");
   assert.equal(body.recipients[0].email, "jane@example.com");
   assert.equal(signWellRequest.files[0].file_url, "https://private-pdf.example.com/short-lived");
   assert.equal(signWellRequest.text_tags, true);
   assert.equal(signWellRequest.with_signature_page, false);
+  assert.equal(signWellRequest.embedded_signing, true);
   assert.deepEqual(signWellRequest.metadata, {
     workspaceId: "user-123",
     proposalId: "prp-sign",
