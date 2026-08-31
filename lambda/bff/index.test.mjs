@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import test from "node:test";
 
 async function loadBff() {
@@ -1109,6 +1110,182 @@ test("proposal asset routes issue workspace-scoped PDF URLs and reject traversal
     ["upload", "user-123", "proposals/prp-123/cover.pdf", "application/pdf"],
     ["download", "user-123", "proposals/prp-123/cover.pdf"],
   ]);
+});
+
+test("proposal signature requests send the private PDF through SignWell and persist safe status", async () => {
+  const proposals = new Map();
+  const proposal = {
+    id: "prp-sign",
+    name: "Dental modernization",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "agreement", kind: "agreement", hidden: false }],
+  };
+  proposals.set("user-123:prp-sign", proposal);
+  let signWellRequest;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal(workspaceId, proposalId) {
+      return proposals.get(`${workspaceId}:${proposalId}`) ?? null;
+    },
+    async updateProposalSignature(workspaceId, proposalId, signatureRequest) {
+      const current = proposals.get(`${workspaceId}:${proposalId}`);
+      proposals.set(`${workspaceId}:${proposalId}`, { ...current, signatureRequest });
+      return signatureRequest;
+    },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      testMode: true,
+      async createDocument(input) {
+        signWellRequest = input;
+        return { id: "signwell-doc-123", status: "Sent", test_mode: true };
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => signWell,
+    getAssetSigner: async () => ({
+      async createDownloadUrl(workspaceId, key) {
+        assert.equal(workspaceId, "user-123");
+        assert.equal(key, "exports/prp-sign.pdf");
+        return "https://private-pdf.example.com/short-lived";
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests",
+    {
+      assetKey: "exports/prp-sign.pdf",
+      recipients: [{ name: "Jane Client", email: "JANE@example.com" }],
+      subject: "Please sign Dental modernization",
+      message: "Please review and sign this proposal.",
+      applySigningOrder: false,
+    },
+  ));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(body.documentId, "signwell-doc-123");
+  assert.equal(body.testMode, true);
+  assert.equal(body.recipients[0].email, "jane@example.com");
+  assert.equal(signWellRequest.files[0].file_url, "https://private-pdf.example.com/short-lived");
+  assert.equal(signWellRequest.text_tags, true);
+  assert.equal(signWellRequest.with_signature_page, false);
+  assert.deepEqual(signWellRequest.metadata, {
+    workspaceId: "user-123",
+    proposalId: "prp-sign",
+    source: "rapidproposal",
+  });
+  assert.equal("apiKey" in body, false);
+});
+
+test("proposal edits preserve server signature state and duplicates start unsigned", async () => {
+  const signatureRequest = {
+    provider: "signwell",
+    documentId: "signwell-doc-123",
+    status: "viewed",
+    recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "viewed" }],
+  };
+  const records = new Map([["user-123:prp-sign", {
+    id: "prp-sign",
+    name: "Original proposal",
+    status: "draft",
+    signatureRequest,
+  }]]);
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal(workspaceId, proposalId) {
+      return records.get(`${workspaceId}:${proposalId}`) ?? null;
+    },
+    async putProposal(workspaceId, proposal) {
+      records.set(`${workspaceId}:${proposal.id}`, structuredClone(proposal));
+      return proposal;
+    },
+    async createProposal(workspaceId, proposal) {
+      records.set(`${workspaceId}:${proposal.id}`, structuredClone(proposal));
+      return proposal;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const updated = await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/proposals/prp-sign",
+    { id: "prp-sign", name: "Edited in an older tab", status: "draft" },
+  ));
+  const duplicated = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/duplicate",
+  ));
+
+  assert.deepEqual(JSON.parse(updated.body).signatureRequest, signatureRequest);
+  assert.equal("signatureRequest" in JSON.parse(duplicated.body), false);
+});
+
+test("SignWell webhooks require the documented HMAC and update only the matching proposal document", async () => {
+  const webhookId = "webhook-123";
+  let signatureRequest = {
+    provider: "signwell",
+    documentId: "signwell-doc-123",
+    status: "sent",
+    recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "pending" }],
+  };
+  const store = {
+    async getProposal(workspaceId, proposalId) {
+      assert.equal(workspaceId, "workspace-123");
+      assert.equal(proposalId, "prp-sign");
+      return { id: proposalId, signatureRequest };
+    },
+    async updateProposalSignature(_workspaceId, _proposalId, next) {
+      signatureRequest = next;
+    },
+  };
+  const type = "document_completed";
+  const time = 1788144000;
+  const hash = createHmac("sha256", webhookId).update(`${type}@${time}`).digest("hex");
+  const payload = {
+    event: {
+      type,
+      time,
+      hash,
+      related_signer: { name: "Jane Client", email: "jane@example.com" },
+    },
+    data: {
+      object: {
+        id: "signwell-doc-123",
+        metadata: { workspaceId: "workspace-123", proposalId: "prp-sign" },
+        recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com" }],
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({ webhookId, client: {} }),
+  });
+
+  const valid = await handler({
+    requestContext: { http: { method: "POST", path: "/webhooks/signwell" } },
+    rawPath: "/webhooks/signwell",
+    body: JSON.stringify(payload),
+  });
+  const invalid = await handler({
+    requestContext: { http: { method: "POST", path: "/webhooks/signwell" } },
+    rawPath: "/webhooks/signwell",
+    body: JSON.stringify({ ...payload, event: { ...payload.event, hash: "0".repeat(64) } }),
+  });
+
+  assert.equal(valid.statusCode, 200);
+  assert.equal(signatureRequest.status, "completed");
+  assert.equal(signatureRequest.completedAt, new Date(time * 1000).toISOString());
+  assert.equal(signatureRequest.recipients[0].status, "signed");
+  assert.equal(invalid.statusCode, 401);
 });
 
 test("workspace membership shares proposal data across Cognito users", async () => {

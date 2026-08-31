@@ -100,3 +100,28 @@ Intended production mapping:
 5. Route signed DID configuration requests to `POST /retell/inbound-lookup`; the response contains the current prompt, tools, voice, transfer numbers, and booking flag.
 
 Do not put API keys or SIP credentials in Terraform variables, source files, or committed examples. See the current Retell Telnyx/custom-telephony guides before live setup because SIP IP allowlists and provider settings can change.
+
+## SignWell proposal signing
+
+Terraform creates the SignWell secret and the public, HMAC-verified webhook
+route. After applying the stack, configure the provider once from this repo:
+
+```sh
+read -s SIGNWELL_API_KEY
+export SIGNWELL_API_KEY
+node scripts/configure-signwell.mjs
+unset SIGNWELL_API_KEY
+```
+
+The script reuses an existing callback when present, otherwise registers
+`terraform output -raw signwell_webhook_url`, then writes
+`apiKey`, `webhookId`, and `testMode` to `symantic/dev/signwell`. It sends the
+secret JSON to AWS CLI through standard input and never prints the API key.
+Test mode is intentionally the default. After end-to-end verification, opt in
+to legally binding live requests with `SIGNWELL_TEST_MODE=false` and rerun the
+same command.
+
+SignWell sends the signature-request and completion emails. RapidProposal does
+not need SES for this workflow. The Lambda receives document status webhooks,
+stores only document/recipient status in the existing proposals table, and
+retrieves the completed PDF from SignWell only after all recipients sign.

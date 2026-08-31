@@ -29,6 +29,9 @@ locals {
     "PATCH /workspaces/me/proposals/{proposalId}",
     "DELETE /workspaces/me/proposals/{proposalId}",
     "POST /workspaces/me/proposals/{proposalId}/duplicate",
+    "POST /workspaces/me/proposals/{proposalId}/signature-requests",
+    "POST /workspaces/me/proposals/{proposalId}/signature-requests/remind",
+    "POST /workspaces/me/proposals/{proposalId}/signature-requests/completed-pdf",
     "GET /workspaces/me/proposal-templates",
     "POST /workspaces/me/proposal-templates",
     "GET /workspaces/me/proposal-templates/{templateId}",
@@ -99,6 +102,13 @@ resource "aws_apigatewayv2_route" "bff" {
 resource "aws_apigatewayv2_route" "retell_inbound_lookup" {
   api_id             = aws_apigatewayv2_api.bff.id
   route_key          = "POST /retell/inbound-lookup"
+  authorization_type = "NONE"
+  target             = "integrations/${aws_apigatewayv2_integration.bff.id}"
+}
+
+resource "aws_apigatewayv2_route" "signwell_webhook" {
+  api_id             = aws_apigatewayv2_api.bff.id
+  route_key          = "POST /webhooks/signwell"
   authorization_type = "NONE"
   target             = "integrations/${aws_apigatewayv2_integration.bff.id}"
 }
