@@ -1085,8 +1085,7 @@ async function handleSignWellWebhook(event, { getStore, getSignWell }) {
   }
 
   const document = payload?.data?.object;
-  const workspaceId = document?.metadata?.workspaceId;
-  const proposalId = document?.metadata?.proposalId;
+  const { workspaceId, proposalId } = signWellDocumentMetadata(document);
   if (
     typeof document?.id !== "string" || !document.id ||
     typeof workspaceId !== "string" || !ENTITY_ID_PATTERN.test(workspaceId) ||
@@ -1176,6 +1175,14 @@ function normalizeSignWellStatus(value, fallback = "sent") {
   return SIGNATURE_STATUSES.has(normalized) ? normalized : fallback;
 }
 
+function signWellDocumentMetadata(document) {
+  const metadata = document?.metadata;
+  return {
+    workspaceId: metadata?.workspaceId ?? metadata?.workspace_id,
+    proposalId: metadata?.proposalId ?? metadata?.proposal_id,
+  };
+}
+
 const SIGNATURE_STATUSES = new Set([
   "created",
   "sent",
@@ -1194,6 +1201,95 @@ function isActiveSignatureRequest(request) {
   return request?.provider === "signwell" &&
     typeof request.documentId === "string" &&
     !TERMINAL_SIGNATURE_STATUSES.has(request.status);
+}
+
+const SIGNWELL_SYNC_INTERVAL_MS = 30_000;
+
+async function reconcileSignWellSignature({
+  proposal,
+  workspaceId,
+  store,
+  client,
+  force = false,
+}) {
+  const current = proposal?.signatureRequest;
+  if (!isActiveSignatureRequest(current) || typeof client?.getDocument !== "function") {
+    return proposal;
+  }
+  const lastSync = Date.parse(current.lastProviderSyncAt ?? "");
+  if (!force && Number.isFinite(lastSync) && Date.now() - lastSync < SIGNWELL_SYNC_INTERVAL_MS) {
+    return proposal;
+  }
+
+  try {
+    const document = await client.getDocument(current.documentId);
+    const metadata = signWellDocumentMetadata(document);
+    if (
+      document?.id !== current.documentId ||
+      metadata.workspaceId !== workspaceId ||
+      metadata.proposalId !== proposal.id
+    ) {
+      console.warn("SignWell reconciliation ignored mismatched document metadata", {
+        workspaceId,
+        proposalId: proposal.id,
+        documentId: current.documentId,
+      });
+      return proposal;
+    }
+
+    const now = new Date().toISOString();
+    const status = normalizeSignWellStatus(document.status, current.status);
+    const documentRecipients = Array.isArray(document.recipients) ? document.recipients : [];
+    const recipients = Array.isArray(current.recipients)
+      ? current.recipients.map((recipient) => {
+        const providerRecipient = documentRecipients.find((item) => item?.id === recipient.id);
+        const providerStatus = normalizeSignWellRecipientStatus(providerRecipient?.status, recipient.status);
+        return {
+          ...recipient,
+          ...(typeof providerRecipient?.name === "string" ? { name: providerRecipient.name } : {}),
+          ...(typeof providerRecipient?.email === "string"
+            ? { email: providerRecipient.email.trim().toLowerCase() }
+            : {}),
+          status: status === "completed" ? "signed" : providerStatus,
+          ...(status === "completed" || providerStatus === "signed"
+            ? { signedAt: recipient.signedAt ?? document.updated_at ?? now }
+            : {}),
+        };
+      })
+      : [];
+    const eventAt = typeof document.updated_at === "string" ? document.updated_at : now;
+    const updated = {
+      ...current,
+      status,
+      recipients,
+      lastProviderSyncAt: now,
+      lastEvent: status === "completed" ? "document_completed" : current.lastEvent,
+      lastEventAt: status === "completed" ? eventAt : current.lastEventAt,
+      updatedAt: now,
+      ...(status === "completed" ? { completedAt: eventAt } : {}),
+    };
+    await store.updateProposalSignature(workspaceId, proposal.id, updated);
+    return { ...proposal, signatureRequest: updated };
+  } catch (error) {
+    console.warn("SignWell reconciliation failed", {
+      workspaceId,
+      proposalId: proposal.id,
+      documentId: current.documentId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return proposal;
+  }
+}
+
+function normalizeSignWellRecipientStatus(value, fallback = "pending") {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "completed" || normalized === "signed") return "signed";
+  if (normalized === "sent" || normalized === "created") return "pending";
+  if (["pending", "viewed", "declined", "bounced", "expired", "canceled"].includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
 }
 
 function proposalPdfFilename(name) {
@@ -1400,7 +1496,7 @@ async function handleProposalApi(event, {
       return json(201, signatureRequest);
     }
 
-    const current = proposal.signatureRequest;
+    let current = proposal.signatureRequest;
     if (!current || current.provider !== "signwell" || typeof current.documentId !== "string") {
       return json(404, { message: "This proposal has no SignWell signature request" });
     }
@@ -1419,6 +1515,16 @@ async function handleProposalApi(event, {
     }
     if (action === "completed-pdf" && method === "POST") {
       if (current.status !== "completed") {
+        const reconciled = await reconcileSignWellSignature({
+          proposal,
+          workspaceId,
+          store,
+          client: signWell.client,
+          force: true,
+        });
+        current = reconciled.signatureRequest;
+      }
+      if (current.status !== "completed") {
         return json(409, { message: "The signed PDF is available after every signer completes the document" });
       }
       return json(200, {
@@ -1431,7 +1537,16 @@ async function handleProposalApi(event, {
   const proposalId = getEntityId(event, path, "proposals", "proposalId");
   if (proposalId) {
     if (method === "GET") {
-      const proposal = await store.getProposal(workspaceId, proposalId);
+      let proposal = await store.getProposal(workspaceId, proposalId);
+      if (proposal && isActiveSignatureRequest(proposal.signatureRequest)) {
+        const signWell = await getSignWell();
+        proposal = await reconcileSignWellSignature({
+          proposal,
+          workspaceId,
+          store,
+          client: signWell.client,
+        });
+      }
       return proposal ? json(200, proposal) : json(404, { message: "Proposal not found" });
     }
     if (method === "PATCH") {

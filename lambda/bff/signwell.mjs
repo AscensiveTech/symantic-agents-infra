@@ -58,6 +58,11 @@ export function createSignWellClient({
 
   return {
     testMode: testMode !== false,
+    getDocument(documentId) {
+      return request(`/documents/${encodeURIComponent(documentId)}`, {
+        method: "GET",
+      });
+    },
     createDocument(document) {
       return request("/documents", {
         method: "POST",
