@@ -7,6 +7,7 @@ import {
   resolveRetellVoiceId,
 } from "./providers.mjs";
 import { buildReceptionistConfig, resolveConfiguredVoiceId } from "./receptionist.mjs";
+import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
   RECEPTIONIST_PLANS,
@@ -29,7 +30,6 @@ const PROFILE_FIELDS = {
   phone: "string",
   description: "string",
   hours: "string",
-  services: "string[]",
   faqs: "faq[]",
   policies: "string",
   escalationContact: "string",
@@ -97,11 +97,14 @@ function isProfile(value) {
       typeof item.question === "string" &&
       typeof item.answer === "string"
     ));
-  });
+  }) && ("businessHours" in value ? isBusinessHours(value.businessHours) : true);
 }
 
 function pickProfile(value) {
-  return Object.fromEntries(Object.keys(PROFILE_FIELDS).map((field) => [field, value[field]]));
+  return {
+    ...Object.fromEntries(Object.keys(PROFILE_FIELDS).map((field) => [field, value[field]])),
+    ...(isBusinessHours(value.businessHours) ? { businessHours: value.businessHours } : {}),
+  };
 }
 
 const INVALID = Symbol("invalid");
@@ -609,6 +612,8 @@ export function createHandler({
           retellAgentId: runtime.retellAgentId,
           workspaceId,
           agentId: agentAction.agentId,
+          currentTime: formatCurrentTime(profile.timezone),
+          timezone: typeof profile.timezone === "string" ? profile.timezone : "UTC",
         });
         return json(202, {
           ...call,
@@ -2068,6 +2073,8 @@ async function handleInboundLookup(event, {
       dynamic_variables: {
         workspaceId: phoneNumber.workspaceId,
         agentId: phoneNumber.agentId,
+        currentTime: formatCurrentTime(profile.timezone),
+        timezone: typeof profile.timezone === "string" ? profile.timezone : "UTC",
       },
       metadata: {
         workspaceId: phoneNumber.workspaceId,
