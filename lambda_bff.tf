@@ -6,6 +6,7 @@ data "archive_file" "bff" {
     "index.test.mjs",
     "providers.test.mjs",
     "receptionist.test.mjs",
+    "receptionist-billing.test.mjs",
     "proposals.test.mjs",
   ]
 }
@@ -70,6 +71,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.control_plane["calls"].arn
+      },
+      {
+        Sid      = "ReadWorkspaceUsage"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["workspace_usage"].arn
       },
       {
         Sid    = "ManagePhoneNumbers"
@@ -204,6 +211,7 @@ resource "aws_lambda_function" "bff" {
       PHONE_NUMBERS_TABLE         = aws_dynamodb_table.control_plane["phone_numbers"].name
       CALENDAR_CONNECTIONS_TABLE  = aws_dynamodb_table.control_plane["calendar_connections"].name
       CALLS_TABLE                 = aws_dynamodb_table.control_plane["calls"].name
+      WORKSPACE_USAGE_TABLE       = aws_dynamodb_table.control_plane["workspace_usage"].name
       PROPOSALS_TABLE             = aws_dynamodb_table.control_plane["proposals"].name
       PROPOSAL_PARTS_TABLE        = aws_dynamodb_table.control_plane["proposal_parts"].name
       PROPOSAL_TEMPLATES_TABLE    = aws_dynamodb_table.control_plane["proposal_templates"].name

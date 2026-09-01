@@ -3,6 +3,58 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 const ROUTE = "/retell/webhooks/call-ended";
 export const MAX_MARSHALLED_CALL_ITEM_BYTES = 380 * 1024;
 
+// Whole-minute billing: any call with talk time bills at least one minute.
+export function billedMinutes(durationMs) {
+  return typeof durationMs === "number" && durationMs > 0
+    ? Math.ceil(durationMs / 60_000)
+    : 0;
+}
+
+// tz-local YYYY-MM for a call's start timestamp — the billing cycle it belongs to.
+export function periodKey(value, timeZone) {
+  const date = value instanceof Date ? value : new Date(value ?? Date.now());
+  if (Number.isNaN(date.getTime())) return null;
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timeZone || "UTC",
+      year: "numeric",
+      month: "2-digit",
+    }).formatToParts(date);
+    const year = parts.find((p) => p.type === "year")?.value;
+    const month = parts.find((p) => p.type === "month")?.value;
+    return year && month ? `${year}-${month}` : null;
+  } catch {
+    return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+}
+
+const CALLER_NAME_PATTERN =
+  /\b(?:my name is|this is|i['’]?m|i am|it['’]?s|speaking[,]? this is)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)/i;
+const CALLER_NAME_STOPWORDS = new Set([
+  "calling", "here", "sorry", "just", "not", "trying", "looking", "wondering",
+  "hoping", "with", "from", "the", "a", "an", "good", "so", "actually",
+]);
+
+// Best-effort caller name when the agent didn't capture one: scan the caller's
+// own turns for a self-introduction. Returns a title-cased name or undefined.
+export function extractCallerNameFromTranscript(transcript) {
+  if (!Array.isArray(transcript)) return undefined;
+  for (const entry of transcript) {
+    if (!entry || entry.speaker !== "Caller" || typeof entry.text !== "string") continue;
+    const match = entry.text.match(CALLER_NAME_PATTERN);
+    if (!match) continue;
+    const name = match[1].trim().replace(/\s+/g, " ");
+    if (name.length > 40) continue;
+    const [first] = name.toLowerCase().split(" ");
+    if (CALLER_NAME_STOPWORDS.has(first)) continue;
+    return name
+      .split(" ")
+      .map((part) => part[0].toUpperCase() + part.slice(1).toLowerCase())
+      .join(" ");
+  }
+  return undefined;
+}
+
 export function verifyRetellSignature(
   rawBody,
   apiKey,
@@ -39,6 +91,7 @@ export function createHandler({
   getRetellApiKey = getDefaultRetellApiKey,
   getStore = getDefaultStore,
   getRecordingStore = getDefaultRecordingStore,
+  getUsageStore = getDefaultUsageStore,
   fetchImpl = globalThis.fetch,
   now = () => new Date(),
 } = {}) {
@@ -122,14 +175,21 @@ export function createHandler({
         fetchImpl,
       });
     }
-    const buildCallRecord = (transcript, storedToolLog, truncated) => ({
+    const buildCallRecord = (transcript, storedToolLog, truncated) => {
+      const transcriptName = summary.callerName
+        ? undefined
+        : extractCallerNameFromTranscript(transcript);
+      return {
       workspaceId,
       callId,
       retellCallId,
       agentId,
       direction: stringValue(call.direction),
       callerNumber: callerNumber(call),
-      callerName: summary.callerName,
+      callerName: summary.callerName ?? transcriptName,
+      callerNameSource: summary.callerName
+        ? "agent"
+        : (transcriptName ? "transcript" : undefined),
       intent: summary.intent,
       startedAt: timestampValue(call.start_timestamp),
       endedAt: timestampValue(call.end_timestamp),
@@ -153,7 +213,8 @@ export function createHandler({
       outcome: inferOutcome(call, toolLog),
       createdAt: timestamp,
       updatedAt: timestamp,
-    });
+      };
+    };
     const content = truncateCallContent(
       normalizeTranscript(call.transcript_object, call.transcript),
       toolLog,
@@ -168,8 +229,20 @@ export function createHandler({
       store ??= await getStore();
       // Merge rather than overwrite: `call_ended` and `call_analyzed` can arrive in
       // either order, and each carries fields the other may not.
-      await store.upsertCall(record);
+      const upsert = (await store.upsertCall(record)) ?? {};
       await backfillToolRecords(store, { ...record, toolLog });
+      // Maintain the per-cycle usage counter that gates the inbound hard stop.
+      // Only the first (item-creating) write of a call increments it, so the
+      // call_ended + call_analyzed webhooks stay idempotent.
+      if (upsert.created) {
+        await incrementUsageCounter({
+          getUsageStore,
+          store,
+          workspaceId,
+          startedAt: record.startedAt ?? timestamp,
+          durationMs: record.durationMs,
+        });
+      }
       if (
         eventType === "call_ended" &&
         call?.metadata?.kind === "test" &&
@@ -316,6 +389,30 @@ async function captureRecording({ recordingUrl, workspaceId, callId, getRecordin
   } catch (error) {
     console.error("Recording capture failed", { name: error?.name, message: error?.message, callId });
     return undefined;
+  }
+}
+
+// Add this call's billed minutes to the workspace's current-cycle counter.
+// Never throws — a failed counter update must not fail the webhook (the Billing
+// page's authoritative total is recomputed from the calls table anyway).
+async function incrementUsageCounter({ getUsageStore, workspaceId, startedAt, durationMs }) {
+  const minutes = billedMinutes(durationMs);
+  if (minutes <= 0) return;
+  try {
+    const usage = await getUsageStore();
+    if (!usage || typeof usage.increment !== "function") return;
+    const timezone = typeof usage.getTimezone === "function"
+      ? await usage.getTimezone(workspaceId)
+      : "UTC";
+    const period = periodKey(startedAt, timezone || "UTC");
+    if (!period) return;
+    await usage.increment(workspaceId, period, minutes);
+  } catch (error) {
+    console.error("Usage counter update failed", {
+      name: error?.name,
+      message: error?.message,
+      workspaceId,
+    });
   }
 }
 
@@ -640,14 +737,15 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
         values[`:v${index}`] = value;
         sets.push(`#k${index} = :v${index}`);
       });
-      await client.send(new commands.UpdateItemCommand({
+      const result = await client.send(new commands.UpdateItemCommand({
         TableName: requiredTable(tableNames.calls),
         Key: marshall({ workspaceId: record.workspaceId, callId: record.callId }),
         UpdateExpression: `SET ${sets.join(", ")}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: marshall(values),
+        ReturnValues: "ALL_OLD",
       }));
-      return record;
+      return { record, created: !result.Attributes };
     },
 
     async upsertAppointment(record) {
@@ -787,9 +885,48 @@ export function createS3RecordingStore(client, commands, bucket) {
   };
 }
 
+export function createDynamoUsageStore(client, commands, { usageTable, profilesTable }) {
+  return {
+    async getTimezone(workspaceId) {
+      if (!profilesTable) return "UTC";
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: profilesTable,
+        Key: marshall({ workspaceId }),
+        ProjectionExpression: "#tz",
+        ExpressionAttributeNames: { "#tz": "timezone" },
+      }));
+      return (result.Item && fromAttributeValue(result.Item.timezone)) || "UTC";
+    },
+    async increment(workspaceId, period, minutes) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: requiredTable(usageTable),
+        Key: marshall({ workspaceId, period }),
+        UpdateExpression:
+          "ADD billedMinutes :m, callCount :one SET expiresAt = if_not_exists(expiresAt, :exp)",
+        ExpressionAttributeValues: marshall({
+          ":m": minutes,
+          ":one": 1,
+          ":exp": Math.floor(Date.now() / 1000) + 18 * 30 * 24 * 60 * 60,
+        }),
+      }));
+    },
+  };
+}
+
 let retellApiKeyPromise;
 let storePromise;
 let recordingStorePromise;
+let usageStorePromise;
+async function getDefaultUsageStore() {
+  if (!process.env.WORKSPACE_USAGE_TABLE) return null;
+  usageStorePromise ??= import("@aws-sdk/client-dynamodb").then((commands) =>
+    createDynamoUsageStore(new commands.DynamoDBClient({}), commands, {
+      usageTable: process.env.WORKSPACE_USAGE_TABLE,
+      profilesTable: process.env.BUSINESS_PROFILES_TABLE,
+    })
+  );
+  return usageStorePromise;
+}
 async function getDefaultRecordingStore() {
   if (!process.env.CALL_ARTIFACTS_BUCKET) return null;
   recordingStorePromise ??= import("@aws-sdk/client-s3").then((commands) =>

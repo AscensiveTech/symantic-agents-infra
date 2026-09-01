@@ -3,10 +3,110 @@ import test from "node:test";
 
 import {
   MAX_MARSHALLED_CALL_ITEM_BYTES,
+  billedMinutes,
   createDynamoPostcallStore,
   createHandler,
+  extractCallerNameFromTranscript,
   marshalledCallItemBytes,
+  periodKey,
 } from "./index.mjs";
+
+test("billedMinutes rounds any talk time up to a whole minute", () => {
+  assert.equal(billedMinutes(0), 0);
+  assert.equal(billedMinutes(undefined), 0);
+  assert.equal(billedMinutes(1), 1);
+  assert.equal(billedMinutes(60_000), 1);
+  assert.equal(billedMinutes(61_000), 2);
+});
+
+test("periodKey buckets a call by the workspace timezone, not UTC", () => {
+  assert.equal(periodKey("2026-09-30T23:30:00-04:00", "America/New_York"), "2026-09");
+  assert.equal(periodKey("2026-09-30T23:30:00-04:00", "UTC"), "2026-10");
+});
+
+test("extractCallerNameFromTranscript finds a self-introduction and rejects junk", () => {
+  assert.equal(
+    extractCallerNameFromTranscript([
+      { speaker: "Agent", text: "Thanks for calling." },
+      { speaker: "Caller", text: "Hi, my name is jordan miles and I need an appointment." },
+    ]),
+    "Jordan Miles",
+  );
+  assert.equal(
+    extractCallerNameFromTranscript([
+      { speaker: "Caller", text: "I'm calling about my bill." },
+    ]),
+    undefined,
+  );
+});
+
+test("call_analyzed falls back to the transcript for the caller name and flags the source", async () => {
+  let persistedCall;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async upsertCall(record) {
+        persistedCall = structuredClone(record);
+        return { record, created: true };
+      },
+    }),
+    getRecordingStore: async () => null,
+  });
+  const response = await handler(callAnalyzedEvent({
+    call_id: "retell-call-name",
+    metadata: { workspaceId: "workspace-123" },
+    start_timestamp: 1_800_000_000_000,
+    end_timestamp: 1_800_000_030_000,
+    transcript_object: [
+      { role: "user", content: "Hello, this is Dana Whitfield calling." },
+    ],
+    transcript_with_tool_calls: [],
+  }));
+  assert.equal(response.statusCode, 204);
+  assert.equal(persistedCall.callerName, "Dana Whitfield");
+  assert.equal(persistedCall.callerNameSource, "transcript");
+});
+
+test("a newly-created call increments the workspace usage counter once", async () => {
+  const increments = [];
+  const store = {
+    async upsertCall() {
+      return { record: {}, created: true };
+    },
+  };
+  const usageStore = {
+    async getTimezone() {
+      return "America/New_York";
+    },
+    async increment(workspaceId, period, minutes) {
+      increments.push({ workspaceId, period, minutes });
+    },
+  };
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => store,
+    getRecordingStore: async () => null,
+    getUsageStore: async () => usageStore,
+  });
+  const call = {
+    call_id: "retell-call-usage",
+    metadata: { workspaceId: "workspace-123" },
+    start_timestamp: Date.parse("2026-09-30T23:30:00-04:00"),
+    end_timestamp: Date.parse("2026-09-30T23:31:30-04:00"),
+    transcript_with_tool_calls: [],
+  };
+  await handler(callEndedEvent(call));
+  assert.deepEqual(increments, [
+    { workspaceId: "workspace-123", period: "2026-09", minutes: 2 },
+  ]);
+
+  // A second webhook for the same call (not created) must not double-count.
+  store.upsertCall = async () => ({ record: {}, created: false });
+  await handler(callAnalyzedEvent(call));
+  assert.equal(increments.length, 1);
+});
 
 test("invalid signature returns 401 without persisting the call", async () => {
   let storeLoads = 0;
