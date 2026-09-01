@@ -1189,6 +1189,7 @@ test("proposal signature requests send the private PDF through SignWell and pers
   assert.equal(signWellRequest.text_tags, true);
   assert.equal(signWellRequest.with_signature_page, false);
   assert.equal(signWellRequest.embedded_signing, true);
+  assert.equal(signWellRequest.recipients[0].send_email, true);
   assert.deepEqual(signWellRequest.metadata, {
     workspaceId: "user-123",
     proposalId: "prp-sign",
