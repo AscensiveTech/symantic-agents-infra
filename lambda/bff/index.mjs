@@ -1285,8 +1285,9 @@ function normalizeSignWellRecipientStatus(value, fallback = "pending") {
   if (typeof value !== "string" || !value.trim()) return fallback;
   const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (normalized === "completed" || normalized === "signed") return "signed";
-  if (normalized === "sent" || normalized === "created") return "pending";
-  if (["pending", "viewed", "declined", "bounced", "expired", "canceled"].includes(normalized)) {
+  if (normalized === "sent") return "sent";
+  if (normalized === "created") return "pending";
+  if (["pending", "in_progress", "viewed", "declined", "bounced", "expired", "canceled"].includes(normalized)) {
     return normalized;
   }
   return fallback;
@@ -1469,6 +1470,7 @@ async function handleProposalApi(event, {
       }
       const now = new Date().toISOString();
       const createdStatus = normalizeSignWellStatus(created.status, "sent");
+      const createdRecipients = Array.isArray(created.recipients) ? created.recipients : [];
       const testSigningUrl = embeddedTestMode && Array.isArray(created.recipients)
         ? created.recipients.find((recipient) =>
           typeof recipient?.embedded_signing_url === "string" && recipient.embedded_signing_url
@@ -1483,12 +1485,21 @@ async function handleProposalApi(event, {
         subject: input.subject,
         message: input.message,
         applySigningOrder: input.applySigningOrder,
-        recipients: input.recipients.map((recipient, index) => ({
-          id: String(index + 1),
-          name: recipient.name,
-          email: recipient.email,
-          status: "pending",
-        })),
+        recipients: input.recipients.map((recipient, index) => {
+          const id = String(index + 1);
+          const providerRecipient = createdRecipients.find((item) =>
+            item?.id === id || item?.email?.trim().toLowerCase() === recipient.email
+          );
+          const fallbackStatus = embeddedTestMode || (input.applySigningOrder && index > 0)
+            ? "pending"
+            : "sent";
+          return {
+            id,
+            name: recipient.name,
+            email: recipient.email,
+            status: normalizeSignWellRecipientStatus(providerRecipient?.status, fallbackStatus),
+          };
+        }),
         sentAt: now,
         updatedAt: now,
       };
