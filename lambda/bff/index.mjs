@@ -940,10 +940,20 @@ async function loadWorkspaceUsageWithCost(store, workspaceId) {
 }
 
 async function platformCompanySummary(store, workspace) {
-  const [members, proposals, templates] = await Promise.all([
+  // proposalCount / templateCount are just numbers on a list badge - counting
+  // with Select: COUNT instead of pulling (and unmarshalling) every full
+  // proposal and template for every company. listProposals here was the
+  // single most expensive call on the platform companies page.
+  const countProposals = typeof store.countProposals === "function"
+    ? store.countProposals(workspace.workspaceId)
+    : store.listProposals(workspace.workspaceId).then((rows) => rows.length);
+  const countTemplates = typeof store.countProposalTemplates === "function"
+    ? store.countProposalTemplates(workspace.workspaceId)
+    : store.listProposalTemplates(workspace.workspaceId).then((rows) => rows.length);
+  const [members, proposalCount, templateCount] = await Promise.all([
     store.listMemberships(workspace.workspaceId),
-    store.listProposals(workspace.workspaceId),
-    store.listProposalTemplates(workspace.workspaceId),
+    countProposals,
+    countTemplates,
   ]);
   return {
     workspaceId: workspace.workspaceId,
@@ -955,8 +965,8 @@ async function platformCompanySummary(store, workspace) {
     ),
     tier: normalizeCompanyTier(workspace.tier),
     userCount: members.filter((member) => member.status !== "disabled").length,
-    proposalCount: proposals.length,
-    templateCount: templates.length,
+    proposalCount,
+    templateCount,
     receptionistPlanOverride: PLAN_KEYS.includes(workspace.receptionistPlanOverride)
       ? workspace.receptionistPlanOverride
       : null,
@@ -2446,13 +2456,46 @@ function toPublicEntity(item, keyField) {
 
 export function createDynamoStore(client, commands, tableNames) {
   async function listRecords(tableName, keyField, workspaceId) {
-    const result = await client.send(new commands.QueryCommand({
-      TableName: tableName,
-      KeyConditionExpression: "workspaceId = :workspaceId",
-      ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
-      ConsistentRead: true,
-    }));
-    return (result.Items ?? []).map((item) => toPublicEntity(unmarshall(item), keyField));
+    // Eventually-consistent: these list reads back the workspace's own
+    // dashboards, where a sub-second lag on a just-written row is invisible
+    // and the frontend applies its own optimistic update anyway. A strongly
+    // consistent Query costs 2x the read capacity and runs slower.
+    const items = [];
+    let exclusiveStartKey;
+    do {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableName,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }));
+      for (const item of result.Items ?? []) items.push(toPublicEntity(unmarshall(item), keyField));
+      // A Query stops at 1 MB of matched items - without following
+      // LastEvaluatedKey a workspace with enough proposals to cross that
+      // silently loses the overflow from every listing.
+      exclusiveStartKey = result.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return items;
+  }
+
+  // COUNT-only variant for callers that just need "how many" (the platform
+  // companies list) - Select: COUNT never ships item bodies, so counting a
+  // workspace's proposals no longer means unmarshalling every full proposal.
+  async function countRecords(tableName, workspaceId) {
+    let count = 0;
+    let exclusiveStartKey;
+    do {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableName,
+        Select: "COUNT",
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }));
+      count += result.Count ?? 0;
+      exclusiveStartKey = result.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return count;
   }
 
   async function getRecord(tableName, keyField, workspaceId, id) {
@@ -2791,6 +2834,14 @@ export function createDynamoStore(client, commands, tableNames) {
     async listProposals(workspaceId) {
       const records = await listRecords(tableNames.proposals, "proposalId", workspaceId);
       return records.sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""));
+    },
+
+    countProposals(workspaceId) {
+      return countRecords(tableNames.proposals, workspaceId);
+    },
+
+    countProposalTemplates(workspaceId) {
+      return countRecords(tableNames.proposalTemplates, workspaceId);
     },
 
     getProposal(workspaceId, proposalId) {

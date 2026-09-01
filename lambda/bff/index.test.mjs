@@ -2531,3 +2531,56 @@ test("PATCH /platform/companies sets a plan override with custom Enterprise numb
   assert.equal(saved.enterpriseMinutes, 8000);
   assert.equal(saved.planHistory.at(-1).plan, "Enterprise");
 });
+
+test("Dynamo list reads page past the 1 MB limit and skip strong consistency", async () => {
+  class QueryCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  const inputs = [];
+  const pages = [
+    { Items: [{ workspaceId: { S: "ws-1" }, proposalId: { S: "prp-1" }, name: { S: "One" } }], LastEvaluatedKey: { proposalId: { S: "prp-1" } } },
+    { Items: [{ workspaceId: { S: "ws-1" }, proposalId: { S: "prp-2" }, name: { S: "Two" } }] },
+  ];
+  const client = {
+    async send(command) {
+      inputs.push(command.input);
+      return pages[inputs.length - 1] ?? { Items: [] };
+    },
+  };
+  const { createDynamoStore } = await loadBff();
+  const store = createDynamoStore(client, { QueryCommand }, { proposals: "proposals-table" });
+
+  const proposals = await store.listProposals("ws-1");
+
+  assert.deepEqual(proposals.map((item) => item.id), ["prp-1", "prp-2"]);
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[0].ConsistentRead, undefined);
+  assert.deepEqual(inputs[1].ExclusiveStartKey, { proposalId: { S: "prp-1" } });
+});
+
+test("Dynamo countProposals uses Select COUNT without shipping item bodies", async () => {
+  class QueryCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  const inputs = [];
+  const client = {
+    async send(command) {
+      inputs.push(command.input);
+      return inputs.length === 1
+        ? { Count: 40, LastEvaluatedKey: { proposalId: { S: "prp-40" } } }
+        : { Count: 12 };
+    },
+  };
+  const { createDynamoStore } = await loadBff();
+  const store = createDynamoStore(client, { QueryCommand }, { proposals: "proposals-table" });
+
+  const count = await store.countProposals("ws-1");
+
+  assert.equal(count, 52);
+  assert.equal(inputs[0].Select, "COUNT");
+  assert.equal(inputs[0].ProjectionExpression, undefined);
+});
