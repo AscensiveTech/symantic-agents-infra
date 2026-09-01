@@ -73,6 +73,12 @@ resource "aws_iam_role_policy" "oauth_runtime" {
         Resource = aws_dynamodb_table.control_plane["calendar_connections"].arn
       },
       {
+        Sid      = "ReadWorkspaceMemberships"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.workspace_memberships.arn
+      },
+      {
         Sid    = "ReadOAuthSecrets"
         Effect = "Allow"
         Action = ["secretsmanager:GetSecretValue"]
@@ -115,14 +121,15 @@ resource "aws_lambda_function" "oauth" {
 
   environment {
     variables = {
-      APP_URL                    = local.app_url
-      OAUTH_REDIRECT_BASE_URL    = aws_apigatewayv2_api.bff.api_endpoint
-      OAUTH_STATE_TTL_SECONDS    = "600"
-      OAUTH_STATES_TABLE         = aws_dynamodb_table.oauth_states.name
-      CALENDAR_CONNECTIONS_TABLE = aws_dynamodb_table.control_plane["calendar_connections"].name
-      CALENDAR_TOKENS_KMS_KEY_ID = aws_kms_key.calendar_tokens.arn
-      GOOGLE_OAUTH_SECRET_ARN    = aws_secretsmanager_secret.providers["google-oauth"].arn
-      MICROSOFT_OAUTH_SECRET_ARN = aws_secretsmanager_secret.providers["microsoft-oauth"].arn
+      APP_URL                     = local.app_url
+      OAUTH_REDIRECT_BASE_URL     = aws_apigatewayv2_api.bff.api_endpoint
+      OAUTH_STATE_TTL_SECONDS     = "600"
+      OAUTH_STATES_TABLE          = aws_dynamodb_table.oauth_states.name
+      CALENDAR_CONNECTIONS_TABLE  = aws_dynamodb_table.control_plane["calendar_connections"].name
+      WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
+      CALENDAR_TOKENS_KMS_KEY_ID  = aws_kms_key.calendar_tokens.arn
+      GOOGLE_OAUTH_SECRET_ARN     = aws_secretsmanager_secret.providers["google-oauth"].arn
+      MICROSOFT_OAUTH_SECRET_ARN  = aws_secretsmanager_secret.providers["microsoft-oauth"].arn
     }
   }
 
