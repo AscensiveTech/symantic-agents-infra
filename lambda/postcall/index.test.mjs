@@ -42,7 +42,7 @@ test("valid call_ended persists a normalized call and marks a test agent tested"
   let persistedCall;
   let testedAgent;
   const store = {
-    async putCall(record) {
+    async upsertCall(record) {
       persistedCall = structuredClone(record);
     },
     async markAgentTested(workspaceId, agentId, testedAt) {
@@ -86,7 +86,8 @@ test("valid call_ended persists a normalized call and marks a test agent tested"
   assert.equal(persistedCall.retellCallId, call.call_id);
   assert.equal(persistedCall.workspaceId, "workspace-123");
   assert.equal(persistedCall.agentId, "agent-123");
-  assert.equal(persistedCall.recordingUrl, call.recording_url);
+  assert.equal(persistedCall.recordingKey, undefined); // recording is captured on call_analyzed
+  assert.equal(persistedCall.callSummary, undefined); // summary arrives on call_analyzed
   assert.equal(persistedCall.outcome, "answered");
   assert.equal(persistedCall.durationMs, 123_000);
   assert.deepEqual(persistedCall.transcript, [
@@ -100,6 +101,95 @@ test("valid call_ended persists a normalized call and marks a test agent tested"
   });
 });
 
+test("call_analyzed persists the summary + sentiment and copies the recording to S3", async () => {
+  let persistedCall;
+  let testedAgent;
+  const recordings = [];
+  const store = {
+    async upsertCall(record) {
+      persistedCall = structuredClone(record);
+    },
+    async markAgentTested(workspaceId, agentId, testedAt) {
+      testedAgent = { workspaceId, agentId, testedAt };
+    },
+  };
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => store,
+    getRecordingStore: async () => ({
+      async putRecording(key, body, contentType) {
+        recordings.push({ key, bytes: body.length, contentType });
+      },
+    }),
+    fetchImpl: async (url) => {
+      assert.equal(url, "https://retell.example/final-recording.wav");
+      return {
+        ok: true,
+        headers: { get: () => "audio/wav" },
+        arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+      };
+    },
+    now: () => new Date("2026-08-16T14:05:00.000Z"),
+  });
+  const call = {
+    call_id: "retell-call-123",
+    direction: "inbound",
+    from_number: "+17035550100",
+    to_number: "+17035550177",
+    start_timestamp: 1_800_000_000_000,
+    end_timestamp: 1_800_000_123_000,
+    recording_url: "https://retell.example/final-recording.wav",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    transcript_object: [
+      { role: "user", content: "Are you open Saturday?", words: [{ start: 1, end: 2 }] },
+    ],
+    transcript_with_tool_calls: [],
+    call_analysis: {
+      call_summary: "Caller asked about Saturday hours; agent confirmed 9-1.",
+      user_sentiment: "Positive",
+      call_successful: true,
+      in_voicemail: false,
+    },
+  };
+
+  const response = await handler(callAnalyzedEvent(call));
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(persistedCall.callSummary, call.call_analysis.call_summary);
+  assert.equal(persistedCall.userSentiment, "Positive");
+  assert.equal(persistedCall.callSuccessful, true);
+  assert.equal(persistedCall.recordingKey, `calls/${persistedCall.callId}.wav`);
+  assert.deepEqual(recordings, [{
+    key: `workspaces/workspace-123/calls/${persistedCall.callId}.wav`,
+    bytes: 4,
+    contentType: "audio/wav",
+  }]);
+  assert.equal(testedAgent, undefined); // markAgentTested is call_ended's job
+});
+
+test("call_analyzed still succeeds when the recording download fails", async () => {
+  let persistedCall;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({ async upsertCall(record) { persistedCall = record; } }),
+    getRecordingStore: async () => ({ async putRecording() { throw new Error("nope"); } }),
+    fetchImpl: async () => ({ ok: false }),
+    now: () => new Date("2026-08-16T14:05:00.000Z"),
+  });
+  const response = await handler(callAnalyzedEvent({
+    call_id: "retell-call-123",
+    recording_url: "https://retell.example/gone.wav",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    transcript_with_tool_calls: [],
+    call_analysis: { call_summary: "Short call." },
+  }));
+  assert.equal(response.statusCode, 204);
+  assert.equal(persistedCall.callSummary, "Short call.");
+  assert.equal(persistedCall.recordingKey, undefined);
+});
+
 test("failed test call_ended persists the call without marking the agent tested", async () => {
   let persistedCall;
   let testedAgent;
@@ -107,7 +197,7 @@ test("failed test call_ended persists the call without marking the agent tested"
     verifySignature: () => true,
     getRetellApiKey: async () => "retell-key",
     getStore: async () => ({
-      async putCall(record) {
+      async upsertCall(record) {
         persistedCall = structuredClone(record);
       },
       async markAgentTested(workspaceId, agentId, testedAt) {
@@ -140,7 +230,7 @@ test("abandoned test call_ended persists the call without marking the agent test
     verifySignature: () => true,
     getRetellApiKey: async () => "retell-key",
     getStore: async () => ({
-      async putCall(record) {
+      async upsertCall(record) {
         persistedCall = structuredClone(record);
       },
       async markAgentTested(workspaceId, agentId, testedAt) {
@@ -176,7 +266,7 @@ test("call_ended resolves workspace from the Retell agent FK when metadata is ab
         agentId: "agent-123",
       };
     },
-    async putCall(record) {
+    async upsertCall(record) {
       persistedCall = structuredClone(record);
     },
   };
@@ -204,7 +294,7 @@ test("oversized transcript content is truncated instead of failing call ingest",
     verifySignature: () => true,
     getRetellApiKey: async () => "retell-key",
     getStore: async () => ({
-      async putCall(record) {
+      async upsertCall(record) {
         persistedCall = structuredClone(record);
       },
     }),
@@ -235,7 +325,7 @@ test("successful booking tool output sets booked and backfills its appointment",
   let persistedCall;
   let appointment;
   const store = {
-    async putCall(record) {
+    async upsertCall(record) {
       persistedCall = structuredClone(record);
     },
     async upsertAppointment(record) {
@@ -343,7 +433,7 @@ test("successful lead and message tool outputs backfill missing records", async 
     let persistedCall;
     let backfilled;
     const store = {
-      async putCall(record) {
+      async upsertCall(record) {
         persistedCall = structuredClone(record);
       },
       async [sample.method](record) {
@@ -433,10 +523,11 @@ test("Dynamo store synchronously writes calls, conditional backfills, and tested
     },
   );
 
-  await store.putCall({
+  await store.upsertCall({
     workspaceId: "workspace-123",
     callId: "call-123",
     retellCallId: "retell-call-123",
+    createdAt: "2026-08-16T14:00:00.000Z",
   });
   await store.upsertAppointment({
     workspaceId: "workspace-123",
@@ -458,6 +549,9 @@ test("Dynamo store synchronously writes calls, conditional backfills, and tested
 
   assert.equal(sent[0].input.TableName, "calls-table");
   assert.equal(sent[0].input.ConditionExpression, undefined);
+  assert.ok(sent[0] instanceof UpdateItemCommand);
+  assert.match(sent[0].input.UpdateExpression, /#createdAt = if_not_exists\(#createdAt, :createdAt\)/);
+  assert.match(sent[0].input.UpdateExpression, /#k0 = :v0/);
   for (const command of sent.slice(1, 4)) {
     assert.match(command.input.ConditionExpression, /attribute_not_exists/);
   }
@@ -468,6 +562,14 @@ test("Dynamo store synchronously writes calls, conditional backfills, and tested
 });
 
 function callEndedEvent(call) {
+  return webhookEvent("call_ended", call);
+}
+
+function callAnalyzedEvent(call) {
+  return webhookEvent("call_analyzed", call);
+}
+
+function webhookEvent(eventName, call) {
   return {
     requestContext: {
       http: {
@@ -477,6 +579,6 @@ function callEndedEvent(call) {
     },
     rawPath: "/retell/webhooks/call-ended",
     headers: { "x-retell-signature": "valid" },
-    body: JSON.stringify({ event: "call_ended", call }),
+    body: JSON.stringify({ event: eventName, call }),
   };
 }

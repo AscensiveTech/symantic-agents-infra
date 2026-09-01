@@ -23,6 +23,7 @@ locals {
     "POST /workspaces/me/agents/{agentId}/start-test-call",
     "GET /workspaces/me/calls",
     "GET /workspaces/me/calls/{callId}",
+    "GET /workspaces/me/calls/{callId}/recording",
     "GET /workspaces/me/proposals",
     "POST /workspaces/me/proposals",
     "GET /workspaces/me/proposals/{proposalId}",
