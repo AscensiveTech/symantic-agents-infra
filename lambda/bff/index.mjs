@@ -1436,7 +1436,6 @@ async function handleProposalApi(event, {
       }
       const signer = await getAssetSigner();
       const fileUrl = await signer.createDownloadUrl(workspaceId, input.assetKey);
-      const embeddedTestMode = signWell.client.testMode === true;
       const created = await signWell.client.createDocument({
         name: proposal.name || "Proposal",
         subject: input.subject,
@@ -1446,7 +1445,6 @@ async function handleProposalApi(event, {
         apply_signing_order: input.applySigningOrder,
         allow_decline: true,
         allow_reassign: true,
-        ...(embeddedTestMode ? { embedded_signing: true } : {}),
         text_tags: agreementHasSigningFields,
         with_signature_page: !agreementHasSigningFields,
         files: [{
@@ -1458,10 +1456,6 @@ async function handleProposalApi(event, {
           name: recipient.name,
           email: recipient.email,
           delivery_method: "email",
-          // Embedded recipients default to email delivery being disabled in
-          // SignWell. Test mode uses embedding only to expose a safe signing
-          // URL, so opt back into the same notification email as live mode.
-          ...(embeddedTestMode ? { send_email: true } : {}),
         })),
         metadata: {
           workspaceId,
@@ -1475,17 +1469,11 @@ async function handleProposalApi(event, {
       const now = new Date().toISOString();
       const createdStatus = normalizeSignWellStatus(created.status, "sent");
       const createdRecipients = Array.isArray(created.recipients) ? created.recipients : [];
-      const testSigningUrl = embeddedTestMode && Array.isArray(created.recipients)
-        ? created.recipients.find((recipient) =>
-          typeof recipient?.embedded_signing_url === "string" && recipient.embedded_signing_url
-        )?.embedded_signing_url
-        : null;
       const signatureRequest = {
         provider: "signwell",
         documentId: created.id,
         status: createdStatus === "created" ? "sent" : createdStatus,
         testMode: created.test_mode === true || signWell.client.testMode === true,
-        ...(testSigningUrl ? { testSigningUrl } : {}),
         subject: input.subject,
         message: input.message,
         applySigningOrder: input.applySigningOrder,
@@ -1494,7 +1482,7 @@ async function handleProposalApi(event, {
           const providerRecipient = createdRecipients.find((item) =>
             item?.id === id || item?.email?.trim().toLowerCase() === recipient.email
           );
-          const fallbackStatus = embeddedTestMode || (input.applySigningOrder && index > 0)
+          const fallbackStatus = input.applySigningOrder && index > 0
             ? "pending"
             : "sent";
           return {
