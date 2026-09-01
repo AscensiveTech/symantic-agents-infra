@@ -123,6 +123,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
         Resource = "${aws_s3_bucket.proposal_assets.arn}/*"
       },
+      {
+        Sid      = "ReadCallRecordings"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.call_artifacts.arn}/*"
+      },
     ]
   })
 }
@@ -204,6 +210,7 @@ resource "aws_lambda_function" "bff" {
       WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
       COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
+      CALL_ARTIFACTS_BUCKET       = aws_s3_bucket.call_artifacts.bucket
       RETELL_SECRET_ARN           = aws_secretsmanager_secret.providers["retell"].arn
       TELNYX_SECRET_ARN           = aws_secretsmanager_secret.providers["telnyx"].arn
       SIGNWELL_SECRET_ARN         = aws_secretsmanager_secret.providers["signwell"].arn

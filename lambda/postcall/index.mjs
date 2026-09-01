@@ -38,6 +38,8 @@ export function createHandler({
   verifySignature = verifyRetellSignature,
   getRetellApiKey = getDefaultRetellApiKey,
   getStore = getDefaultStore,
+  getRecordingStore = getDefaultRecordingStore,
+  fetchImpl = globalThis.fetch,
   now = () => new Date(),
 } = {}) {
   return async function handle(event) {
@@ -71,9 +73,13 @@ export function createHandler({
     } catch {
       return json(400, { message: "Invalid JSON body" });
     }
-    const call = payload?.event === "call_ended" ? payload.call : null;
+    const eventType = payload?.event;
+    if (eventType !== "call_ended" && eventType !== "call_analyzed") {
+      return json(400, { message: "A call_ended or call_analyzed payload is required" });
+    }
+    const call = payload.call;
     if (!call || typeof call !== "object" || Array.isArray(call)) {
-      return json(400, { message: "A call_ended payload is required" });
+      return json(400, { message: "A call payload is required" });
     }
 
     const toolLog = normalizeToolLog(call.transcript_with_tool_calls);
@@ -101,6 +107,21 @@ export function createHandler({
     const timestamp = new Date(now()).toISOString();
     const callId = stableId("call", workspaceId, retellCallId);
     const summary = summarizeCall(call, toolLog);
+    const analysis = call.call_analysis && typeof call.call_analysis === "object"
+      ? call.call_analysis
+      : {};
+    // The recording URL from Retell is short-lived; on `call_analyzed` (where it is
+    // final) we copy the audio into our own S3 so it stays available and access-controlled.
+    let recordingKey;
+    if (eventType === "call_analyzed") {
+      recordingKey = await captureRecording({
+        recordingUrl: stringValue(call.recording_url),
+        workspaceId,
+        callId,
+        getRecordingStore,
+        fetchImpl,
+      });
+    }
     const buildCallRecord = (transcript, storedToolLog, truncated) => ({
       workspaceId,
       callId,
@@ -113,10 +134,15 @@ export function createHandler({
       startedAt: timestampValue(call.start_timestamp),
       endedAt: timestampValue(call.end_timestamp),
       durationMs: durationMs(call),
-      recordingUrl: stringValue(call.recording_url),
+      recordingKey,
       disconnectionReason: stringValue(call.disconnection_reason),
       transcript,
       toolLog: storedToolLog,
+      actions: describeActions(toolLog),
+      callSummary: stringValue(analysis.call_summary),
+      userSentiment: stringValue(analysis.user_sentiment),
+      callSuccessful: typeof analysis.call_successful === "boolean" ? analysis.call_successful : undefined,
+      inVoicemail: typeof analysis.in_voicemail === "boolean" ? analysis.in_voicemail : undefined,
       ...(truncated
         ? {
           transcriptTruncated: true,
@@ -140,9 +166,12 @@ export function createHandler({
     );
     try {
       store ??= await getStore();
-      await store.putCall(record);
+      // Merge rather than overwrite: `call_ended` and `call_analyzed` can arrive in
+      // either order, and each carries fields the other may not.
+      await store.upsertCall(record);
       await backfillToolRecords(store, { ...record, toolLog });
       if (
+        eventType === "call_ended" &&
         call?.metadata?.kind === "test" &&
         agentId &&
         isSuccessfulTestOutcome(record.outcome) &&
@@ -241,6 +270,53 @@ function toolActions(toolLog) {
         successful: result?.successful !== false && output.ok !== false,
       };
     });
+}
+
+function describeActions(toolLog) {
+  const out = toolActions(toolLog)
+    .filter(({ successful }) => successful)
+    .flatMap(({ name, arguments: args }) => {
+      if (name === "calendar_create_booking") {
+        const service = stringValue(args?.service);
+        return [service ? `Booked appointment · ${service}` : "Booked an appointment"];
+      }
+      if (name === "calendar_reschedule_booking") return ["Rescheduled an appointment"];
+      if (name === "calendar_cancel_booking") return ["Cancelled an appointment"];
+      if (name === "message_take") return ["Took a message for the office"];
+      if (name === "lead_capture") return ["Captured a new lead"];
+      if (name === "call_transfer" || (typeof name === "string" && name.startsWith("transfer_call"))) {
+        return ["Transferred the call"];
+      }
+      return [];
+    });
+  return out.length ? out : undefined;
+}
+
+// Copy the Retell recording into our own S3 bucket. Returns the object key on success,
+// undefined on any failure (a missing recording must never fail the webhook).
+async function captureRecording({ recordingUrl, workspaceId, callId, getRecordingStore, fetchImpl }) {
+  if (!recordingUrl || typeof fetchImpl !== "function") return undefined;
+  let store;
+  try {
+    store = await getRecordingStore();
+  } catch (error) {
+    console.error("Recording store unavailable", { name: error?.name, message: error?.message });
+    return undefined;
+  }
+  if (!store || typeof store.putRecording !== "function") return undefined;
+  try {
+    const response = await fetchImpl(recordingUrl);
+    if (!response || !response.ok) return undefined;
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length) return undefined;
+    const key = `calls/${callId}.wav`;
+    const contentType = stringValue(response.headers?.get?.("content-type")) || "audio/wav";
+    await store.putRecording(`workspaces/${workspaceId}/${key}`, bytes, contentType);
+    return key;
+  } catch (error) {
+    console.error("Recording capture failed", { name: error?.name, message: error?.message, callId });
+    return undefined;
+  }
 }
 
 async function backfillToolRecords(store, call) {
@@ -552,8 +628,25 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
       return result.Items?.[0] ? unmarshall(result.Items[0]) : null;
     },
 
-    async putCall(record) {
-      await put(client, commands, tableNames.calls, record);
+    async upsertCall(record) {
+      const reserved = new Set(["workspaceId", "callId", "createdAt"]);
+      const entries = Object.entries(record)
+        .filter(([key, value]) => value !== undefined && !reserved.has(key));
+      const names = { "#createdAt": "createdAt" };
+      const values = { ":createdAt": record.createdAt ?? new Date().toISOString() };
+      const sets = ["#createdAt = if_not_exists(#createdAt, :createdAt)"];
+      entries.forEach(([key, value], index) => {
+        names[`#k${index}`] = key;
+        values[`:v${index}`] = value;
+        sets.push(`#k${index} = :v${index}`);
+      });
+      await client.send(new commands.UpdateItemCommand({
+        TableName: requiredTable(tableNames.calls),
+        Key: marshall({ workspaceId: record.workspaceId, callId: record.callId }),
+        UpdateExpression: `SET ${sets.join(", ")}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: marshall(values),
+      }));
       return record;
     },
 
@@ -605,13 +698,6 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
       }));
     },
   };
-}
-
-async function put(client, commands, tableName, record) {
-  await client.send(new commands.PutItemCommand({
-    TableName: requiredTable(tableName),
-    Item: marshall(record),
-  }));
 }
 
 async function putIfMissing(
@@ -688,8 +774,34 @@ function unmarshall(item) {
   );
 }
 
+export function createS3RecordingStore(client, commands, bucket) {
+  return {
+    async putRecording(key, body, contentType) {
+      await client.send(new commands.PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      }));
+    },
+  };
+}
+
 let retellApiKeyPromise;
 let storePromise;
+let recordingStorePromise;
+async function getDefaultRecordingStore() {
+  if (!process.env.CALL_ARTIFACTS_BUCKET) return null;
+  recordingStorePromise ??= import("@aws-sdk/client-s3").then((commands) =>
+    createS3RecordingStore(
+      new commands.S3Client({}),
+      commands,
+      process.env.CALL_ARTIFACTS_BUCKET,
+    )
+  );
+  return recordingStorePromise;
+}
+
 async function getDefaultStore() {
   storePromise ??= import("@aws-sdk/client-dynamodb").then((commands) =>
     createDynamoPostcallStore(

@@ -41,11 +41,22 @@ resource "aws_iam_role_policy" "postcall_runtime" {
         Effect = "Allow"
         Action = ["dynamodb:PutItem"]
         Resource = [
-          aws_dynamodb_table.control_plane["calls"].arn,
           aws_dynamodb_table.control_plane["appointments"].arn,
           aws_dynamodb_table.control_plane["leads"].arn,
           aws_dynamodb_table.control_plane["messages"].arn,
         ]
+      },
+      {
+        Sid      = "UpsertCallRecord"
+        Effect   = "Allow"
+        Action   = ["dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.control_plane["calls"].arn
+      },
+      {
+        Sid      = "StoreCallRecording"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "${aws_s3_bucket.call_artifacts.arn}/*"
       },
       {
         Sid      = "MarkTestAgentComplete"
@@ -93,12 +104,13 @@ resource "aws_lambda_function" "postcall" {
 
   environment {
     variables = {
-      CALLS_TABLE        = aws_dynamodb_table.control_plane["calls"].name
-      APPOINTMENTS_TABLE = aws_dynamodb_table.control_plane["appointments"].name
-      LEADS_TABLE        = aws_dynamodb_table.control_plane["leads"].name
-      MESSAGES_TABLE     = aws_dynamodb_table.control_plane["messages"].name
-      AGENTS_TABLE       = aws_dynamodb_table.control_plane["agents"].name
-      RETELL_SECRET_ARN  = aws_secretsmanager_secret.providers["retell"].arn
+      CALLS_TABLE          = aws_dynamodb_table.control_plane["calls"].name
+      APPOINTMENTS_TABLE   = aws_dynamodb_table.control_plane["appointments"].name
+      LEADS_TABLE          = aws_dynamodb_table.control_plane["leads"].name
+      MESSAGES_TABLE       = aws_dynamodb_table.control_plane["messages"].name
+      AGENTS_TABLE         = aws_dynamodb_table.control_plane["agents"].name
+      RETELL_SECRET_ARN    = aws_secretsmanager_secret.providers["retell"].arn
+      CALL_ARTIFACTS_BUCKET = aws_s3_bucket.call_artifacts.bucket
     }
   }
 

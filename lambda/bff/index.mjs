@@ -172,6 +172,18 @@ function getCallId(event, path) {
   }
 }
 
+function getCallRecordingId(event, path) {
+  const value = event?.pathParameters?.callId ??
+    path.match(/^\/workspaces\/me\/calls\/([^/]+)\/recording$/)?.[1];
+  if (!value || !path.endsWith("/recording")) return null;
+  try {
+    const decoded = decodeURIComponent(value);
+    return CALL_ID_PATTERN.test(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
 function getEntityId(event, path, collection, parameterName) {
   const pattern = new RegExp(`^/workspaces/me/${collection}/([^/]+)$`);
   const value = event?.pathParameters?.[parameterName] ?? path.match(pattern)?.[1];
@@ -261,6 +273,7 @@ export function createHandler({
   getStore = getDefaultStore,
   getUserDirectory = getDefaultUserDirectory,
   getAssetSigner = getDefaultAssetSigner,
+  getRecordingSigner = getDefaultRecordingSigner,
   getProviders = getDefaultProviders,
   getRetellApiKey = getDefaultRetellApiKey,
   getSignWell = getDefaultSignWell,
@@ -393,6 +406,20 @@ export function createHandler({
         await store.ensureWorkspace(workspaceId);
         const calls = await store.listCalls(workspaceId);
         return json(200, calls.map(toPublicCallSummary));
+      }
+
+      const recordingCallId = getCallRecordingId(event, path);
+      if (recordingCallId && method === "GET") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const call = await store.getCall(workspaceId, recordingCallId);
+        if (!call?.recordingKey) {
+          return json(404, { message: "Recording not available" });
+        }
+        const signer = await getRecordingSigner();
+        return json(200, {
+          url: await signer.createDownloadUrl(workspaceId, call.recordingKey),
+        });
       }
 
       const callId = getCallId(event, path);
@@ -2083,16 +2110,17 @@ function toPublicCall(item) {
   const {
     workspaceId: _workspaceId,
     retellCallId: _retellCallId,
+    recordingKey,
+    recordingUrl: _recordingUrl,
     ...call
   } = item;
-  return call;
+  return { ...call, hasRecording: Boolean(recordingKey) };
 }
 
 function toPublicCallSummary(item) {
   const {
     transcript: _transcript,
     toolLog: _toolLog,
-    recordingUrl: _recordingUrl,
     ...summary
   } = toPublicCall(item);
   return summary;
@@ -2700,6 +2728,22 @@ async function getDefaultAssetSigner() {
     },
   }));
   return assetSignerPromise;
+}
+
+let recordingSignerPromise;
+async function getDefaultRecordingSigner() {
+  const bucket = process.env.CALL_ARTIFACTS_BUCKET;
+  if (!bucket) throw new Error("CALL_ARTIFACTS_BUCKET is required");
+  recordingSignerPromise ??= Promise.resolve(createS3AssetSigner({
+    bucket,
+    region: process.env.AWS_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      sessionToken: process.env.AWS_SESSION_TOKEN,
+    },
+  }));
+  return recordingSignerPromise;
 }
 
 export function createS3AssetSigner({ bucket, region, credentials, now = () => new Date() }) {

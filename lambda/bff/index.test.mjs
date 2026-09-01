@@ -359,7 +359,8 @@ test("GET calls lists workspace calls without exposing Retell identifiers", asyn
     callerNumber: "+17035550123",
     outcome: "answered",
     startedAt: "2026-08-16T14:00:00.000Z",
-    recordingUrl: "https://retell.example/recording.wav",
+    callSummary: "Caller asked about hours.",
+    recordingKey: "calls/call-123.wav",
     transcript: [{ speaker: "Caller", text: "Hello" }],
     toolLog: [{ role: "tool_call_result", tool_call_id: "retell-tool-1" }],
   }];
@@ -385,8 +386,11 @@ test("GET calls lists workspace calls without exposing Retell identifiers", asyn
     callerNumber: "+17035550123",
     outcome: "answered",
     startedAt: "2026-08-16T14:00:00.000Z",
+    callSummary: "Caller asked about hours.",
+    hasRecording: true,
   }]);
   assert.doesNotMatch(response.body, /retell-call-secret/);
+  assert.doesNotMatch(response.body, /calls\/call-123\.wav/); // recordingKey is not exposed
 });
 
 test("GET call detail uses the product call id and hides provider keys", async () => {
@@ -400,7 +404,8 @@ test("GET call detail uses the product call id and hides provider keys", async (
         callId,
         retellCallId: "retell-call-secret",
         transcript: [{ speaker: "Caller", text: "Hello" }],
-        recordingUrl: "https://retell.example/recording.wav",
+        recordingKey: "calls/call-123.wav",
+        callSummary: "Caller asked about hours.",
         outcome: "answered",
       };
     },
@@ -421,10 +426,40 @@ test("GET call detail uses the product call id and hides provider keys", async (
   assert.deepEqual(JSON.parse(response.body), {
     callId: "call-123",
     transcript: [{ speaker: "Caller", text: "Hello" }],
-    recordingUrl: "https://retell.example/recording.wav",
+    callSummary: "Caller asked about hours.",
+    hasRecording: true,
     outcome: "answered",
   });
   assert.doesNotMatch(response.body, /retell-call-secret/);
+  assert.doesNotMatch(response.body, /calls\/call-123\.wav/);
+});
+
+test("GET call recording returns a presigned URL, or 404 when there is none", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getCall(workspaceId, callId) {
+      if (callId === "call-nokey") return { workspaceId, callId };
+      return { workspaceId, callId, recordingKey: "calls/call-123.wav" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getRecordingSigner: async () => ({
+      async createDownloadUrl(workspaceId, key) {
+        assert.equal(workspaceId, "user-123");
+        assert.equal(key, "calls/call-123.wav");
+        return "https://call-artifacts.s3.amazonaws.com/workspaces/user-123/calls/call-123.wav?sig=abc";
+      },
+    }),
+  });
+
+  const ok = await handler(authenticatedEvent("GET", "/workspaces/me/calls/call-123/recording"));
+  assert.equal(ok.statusCode, 200);
+  assert.match(JSON.parse(ok.body).url, /call-artifacts\.s3\.amazonaws\.com/);
+
+  const missing = await handler(authenticatedEvent("GET", "/workspaces/me/calls/call-nokey/recording"));
+  assert.equal(missing.statusCode, 404);
 });
 
 test("Dynamo agent updates preserve provider foreign keys", async () => {
