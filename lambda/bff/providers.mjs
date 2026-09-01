@@ -319,6 +319,8 @@ export function createRetellClient({
       retellAgentId,
       workspaceId,
       agentId,
+      currentTime,
+      timezone,
     }) {
       const result = await retellRequest("/v2/create-phone-call", {
         method: "POST",
@@ -334,6 +336,8 @@ export function createRetellClient({
           retell_llm_dynamic_variables: {
             workspaceId,
             agentId,
+            ...(currentTime ? { currentTime } : {}),
+            ...(timezone ? { timezone } : {}),
           },
           ignore_e164_validation: true,
         },
