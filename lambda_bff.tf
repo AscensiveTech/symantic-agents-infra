@@ -83,7 +83,7 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid      = "ManageProposals"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.control_plane["proposals"].arn
       },
       {

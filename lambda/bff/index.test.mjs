@@ -1196,7 +1196,16 @@ test("proposal signature requests send the private PDF through SignWell and pers
       testMode: true,
       async createDocument(input) {
         signWellRequest = input;
-        return { id: "signwell-doc-123", status: "Sent", test_mode: true };
+        return {
+          id: "signwell-doc-123",
+          status: "Created",
+          test_mode: true,
+          recipients: [{
+            id: "1",
+            status: "sent",
+            embedded_signing_url: "https://www.signwell.com/docs/test-signing/",
+          }],
+        };
       },
     },
   };
@@ -1229,16 +1238,152 @@ test("proposal signature requests send the private PDF through SignWell and pers
   assert.equal(response.statusCode, 201);
   assert.equal(body.documentId, "signwell-doc-123");
   assert.equal(body.testMode, true);
+  assert.equal(body.status, "sent");
+  assert.equal(body.testSigningUrl, "https://www.signwell.com/docs/test-signing/");
   assert.equal(body.recipients[0].email, "jane@example.com");
+  assert.equal(body.recipients[0].status, "sent");
   assert.equal(signWellRequest.files[0].file_url, "https://private-pdf.example.com/short-lived");
   assert.equal(signWellRequest.text_tags, true);
   assert.equal(signWellRequest.with_signature_page, false);
+  assert.equal(signWellRequest.embedded_signing, true);
+  assert.equal(signWellRequest.recipients[0].send_email, true);
   assert.deepEqual(signWellRequest.metadata, {
     workspaceId: "user-123",
     proposalId: "prp-sign",
     source: "rapidproposal",
   });
   assert.equal("apiKey" in body, false);
+});
+
+test("completed PDF requests reconcile a missed SignWell completion webhook", async () => {
+  let proposal = {
+    id: "prp-sign",
+    name: "Dental modernization",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-123",
+      status: "sent",
+      recipients: [{
+        id: "1",
+        name: "Jane Client",
+        email: "jane@example.com",
+        status: "pending",
+      }],
+      sentAt: "2026-08-31T17:30:00.000Z",
+      updatedAt: "2026-08-31T17:30:00.000Z",
+    },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal(workspaceId, proposalId) {
+      assert.equal(workspaceId, "user-123");
+      assert.equal(proposalId, "prp-sign");
+      return structuredClone(proposal);
+    },
+    async updateProposalSignature(workspaceId, proposalId, signatureRequest) {
+      assert.equal(workspaceId, "user-123");
+      assert.equal(proposalId, "prp-sign");
+      proposal = { ...proposal, signatureRequest: structuredClone(signatureRequest) };
+      return signatureRequest;
+    },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      async getDocument(documentId) {
+        assert.equal(documentId, "signwell-doc-123");
+        return {
+          id: documentId,
+          status: "Completed",
+          updated_at: "2026-08-31T17:40:00.000Z",
+          metadata: { workspace_id: "user-123", proposal_id: "prp-sign" },
+          recipients: [{
+            id: "1",
+            name: "Jane Client",
+            email: "JANE@example.com",
+            status: "completed",
+          }],
+        };
+      },
+      async getCompletedPdfUrl(documentId) {
+        assert.equal(documentId, "signwell-doc-123");
+        return "https://signed.example.com/completed.pdf";
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => signWell,
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests/completed-pdf",
+  ));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.url, "https://signed.example.com/completed.pdf");
+  assert.equal(proposal.signatureRequest.status, "completed");
+  assert.equal(proposal.signatureRequest.lastEvent, "document_completed");
+  assert.equal(proposal.signatureRequest.completedAt, "2026-08-31T17:40:00.000Z");
+  assert.equal(proposal.signatureRequest.recipients[0].status, "signed");
+  assert.equal(proposal.signatureRequest.recipients[0].email, "jane@example.com");
+  assert.equal(proposal.signatureRequest.recipients[0].signedAt, "2026-08-31T17:40:00.000Z");
+});
+
+test("proposal status refresh preserves SignWell sent and in-progress recipient states", async () => {
+  let signatureRequest = {
+    provider: "signwell",
+    documentId: "signwell-doc-123",
+    status: "sent",
+    recipients: [
+      { id: "1", name: "Jane Client", email: "jane@example.com", status: "pending" },
+      { id: "2", name: "Alex Client", email: "alex@example.com", status: "pending" },
+    ],
+    sentAt: "2026-08-31T17:30:00.000Z",
+    updatedAt: "2026-08-31T17:30:00.000Z",
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() {
+      return { id: "prp-sign", signatureRequest: structuredClone(signatureRequest) };
+    },
+    async updateProposalSignature(_workspaceId, _proposalId, next) {
+      signatureRequest = structuredClone(next);
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({
+      webhookId: "webhook-123",
+      client: {
+        async getDocument() {
+          return {
+            id: "signwell-doc-123",
+            status: "Sent",
+            metadata: { workspace_id: "user-123", proposal_id: "prp-sign" },
+            recipients: [
+              { id: "1", name: "Jane Client", email: "jane@example.com", status: "sent" },
+              { id: "2", name: "Alex Client", email: "alex@example.com", status: "in progress" },
+            ],
+          };
+        },
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/proposals/prp-sign"));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.signatureRequest.status, "sent");
+  assert.deepEqual(
+    body.signatureRequest.recipients.map((recipient) => recipient.status),
+    ["sent", "in_progress"],
+  );
 });
 
 test("proposal edits preserve server signature state and duplicates start unsigned", async () => {
@@ -1316,7 +1461,7 @@ test("SignWell webhooks require the documented HMAC and update only the matching
     data: {
       object: {
         id: "signwell-doc-123",
-        metadata: { workspaceId: "workspace-123", proposalId: "prp-sign" },
+        metadata: { workspace_id: "workspace-123", proposal_id: "prp-sign" },
         recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com" }],
       },
     },
