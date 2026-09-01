@@ -1458,6 +1458,10 @@ async function handleProposalApi(event, {
           name: recipient.name,
           email: recipient.email,
           delivery_method: "email",
+          // Embedded recipients default to email delivery being disabled in
+          // SignWell. Test mode uses embedding only to expose a safe signing
+          // URL, so opt back into the same notification email as live mode.
+          ...(embeddedTestMode ? { send_email: true } : {}),
         })),
         metadata: {
           workspaceId,
