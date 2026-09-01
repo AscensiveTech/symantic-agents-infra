@@ -53,6 +53,18 @@ resource "aws_iam_role_policy" "postcall_runtime" {
         Resource = aws_dynamodb_table.control_plane["calls"].arn
       },
       {
+        Sid      = "ReadWorkspaceTimezone"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["business_profiles"].arn
+      },
+      {
+        Sid      = "IncrementWorkspaceUsage"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.control_plane["workspace_usage"].arn
+      },
+      {
         Sid      = "StoreCallRecording"
         Effect   = "Allow"
         Action   = ["s3:PutObject"]
@@ -104,13 +116,15 @@ resource "aws_lambda_function" "postcall" {
 
   environment {
     variables = {
-      CALLS_TABLE          = aws_dynamodb_table.control_plane["calls"].name
-      APPOINTMENTS_TABLE   = aws_dynamodb_table.control_plane["appointments"].name
-      LEADS_TABLE          = aws_dynamodb_table.control_plane["leads"].name
-      MESSAGES_TABLE       = aws_dynamodb_table.control_plane["messages"].name
-      AGENTS_TABLE         = aws_dynamodb_table.control_plane["agents"].name
-      RETELL_SECRET_ARN    = aws_secretsmanager_secret.providers["retell"].arn
-      CALL_ARTIFACTS_BUCKET = aws_s3_bucket.call_artifacts.bucket
+      CALLS_TABLE             = aws_dynamodb_table.control_plane["calls"].name
+      APPOINTMENTS_TABLE      = aws_dynamodb_table.control_plane["appointments"].name
+      LEADS_TABLE             = aws_dynamodb_table.control_plane["leads"].name
+      MESSAGES_TABLE          = aws_dynamodb_table.control_plane["messages"].name
+      AGENTS_TABLE            = aws_dynamodb_table.control_plane["agents"].name
+      BUSINESS_PROFILES_TABLE = aws_dynamodb_table.control_plane["business_profiles"].name
+      WORKSPACE_USAGE_TABLE   = aws_dynamodb_table.control_plane["workspace_usage"].name
+      RETELL_SECRET_ARN       = aws_secretsmanager_secret.providers["retell"].arn
+      CALL_ARTIFACTS_BUCKET   = aws_s3_bucket.call_artifacts.bucket
     }
   }
 

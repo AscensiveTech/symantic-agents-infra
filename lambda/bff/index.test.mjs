@@ -2214,13 +2214,14 @@ test("S3 image upload signer enforces content type and a 10 MB form limit", asyn
   assert.ok(policy.conditions.some((condition) => condition["Content-Type"] === "image/png"));
 });
 
-function authenticatedEvent(method, path, body) {
+function authenticatedEvent(method, path, body, queryStringParameters) {
   return {
     requestContext: {
       authorizer: { jwt: { claims: { sub: "user-123" } } },
       http: { method, path },
     },
     rawPath: path,
+    ...(queryStringParameters ? { queryStringParameters } : {}),
     body: body === undefined ? undefined : JSON.stringify(body),
   };
 }
@@ -2274,3 +2275,259 @@ function receptionistProfile() {
     communicationStyle: "Warm and concise",
   };
 }
+
+// ---------------------------------------------------------------------------
+// Feature 2 - minute metering, plans, overage and billing
+// ---------------------------------------------------------------------------
+
+function superAdminEvent(method, path, body, queryStringParameters) {
+  const event = authenticatedEvent(method, path, body, queryStringParameters);
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  return event;
+}
+
+function meteringStore(overrides = {}) {
+  return {
+    async ensureWorkspace() {},
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "starter" };
+    },
+    async getWorkspace() {
+      return { workspaceId: "workspace-123", name: "Arc Dental" };
+    },
+    async putWorkspace(value) {
+      return value;
+    },
+    async putProfile(_workspaceId, value) {
+      return value;
+    },
+    async listCalls() {
+      return [];
+    },
+    ...overrides,
+  };
+}
+
+const minuteCall = (startedAt, durationMs) => ({
+  callId: `call-${startedAt}`,
+  startedAt,
+  durationMs,
+  outcome: "answered",
+});
+
+test("GET /workspaces/me/usage returns a tz-correct billing cycle with no cost data", async () => {
+  const { createHandler } = await loadBff();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const store = meteringStore({
+    async listCalls() {
+      return [
+        minuteCall(`${period}-05T10:00:00-04:00`, 90_000),
+        minuteCall(`${period}-06T11:00:00-04:00`, 30_000),
+      ];
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/usage"));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.plan, "starter");
+  assert.equal(body.minuteAllowance, 1000);
+  assert.equal(body.billingCycle.minutes, 3);
+  assert.equal(body.billingCycle.usageState, "ok");
+  assert.equal(body.cost, undefined);
+  assert.ok(Array.isArray(body.calls));
+});
+
+test("PUT /workspaces/me/profile queues a downgrade for next cycle", async () => {
+  const { createHandler } = await loadBff();
+  let savedWorkspace;
+  let savedProfile;
+  const store = meteringStore({
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "growth" };
+    },
+    async putWorkspace(value) {
+      savedWorkspace = value;
+      return value;
+    },
+    async putProfile(_workspaceId, value) {
+      savedProfile = value;
+      return value;
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
+    ...receptionistProfile(),
+    receptionistPlan: "starter",
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(savedProfile.receptionistPlan, "growth");
+  assert.equal(savedWorkspace.receptionistPlanPending, "starter");
+  assert.match(savedWorkspace.receptionistPlanPendingFrom, /^\d{4}-\d{2}$/);
+  assert.equal(savedWorkspace.planHistory.at(-1).plan, "Starter");
+});
+
+test("PUT /workspaces/me/profile applies an upgrade immediately", async () => {
+  const { createHandler } = await loadBff();
+  let savedProfile;
+  const store = meteringStore({
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "starter" };
+    },
+    async putProfile(_workspaceId, value) {
+      savedProfile = value;
+      return value;
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
+    ...receptionistProfile(),
+    receptionistPlan: "pro",
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(savedProfile.receptionistPlan, "pro");
+});
+
+test("PUT /workspaces/me/profile rejects an unknown plan key", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => meteringStore() });
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
+    ...receptionistProfile(),
+    receptionistPlan: "platinum",
+  }));
+  assert.equal(response.statusCode, 400);
+});
+
+test("inbound lookup rejects the call once the overage cap is reached", async () => {
+  const { createHandler } = await loadBff();
+  const store = {
+    async getPhoneNumberByDid() {
+      return { workspaceId: "workspace-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "active", retellAgentId: "retell-agent-1" };
+    },
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "starter" };
+    },
+    async getWorkspace() {
+      return { workspaceId: "workspace-123" };
+    },
+    async getUsageCounter() {
+      return { billedMinutes: 2200 };
+    },
+  };
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550100" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
+});
+
+test("GET /platform/billing aggregates workspaces and is super-admin only", async () => {
+  const { createHandler } = await loadBff();
+  const workspaces = [
+    { workspaceId: "ws-a", name: "Alpha" },
+    { workspaceId: "ws-b", name: "Bravo" },
+  ];
+  const profiles = {
+    "ws-a": { timezone: "UTC", receptionistPlan: "starter" },
+    "ws-b": { timezone: "UTC", receptionistPlan: "" },
+  };
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "ws-platform", role: "super-admin", status: "active" };
+    },
+    async ensureWorkspace() {},
+    async getProfile(id) {
+      return profiles[id] ?? null;
+    },
+    async getWorkspace(id) {
+      return workspaces.find((w) => w.workspaceId === id) ?? null;
+    },
+    async listWorkspaces() {
+      return workspaces;
+    },
+    async listCalls(id) {
+      return id === "ws-a"
+        ? Array.from({ length: 20 }, (_, i) => minuteCall(`${period}-02T10:${String(i).padStart(2, "0")}:00Z`, 60_000))
+        : [];
+    },
+    async listMemberships() { return []; },
+    async listProposals() { return []; },
+    async listProposalTemplates() { return []; },
+  };
+  const handler = createHandler({ getStore: async () => store });
+
+  const forbidden = await createHandler({ getStore: async () => ({ async ensureWorkspace() {} }) })(
+    authenticatedEvent("GET", "/platform/billing"),
+  );
+  assert.equal(forbidden.statusCode, 403);
+
+  const response = await handler(superAdminEvent("GET", "/platform/billing"));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.rows.length, 2);
+  const alpha = body.rows.find((row) => row.workspaceId === "ws-a");
+  assert.equal(alpha.minutesUsed, 20);
+  assert.equal(alpha.totalDue, 349);
+  assert.equal(typeof alpha.grossMarginPct, "number");
+  const bravo = body.rows.find((row) => row.workspaceId === "ws-b");
+  assert.equal(bravo.totalDue, null);
+});
+
+test("PATCH /platform/companies sets a plan override with custom Enterprise numbers", async () => {
+  const { createHandler } = await loadBff();
+  let saved;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "ws-platform", role: "super-admin", status: "active" };
+    },
+    async ensureWorkspace() {},
+    async getWorkspace() {
+      return { workspaceId: "ws-tech", name: "Technovate" };
+    },
+    async putWorkspace(value) {
+      saved = value;
+      return value;
+    },
+    async getProfile() { return null; },
+    async listCalls() { return []; },
+    async listMemberships() { return []; },
+    async listProposals() { return []; },
+    async listProposalTemplates() { return []; },
+  };
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("PATCH", "/platform/companies/ws-tech", {
+    receptionistPlanOverride: "enterprise",
+    enterpriseMinutes: 8000,
+    enterprisePriceMonthly: 1999,
+    enterpriseOveragePerMinute: 0.25,
+  });
+  event.pathParameters = { workspaceId: "ws-tech" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.receptionistPlanOverride, "enterprise");
+  assert.equal(saved.enterpriseMinutes, 8000);
+  assert.equal(saved.planHistory.at(-1).plan, "Enterprise");
+});

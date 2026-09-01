@@ -28,6 +28,10 @@ locals {
       name_suffix = "calls"
       range_key   = "callId"
     }
+    workspace_usage = {
+      name_suffix = "workspace-usage"
+      range_key   = "period"
+    }
     leads = {
       name_suffix = "leads"
       range_key   = "leadId"
@@ -90,6 +94,15 @@ resource "aws_dynamodb_table" "control_plane" {
       name            = "retellAgentId-index"
       hash_key        = "retellAgentId"
       projection_type = "ALL"
+    }
+  }
+
+  dynamic "ttl" {
+    for_each = each.key == "workspace_usage" ? [1] : []
+
+    content {
+      attribute_name = "expiresAt"
+      enabled        = true
     }
   }
 

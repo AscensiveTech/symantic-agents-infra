@@ -9,6 +9,14 @@ import {
 import { buildReceptionistConfig, resolveConfiguredVoiceId } from "./receptionist.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
+  PLAN_KEYS,
+  RECEPTIONIST_PLANS,
+  buildUsage,
+  costBreakdown,
+  periodKey,
+  resolvePlan,
+} from "./receptionist-billing.mjs";
+import {
   createSignWellClient,
   SignWellRequestError,
   verifySignWellEvent,
@@ -97,6 +105,73 @@ function pickProfile(value) {
     ...Object.fromEntries(Object.keys(PROFILE_FIELDS).map((field) => [field, value[field]])),
     ...(isBusinessHours(value.businessHours) ? { businessHours: value.businessHours } : {}),
   };
+}
+
+const INVALID = Symbol("invalid");
+
+// receptionistPlan rides alongside the profile but is kept out of PROFILE_FIELDS
+// so the strict profile shape check and every existing client stay unaffected.
+// Returns undefined (absent), "" / a plan key (valid), or INVALID.
+function readReceptionistPlan(body) {
+  if (!body || !Object.hasOwn(body, "receptionistPlan")) return undefined;
+  const value = body.receptionistPlan;
+  if (value === "" || value === null) return "";
+  if (typeof value === "string" && PLAN_KEYS.includes(value)) return value;
+  return INVALID;
+}
+
+// Apply a customer plan choice: upgrades (more minutes) take effect immediately;
+// downgrades are queued for the first of next month. Always records planHistory.
+async function applyCustomerPlanChange(store, workspaceId, planKey, userId) {
+  if (typeof store.getWorkspace !== "function" || typeof store.putWorkspace !== "function") {
+    return planKey;
+  }
+  const [workspace, profile] = await Promise.all([
+    store.getWorkspace(workspaceId),
+    typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
+  ]);
+  const ws = workspace ?? { workspaceId };
+  const currentPlan = profile?.receptionistPlan ?? "";
+  if (currentPlan === planKey && !ws.receptionistPlanPending) return planKey;
+
+  const now = new Date();
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const current = resolvePlan(profile, ws, now, timezone);
+
+  const nextMinutes = RECEPTIONIST_PLANS[planKey]?.minutes ?? null;
+  const isDowngrade = planKey !== "" &&
+    typeof nextMinutes === "number" &&
+    typeof current.minutes === "number" &&
+    nextMinutes < current.minutes;
+
+  const label = RECEPTIONIST_PLANS[planKey]?.label ?? "unset";
+  const at = now.toISOString();
+  const updated = {
+    ...ws,
+    planHistory: [
+      ...(Array.isArray(ws.planHistory) ? ws.planHistory : []),
+      { plan: label, at, changedBy: userId },
+    ],
+    updatedAt: at,
+  };
+  delete updated.receptionistPlanPending;
+  delete updated.receptionistPlanPendingFrom;
+  if (isDowngrade) {
+    updated.receptionistPlanPending = planKey;
+    updated.receptionistPlanPendingFrom = nextPeriodKey(now, timezone);
+  }
+  await store.putWorkspace(updated);
+  // Upgrades / first choices land on the profile now; a queued downgrade keeps
+  // the current plan on the profile until its effective month.
+  return isDowngrade ? currentPlan : planKey;
+}
+
+function nextPeriodKey(now, timezone) {
+  const period = periodKey(now, timezone);
+  const [year, month] = period.split("-").map(Number);
+  return month === 12
+    ? `${year + 1}-01`
+    : `${year}-${String(month + 1).padStart(2, "0")}`;
 }
 
 function pickAgent(value, routeAgentId) {
@@ -323,6 +398,14 @@ export function createHandler({
       });
       if (platformResponse) return platformResponse;
 
+      const billingResponse = await handlePlatformBilling(event, {
+        method,
+        path,
+        actor,
+        store,
+      });
+      if (billingResponse) return billingResponse;
+
       const usersResponse = await handleWorkspaceUsers(event, {
         method,
         path,
@@ -372,8 +455,16 @@ export function createHandler({
       if (path === "/workspaces/me/profile" && method === "PUT") {
         const body = readBody(event);
         if (!isProfile(body)) return json(400, { message: "Invalid profile" });
-        const profile = pickProfile(body);
+        const planKey = readReceptionistPlan(body);
+        if (planKey === INVALID) return json(400, { message: "Invalid receptionist plan" });
         await store.ensureWorkspace(workspaceId);
+        const effectivePlan = planKey !== undefined
+          ? await applyCustomerPlanChange(store, workspaceId, planKey, actor.userId)
+          : undefined;
+        const profile = {
+          ...pickProfile(body),
+          ...(effectivePlan !== undefined ? { receptionistPlan: effectivePlan } : {}),
+        };
         const saved = await store.putProfile(workspaceId, profile);
         return json(200, saved);
       }
@@ -406,6 +497,11 @@ export function createHandler({
         await store.ensureWorkspace(workspaceId);
         const calls = await store.listCalls(workspaceId);
         return json(200, calls.map(toPublicCallSummary));
+      }
+
+      if (path === "/workspaces/me/usage" && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        return json(200, await loadWorkspaceUsage(store, workspaceId));
       }
 
       const recordingCallId = getCallRecordingId(event, path);
@@ -655,23 +751,32 @@ async function handlePlatformCompanies(event, {
       const body = readBody(event);
       const hasName = body && Object.hasOwn(body, "name");
       const hasTier = body && Object.hasOwn(body, "tier");
+      const hasPlan = isPlanPatch(body);
       const name = typeof body?.name === "string" ? body.name.trim() : "";
       if (
-        (!hasName && !hasTier) ||
+        (!hasName && !hasTier && !hasPlan) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier))
       ) {
         return json(400, { message: "Invalid company update" });
       }
-      const updated = {
+      let updated = {
         ...workspace,
         ...(hasName ? { name } : {}),
         ...(hasTier ? { tier: body.tier } : {}),
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
       };
+      if (hasPlan) {
+        updated = applyPlanPatch(updated, body, actor.userId);
+        if (!updated) return json(400, { message: "Invalid plan update" });
+      }
       await store.putWorkspace(updated);
       return json(200, await platformCompanySummary(store, updated));
+    }
+
+    if (target.kind === "usage" && method === "GET") {
+      return json(200, await loadWorkspaceUsageWithCost(store, target.workspaceId));
     }
 
     if (target.kind === "users" && method === "GET") {
@@ -800,6 +905,40 @@ async function handlePlatformCompanies(event, {
   }
 }
 
+async function listCallsForUsage(store, workspaceId) {
+  if (typeof store.listCallsForUsage === "function") {
+    return store.listCallsForUsage(workspaceId);
+  }
+  if (typeof store.listCalls === "function") {
+    return store.listCalls(workspaceId);
+  }
+  return [];
+}
+
+// Build the customer-facing usage view for a workspace (no cost/margin).
+async function loadWorkspaceUsage(store, workspaceId) {
+  const [calls, profile, workspace] = await Promise.all([
+    listCallsForUsage(store, workspaceId),
+    typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
+    typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
+  ]);
+  const now = new Date();
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const plan = resolvePlan(profile, workspace, now, timezone);
+  return buildUsage(calls ?? [], { now, timezone, plan });
+}
+
+// Same as loadWorkspaceUsage, plus the modeled provider cost / margin block.
+async function loadWorkspaceUsageWithCost(store, workspaceId) {
+  const usage = await loadWorkspaceUsage(store, workspaceId);
+  const cost = costBreakdown(
+    usage.billingCycle.actualSeconds,
+    usage.priceMonthly,
+    usage.billingCycle.overageCharge,
+  );
+  return { ...usage, cost };
+}
+
 async function platformCompanySummary(store, workspace) {
   const [members, proposals, templates] = await Promise.all([
     store.listMemberships(workspace.workspaceId),
@@ -818,7 +957,35 @@ async function platformCompanySummary(store, workspace) {
     userCount: members.filter((member) => member.status !== "disabled").length,
     proposalCount: proposals.length,
     templateCount: templates.length,
+    receptionistPlanOverride: PLAN_KEYS.includes(workspace.receptionistPlanOverride)
+      ? workspace.receptionistPlanOverride
+      : null,
+    enterpriseMinutes: numberOrNullValue(workspace.enterpriseMinutes),
+    enterprisePriceMonthly: numberOrNullValue(workspace.enterprisePriceMonthly),
+    enterpriseOveragePerMinute: numberOrNullValue(workspace.enterpriseOveragePerMinute),
+    ...(await workspaceUsageState(store, workspace)),
   };
+}
+
+function numberOrNullValue(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+// Lightweight current-cycle state for the companies list badges. Best-effort:
+// any failure degrades to no badge rather than failing the whole listing.
+async function workspaceUsageState(store, workspace) {
+  try {
+    const usage = await loadWorkspaceUsage(store, workspace.workspaceId);
+    return {
+      usageState: usage.billingCycle.usageState,
+      blocked: usage.billingCycle.blocked,
+      minutesUsed: usage.billingCycle.minutes,
+      minuteAllowance: usage.minuteAllowance,
+      planLabel: usage.planLabel,
+    };
+  } catch {
+    return { usageState: "ok", blocked: false };
+  }
 }
 
 function getPlatformCompanyTarget(event, path) {
@@ -827,6 +994,7 @@ function getPlatformCompanyTarget(event, path) {
     ["logo-complete", /^\/platform\/companies\/([^/]+)\/logo\/complete$/],
     ["user", /^\/platform\/companies\/([^/]+)\/users\/([^/]+)$/],
     ["users", /^\/platform\/companies\/([^/]+)\/users$/],
+    ["usage", /^\/platform\/companies\/([^/]+)\/usage$/],
     ["company", /^\/platform\/companies\/([^/]+)$/],
   ];
   for (const [kind, pattern] of patterns) {
@@ -849,6 +1017,125 @@ function getPlatformCompanyTarget(event, path) {
     }
   }
   return null;
+}
+
+const PLAN_PATCH_KEYS = [
+  "receptionistPlanOverride",
+  "enterpriseMinutes",
+  "enterprisePriceMonthly",
+  "enterpriseOveragePerMinute",
+];
+
+function isPlanPatch(body) {
+  return Boolean(body) && PLAN_PATCH_KEYS.some((key) => Object.hasOwn(body, key));
+}
+
+// Validate + apply a super-admin plan override. Returns the updated workspace, or
+// null when the payload is invalid. Appends to planHistory.
+function applyPlanPatch(workspace, body, userId) {
+  const now = new Date().toISOString();
+  const patch = { ...workspace, updatedAt: now, updatedBy: userId };
+
+  if (Object.hasOwn(body, "receptionistPlanOverride")) {
+    const value = body.receptionistPlanOverride;
+    if (value === "" || value === null) {
+      delete patch.receptionistPlanOverride;
+    } else if (PLAN_KEYS.includes(value)) {
+      patch.receptionistPlanOverride = value;
+    } else {
+      return null;
+    }
+  }
+
+  for (const key of ["enterpriseMinutes", "enterprisePriceMonthly", "enterpriseOveragePerMinute"]) {
+    if (!Object.hasOwn(body, key)) continue;
+    const value = body[key];
+    if (value === null || value === "") {
+      delete patch[key];
+    } else if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      patch[key] = value;
+    } else {
+      return null;
+    }
+  }
+
+  const label = patch.receptionistPlanOverride
+    ? RECEPTIONIST_PLANS[patch.receptionistPlanOverride]?.label ?? patch.receptionistPlanOverride
+    : "unset";
+  patch.planHistory = [
+    ...(Array.isArray(workspace.planHistory) ? workspace.planHistory : []),
+    { plan: label, at: now, changedBy: userId },
+  ];
+  return patch;
+}
+
+// Super-admin billing report across every workspace for a calendar month.
+async function handlePlatformBilling(event, { method, path, actor, store }) {
+  if (path !== "/platform/billing") return null;
+  if (!actor.roles.includes("super-admin")) {
+    return json(403, { message: "Super administrator access is required" });
+  }
+  if (method !== "GET") return json(404, { message: "Not found" });
+
+  const period = typeof event?.queryStringParameters?.period === "string"
+    ? event.queryStringParameters.period
+    : periodKey(new Date(), "UTC");
+
+  const workspaces = await store.listWorkspaces();
+  const rows = [];
+  // Bounded concurrency to keep the fan-out of scans in check.
+  const queue = [...workspaces];
+  async function worker() {
+    while (queue.length) {
+      const workspace = queue.shift();
+      rows.push(await platformBillingRow(store, workspace, period));
+    }
+  }
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  rows.sort((left, right) => (left.companyName || "").localeCompare(right.companyName || ""));
+  return json(200, { period, rows });
+}
+
+async function platformBillingRow(store, workspace, period) {
+  const workspaceId = workspace.workspaceId;
+  const [calls, profile] = await Promise.all([
+    listCallsForUsage(store, workspaceId),
+    store.getProfile(workspaceId),
+  ]);
+  const now = periodMidpoint(period);
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const plan = resolvePlan(profile, workspace, now, timezone);
+  const usage = buildUsage(calls ?? [], { now, timezone, plan });
+  const cycle = usage.billingCycle;
+  const cost = costBreakdown(cycle.actualSeconds, usage.priceMonthly, cycle.overageCharge);
+  const totalDue = usage.priceMonthly == null
+    ? null
+    : Math.round((usage.priceMonthly + cycle.overageCharge + Number.EPSILON) * 100) / 100;
+  return {
+    workspaceId,
+    companyName: workspace.name || workspaceId,
+    plan: usage.plan,
+    planLabel: usage.planLabel,
+    priceMonthly: usage.priceMonthly,
+    minuteAllowance: usage.minuteAllowance,
+    minutesUsed: cycle.minutes,
+    actualSeconds: cycle.actualSeconds,
+    overageMinutes: cycle.overageMinutes,
+    overageCharge: cycle.overageCharge,
+    overageChargeCapped: cycle.overageChargeCapped,
+    usageState: cycle.usageState,
+    blocked: cycle.blocked,
+    totalDue,
+    estimatedCost: cost.estimatedCost,
+    grossProfit: cost.grossProfit,
+    grossMarginPct: cost.grossMarginPct,
+  };
+}
+
+function periodMidpoint(period) {
+  const [year, month] = String(period).split("-").map(Number);
+  if (!year || !month) return new Date();
+  return new Date(Date.UTC(year, month - 1, 15, 12, 0, 0));
 }
 
 function validCompanyLogoRequest(value) {
@@ -1764,14 +2051,20 @@ async function handleInboundLookup(event, {
   const store = await getStore();
   const phoneNumber = await store.getPhoneNumberByDid(did);
   if (!phoneNumber) return json(404, { message: "Phone number not found" });
-  const [agent, profile] = await Promise.all([
+  const [agent, profile, workspace] = await Promise.all([
     store.getAgent(phoneNumber.workspaceId, phoneNumber.agentId),
     store.getProfile(phoneNumber.workspaceId),
+    typeof store.getWorkspace === "function"
+      ? store.getWorkspace(phoneNumber.workspaceId)
+      : null,
   ]);
   if (!agent || !profile) {
     return json(404, { message: "Receptionist configuration not found" });
   }
   if (agent.status !== "active" || !agent.retellAgentId) {
+    return json(200, { call_inbound: { reject: true } });
+  }
+  if (await inboundCapReached(store, phoneNumber.workspaceId, profile, workspace)) {
     return json(200, { call_inbound: { reject: true } });
   }
   return json(200, {
@@ -1789,6 +2082,26 @@ async function handleInboundLookup(event, {
       },
     },
   });
+}
+
+// True when this cycle's billed minutes have reached the plan's overage charge
+// cap — the one hard stop, where the receptionist stops accepting inbound calls
+// until the cycle resets or the customer upgrades. Reads a single counter item;
+// a missing counter or an unmetered plan is never blocked.
+async function inboundCapReached(store, workspaceId, profile, workspace) {
+  if (typeof store.getUsageCounter !== "function") return false;
+  const now = new Date();
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const plan = resolvePlan(profile, workspace, now, timezone);
+  if (plan.priceMonthly == null || plan.minutes == null || !plan.overagePerMinute) return false;
+  const capMinute = plan.minutes + Math.ceil(plan.priceMonthly / plan.overagePerMinute);
+  try {
+    const counter = await store.getUsageCounter(workspaceId, periodKey(now, timezone));
+    return Number(counter?.billedMinutes ?? 0) >= capMinute;
+  } catch (error) {
+    console.error("Usage cap check failed", { name: error?.name, message: error?.message, workspaceId });
+    return false;
+  }
 }
 
 async function syncReceptionistRuntime({
@@ -2320,6 +2633,43 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    // Lean projection of the full call history for usage aggregation. Paginated;
+    // capped so a pathological partition can't blow the Lambda's memory.
+    async listCallsForUsage(workspaceId) {
+      const items = [];
+      let exclusiveStartKey;
+      let truncated = false;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tableNames.calls,
+          KeyConditionExpression: "workspaceId = :workspaceId",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+          ConsistentRead: false,
+          ProjectionExpression:
+            "callId, callerName, callerNameSource, callerNumber, startedAt, createdAt, durationMs, outcome, callSummary, recordingKey",
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map((item) => unmarshall(item)));
+        exclusiveStartKey = result.LastEvaluatedKey;
+        if (items.length >= 20_000) {
+          truncated = true;
+          break;
+        }
+      } while (exclusiveStartKey);
+      if (truncated) items.truncated = true;
+      return items;
+    },
+
+    async getUsageCounter(workspaceId, period) {
+      if (!tableNames.workspaceUsage) return null;
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.workspaceUsage,
+        Key: marshall({ workspaceId, period }),
+        ConsistentRead: false,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
     async listAgents(workspaceId) {
       const result = await client.send(new commands.QueryCommand({
         TableName: tableNames.agents,
@@ -2603,6 +2953,7 @@ async function getDefaultStore() {
       proposalParts: process.env.PROPOSAL_PARTS_TABLE,
       proposalTemplates: process.env.PROPOSAL_TEMPLATES_TABLE,
       workspaceMemberships: process.env.WORKSPACE_MEMBERSHIPS_TABLE,
+      workspaceUsage: process.env.WORKSPACE_USAGE_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");
