@@ -427,7 +427,7 @@ test("google callback preserves an existing refresh token when Google omits one"
   });
 });
 
-test("callback leaves multiple calendars unselected and exposes them for explicit selection", async () => {
+test("callback auto-selects the primary calendar and still exposes the rest for switching", async () => {
   const stateStore = createInMemoryStateStore();
   await stateStore.put({
     state: "multi-calendar-state",
@@ -491,8 +491,10 @@ test("callback leaves multiple calendars unselected and exposes them for explici
   assert.equal(callback.statusCode, 302);
   assert.deepEqual(JSON.parse(connection.body), {
     provider: "google-calendar",
-    selectedCalendarId: null,
-    calendarTimezone: "UTC",
+    // Primary calendar auto-selected; the customer can still switch via
+    // /calendars/select (covered separately) or the wizard's Connections step.
+    selectedCalendarId: "calendar-a",
+    calendarTimezone: "America/New_York",
     tokenVersion: 1,
     scopes: ["calendar"],
     connectionState: "connected",

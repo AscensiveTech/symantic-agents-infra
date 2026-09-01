@@ -415,8 +415,11 @@ export function createHandler(options = {}) {
           const calendars = await providerClient.listCalendars({
             accessToken: tokens.accessToken,
           });
-          const selected = calendars.length === 1 ? calendars[0] : null;
-          if (calendars.length === 0) selectDefaultCalendar(calendars);
+          // Auto-select the primary calendar (falls back to the first, throws
+          // no_calendars if the list is empty). The connection is then complete
+          // and usable everywhere; the wizard's Connections step still lets the
+          // customer switch to a different calendar afterwards.
+          const selected = selectDefaultCalendar(calendars);
           const connectionStore = await getConnectionStore();
           const existing = await connectionStore.get(stateRecord.workspaceId);
           const tokenCrypto = await getTokenCrypto();
