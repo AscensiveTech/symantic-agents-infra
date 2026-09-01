@@ -14,7 +14,6 @@ const profile = {
   address: "123 Main Street",
   timezone: "America/New_York",
   hours: "Mon-Fri, 8:00 AM-5:00 PM",
-  services: ["Cleanings", "Emergency exams"],
   faqs: [
     {
       question: "Do you accept insurance?",
@@ -59,6 +58,9 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   const prompt = buildReceptionistPrompt(agent, profile);
 
   assert.match(prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
+  assert.match(prompt, /- Services and business overview: Family dentistry/);
+  assert.doesNotMatch(prompt, /^- Description:/m);
+  assert.doesNotMatch(prompt, /^- Services:/m);
   assert.match(prompt, /Do you accept insurance\?/);
   assert.match(prompt, /Yes, most PPO plans\./);
   assert.match(prompt, /Do you see children\?/);
