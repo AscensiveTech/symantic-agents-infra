@@ -1988,9 +1988,11 @@ async function handleProposalApi(event, {
       if (current.status !== "completed") {
         return json(409, { message: "The signed PDF is available after every signer completes the document" });
       }
-      return json(200, {
-        url: await signWell.client.getCompletedPdfUrl(current.documentId),
-      });
+      const [url, pdfBase64] = await Promise.all([
+        signWell.client.getCompletedPdfUrl(current.documentId),
+        signWell.client.getCompletedPdfBase64(current.documentId).catch(() => null),
+      ]);
+      return json(200, { url, ...(pdfBase64 ? { pdfBase64 } : {}) });
     }
     return json(404, { message: "Not found" });
   }
