@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CALL_HANDLING,
   buildReceptionistConfig,
   buildReceptionistPrompt,
+  resolveAllowedInboundCountries,
+  resolveCallHandling,
   resolveConfiguredVoiceId,
 } from "./receptionist.mjs";
 
@@ -68,6 +71,42 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /chest pain/);
   assert.match(prompt, /can't breathe/);
   assert.match(prompt, /\+17035550102/);
+});
+
+test("prompt carries spam / robocall handling rules by default and drops them when screening is off", () => {
+  const withScreening = buildReceptionistPrompt(agent, profile);
+  assert.match(withScreening, /Spam and robocall handling/);
+  assert.match(withScreening, /telemarketer reading a script/);
+  assert.match(withScreening, /call the end_call tool/);
+
+  const off = buildReceptionistPrompt(
+    { ...agent, configuration: { ...agent.configuration, spamScreening: false } },
+    profile,
+  );
+  assert.doesNotMatch(off, /Spam and robocall handling/);
+});
+
+test("resolveCallHandling applies defaults and clamps to the Retell range", () => {
+  assert.deepEqual(resolveCallHandling({ configuration: {} }), {
+    silenceSec: CALL_HANDLING.silence.defaultSec,
+    maxDurationMin: CALL_HANDLING.maxDuration.defaultMin,
+  });
+  assert.deepEqual(
+    resolveCallHandling({ configuration: { silenceTimeoutSec: 20, maxCallDurationMin: 5 } }),
+    { silenceSec: 20, maxDurationMin: 5 },
+  );
+  assert.deepEqual(
+    resolveCallHandling({ configuration: { silenceTimeoutSec: 5, maxCallDurationMin: 45 } }),
+    { silenceSec: CALL_HANDLING.silence.minSec, maxDurationMin: CALL_HANDLING.maxDuration.maxMin },
+  );
+});
+
+test("resolveAllowedInboundCountries normalizes to unique upper-case ISO codes", () => {
+  assert.deepEqual(resolveAllowedInboundCountries({ configuration: {} }), []);
+  assert.deepEqual(
+    resolveAllowedInboundCountries({ configuration: { allowedInboundCountries: ["us", " ca ", "US", "bad", 7] } }),
+    ["US", "CA"],
+  );
 });
 
 test("prompt prefers structured business hours (with split intervals) and carries the call clock", () => {
@@ -150,6 +189,18 @@ test("receptionist config exposes lookup tools, invocation-safe functions, and n
     assert.equal(tool.parameters.properties.idempotencyKey, undefined);
     assert.ok(!tool.parameters.required.includes("idempotencyKey"));
   }
+  const endCall = config.tools.filter(({ type }) => type === "end_call");
+  assert.equal(endCall.length, 1);
+  assert.equal(endCall[0].name, "end_call");
+
+  assert.equal(config.retellAgent.end_call_after_silence_ms, 60_000);
+  assert.equal(config.retellAgent.max_call_duration_ms, 600_000);
+  assert.deepEqual(config.retellAgent.post_call_analysis_data, [
+    { type: "boolean", name: "is_spam", description: config.retellAgent.post_call_analysis_data[0].description },
+  ]);
+  assert.match(config.retellAgent.post_call_analysis_data[0].description, /robocall|telemarketer/i);
+  assert.deepEqual(config.allowedInboundCountries, []);
+
   const transferTools = config.tools.filter(({ type }) => type === "transfer_call");
   assert.equal(transferTools.length, 4);
   assert.deepEqual(transferTools[0].transfer_destination, {
@@ -178,4 +229,16 @@ test("booking-disabled agents omit calendar tools", () => {
   assert.deepEqual(config.tools.filter(({ type }) => type === "custom")
     .map(({ name }) => name), ["lead_capture", "message_take"]);
   assert.ok(config.tools.some(({ type }) => type === "transfer_call"));
+  assert.ok(config.tools.some(({ type }) => type === "end_call"));
+});
+
+test("spamScreening:false drops the end_call tool", () => {
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: { ...agent, configuration: { ...agent.configuration, spamScreening: false } },
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.ok(!config.tools.some(({ type }) => type === "end_call"));
 });

@@ -79,6 +79,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["workspace_usage"].arn
       },
       {
+        Sid      = "ManageBlockedNumbers"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["blocked_numbers"].arn
+      },
+      {
         Sid    = "ManagePhoneNumbers"
         Effect = "Allow"
         Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
@@ -212,6 +218,7 @@ resource "aws_lambda_function" "bff" {
       CALENDAR_CONNECTIONS_TABLE  = aws_dynamodb_table.control_plane["calendar_connections"].name
       CALLS_TABLE                 = aws_dynamodb_table.control_plane["calls"].name
       WORKSPACE_USAGE_TABLE       = aws_dynamodb_table.control_plane["workspace_usage"].name
+      BLOCKED_NUMBERS_TABLE       = aws_dynamodb_table.control_plane["blocked_numbers"].name
       PROPOSALS_TABLE             = aws_dynamodb_table.control_plane["proposals"].name
       PROPOSAL_PARTS_TABLE        = aws_dynamodb_table.control_plane["proposal_parts"].name
       PROPOSAL_TEMPLATES_TABLE    = aws_dynamodb_table.control_plane["proposal_templates"].name

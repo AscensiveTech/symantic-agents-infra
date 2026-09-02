@@ -14,6 +14,7 @@ import {
   buildUsage,
   costBreakdown,
   periodKey,
+  resolveCallBlocklist,
   resolvePlan,
 } from "./receptionist-billing.mjs";
 import {
@@ -504,6 +505,62 @@ export function createHandler({
         return json(200, await loadWorkspaceUsage(store, workspaceId));
       }
 
+      if (path === "/workspaces/me/blocked-numbers" || path.startsWith("/workspaces/me/blocked-numbers/")) {
+        await store.ensureWorkspace(workspaceId);
+        if (!await isCallBlocklistEnabled(store, workspaceId)) {
+          return json(403, { message: "Call blocking is not enabled for this workspace" });
+        }
+        if (path === "/workspaces/me/blocked-numbers" && method === "GET") {
+          return json(200, await store.listBlockedNumbers(workspaceId));
+        }
+        if (path === "/workspaces/me/blocked-numbers" && method === "POST") {
+          const body = readBody(event) ?? {};
+          const phoneNumber = normalizeE164(body.phoneNumber);
+          if (!phoneNumber) {
+            return json(400, { message: "A valid phone number is required" });
+          }
+          const label = typeof body.label === "string" ? body.label.trim().slice(0, 120) : undefined;
+          const note = typeof body.note === "string" ? body.note.trim().slice(0, 500) : undefined;
+          const sourceCallId = typeof body.sourceCallId === "string" && body.sourceCallId
+            ? body.sourceCallId
+            : undefined;
+          const record = {
+            workspaceId,
+            phoneNumber,
+            reason: "manual",
+            label: label || undefined,
+            note: note || undefined,
+            sourceCallId,
+            blockedBy: subject,
+            blockedAt: new Date().toISOString(),
+            hitCount: 0,
+          };
+          try {
+            await store.putBlockedNumber(record);
+          } catch (error) {
+            if (isConditionalCheckFailed(error)) {
+              return json(409, { message: "That number is already blocked" });
+            }
+            throw error;
+          }
+          return json(201, record);
+        }
+        const blockedTarget = path.match(/^\/workspaces\/me\/blocked-numbers\/(.+)$/)?.[1];
+        if (blockedTarget && method === "DELETE") {
+          let decoded;
+          try {
+            decoded = decodeURIComponent(blockedTarget);
+          } catch {
+            decoded = blockedTarget;
+          }
+          const phoneNumber = normalizeE164(decoded);
+          if (!phoneNumber) return json(400, { message: "A valid phone number is required" });
+          await store.deleteBlockedNumber(workspaceId, phoneNumber);
+          return json(200, { ok: true });
+        }
+        return json(404, { message: "Not found" });
+      }
+
       const recordingCallId = getCallRecordingId(event, path);
       if (recordingCallId && method === "GET") {
         const store = await getStore();
@@ -752,11 +809,13 @@ async function handlePlatformCompanies(event, {
       const hasName = body && Object.hasOwn(body, "name");
       const hasTier = body && Object.hasOwn(body, "tier");
       const hasPlan = isPlanPatch(body);
+      const hasBlocklist = body && Object.hasOwn(body, "callBlocklistEnabled");
       const name = typeof body?.name === "string" ? body.name.trim() : "";
       if (
-        (!hasName && !hasTier && !hasPlan) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
-        (hasTier && !COMPANY_TIERS.has(body?.tier))
+        (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
+        (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean")
       ) {
         return json(400, { message: "Invalid company update" });
       }
@@ -764,6 +823,7 @@ async function handlePlatformCompanies(event, {
         ...workspace,
         ...(hasName ? { name } : {}),
         ...(hasTier ? { tier: body.tier } : {}),
+        ...(hasBlocklist ? { callBlocklistEnabled: body.callBlocklistEnabled } : {}),
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
       };
@@ -925,7 +985,22 @@ async function loadWorkspaceUsage(store, workspaceId) {
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
   const plan = resolvePlan(profile, workspace, now, timezone);
-  return buildUsage(calls ?? [], { now, timezone, plan });
+  const usage = buildUsage(calls ?? [], { now, timezone, plan });
+  return {
+    ...usage,
+    features: { callBlocklist: resolveCallBlocklist(workspace, plan) },
+  };
+}
+
+// Whether the premium call blocklist is available to this workspace right now.
+async function isCallBlocklistEnabled(store, workspaceId) {
+  const [profile, workspace] = await Promise.all([
+    typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
+    typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
+  ]);
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const plan = resolvePlan(profile, workspace, new Date(), timezone);
+  return resolveCallBlocklist(workspace, plan);
 }
 
 // Same as loadWorkspaceUsage, plus the modeled provider cost / margin block.
@@ -973,6 +1048,7 @@ async function platformCompanySummary(store, workspace) {
     enterpriseMinutes: numberOrNullValue(workspace.enterpriseMinutes),
     enterprisePriceMonthly: numberOrNullValue(workspace.enterprisePriceMonthly),
     enterpriseOveragePerMinute: numberOrNullValue(workspace.enterpriseOveragePerMinute),
+    callBlocklistEnabled: workspace.callBlocklistEnabled === true,
     ...(await workspaceUsageState(store, workspace)),
   };
 }
@@ -2193,6 +2269,9 @@ async function handleInboundLookup(event, {
   if (agent.status !== "active" || !agent.retellAgentId) {
     return json(200, { call_inbound: { reject: true } });
   }
+  if (await inboundCallerBlocked(store, phoneNumber.workspaceId, profile, workspace, input.call_inbound.from_number)) {
+    return json(200, { call_inbound: { reject: true } });
+  }
   if (await inboundCapReached(store, phoneNumber.workspaceId, profile, workspace)) {
     return json(200, { call_inbound: { reject: true } });
   }
@@ -2211,6 +2290,24 @@ async function handleInboundLookup(event, {
       },
     },
   });
+}
+
+// True when the caller's number is on this workspace's blocklist AND the
+// premium call-blocking feature is enabled. Records a hit for the UI. Skips the
+// blocklist read entirely when the workspace isn't entitled.
+async function inboundCallerBlocked(store, workspaceId, profile, workspace, fromNumber) {
+  if (typeof store.getBlockedNumber !== "function") return false;
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const plan = resolvePlan(profile, workspace, new Date(), timezone);
+  if (!resolveCallBlocklist(workspace, plan)) return false;
+  const caller = normalizeE164(fromNumber);
+  if (!caller) return false;
+  const blocked = await store.getBlockedNumber(workspaceId, caller);
+  if (!blocked) return false;
+  if (typeof store.recordBlockedHit === "function") {
+    await store.recordBlockedHit(workspaceId, caller).catch(() => {});
+  }
+  return true;
 }
 
 // True when this cycle's billed minutes have reached the plan's overage charge
@@ -2297,8 +2394,26 @@ async function syncReceptionistRuntime({
     });
     phoneNumber = { ...phoneNumber, ...imported };
   }
+  const desiredCountries = config.allowedInboundCountries ?? [];
+  const appliedCountries = Array.isArray(phoneNumber.allowedInboundCountries)
+    ? phoneNumber.allowedInboundCountries
+    : [];
+  const countriesChanged =
+    desiredCountries.length !== appliedCountries.length ||
+    desiredCountries.some((code, index) => code !== appliedCountries[index]);
+  if (
+    countriesChanged &&
+    phoneNumber.retellPhoneNumberId &&
+    typeof providers.retell.setPhoneNumberCountries === "function"
+  ) {
+    await providers.retell.setPhoneNumberCountries(
+      phoneNumber.retellPhoneNumberId,
+      { allowed_inbound_country_list: desiredCountries },
+    );
+  }
   phoneNumber = {
     ...phoneNumber,
+    allowedInboundCountries: desiredCountries,
     status: phoneStatus,
     updatedAt: new Date().toISOString(),
   };
@@ -2467,6 +2582,19 @@ function readHeader(headers, name) {
 
 function isE164(value) {
   return typeof value === "string" && /^\+[1-9]\d{7,14}$/.test(value);
+}
+
+// Normalize loose caller-ID input to E.164, or null when it can't be. Accepts
+// spaces / dashes / parens, a bare 10-digit US number, and 1-prefixed 11 digits.
+function normalizeE164(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (isE164(trimmed)) return trimmed;
+  const digits = trimmed.replace(/[^\d]/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (digits.length >= 8 && digits.length <= 15) return `+${digits}`;
+  return null;
 }
 
 function isConditionalCheckFailed(error) {
@@ -2832,6 +2960,57 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    async listBlockedNumbers(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.blockedNumbers,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ConsistentRead: false,
+      }));
+      return (result.Items ?? [])
+        .map((item) => unmarshall(item))
+        .sort((left, right) =>
+          String(right.blockedAt ?? "").localeCompare(String(left.blockedAt ?? "")));
+    },
+
+    async getBlockedNumber(workspaceId, phoneNumber) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.blockedNumbers,
+        Key: marshall({ workspaceId, phoneNumber }),
+        ConsistentRead: false,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    async putBlockedNumber(item) {
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.blockedNumbers,
+        Item: marshall(item, { removeUndefinedValues: true }),
+        ConditionExpression: "attribute_not_exists(phoneNumber)",
+      }));
+      return item;
+    },
+
+    async deleteBlockedNumber(workspaceId, phoneNumber) {
+      await client.send(new commands.DeleteItemCommand({
+        TableName: tableNames.blockedNumbers,
+        Key: marshall({ workspaceId, phoneNumber }),
+      }));
+    },
+
+    async recordBlockedHit(workspaceId, phoneNumber) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.blockedNumbers,
+        Key: marshall({ workspaceId, phoneNumber }),
+        UpdateExpression: "ADD hitCount :one SET lastHitAt = :now",
+        ExpressionAttributeValues: marshall({
+          ":one": 1,
+          ":now": new Date().toISOString(),
+        }),
+        ConditionExpression: "attribute_exists(phoneNumber)",
+      }));
+    },
+
     async listAgents(workspaceId) {
       const result = await client.send(new commands.QueryCommand({
         TableName: tableNames.agents,
@@ -3124,6 +3303,7 @@ async function getDefaultStore() {
       proposalTemplates: process.env.PROPOSAL_TEMPLATES_TABLE,
       workspaceMemberships: process.env.WORKSPACE_MEMBERSHIPS_TABLE,
       workspaceUsage: process.env.WORKSPACE_USAGE_TABLE,
+      blockedNumbers: process.env.BLOCKED_NUMBERS_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");

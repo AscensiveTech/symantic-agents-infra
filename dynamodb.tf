@@ -32,6 +32,10 @@ locals {
       name_suffix = "workspace-usage"
       range_key   = "period"
     }
+    blocked_numbers = {
+      name_suffix = "blocked-numbers"
+      range_key   = "phoneNumber"
+    }
     leads = {
       name_suffix = "leads"
       range_key   = "leadId"

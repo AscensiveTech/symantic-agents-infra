@@ -2661,6 +2661,199 @@ test("inbound lookup rejects the call once the overage cap is reached", async ()
   assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
 });
 
+// ---------------------------------------------------------------------------
+// Feature 5 - blocked callers (premium)
+// ---------------------------------------------------------------------------
+
+function blocklistStore(overrides = {}) {
+  const rows = new Map();
+  return {
+    rows,
+    async ensureWorkspace() {},
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "starter" };
+    },
+    async getWorkspace() {
+      return { workspaceId: "user-123", callBlocklistEnabled: true };
+    },
+    async listBlockedNumbers() {
+      return [...rows.values()];
+    },
+    async getBlockedNumber(_ws, phoneNumber) {
+      return rows.get(phoneNumber) ?? null;
+    },
+    async putBlockedNumber(item) {
+      if (rows.has(item.phoneNumber)) {
+        const error = new Error("exists");
+        error.name = "ConditionalCheckFailedException";
+        throw error;
+      }
+      rows.set(item.phoneNumber, item);
+      return item;
+    },
+    async deleteBlockedNumber(_ws, phoneNumber) {
+      rows.delete(phoneNumber);
+    },
+    async recordBlockedHit(_ws, phoneNumber) {
+      const row = rows.get(phoneNumber);
+      if (row) row.hitCount = (row.hitCount ?? 0) + 1;
+    },
+    ...overrides,
+  };
+}
+
+test("blocked-numbers routes 403 when the premium feature is off", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore({
+    async getWorkspace() {
+      return { workspaceId: "user-123", callBlocklistEnabled: false };
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/blocked-numbers"));
+  assert.equal(response.statusCode, 403);
+});
+
+test("blocked-numbers CRUD works when the premium feature is enabled", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const handler = createHandler({ getStore: async () => store });
+
+  const created = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0100",
+    label: "Warranty robocall",
+  }));
+  assert.equal(created.statusCode, 201);
+  assert.equal(JSON.parse(created.body).phoneNumber, "+17035550100");
+
+  const listed = await handler(authenticatedEvent("GET", "/workspaces/me/blocked-numbers"));
+  assert.equal(listed.statusCode, 200);
+  assert.equal(JSON.parse(listed.body).length, 1);
+
+  const dup = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "+17035550100",
+  }));
+  assert.equal(dup.statusCode, 409);
+
+  const bad = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "not-a-number",
+  }));
+  assert.equal(bad.statusCode, 400);
+
+  const removed = await handler(authenticatedEvent(
+    "DELETE",
+    "/workspaces/me/blocked-numbers/%2B17035550100",
+  ));
+  assert.equal(removed.statusCode, 200);
+  assert.equal(store.rows.size, 0);
+});
+
+test("inbound lookup rejects a blocked caller and records a hit", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore({
+    async getPhoneNumberByDid() {
+      return { workspaceId: "user-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "active", retellAgentId: "retell-agent-1" };
+    },
+    async getUsageCounter() {
+      return null;
+    },
+  });
+  store.rows.set("+17035550100", { phoneNumber: "+17035550100", hitCount: 0 });
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550177", from_number: "+1 703-555-0100" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
+  assert.equal(store.rows.get("+17035550100").hitCount, 1);
+});
+
+test("inbound lookup ignores the blocklist for an unentitled workspace", async () => {
+  const { createHandler } = await loadBff();
+  let blockRead = false;
+  const store = blocklistStore({
+    async getWorkspace() {
+      return { workspaceId: "user-123", callBlocklistEnabled: false };
+    },
+    async getPhoneNumberByDid() {
+      return { workspaceId: "user-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "active", retellAgentId: "retell-agent-1" };
+    },
+    async getUsageCounter() {
+      return null;
+    },
+    async getBlockedNumber() {
+      blockRead = true;
+      return { phoneNumber: "+17035550100" };
+    },
+  });
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550177", from_number: "+17035550100" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).call_inbound.override_agent_id, "retell-agent-1");
+  assert.equal(blockRead, false);
+});
+
+test("PATCH /platform/companies toggles callBlocklistEnabled", async () => {
+  const { createHandler } = await loadBff();
+  let saved;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "ws-platform", role: "super-admin", status: "active" };
+    },
+    async ensureWorkspace() {},
+    async getWorkspace() {
+      return { workspaceId: "ws-tech", name: "Technovate" };
+    },
+    async putWorkspace(value) {
+      saved = value;
+      return value;
+    },
+    async getProfile() { return null; },
+    async listCalls() { return []; },
+    async listMemberships() { return []; },
+    async listProposals() { return []; },
+    async listProposalTemplates() { return []; },
+  };
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("PATCH", "/platform/companies/ws-tech", {
+    callBlocklistEnabled: true,
+  });
+  event.pathParameters = { workspaceId: "ws-tech" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.callBlocklistEnabled, true);
+  assert.equal(JSON.parse(response.body).callBlocklistEnabled, true);
+});
+
 test("GET /platform/billing aggregates workspaces and is super-admin only", async () => {
   const { createHandler } = await loadBff();
   const workspaces = [

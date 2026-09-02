@@ -290,6 +290,38 @@ test("call_analyzed still succeeds when the recording download fails", async () 
   assert.equal(persistedCall.recordingKey, undefined);
 });
 
+test("call_analyzed with is_spam classifies the call as spam and does not mark the agent tested", async () => {
+  let persistedCall;
+  let testedAgent;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async upsertCall(record) {
+        persistedCall = structuredClone(record);
+      },
+      async markAgentTested(workspaceId, agentId, testedAt) {
+        testedAgent = { workspaceId, agentId, testedAt };
+      },
+    }),
+    now: () => new Date("2026-08-16T14:00:00.000Z"),
+  });
+
+  const response = await handler(callAnalyzedEvent({
+    call_id: "retell-call-spam",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123", kind: "test" },
+    transcript_with_tool_calls: [],
+    call_analysis: {
+      call_summary: "Automated message about vehicle warranty.",
+      custom_analysis_data: { is_spam: true },
+    },
+  }));
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(persistedCall.outcome, "spam");
+  assert.equal(testedAgent, undefined);
+});
+
 test("failed test call_ended persists the call without marking the agent tested", async () => {
   let persistedCall;
   let testedAgent;

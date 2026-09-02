@@ -202,6 +202,7 @@ export function createRetellClient({
       },
       voice_id: config.voice,
       agent_name: `Symantic ${symanticAgentId} · ${agentName}`,
+      ...(config.retellAgent ?? {}),
     };
   }
 
@@ -311,6 +312,22 @@ export function createRetellClient({
           "Retell phone_number",
         ),
       };
+    },
+
+    // Restrict (or clear) which countries may call this number inbound. Retell
+    // takes ISO 3166-1 alpha-2 codes; an empty list clears the restriction.
+    async setPhoneNumberCountries(phoneNumber, { allowed_inbound_country_list }) {
+      await retellRequest(
+        `/update-phone-number/${encodeURIComponent(required(phoneNumber, "phoneNumber"))}`,
+        {
+          method: "PATCH",
+          body: {
+            allowed_inbound_country_list: Array.isArray(allowed_inbound_country_list)
+              ? allowed_inbound_country_list
+              : [],
+          },
+        },
+      );
     },
 
     async startPhoneCall({
