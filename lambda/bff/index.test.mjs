@@ -1290,6 +1290,52 @@ test("proposal signature requests send the private PDF through SignWell and pers
   assert.equal("apiKey" in body, false);
 });
 
+test("initials markers on a proposal with no agreement page still force SignWell text-tag parsing", async () => {
+  let signWellRequest;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() {
+      return {
+        id: "prp-ini",
+        name: "Services proposal",
+        signerNames: ["Jane Client"],
+        documentItems: [{ id: "scope", kind: "scope", hidden: false, initialFields: [{ id: "ini-1", xFrac: 0.5, yFracFromTop: 0.5 }] }],
+      };
+    },
+    async updateProposalSignature(_w, _p, signatureRequest) { return signatureRequest; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({
+      webhookId: "webhook-123",
+      client: {
+        testMode: false,
+        async createDocument(input) {
+          signWellRequest = input;
+          return { id: "signwell-doc-ini", status: "Sent", recipients: [{ id: "1", status: "sent" }] };
+        },
+      },
+    }),
+    getAssetSigner: async () => ({ async createDownloadUrl() { return "https://private.example.com/p.pdf"; } }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-ini/signature-requests",
+    {
+      assetKey: "exports/prp-ini.pdf",
+      recipients: [{ name: "Jane Client", email: "jane@example.com" }],
+      subject: "Please sign",
+      message: "Please review and sign.",
+      applySigningOrder: false,
+    },
+  ));
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, true);
+});
+
 test("editing an untouched signer email updates the sent SignWell recipient and resends its notification", async () => {
   let proposal = {
     id: "prp-sign",
@@ -1363,13 +1409,15 @@ test("editing an untouched signer email updates the sent SignWell recipient and 
   assert.ok(body.lastResentAt);
 });
 
-test("adding a signer and initials pages cancels the old request and sends a replacement draft", async () => {
+test("adding a signer and initials markers cancels the old request and sends a replacement draft", async () => {
   let proposal = {
     id: "prp-sign",
     name: "Dental modernization",
     signerNames: ["Jane Client", "Alex Client"],
-    signatureInitials: { enabled: true, signerIndex: 1, pageMode: "selected", pageNumbers: [1, 3] },
-    documentItems: [{ id: "agreement", kind: "agreement", hidden: false }],
+    documentItems: [
+      { id: "agreement", kind: "agreement", hidden: false },
+      { id: "scope", kind: "scope", hidden: false, initialFields: [{ id: "ini-1", xFrac: 0.5, yFracFromTop: 0.5 }] },
+    ],
     signatureRequest: {
       provider: "signwell",
       documentId: "signwell-doc-old",
@@ -1455,7 +1503,7 @@ test("adding a signer and initials pages cancels the old request and sends a rep
   assert.equal(draftInput.with_signature_page, false);
   assert.equal(body.documentId, "signwell-doc-new");
   assert.equal(body.replacedDocumentId, "signwell-doc-old");
-  assert.deepEqual(body.initials, proposal.signatureInitials);
+  assert.equal(body.initials, undefined);
   assert.deepEqual(body.recipients.map((recipient) => recipient.email), ["jane@example.com", "alex@example.com"]);
 });
 
@@ -1513,6 +1561,10 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
         assert.equal(documentId, "signwell-doc-123");
         return "https://signed.example.com/completed.pdf";
       },
+      async getCompletedPdfBase64(documentId) {
+        assert.equal(documentId, "signwell-doc-123");
+        return Buffer.from("%PDF-1.4 signed").toString("base64");
+      },
     },
   };
   const { createHandler } = await loadBff();
@@ -1529,6 +1581,7 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
 
   assert.equal(response.statusCode, 200);
   assert.equal(body.url, "https://signed.example.com/completed.pdf");
+  assert.equal(Buffer.from(body.pdfBase64, "base64").toString(), "%PDF-1.4 signed");
   assert.equal(proposal.signatureRequest.status, "completed");
   assert.equal(proposal.signatureRequest.lastEvent, "document_completed");
   assert.equal(proposal.signatureRequest.completedAt, "2026-08-31T17:40:00.000Z");

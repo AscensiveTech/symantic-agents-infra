@@ -1680,25 +1680,13 @@ function hasAgreementSigningFields(proposal, recipients) {
   );
 }
 
-function proposalInitialsSettings(proposal, recipients) {
-  const value = proposal?.signatureInitials;
-  if (!value?.enabled) return null;
-  const signerIndex = Number(value.signerIndex);
-  const pageMode = value.pageMode;
-  const pageNumbers = Array.isArray(value.pageNumbers)
-    ? [...new Set(value.pageNumbers.map(Number))].sort((a, b) => a - b)
-    : [];
-  if (
-    !Number.isInteger(signerIndex) || signerIndex < 0 || signerIndex >= recipients.length ||
-    !["all", "selected"].includes(pageMode) ||
-    (pageMode === "selected" && (pageNumbers.length === 0 || pageNumbers.length > 500)) ||
-    pageNumbers.some((page) => !Number.isInteger(page) || page < 1)
-  ) return undefined;
-  return { enabled: true, signerIndex, pageMode, pageNumbers };
-}
-
-function sameInitialsSettings(left, right) {
-  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+// Whether any visible document item carries dropped "initial here" markers.
+// The frontend bakes the actual SignWell {{initial:...}} text tags into the
+// exported PDF; the BFF only needs this to force text-tag parsing on.
+function proposalHasInitialFields(proposal) {
+  return Array.isArray(proposal?.documentItems) && proposal.documentItems.some(
+    (item) => item?.hidden !== true && Array.isArray(item?.initialFields) && item.initialFields.length > 0,
+  );
 }
 
 async function handleProposalApi(event, {
@@ -1798,10 +1786,7 @@ async function handleProposalApi(event, {
         proposal,
         input.recipients,
       );
-      const initials = proposalInitialsSettings(proposal, input.recipients);
-      if (initials === undefined) {
-        return json(409, { message: "The customer initials settings are invalid. Choose a signer and valid PDF pages, then regenerate the PDF." });
-      }
+      const hasInitials = proposalHasInitialFields(proposal);
       if (proposal.documentItems?.some((item) => item?.kind === "agreement" && !item.hidden) && !agreementHasSigningFields) {
         return json(409, {
           message: "The generated PDF signer names do not match these recipients. Save the signer names and regenerate the PDF first.",
@@ -1828,7 +1813,10 @@ async function handleProposalApi(event, {
           previous.subject === input.subject &&
           previous.message === input.message &&
           previous.applySigningOrder === input.applySigningOrder &&
-          sameInitialsSettings(previous.initials, initials);
+          // Marker positions live only in the exported PDF; the in-place path
+          // never re-uploads it, so any initials at all forces the full
+          // draft-replace path (which does).
+          !hasInitials;
         if (canUpdateRecipientsInPlace) {
           await signWell.client.updateRecipients(
             previous.documentId,
@@ -1867,7 +1855,7 @@ async function handleProposalApi(event, {
         allow_decline: true,
         allow_reassign: true,
         ...(embeddedTestMode ? { embedded_signing: true } : {}),
-        text_tags: agreementHasSigningFields || initials !== null,
+        text_tags: agreementHasSigningFields || hasInitials,
         with_signature_page: !agreementHasSigningFields,
         files: [{
           name: proposalPdfFilename(proposal.name),
@@ -1946,7 +1934,6 @@ async function handleProposalApi(event, {
         subject: input.subject,
         message: input.message,
         applySigningOrder: input.applySigningOrder,
-        ...(initials ? { initials } : {}),
         recipients: input.recipients.map((recipient, index) => {
           const id = String(index + 1);
           const providerRecipient = createdRecipients.find((item) =>
@@ -2001,9 +1988,11 @@ async function handleProposalApi(event, {
       if (current.status !== "completed") {
         return json(409, { message: "The signed PDF is available after every signer completes the document" });
       }
-      return json(200, {
-        url: await signWell.client.getCompletedPdfUrl(current.documentId),
-      });
+      const [url, pdfBase64] = await Promise.all([
+        signWell.client.getCompletedPdfUrl(current.documentId),
+        signWell.client.getCompletedPdfBase64(current.documentId).catch(() => null),
+      ]);
+      return json(200, { url, ...(pdfBase64 ? { pdfBase64 } : {}) });
     }
     return json(404, { message: "Not found" });
   }
