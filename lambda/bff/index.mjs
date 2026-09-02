@@ -1651,6 +1651,7 @@ function validSignatureRequest(value, proposalId) {
     subject,
     message,
     applySigningOrder: value.applySigningOrder === true,
+    replaceSignedAcknowledged: value.replaceSignedAcknowledged === true,
   };
 }
 
@@ -1677,6 +1678,27 @@ function hasAgreementSigningFields(proposal, recipients) {
   return names.length === recipients.length && names.every(
     (name, index) => name.toLocaleLowerCase() === recipients[index]?.name.toLocaleLowerCase(),
   );
+}
+
+function proposalInitialsSettings(proposal, recipients) {
+  const value = proposal?.signatureInitials;
+  if (!value?.enabled) return null;
+  const signerIndex = Number(value.signerIndex);
+  const pageMode = value.pageMode;
+  const pageNumbers = Array.isArray(value.pageNumbers)
+    ? [...new Set(value.pageNumbers.map(Number))].sort((a, b) => a - b)
+    : [];
+  if (
+    !Number.isInteger(signerIndex) || signerIndex < 0 || signerIndex >= recipients.length ||
+    !["all", "selected"].includes(pageMode) ||
+    (pageMode === "selected" && (pageNumbers.length === 0 || pageNumbers.length > 500)) ||
+    pageNumbers.some((page) => !Number.isInteger(page) || page < 1)
+  ) return undefined;
+  return { enabled: true, signerIndex, pageMode, pageNumbers };
+}
+
+function sameInitialsSettings(left, right) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 }
 
 async function handleProposalApi(event, {
@@ -1732,7 +1754,7 @@ async function handleProposalApi(event, {
   }
 
   const signatureMatch = path.match(
-    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(remind|completed-pdf))?$/,
+    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(resend|remind|completed-pdf))?$/,
   );
   if (signatureMatch) {
     const proposalId = decodeEntityId(
@@ -1744,39 +1766,108 @@ async function handleProposalApi(event, {
     const action = signatureMatch[2] ?? "create";
     const signWell = await getSignWell();
 
-    if (action === "create" && method === "POST") {
+    if ((action === "create" || action === "resend") && method === "POST") {
       const input = validSignatureRequest(readBody(event), proposalId);
       if (!input) {
         return json(400, {
           message: "Provide 1 to 10 unique signer names and email addresses for the generated proposal PDF",
         });
       }
-      if (isActiveSignatureRequest(proposal.signatureRequest)) {
+      const replacing = action === "resend";
+      let previous = proposal.signatureRequest;
+      if (!replacing && isActiveSignatureRequest(previous)) {
         return json(409, { message: "This proposal already has an active signature request" });
+      }
+      if (replacing) {
+        if (!isActiveSignatureRequest(previous)) {
+          return json(409, { message: "Only an active signature request can be edited and resent" });
+        }
+        const reconciled = await reconcileSignWellSignature({
+          proposal,
+          workspaceId,
+          store,
+          client: signWell.client,
+          force: true,
+        });
+        previous = reconciled.signatureRequest;
+        if (!isActiveSignatureRequest(previous)) {
+          return json(409, { message: "This signature request is no longer active. Refresh its status before sending another request." });
+        }
       }
       const agreementHasSigningFields = hasAgreementSigningFields(
         proposal,
         input.recipients,
       );
+      const initials = proposalInitialsSettings(proposal, input.recipients);
+      if (initials === undefined) {
+        return json(409, { message: "The customer initials settings are invalid. Choose a signer and valid PDF pages, then regenerate the PDF." });
+      }
       if (proposal.documentItems?.some((item) => item?.kind === "agreement" && !item.hidden) && !agreementHasSigningFields) {
         return json(409, {
           message: "The generated PDF signer names do not match these recipients. Save the signer names and regenerate the PDF first.",
         });
       }
+
+      if (replacing) {
+        const previousRecipients = Array.isArray(previous.recipients) ? previous.recipients : [];
+        const sameNames = previousRecipients.length === input.recipients.length && previousRecipients.every(
+          (recipient, index) => recipient.name?.trim().toLowerCase() === input.recipients[index]?.name.toLowerCase(),
+        );
+        const changedRecipients = sameNames
+          ? input.recipients.flatMap((recipient, index) => {
+            const old = previousRecipients[index];
+            return old?.email?.trim().toLowerCase() === recipient.email
+              ? []
+              : [{ id: old.id, name: recipient.name, email: recipient.email, index }];
+          })
+          : [];
+        const canUpdateRecipientsInPlace =
+          sameNames &&
+          changedRecipients.length > 0 &&
+          changedRecipients.every(({ index }) => ["pending", "sent", "bounced"].includes(previousRecipients[index]?.status)) &&
+          previous.subject === input.subject &&
+          previous.message === input.message &&
+          previous.applySigningOrder === input.applySigningOrder &&
+          sameInitialsSettings(previous.initials, initials);
+        if (canUpdateRecipientsInPlace) {
+          await signWell.client.updateRecipients(
+            previous.documentId,
+            changedRecipients.map(({ id, name, email }) => ({ id, name, email })),
+          );
+          const now = new Date().toISOString();
+          const updated = {
+            ...previous,
+            recipients: previousRecipients.map((recipient, index) => ({
+              ...recipient,
+              name: input.recipients[index].name,
+              email: input.recipients[index].email,
+              ...(changedRecipients.some((changed) => changed.index === index) ? { status: "sent" } : {}),
+            })),
+            lastResentAt: now,
+            updatedAt: now,
+          };
+          await store.updateProposalSignature(workspaceId, proposalId, updated);
+          return json(200, updated);
+        }
+        if (previousRecipients.some((recipient) => recipient.status === "signed") && !input.replaceSignedAcknowledged) {
+          return json(409, { message: "A signer has already signed. Confirm that those signatures will not carry into the replacement request." });
+        }
+      }
+
       const signer = await getAssetSigner();
       const fileUrl = await signer.createDownloadUrl(workspaceId, input.assetKey);
       const embeddedTestMode = signWell.client.testMode === true;
-      const created = await signWell.client.createDocument({
+      const documentInput = {
         name: proposal.name || "Proposal",
         subject: input.subject,
         message: input.message,
-        draft: false,
+        draft: replacing,
         reminders: true,
         apply_signing_order: input.applySigningOrder,
         allow_decline: true,
         allow_reassign: true,
         ...(embeddedTestMode ? { embedded_signing: true } : {}),
-        text_tags: agreementHasSigningFields,
+        text_tags: agreementHasSigningFields || initials !== null,
         with_signature_page: !agreementHasSigningFields,
         files: [{
           name: proposalPdfFilename(proposal.name),
@@ -1797,9 +1888,46 @@ async function handleProposalApi(event, {
           proposalId,
           source: "rapidproposal",
         },
-      });
+      };
+      let created = await signWell.client.createDocument(documentInput);
       if (typeof created?.id !== "string" || !created.id) {
         throw new SignWellRequestError("SignWell did not return a document ID");
+      }
+      if (replacing) {
+        const draftId = created.id;
+        let previousCanceled = false;
+        try {
+          await signWell.client.deleteDocument(previous.documentId);
+          previousCanceled = true;
+          const sent = await signWell.client.sendDocument(draftId, {
+            name: proposal.name || "Proposal",
+            subject: input.subject,
+            message: input.message,
+            reminders: true,
+            apply_signing_order: input.applySigningOrder,
+            allow_decline: true,
+            allow_reassign: true,
+            ...(embeddedTestMode ? { embedded_signing: true } : {}),
+          });
+          created = {
+            ...created,
+            ...sent,
+            id: draftId,
+            recipients: Array.isArray(sent?.recipients) ? sent.recipients : created.recipients,
+          };
+        } catch (error) {
+          try { await signWell.client.deleteDocument(draftId); } catch { /* best-effort draft cleanup */ }
+          if (previousCanceled) {
+            await store.updateProposalSignature(workspaceId, proposalId, {
+              ...previous,
+              status: "canceled",
+              lastEvent: "document_replaced",
+              lastEventAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+          }
+          throw error;
+        }
       }
       const now = new Date().toISOString();
       const createdStatus = normalizeSignWellStatus(created.status, "sent");
@@ -1818,6 +1946,7 @@ async function handleProposalApi(event, {
         subject: input.subject,
         message: input.message,
         applySigningOrder: input.applySigningOrder,
+        ...(initials ? { initials } : {}),
         recipients: input.recipients.map((recipient, index) => {
           const id = String(index + 1);
           const providerRecipient = createdRecipients.find((item) =>
@@ -1835,9 +1964,10 @@ async function handleProposalApi(event, {
         }),
         sentAt: now,
         updatedAt: now,
+        ...(replacing ? { replacedDocumentId: previous.documentId, lastResentAt: now } : {}),
       };
       await store.updateProposalSignature(workspaceId, proposalId, signatureRequest);
-      return json(201, signatureRequest);
+      return json(replacing ? 200 : 201, signatureRequest);
     }
 
     let current = proposal.signatureRequest;

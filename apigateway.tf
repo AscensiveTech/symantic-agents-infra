@@ -34,6 +34,7 @@ locals {
     "DELETE /workspaces/me/proposals/{proposalId}",
     "POST /workspaces/me/proposals/{proposalId}/duplicate",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests",
+    "POST /workspaces/me/proposals/{proposalId}/signature-requests/resend",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/remind",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/completed-pdf",
     "GET /workspaces/me/proposal-templates",

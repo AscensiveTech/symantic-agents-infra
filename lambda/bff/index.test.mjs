@@ -1290,6 +1290,175 @@ test("proposal signature requests send the private PDF through SignWell and pers
   assert.equal("apiKey" in body, false);
 });
 
+test("editing an untouched signer email updates the sent SignWell recipient and resends its notification", async () => {
+  let proposal = {
+    id: "prp-sign",
+    name: "Dental modernization",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "agreement", kind: "agreement", hidden: false }],
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-old",
+      status: "sent",
+      testMode: false,
+      subject: "Please sign",
+      message: "Please review and sign.",
+      applySigningOrder: false,
+      recipients: [{ id: "1", name: "Jane Client", email: "wrong@example.com", status: "sent" }],
+      sentAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    },
+  };
+  let recipientPatch;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(proposal); },
+    async updateProposalSignature(_workspaceId, _proposalId, signatureRequest) {
+      proposal = { ...proposal, signatureRequest: structuredClone(signatureRequest) };
+      return signatureRequest;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({
+      webhookId: "webhook-123",
+      client: {
+        testMode: false,
+        async getDocument() {
+          return {
+            id: "signwell-doc-old",
+            status: "Sent",
+            metadata: { workspace_id: "user-123", proposal_id: "prp-sign" },
+            recipients: [{ id: "1", name: "Jane Client", email: "wrong@example.com", status: "sent" }],
+          };
+        },
+        async updateRecipients(documentId, recipients) {
+          assert.equal(documentId, "signwell-doc-old");
+          recipientPatch = recipients;
+          return { id: documentId };
+        },
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests/resend",
+    {
+      assetKey: "exports/prp-sign.pdf",
+      recipients: [{ name: "Jane Client", email: "correct@example.com" }],
+      subject: "Please sign",
+      message: "Please review and sign.",
+      applySigningOrder: false,
+    },
+  ));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(recipientPatch, [{ id: "1", name: "Jane Client", email: "correct@example.com" }]);
+  assert.equal(body.documentId, "signwell-doc-old");
+  assert.equal(body.recipients[0].email, "correct@example.com");
+  assert.equal(body.recipients[0].status, "sent");
+  assert.ok(body.lastResentAt);
+});
+
+test("adding a signer and initials pages cancels the old request and sends a replacement draft", async () => {
+  let proposal = {
+    id: "prp-sign",
+    name: "Dental modernization",
+    signerNames: ["Jane Client", "Alex Client"],
+    signatureInitials: { enabled: true, signerIndex: 1, pageMode: "selected", pageNumbers: [1, 3] },
+    documentItems: [{ id: "agreement", kind: "agreement", hidden: false }],
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-old",
+      status: "sent",
+      testMode: false,
+      subject: "Please sign",
+      message: "Please review and sign.",
+      applySigningOrder: false,
+      recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "sent" }],
+      sentAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    },
+  };
+  const calls = [];
+  let draftInput;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(proposal); },
+    async updateProposalSignature(_workspaceId, _proposalId, signatureRequest) {
+      proposal = { ...proposal, signatureRequest: structuredClone(signatureRequest) };
+      return signatureRequest;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getAssetSigner: async () => ({ async createDownloadUrl() { return "https://private.example.com/proposal.pdf"; } }),
+    getSignWell: async () => ({
+      webhookId: "webhook-123",
+      client: {
+        testMode: false,
+        async getDocument() {
+          return {
+            id: "signwell-doc-old",
+            status: "Sent",
+            metadata: { workspace_id: "user-123", proposal_id: "prp-sign" },
+            recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "sent" }],
+          };
+        },
+        async createDocument(input) {
+          calls.push("create-draft");
+          draftInput = input;
+          return { id: "signwell-doc-new", status: "Created", recipients: input.recipients };
+        },
+        async deleteDocument(documentId) {
+          calls.push(`delete:${documentId}`);
+        },
+        async sendDocument(documentId) {
+          calls.push(`send:${documentId}`);
+          return {
+            id: documentId,
+            status: "Sent",
+            recipients: [
+              { id: "1", email: "jane@example.com", status: "sent" },
+              { id: "2", email: "alex@example.com", status: "sent" },
+            ],
+          };
+        },
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests/resend",
+    {
+      assetKey: "exports/prp-sign.pdf",
+      recipients: [
+        { name: "Jane Client", email: "jane@example.com" },
+        { name: "Alex Client", email: "alex@example.com" },
+      ],
+      subject: "Please sign",
+      message: "Please review and sign.",
+      applySigningOrder: false,
+    },
+  ));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(calls, ["create-draft", "delete:signwell-doc-old", "send:signwell-doc-new"]);
+  assert.equal(draftInput.draft, true);
+  assert.equal(draftInput.text_tags, true);
+  assert.equal(draftInput.with_signature_page, false);
+  assert.equal(body.documentId, "signwell-doc-new");
+  assert.equal(body.replacedDocumentId, "signwell-doc-old");
+  assert.deepEqual(body.initials, proposal.signatureInitials);
+  assert.deepEqual(body.recipients.map((recipient) => recipient.email), ["jane@example.com", "alex@example.com"]);
+});
+
 test("completed PDF requests reconcile a missed SignWell completion webhook", async () => {
   let proposal = {
     id: "prp-sign",
