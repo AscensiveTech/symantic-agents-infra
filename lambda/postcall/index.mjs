@@ -586,7 +586,7 @@ function durationMs(call) {
 }
 
 function isSuccessfulTestOutcome(outcome) {
-  return outcome !== "failed" && outcome !== "abandoned";
+  return outcome !== "failed" && outcome !== "abandoned" && outcome !== "spam";
 }
 
 function inferOutcome(call, toolLog) {
@@ -604,6 +604,16 @@ function inferOutcome(call, toolLog) {
   }
   if (successfulTools.has("message_take")) return "message";
   if (successfulTools.has("lead_capture")) return "lead";
+  // Retell's post-call analysis flags spam via a custom is_spam field. A call
+  // that completed a real action above is never spam.
+  const analysis = call?.call_analysis && typeof call.call_analysis === "object"
+    ? call.call_analysis
+    : {};
+  const custom = analysis.custom_analysis_data
+      && typeof analysis.custom_analysis_data === "object"
+    ? analysis.custom_analysis_data
+    : {};
+  if (custom.is_spam === true) return "spam";
   const failure = [
     call?.call_status,
     call?.disconnection_reason,

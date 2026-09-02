@@ -1,5 +1,70 @@
 import { formatBusinessHours, isBusinessHours } from "./business-hours.mjs";
 
+// Call-handling defaults + clamp bounds. Collected in the Symantic UI and passed
+// straight through to Retell (end_call_after_silence_ms / max_call_duration_ms).
+// Keep these identical to the frontend mirror in lib/domain/call-handling.ts.
+export const CALL_HANDLING = {
+  silence: { defaultSec: 60, minSec: 10, maxSec: 300 },
+  maxDuration: { defaultMin: 10, minMin: 1, maxMin: 30 },
+};
+
+// Never surfaced in the UI - the agent nudges a silent caller once, then the
+// silence timeout above ends the call.
+const REMINDER_TRIGGER_MS = 8000;
+const REMINDER_MAX_COUNT = 1;
+
+const END_CALL_TOOL = {
+  type: "end_call",
+  name: "end_call",
+  description:
+    "End the call politely when the caller is clearly a recorded message, an automated "
+    + "system / IVR, or a telemarketer working from a script - i.e. there is no genuine "
+    + "back-and-forth. Do not use this on a hesitant or confused real caller.",
+};
+
+const SPAM_ANALYSIS_FIELD = {
+  type: "boolean",
+  name: "is_spam",
+  description:
+    "True if the caller was a robocall, automated system / IVR, or a telemarketer rather "
+    + "than a genuine prospective or existing customer.",
+};
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+// Read the customer's call-handling settings off the agent config, applying
+// defaults and clamping to the supported Retell range.
+export function resolveCallHandling(agent) {
+  const config = agent?.configuration ?? {};
+  const silenceRaw = Number(config.silenceTimeoutSec);
+  const maxRaw = Number(config.maxCallDurationMin);
+  const silenceSec = Number.isFinite(silenceRaw)
+    ? clamp(Math.round(silenceRaw), CALL_HANDLING.silence.minSec, CALL_HANDLING.silence.maxSec)
+    : CALL_HANDLING.silence.defaultSec;
+  const maxDurationMin = Number.isFinite(maxRaw)
+    ? clamp(Math.round(maxRaw), CALL_HANDLING.maxDuration.minMin, CALL_HANDLING.maxDuration.maxMin)
+    : CALL_HANDLING.maxDuration.defaultMin;
+  return { silenceSec, maxDurationMin };
+}
+
+// ISO 3166-1 alpha-2 list of countries allowed to call the receptionist inbound.
+// Empty = accept calls from anywhere (Retell's default).
+export function resolveAllowedInboundCountries(agent) {
+  const raw = agent?.configuration?.allowedInboundCountries;
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(
+    raw
+      .map((code) => (typeof code === "string" ? code.trim().toUpperCase() : ""))
+      .filter((code) => /^[A-Z]{2}$/.test(code)),
+  )];
+}
+
+function spamScreeningEnabled(agent) {
+  return agent?.configuration?.spamScreening !== false;
+}
+
 const CALENDAR_TOOLS = [
   {
     name: "calendar_find_appointment",
@@ -206,6 +271,17 @@ export function buildReceptionistPrompt(agent, profile) {
     ].filter(Boolean).join("\n") ||
       "For emergencies or requests for a person, use the matching transfer_call tool. If transfer is unavailable, use message_take.",
     "",
+    ...(spamScreeningEnabled(agent)
+      ? [
+        "Spam and robocall handling",
+        "- If the caller is clearly a recording, an automated system, an IVR menu, or a "
+        + "telemarketer reading a script (no real back-and-forth, ignores your questions, "
+        + "repeats a pitch), say one brief polite line and call the end_call tool.",
+        "- Be conservative. A slow, hesitant, or confused person is NOT spam - keep helping. "
+        + "When unsure, continue the call.",
+        "",
+      ]
+      : []),
     "Operating rules",
     "- Never invent business facts, prices, availability, medical advice, or policy.",
     "- Use only Symantic tool results as confirmation that an action completed.",
@@ -233,6 +309,7 @@ export function buildReceptionistConfig({
     ? [...CALENDAR_TOOLS, ...CORE_TOOLS]
     : CORE_TOOLS;
   const transferDefinitions = buildTransferTools(agent, profile);
+  const callHandling = resolveCallHandling(agent);
   return {
     prompt: buildReceptionistPrompt(agent, profile),
     tools: [
@@ -244,12 +321,22 @@ export function buildReceptionistConfig({
         })
       ),
       ...transferDefinitions,
+      ...(spamScreeningEnabled(agent) ? [END_CALL_TOOL] : []),
     ],
     voice: voiceId,
     transferNumbers: transferDefinitions.map(
       ({ transfer_destination }) => transfer_destination.number,
     ),
     bookingEnabled,
+    // Agent-level Retell settings, spread into the create/update-agent body.
+    retellAgent: {
+      end_call_after_silence_ms: callHandling.silenceSec * 1000,
+      max_call_duration_ms: callHandling.maxDurationMin * 60_000,
+      reminder_trigger_ms: REMINDER_TRIGGER_MS,
+      reminder_max_count: REMINDER_MAX_COUNT,
+      post_call_analysis_data: [SPAM_ANALYSIS_FIELD],
+    },
+    allowedInboundCountries: resolveAllowedInboundCountries(agent),
   };
 }
 

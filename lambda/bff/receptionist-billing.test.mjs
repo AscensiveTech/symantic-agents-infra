@@ -7,6 +7,7 @@ import {
   buildUsage,
   costBreakdown,
   periodKey,
+  resolveCallBlocklist,
   resolvePlan,
 } from "./receptionist-billing.mjs";
 
@@ -134,4 +135,23 @@ test("costBreakdown yields cost, profit and margin from actual talk time", () =>
   const c2 = costBreakdown(0, null, 0);
   assert.equal(c2.grossProfit, null);
   assert.equal(c2.grossMarginPct, null);
+});
+
+test("resolveCallBlocklist: explicit super-admin toggle wins, otherwise off by default", () => {
+  assert.equal(resolveCallBlocklist({ callBlocklistEnabled: true }, { plan: "starter" }), true);
+  assert.equal(resolveCallBlocklist({ callBlocklistEnabled: false }, { plan: "pro" }), false);
+  assert.equal(resolveCallBlocklist({}, { plan: "enterprise" }), false);
+  assert.equal(resolveCallBlocklist(null, null), false);
+});
+
+test("buildUsage counts spam calls separately without dropping them from totals", () => {
+  const now = new Date("2026-09-15T12:00:00Z");
+  const usage = buildUsage([
+    call("2026-09-02T10:00:00Z", 60_000, { outcome: "answered" }),
+    call("2026-09-03T10:00:00Z", 30_000, { outcome: "spam" }),
+    call("2026-09-04T10:00:00Z", 30_000, { outcome: "spam" }),
+  ], { now, timezone: "UTC", plan: resolvePlan({ receptionistPlan: "starter" }, {}, now, "UTC") });
+  assert.equal(usage.billingCycle.calls, 3);
+  assert.equal(usage.billingCycle.spamCalls, 2);
+  assert.equal(usage.billingCycle.minutes, 3);
 });

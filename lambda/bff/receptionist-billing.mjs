@@ -15,6 +15,21 @@ export const RECEPTIONIST_PLANS = {
 
 export const PLAN_KEYS = Object.keys(RECEPTIONIST_PLANS);
 
+// Premium features that a plan tier can include by default. Empty for now - the
+// call blocklist is enabled per-workspace by a super admin. When the tier
+// mapping is decided, add e.g. `pro: { callBlocklist: true }` here.
+export const PLAN_FEATURES = {};
+
+/**
+ * Whether the premium call blocklist is available to a workspace. An explicit
+ * super-admin toggle on the workspace record wins; otherwise fall back to the
+ * plan-tier default (none today).
+ */
+export function resolveCallBlocklist(workspace, plan) {
+  if (workspace?.callBlocklistEnabled === true) return true;
+  return Boolean(PLAN_FEATURES[plan?.plan]?.callBlocklist);
+}
+
 // Modeled provider cost per ACTUAL talk-minute, plus a fixed monthly platform cost.
 // Super-admin billing report only — never exposed to org admins.
 export const PROVIDER_COST = {
@@ -175,6 +190,7 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
   const byMonth = new Map();
   let cycleMinutes = 0;
   let cycleCalls = 0;
+  let cycleSpamCalls = 0;
   let cycleActualSeconds = 0;
   const detail = [];
   const detailCutoff = new Date(now.getTime() - 45 * 24 * 60 * 60 * 1000);
@@ -194,6 +210,7 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
     if (at >= startsOn && at < endsOn) {
       cycleMinutes += minutes;
       cycleCalls += 1;
+      if (call.outcome === "spam") cycleSpamCalls += 1;
       cycleActualSeconds += Math.max(0, Math.round((call.durationMs ?? 0) / 1000));
     }
     if (at >= detailCutoff) {
@@ -249,6 +266,7 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
       daysElapsed,
       minutes: cycleMinutes,
       calls: cycleCalls,
+      spamCalls: cycleSpamCalls,
       actualSeconds: cycleActualSeconds,
       overageMinutes,
       overageCharge: round2(overageCharge),

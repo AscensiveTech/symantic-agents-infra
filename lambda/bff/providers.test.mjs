@@ -371,6 +371,67 @@ test("Retell test call sends provider IDs only in the provider request", async (
   });
 });
 
+test("Retell agent body carries the call-handling settings from config.retellAgent", async () => {
+  const calls = [];
+  const client = createRetellClient({
+    apiKey: "retell-key",
+    fetchImpl: async (url, init = {}) => {
+      calls.push([String(url), init]);
+      if (String(url).endsWith("/list-agents")) return response([], 200);
+      if (String(url).endsWith("/create-retell-llm")) return response({ llm_id: "llm-1" }, 201);
+      return response({ agent_id: "retell-agent-1" }, 201);
+    },
+  });
+
+  await client.upsertAgent({
+    symanticAgentId: "agent-1",
+    agentName: "Maya",
+    greeting: "Hi",
+    config: {
+      prompt: "p",
+      tools: [],
+      voice: "retell-Cimo",
+      retellAgent: {
+        end_call_after_silence_ms: 20000,
+        max_call_duration_ms: 120000,
+        reminder_trigger_ms: 8000,
+        reminder_max_count: 1,
+        post_call_analysis_data: [{ type: "boolean", name: "is_spam", description: "d" }],
+      },
+    },
+  });
+
+  const createAgentBody = JSON.parse(calls.find(([url]) => url.endsWith("/create-agent"))[1].body);
+  assert.equal(createAgentBody.end_call_after_silence_ms, 20000);
+  assert.equal(createAgentBody.max_call_duration_ms, 120000);
+  assert.deepEqual(createAgentBody.post_call_analysis_data, [
+    { type: "boolean", name: "is_spam", description: "d" },
+  ]);
+});
+
+test("setPhoneNumberCountries PATCHes the Retell phone number with ISO codes", async () => {
+  const calls = [];
+  const client = createRetellClient({
+    apiKey: "retell-key",
+    fetchImpl: async (url, init = {}) => {
+      calls.push([String(url), init]);
+      return response({}, 200);
+    },
+  });
+
+  await client.setPhoneNumberCountries("+17035550177", {
+    allowed_inbound_country_list: ["US", "CA"],
+  });
+  assert.equal(calls[0][0], "https://api.retellai.com/update-phone-number/%2B17035550177");
+  assert.equal(calls[0][1].method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0][1].body), {
+    allowed_inbound_country_list: ["US", "CA"],
+  });
+
+  await client.setPhoneNumberCountries("+17035550177", { allowed_inbound_country_list: null });
+  assert.deepEqual(JSON.parse(calls[1][1].body), { allowed_inbound_country_list: [] });
+});
+
 test("voice resolver maps product labels without treating them as provider IDs", () => {
   assert.equal(resolveRetellVoiceId("Calm and natural", {
     defaultVoiceId: "retell-Cimo",
