@@ -69,6 +69,23 @@ export function createSignWellClient({
         body: JSON.stringify({ test_mode: testMode !== false, ...document }),
       });
     },
+    updateRecipients(documentId, recipients) {
+      return request(`/documents/${encodeURIComponent(documentId)}/recipients`, {
+        method: "PATCH",
+        body: JSON.stringify({ recipients }),
+      });
+    },
+    sendDocument(documentId, document = {}) {
+      return request(`/documents/${encodeURIComponent(documentId)}/send`, {
+        method: "POST",
+        body: JSON.stringify({ test_mode: testMode !== false, ...document }),
+      });
+    },
+    deleteDocument(documentId) {
+      return request(`/documents/${encodeURIComponent(documentId)}`, {
+        method: "DELETE",
+      });
+    },
     sendReminder(documentId, recipients) {
       const body = Array.isArray(recipients) && recipients.length > 0
         ? { recipients }
