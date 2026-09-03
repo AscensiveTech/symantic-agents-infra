@@ -119,14 +119,22 @@ test("buildProposalBilling: prorated upcoming while unpaid, full month once a pa
 });
 
 test("buildProposalBilling honours a per-company price override", () => {
-  const billing = buildProposalBilling(
+  const paid = [{ paymentId: "p1", paidAt: "2026-08-05", planLabel: "Pro", amount: 80, receivedBy: "x" }];
+  const custom = buildProposalBilling(
     { tier: "repository", proposalPlanPriceOverride: 80, createdAt: "2026-08-01T00:00:00Z" },
-    "repository", [{ paymentId: "p1", paidAt: "2026-08-05", planLabel: "Pro", amount: 80, receivedBy: "x" }],
-    { now, timezone: "UTC" },
+    "repository", paid, { now, timezone: "UTC" },
   );
-  assert.equal(billing.monthlyPrice, 80);
-  assert.equal(billing.priceOverridden, true);
-  assert.equal(billing.upcoming.amount, 80);
+  assert.equal(custom.monthlyPrice, 80);
+  assert.equal(custom.priceOverridden, true);
+  assert.equal(custom.upcoming.amount, 80);
+
+  // An override that equals the tier default is not a "custom rate".
+  const atDefault = buildProposalBilling(
+    { tier: "repository", proposalPlanPriceOverride: 119, createdAt: "2026-08-01T00:00:00Z" },
+    "repository", paid, { now, timezone: "UTC" },
+  );
+  assert.equal(atDefault.monthlyPrice, 119);
+  assert.equal(atDefault.priceOverridden, false);
 });
 
 test("validProposalPayment enforces the required fields", () => {

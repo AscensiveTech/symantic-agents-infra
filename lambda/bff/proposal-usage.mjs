@@ -197,7 +197,10 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
   const normalizedTier = PROPOSAL_LIMITS[tier] ? tier : "basic";
   const tz = timezone || "UTC";
   const monthlyPrice = resolveProposalMonthlyPrice(normalizedTier, workspace);
-  const priceOverridden = money(workspace?.proposalPlanPriceOverride) != null;
+  const override = money(workspace?.proposalPlanPriceOverride);
+  // "Overridden" only when it actually differs from the tier default - an
+  // override that equals the default is just the plan price, not a custom rate.
+  const priceOverridden = override != null && override !== PROPOSAL_PLAN_PRICES[normalizedTier];
   const planLabel = TIER_LABELS[normalizedTier];
 
   const payments = (Array.isArray(paymentRows) ? paymentRows : [])
