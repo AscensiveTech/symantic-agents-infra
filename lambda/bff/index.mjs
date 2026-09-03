@@ -1818,7 +1818,7 @@ async function handleProposalApi(event, {
   }
 
   const signatureMatch = path.match(
-    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(resend|remind|completed-pdf))?$/,
+    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(resend|remind|completed-pdf|cancel))?$/,
   );
   if (signatureMatch) {
     const proposalId = decodeEntityId(
@@ -2036,6 +2036,22 @@ async function handleProposalApi(event, {
     let current = proposal.signatureRequest;
     if (!current || current.provider !== "signwell" || typeof current.documentId !== "string") {
       return json(404, { message: "This proposal has no SignWell signature request" });
+    }
+    if (action === "cancel" && method === "POST") {
+      // "Revise Proposal" reopened this proposal for editing. Stop an
+      // in-progress signing in SignWell so pending signers can't sign the
+      // stale version; a completed document is legally final and stays as
+      // SignWell's permanent record (nothing to do). Best-effort - the
+      // frontend clears its own signature state regardless.
+      if (isActiveSignatureRequest(current)) {
+        await signWell.client.cancelDocument(current.documentId);
+        await store.updateProposalSignature(workspaceId, proposalId, {
+          ...current,
+          status: "canceled",
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      return json(200, { ok: true });
     }
     if (action === "remind" && method === "POST") {
       if (!isActiveSignatureRequest(current)) {

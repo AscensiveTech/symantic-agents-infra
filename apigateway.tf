@@ -39,6 +39,7 @@ locals {
     "POST /workspaces/me/proposals/{proposalId}/signature-requests",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/resend",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/remind",
+    "POST /workspaces/me/proposals/{proposalId}/signature-requests/cancel",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/completed-pdf",
     "GET /workspaces/me/proposal-templates",
     "POST /workspaces/me/proposal-templates",

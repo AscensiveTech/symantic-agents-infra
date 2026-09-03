@@ -1507,6 +1507,83 @@ test("adding a signer and initials markers cancels the old request and sends a r
   assert.deepEqual(body.recipients.map((recipient) => recipient.email), ["jane@example.com", "alex@example.com"]);
 });
 
+test("cancel action deletes an active SignWell document and marks the request canceled", async () => {
+  let proposal = {
+    id: "prp-sign",
+    name: "Out for signature",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-abc",
+      status: "sent",
+      recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "sent" }],
+      sentAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    },
+  };
+  const calls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(proposal); },
+    async updateProposalSignature(_w, _p, signatureRequest) {
+      proposal = { ...proposal, signatureRequest: structuredClone(signatureRequest) };
+      return signatureRequest;
+    },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      async cancelDocument(documentId) { calls.push(`cancel:${documentId}`); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getSignWell: async () => signWell });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests/cancel",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { ok: true });
+  assert.deepEqual(calls, ["cancel:signwell-doc-abc"]);
+  assert.equal(proposal.signatureRequest.status, "canceled");
+});
+
+test("cancel action is a no-op for an already-completed document", async () => {
+  const proposal = {
+    id: "prp-sign",
+    name: "Signed",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-done",
+      status: "completed",
+      recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "signed" }],
+      sentAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    },
+  };
+  let canceled = false;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(proposal); },
+    async updateProposalSignature() { throw new Error("should not update a completed request"); },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: { async cancelDocument() { canceled = true; } },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getSignWell: async () => signWell });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests/cancel",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(canceled, false);
+});
+
 test("completed PDF requests reconcile a missed SignWell completion webhook", async () => {
   let proposal = {
     id: "prp-sign",
