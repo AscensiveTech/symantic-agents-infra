@@ -2759,12 +2759,26 @@ function usageQuotaStore(overrides = {}) {
     row[field] = (row[field] ?? 0) + by;
     counters.set(sk, row);
   };
+  const payments = new Map(); // sk -> record
   return {
     _proposals: proposals,
     _counters: counters,
+    _payments: payments,
     async ensureWorkspace() {},
     async getProfile() { return { timezone: "UTC" }; },
-    async getWorkspace() { return { workspaceId: "user-123", tier: "repository" }; },
+    async getWorkspace() { return { workspaceId: "user-123", tier: "repository", createdAt: "2026-09-10T00:00:00.000Z" }; },
+    async listWorkspaces() { return []; },
+    async listMemberships() { return []; },
+    async countProposals() { return 0; },
+    async countProposalTemplates() { return 0; },
+    async listProposalPayments() { return [...payments.values()]; },
+    async putProposalPayment(_workspaceId, payment) {
+      payments.set(`payment#${payment.paidAt}#${payment.paymentId}`, payment);
+      return payment;
+    },
+    async deleteProposalPayment(_workspaceId, paidAt, paymentId) {
+      payments.delete(`payment#${paidAt}#${paymentId}`);
+    },
     async listProposals() { return [...proposals.values()]; },
     async createProposal(_workspaceId, proposal) {
       proposals.set(proposal.id, structuredClone(proposal));
@@ -2934,6 +2948,91 @@ test("PATCH /platform/companies/{id}/proposal-usage sets an absolute count and t
   const notSuper = authenticatedEvent("PATCH", "/platform/companies/user-123/proposal-usage", { proposalsCreated: 1 });
   notSuper.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
   assert.equal((await handler(notSuper)).statusCode, 403);
+});
+
+test("GET /workspaces/me/proposal-payments returns a billing view for an admin, 403 for a proposal-only user", async () => {
+  const store = usageQuotaStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const ok = await handler(authenticatedEvent("GET", "/workspaces/me/proposal-payments"));
+  assert.equal(ok.statusCode, 200);
+  const body = JSON.parse(ok.body);
+  assert.equal(body.monthlyPrice, 119); // Pro default
+  assert.equal(body.upcoming.prorated, true); // no payments yet
+  assert.equal(Array.isArray(body.payments), true);
+
+  const memberStore = {
+    ...usageQuotaStore(),
+    async getMembership(userId) {
+      return { userId, workspaceId: "user-123", role: "quotation-builder", status: "active" };
+    },
+  };
+  const memberHandler = createHandler({ getStore: async () => memberStore });
+  const denied = authenticatedEvent("GET", "/workspaces/me/proposal-payments");
+  denied.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  assert.equal((await memberHandler(denied)).statusCode, 403);
+});
+
+test("a super admin logs a payment for a company and it shows up in that company's billing history", async () => {
+  const base = usageQuotaStore();
+  const store = {
+    ...base,
+    async getMembership(userId) {
+      return { userId, workspaceId: "user-123", role: "company-admin", status: "active", name: "Sulav" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const bad = authenticatedEvent("POST", "/platform/companies/user-123/proposal-payments", { paidAt: "nope", planLabel: "Pro", amount: 1, receivedBy: "x" });
+  bad.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(bad)).statusCode, 400);
+
+  const log = authenticatedEvent("POST", "/platform/companies/user-123/proposal-payments", {
+    paidAt: "2026-09-10", planLabel: "Pro", amount: 79.67, receivedBy: "Ops", method: "Stripe", note: "first month prorated",
+  });
+  log.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const logged = await handler(log);
+  assert.equal(logged.statusCode, 201);
+  const afterLog = JSON.parse(logged.body);
+  assert.equal(afterLog.payments.length, 1);
+  assert.equal(afterLog.payments[0].amount, 79.67);
+  assert.equal(afterLog.payments[0].loggedByName, "Sulav");
+  assert.equal(afterLog.upcoming.prorated, false); // a payment now exists
+  assert.equal(afterLog.upcoming.amount, 119);
+
+  // The org admin for that company sees the same payment.
+  const orgViewEvent = authenticatedEvent("GET", "/workspaces/me/proposal-payments");
+  orgViewEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const orgView = await handler(orgViewEvent);
+  assert.equal(JSON.parse(orgView.body).payments.length, 1);
+
+  const paymentId = afterLog.payments[0].paymentId;
+  const del = authenticatedEvent("DELETE", `/platform/companies/user-123/proposal-payments/${paymentId}`, undefined, { paidAt: "2026-09-10" });
+  del.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(del)).statusCode, 200);
+  assert.equal(store._payments.size, 0);
+});
+
+test("PATCH /platform/companies/{id} accepts a per-company proposal price override", async () => {
+  const workspace = { workspaceId: "user-123", tier: "repository", createdAt: "2026-09-01T00:00:00Z" };
+  const saved = [];
+  const store = {
+    ...usageQuotaStore(),
+    async getMembership(userId) { return { userId, workspaceId: "user-123", role: "super-admin", status: "active" }; },
+    async getWorkspace() { return { ...workspace }; },
+    async putWorkspace(next) { saved.push(next); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const patch = authenticatedEvent("PATCH", "/platform/companies/user-123", { proposalPlanPriceOverride: 95 });
+  patch.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const res = await handler(patch);
+  assert.equal(res.statusCode, 200);
+  assert.equal(saved[0].proposalPlanPriceOverride, 95);
+  assert.equal(JSON.parse(res.body).proposalMonthlyPrice, 95);
 });
 
 function authenticatedEvent(method, path, body, queryStringParameters) {

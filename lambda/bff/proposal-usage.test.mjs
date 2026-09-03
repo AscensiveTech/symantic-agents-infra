@@ -3,10 +3,16 @@ import test from "node:test";
 
 import {
   PROPOSAL_LIMITS,
+  PROPOSAL_PLAN_PRICES,
+  buildProposalBilling,
   buildProposalUsage,
   dayKey,
+  firstOfNextMonthKey,
   limitsForTier,
+  proratePartialMonth,
+  resolveProposalMonthlyPrice,
   usageStateFor,
+  validProposalPayment,
 } from "./proposal-usage.mjs";
 
 const now = new Date("2026-09-15T12:00:00.000Z");
@@ -73,4 +79,63 @@ test("buildProposalUsage defaults a missing counter to zero and an unknown tier 
   const usage = buildProposalUsage(null, [], [], { tier: undefined, now, timezone: "UTC" });
   assert.equal(usage.tier, "basic");
   assert.deepEqual(usage.proposals, { used: 0, limit: 25, remaining: 25, state: "ok" });
+});
+
+test("resolveProposalMonthlyPrice: tier default, then per-company override", () => {
+  assert.equal(resolveProposalMonthlyPrice("repository", null), PROPOSAL_PLAN_PRICES.repository);
+  assert.equal(resolveProposalMonthlyPrice("repository", { proposalPlanPriceOverride: 99 }), 99);
+  assert.equal(resolveProposalMonthlyPrice("nonsense", {}), PROPOSAL_PLAN_PRICES.basic);
+});
+
+test("proratePartialMonth splits by remaining days inclusive of the join day", () => {
+  assert.deepEqual(proratePartialMonth(310, "2026-09-01"), { amount: 310, remaining: 30, total: 30 });
+  assert.deepEqual(proratePartialMonth(310, "2026-09-30"), { amount: 10.33, remaining: 1, total: 30 });
+  assert.deepEqual(proratePartialMonth(300, "2026-09-16"), { amount: 150, remaining: 15, total: 30 });
+});
+
+test("firstOfNextMonthKey rolls the year over", () => {
+  assert.equal(firstOfNextMonthKey("2026-09"), "2026-10-01");
+  assert.equal(firstOfNextMonthKey("2026-12"), "2027-01-01");
+});
+
+test("buildProposalBilling: prorated upcoming while unpaid, full month once a payment exists", () => {
+  const workspace = { tier: "repository", createdAt: "2026-09-16T10:00:00.000Z" };
+
+  const unpaid = buildProposalBilling(workspace, "repository", [], { now, timezone: "UTC" });
+  assert.equal(unpaid.monthlyPrice, 119);
+  assert.equal(unpaid.priceOverridden, false);
+  assert.equal(unpaid.upcoming.prorated, true);
+  assert.equal(unpaid.upcoming.dueOn, "2026-10-01");
+  assert.equal(unpaid.upcoming.amount, 59.5); // 119 * 15/30
+  assert.match(unpaid.upcoming.basis, /Prorated 2026-09-16/);
+
+  const paid = buildProposalBilling(workspace, "repository", [
+    { paymentId: "p1", paidAt: "2026-09-16", planLabel: "Pro", amount: 59.5, receivedBy: "AJ", method: "Stripe" },
+  ], { now, timezone: "UTC" });
+  assert.equal(paid.upcoming.prorated, false);
+  assert.equal(paid.upcoming.amount, 119);
+  assert.equal(paid.upcoming.dueOn, "2026-10-01");
+  assert.equal(paid.payments.length, 1);
+});
+
+test("buildProposalBilling honours a per-company price override", () => {
+  const billing = buildProposalBilling(
+    { tier: "repository", proposalPlanPriceOverride: 80, createdAt: "2026-08-01T00:00:00Z" },
+    "repository", [{ paymentId: "p1", paidAt: "2026-08-05", planLabel: "Pro", amount: 80, receivedBy: "x" }],
+    { now, timezone: "UTC" },
+  );
+  assert.equal(billing.monthlyPrice, 80);
+  assert.equal(billing.priceOverridden, true);
+  assert.equal(billing.upcoming.amount, 80);
+});
+
+test("validProposalPayment enforces the required fields", () => {
+  assert.equal(validProposalPayment(null), null);
+  assert.equal(validProposalPayment({ paidAt: "nope", planLabel: "Pro", amount: 10, receivedBy: "x" }), null);
+  assert.equal(validProposalPayment({ paidAt: "2026-09-01", planLabel: "Pro", amount: -1, receivedBy: "x" }), null);
+  assert.equal(validProposalPayment({ paidAt: "2026-09-01", planLabel: "Pro", amount: 10, receivedBy: "" }), null);
+  assert.deepEqual(
+    validProposalPayment({ paidAt: "2026-09-01", planLabel: "Pro", amount: 119, receivedBy: "Sulav", method: "Stripe", note: "  ok " }),
+    { paidAt: "2026-09-01", planLabel: "Pro", amount: 119, receivedBy: "Sulav", method: "Stripe", note: "ok" },
+  );
 });

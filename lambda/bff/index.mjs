@@ -17,7 +17,13 @@ import {
   resolveCallBlocklist,
   resolvePlan,
 } from "./receptionist-billing.mjs";
-import { buildProposalUsage, dayKey } from "./proposal-usage.mjs";
+import {
+  buildProposalBilling,
+  buildProposalUsage,
+  dayKey,
+  resolveProposalMonthlyPrice,
+  validProposalPayment,
+} from "./proposal-usage.mjs";
 import {
   createSignWellClient,
   SignWellRequestError,
@@ -515,6 +521,14 @@ export function createHandler({
         return json(200, await loadProposalUsage(store, workspaceId));
       }
 
+      if (path === "/workspaces/me/proposal-payments" && method === "GET") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can view billing" });
+        }
+        await store.ensureWorkspace(workspaceId);
+        return json(200, await loadProposalBilling(store, workspaceId));
+      }
+
       if (path === "/workspaces/me/blocked-numbers" || path.startsWith("/workspaces/me/blocked-numbers/")) {
         await store.ensureWorkspace(workspaceId);
         if (!await isCallBlocklistEnabled(store, workspaceId)) {
@@ -823,12 +837,17 @@ async function handlePlatformCompanies(event, {
       const hasTier = body && Object.hasOwn(body, "tier");
       const hasPlan = isPlanPatch(body);
       const hasBlocklist = body && Object.hasOwn(body, "callBlocklistEnabled");
+      const hasProposalPrice = body && Object.hasOwn(body, "proposalPlanPriceOverride");
       const name = typeof body?.name === "string" ? body.name.trim() : "";
+      const proposalPrice = body?.proposalPlanPriceOverride;
+      const proposalPriceValid = proposalPrice === null || proposalPrice === ""
+        || (typeof proposalPrice === "number" && Number.isFinite(proposalPrice) && proposalPrice >= 0);
       if (
-        (!hasName && !hasTier && !hasPlan && !hasBlocklist) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasProposalPrice) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
-        (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean")
+        (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
+        (hasProposalPrice && !proposalPriceValid)
       ) {
         return json(400, { message: "Invalid company update" });
       }
@@ -840,6 +859,10 @@ async function handlePlatformCompanies(event, {
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
       };
+      if (hasProposalPrice) {
+        if (proposalPrice === null || proposalPrice === "") delete updated.proposalPlanPriceOverride;
+        else updated.proposalPlanPriceOverride = Math.round(proposalPrice * 100) / 100;
+      }
       if (hasPlan) {
         updated = applyPlanPatch(updated, body, actor.userId);
         if (!updated) return json(400, { message: "Invalid plan update" });
@@ -877,6 +900,33 @@ async function handlePlatformCompanies(event, {
       const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
       await store.setProposalUsageCounter(target.workspaceId, periodKey(new Date(), tz), patch);
       return json(200, await loadProposalUsage(store, target.workspaceId));
+    }
+
+    if (target.kind === "proposal-payments" && method === "GET") {
+      return json(200, await loadProposalBilling(store, target.workspaceId));
+    }
+
+    if (target.kind === "proposal-payments" && method === "POST") {
+      const clean = validProposalPayment(readBody(event));
+      if (!clean) return json(400, { message: "Invalid payment. Provide paidAt (YYYY-MM-DD), planLabel, amount, and receivedBy." });
+      const nowIso = new Date().toISOString();
+      await store.putProposalPayment(target.workspaceId, {
+        ...clean,
+        paymentId: randomUUID(),
+        loggedByName: actor.membership?.name || actor.userId,
+        loggedByUserId: actor.userId,
+        createdAt: nowIso,
+      });
+      return json(201, await loadProposalBilling(store, target.workspaceId));
+    }
+
+    if (target.kind === "proposal-payment" && method === "DELETE") {
+      const paidAt = event?.queryStringParameters?.paidAt;
+      if (typeof paidAt !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(paidAt)) {
+        return json(400, { message: "paidAt query parameter is required" });
+      }
+      await store.deleteProposalPayment(target.workspaceId, paidAt, target.paymentId);
+      return json(200, await loadProposalBilling(store, target.workspaceId));
     }
 
     if (target.kind === "users" && method === "GET") {
@@ -1073,6 +1123,19 @@ async function loadProposalUsage(store, workspaceId) {
   return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone });
 }
 
+// Build the RapidProposal billing view (monthly price + logged payment history
+// + computed upcoming payment). Separate from usage on purpose.
+async function loadProposalBilling(store, workspaceId) {
+  const [workspace, profile, payments] = await Promise.all([
+    typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
+    typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
+    typeof store.listProposalPayments === "function" ? store.listProposalPayments(workspaceId) : [],
+  ]);
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const tier = normalizeCompanyTier(workspace?.tier);
+  return buildProposalBilling(workspace, tier, payments ?? [], { now: new Date(), timezone });
+}
+
 // Throws {status:403, error} when the workspace has hit its monthly quota for
 // `kind` ("proposals" | "signatures"). No-ops for unlimited (signing) tiers.
 async function assertProposalQuota(store, workspaceId, kind) {
@@ -1163,6 +1226,8 @@ async function platformCompanySummary(store, workspace) {
     enterprisePriceMonthly: numberOrNullValue(workspace.enterprisePriceMonthly),
     enterpriseOveragePerMinute: numberOrNullValue(workspace.enterpriseOveragePerMinute),
     callBlocklistEnabled: workspace.callBlocklistEnabled === true,
+    proposalPlanPriceOverride: numberOrNullValue(workspace.proposalPlanPriceOverride),
+    proposalMonthlyPrice: resolveProposalMonthlyPrice(normalizeCompanyTier(workspace.tier), workspace),
     ...(await workspaceUsageState(store, workspace)),
     proposalUsage: await proposalUsageSummary(store, workspace.workspaceId),
   };
@@ -1213,6 +1278,8 @@ function getPlatformCompanyTarget(event, path) {
     ["users", /^\/platform\/companies\/([^/]+)\/users$/],
     ["usage", /^\/platform\/companies\/([^/]+)\/usage$/],
     ["proposal-usage", /^\/platform\/companies\/([^/]+)\/proposal-usage$/],
+    ["proposal-payments", /^\/platform\/companies\/([^/]+)\/proposal-payments$/],
+    ["proposal-payment", /^\/platform\/companies\/([^/]+)\/proposal-payments\/([A-Za-z0-9._-]{1,64})$/],
     ["company", /^\/platform\/companies\/([^/]+)$/],
   ];
   for (const [kind, pattern] of patterns) {
@@ -1225,11 +1292,14 @@ function getPlatformCompanyTarget(event, path) {
       const userId = kind === "user"
         ? decodeURIComponent(event?.pathParameters?.userId ?? match[2])
         : null;
+      const paymentId = kind === "proposal-payment"
+        ? decodeURIComponent(event?.pathParameters?.paymentId ?? match[2])
+        : null;
       if (
         !ENTITY_ID_PATTERN.test(workspaceId) ||
         (kind === "user" && !ENTITY_ID_PATTERN.test(userId))
       ) return null;
-      return { kind, workspaceId, ...(userId ? { userId } : {}) };
+      return { kind, workspaceId, ...(userId ? { userId } : {}), ...(paymentId ? { paymentId } : {}) };
     } catch {
       return null;
     }
@@ -3298,6 +3368,47 @@ export function createDynamoStore(client, commands, tableNames) {
           ExpressionAttributeValues: marshall({ ":one": 1, ":exp": target.exp }),
         }));
       }
+    },
+
+    async listProposalPayments(workspaceId) {
+      if (!tableNames.workspaceUsage) return [];
+      const items = [];
+      let exclusiveStartKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tableNames.workspaceUsage,
+          KeyConditionExpression: "workspaceId = :workspaceId AND begins_with(#period, :prefix)",
+          ExpressionAttributeNames: { "#period": "period" },
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":prefix": "payment#" }),
+          ConsistentRead: false,
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map((item) => unmarshall(item)));
+        exclusiveStartKey = result.LastEvaluatedKey;
+      } while (exclusiveStartKey);
+      return items;
+    },
+
+    async putProposalPayment(workspaceId, payment) {
+      if (!tableNames.workspaceUsage) return payment;
+      // No expiresAt - payment records are permanent (unlike usage counters).
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.workspaceUsage,
+        Item: marshall({
+          workspaceId,
+          period: `payment#${payment.paidAt}#${payment.paymentId}`,
+          ...payment,
+        }),
+      }));
+      return payment;
+    },
+
+    async deleteProposalPayment(workspaceId, paidAt, paymentId) {
+      if (!tableNames.workspaceUsage) return;
+      await client.send(new commands.DeleteItemCommand({
+        TableName: tableNames.workspaceUsage,
+        Key: marshall({ workspaceId, period: `payment#${paidAt}#${paymentId}` }),
+      }));
     },
 
     async setProposalUsageCounter(workspaceId, period, patch) {
