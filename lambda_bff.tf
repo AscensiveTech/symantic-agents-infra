@@ -203,8 +203,13 @@ resource "aws_lambda_function" "bff" {
   runtime       = "nodejs20.x"
   handler       = "index.handler"
   architectures = ["arm64"]
-  memory_size   = 256
-  timeout       = 29
+  # Memory = CPU on Lambda. The proposals-list endpoint returns full proposal
+  # bodies and unmarshals + serializes the lot; at 256 MB (~0.15 vCPU on
+  # Graviton) that ran 4-7 s. 1024 MB (~0.6 vCPU) brings it under ~1.5 s. Actual
+  # memory used is ~110-150 MB, so this buys CPU, not headroom. Can drop to 512
+  # once the list endpoint returns a projection instead of whole proposals.
+  memory_size = 1024
+  timeout     = 29
 
   filename         = data.archive_file.bff.output_path
   source_code_hash = data.archive_file.bff.output_base64sha256
