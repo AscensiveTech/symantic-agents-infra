@@ -447,6 +447,7 @@ export function createHandler({
         method,
         path,
         workspaceId,
+        actor,
         getStore: async () => store,
         getAssetSigner,
         getSignWell,
@@ -1823,6 +1824,7 @@ async function handleProposalApi(event, {
   method,
   path,
   workspaceId,
+  actor,
   getStore,
   getAssetSigner,
   getSignWell,
@@ -1975,6 +1977,26 @@ async function handleProposalApi(event, {
       const signer = await getAssetSigner();
       const fileUrl = await signer.createDownloadUrl(workspaceId, input.assetKey);
       const embeddedTestMode = signWell.client.testMode === true;
+
+      // Make the SignWell email come from the sender, not the SignWell
+      // account owner: the company name (falling back to the sender's own
+      // name) drives the "X sent you a document" line, and the sender's
+      // email becomes the reply-to. SignWell's per-request "custom requester"
+      // does both with no separate sender provisioning; the envelope From
+      // stays SignWell's sending domain either way.
+      const senderWorkspace = typeof store.getWorkspace === "function"
+        ? await store.getWorkspace(workspaceId)
+        : null;
+      const requesterName =
+        (senderWorkspace?.name || "").trim() ||
+        (actor?.membership?.name || "").trim() ||
+        undefined;
+      const requesterEmail = (actor?.membership?.email || "").trim() || undefined;
+      const requesterFields = {
+        ...(requesterName ? { custom_requester_name: requesterName } : {}),
+        ...(requesterEmail ? { custom_requester_email: requesterEmail } : {}),
+      };
+
       const documentInput = {
         name: proposal.name || "Proposal",
         subject: input.subject,
@@ -1984,6 +2006,7 @@ async function handleProposalApi(event, {
         apply_signing_order: input.applySigningOrder,
         allow_decline: true,
         allow_reassign: true,
+        ...requesterFields,
         ...(embeddedTestMode ? { embedded_signing: true } : {}),
         text_tags: agreementHasSigningFields || hasInitials,
         with_signature_page: !agreementHasSigningFields,
@@ -2025,6 +2048,7 @@ async function handleProposalApi(event, {
             apply_signing_order: input.applySigningOrder,
             allow_decline: true,
             allow_reassign: true,
+            ...requesterFields,
             ...(embeddedTestMode ? { embedded_signing: true } : {}),
           });
           created = {

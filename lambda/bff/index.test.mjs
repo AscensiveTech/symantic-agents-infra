@@ -1290,6 +1290,79 @@ test("proposal signature requests send the private PDF through SignWell and pers
   assert.equal("apiKey" in body, false);
 });
 
+test("the SignWell email is sent from the sender's company (or name) with their email as reply-to", async () => {
+  const proposal = {
+    id: "prp-sender",
+    name: "Alpine Peak",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "agreement", kind: "agreement", hidden: false }],
+  };
+  let signWellRequest;
+  function makeStore(workspaceName, memberName) {
+    return {
+      async ensureWorkspace() {},
+      async getMembership() {
+        return {
+          userId: "user-123",
+          workspaceId: "workspace-tech",
+          role: "company-admin",
+          status: "active",
+          email: "AJM@technovate.design",
+          name: memberName,
+        };
+      },
+      async getWorkspace() {
+        return { workspaceId: "workspace-tech", name: workspaceName };
+      },
+      async getProposal() {
+        return proposal;
+      },
+      async updateProposalSignature(_w, _p, signatureRequest) {
+        return signatureRequest;
+      },
+    };
+  }
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      testMode: false,
+      async createDocument(input) {
+        signWellRequest = input;
+        return { id: "signwell-doc-sender", status: "Sent", recipients: [{ id: "1", status: "sent" }] };
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  function send(store) {
+    const handler = createHandler({
+      getStore: async () => store,
+      getSignWell: async () => signWell,
+      getAssetSigner: async () => ({ async createDownloadUrl() { return "https://private.example.com/pdf"; } }),
+    });
+    const event = authenticatedEvent("POST", "/workspaces/me/proposals/prp-sender/signature-requests", {
+      assetKey: "exports/prp-sender.pdf",
+      recipients: [{ name: "Jane Client", email: "jane@example.com" }],
+      subject: "Please sign Alpine Peak",
+      message: "Please review and sign.",
+      applySigningOrder: false,
+    });
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+    return handler(event);
+  }
+
+  // Company name present -> it is the requester name.
+  const withCompany = await send(makeStore("Technovate Design", "AJ Morrison"));
+  assert.equal(withCompany.statusCode, 201);
+  assert.equal(signWellRequest.custom_requester_name, "Technovate Design");
+  assert.equal(signWellRequest.custom_requester_email, "AJM@technovate.design");
+
+  // Company name blank -> fall back to the sender's own name.
+  const noCompany = await send(makeStore("   ", "AJ Morrison"));
+  assert.equal(noCompany.statusCode, 201);
+  assert.equal(signWellRequest.custom_requester_name, "AJ Morrison");
+  assert.equal(signWellRequest.custom_requester_email, "AJM@technovate.design");
+});
+
 test("initials markers on a proposal with no agreement page still force SignWell text-tag parsing", async () => {
   let signWellRequest;
   const store = {
