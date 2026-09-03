@@ -2816,11 +2816,16 @@ function toPublicEntity(item, keyField) {
 }
 
 export function createDynamoStore(client, commands, tableNames) {
-  async function listRecords(tableName, keyField, workspaceId) {
+  async function listRecords(tableName, keyField, workspaceId, projection) {
     // Eventually-consistent: these list reads back the workspace's own
     // dashboards, where a sub-second lag on a just-written row is invisible
     // and the frontend applies its own optimistic update anyway. A strongly
     // consistent Query costs 2x the read capacity and runs slower.
+    //
+    // `projection` = { expression, names } to pull only the attributes a
+    // list/dashboard renders instead of every full item (a proposal drags its
+    // whole documentItems canvas tree, part lines and HTML blobs otherwise -
+    // seconds of unmarshal + serialize per listing).
     const items = [];
     let exclusiveStartKey;
     do {
@@ -2828,6 +2833,9 @@ export function createDynamoStore(client, commands, tableNames) {
         TableName: tableName,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ...(projection
+          ? { ProjectionExpression: projection.expression, ExpressionAttributeNames: projection.names }
+          : {}),
         ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
       }));
       for (const item of result.Items ?? []) items.push(toPublicEntity(unmarshall(item), keyField));
@@ -3244,7 +3252,17 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async listProposals(workspaceId) {
-      const records = await listRecords(tableNames.proposals, "proposalId", workspaceId);
+      // The dashboard / All Proposals render ~12 scalar fields per row; the
+      // builder loads the full proposal by id when you open one. Projecting
+      // keeps this call from returning (and unmarshalling) every proposal's
+      // whole canvas tree. signatureRequest is a small nested map - pulled
+      // whole so lifecycle / lock / "download signed" gates keep working.
+      const records = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
+        expression:
+          "workspaceId, proposalId, #name, #status, clientName, clientNameSecondary, " +
+          "presentedBy, assignedTo, dueDate, createdAt, updatedAt, revisedAt, signatureRequest",
+        names: { "#name": "name", "#status": "status" },
+      });
       return records.sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""));
     },
 

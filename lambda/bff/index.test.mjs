@@ -3236,6 +3236,11 @@ test("Dynamo list reads page past the 1 MB limit and skip strong consistency", a
   assert.equal(inputs.length, 2);
   assert.equal(inputs[0].ConsistentRead, undefined);
   assert.deepEqual(inputs[1].ExclusiveStartKey, { proposalId: { S: "prp-1" } });
+  // listProposals projects to the summary fields the dashboard renders - it must
+  // not pull every proposal's full documentItems / part lines / HTML blobs.
+  assert.match(inputs[0].ProjectionExpression, /#name, #status/);
+  assert.doesNotMatch(inputs[0].ProjectionExpression, /documentItems/);
+  assert.deepEqual(inputs[0].ExpressionAttributeNames, { "#name": "name", "#status": "status" });
 });
 
 test("Dynamo countProposals uses Select COUNT without shipping item bodies", async () => {
