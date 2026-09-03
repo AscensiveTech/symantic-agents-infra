@@ -86,6 +86,17 @@ export function createSignWellClient({
         method: "DELETE",
       });
     },
+    // Stop an in-progress signing. SignWell has no dedicated "void" - deleting
+    // the document cancels signing for it ("Deleting a document will also
+    // cancel document signing"). A 404 means it's already gone - treat as done.
+    async cancelDocument(documentId) {
+      try {
+        await request(`/documents/${encodeURIComponent(documentId)}`, { method: "DELETE" });
+      } catch (error) {
+        if (error instanceof SignWellRequestError && error.status === 404) return;
+        throw error;
+      }
+    },
     sendReminder(documentId, recipients) {
       const body = Array.isArray(recipients) && recipients.length > 0
         ? { recipients }

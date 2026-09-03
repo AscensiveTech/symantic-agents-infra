@@ -843,6 +843,18 @@ async function handlePlatformCompanies(event, {
       return json(200, await store.listMemberships(target.workspaceId));
     }
 
+    if (target.kind === "users" && method === "POST") {
+      const directory = await getUserDirectory();
+      return addWorkspaceMember({
+        store,
+        directory,
+        workspaceId: target.workspaceId,
+        tier: workspace.tier,
+        actorUserId: actor.userId,
+        body: readBody(event),
+      });
+    }
+
     if (target.kind === "user" && method === "PATCH") {
       const body = readBody(event);
       const role = body?.role;
@@ -1285,6 +1297,76 @@ function normalizeCompanyTier(value) {
   return COMPANY_TIERS.has(value) ? value : "basic";
 }
 
+// Users allowed per plan (Starter/Pro/Enterprise). Mirrors TIER_USER_LIMITS in
+// the frontend's lib/domain/company.ts - keep the two in sync.
+const TIER_USER_LIMITS = { basic: 3, repository: 5, signing: Infinity };
+
+// Throws a {status, message} if the workspace is already at its plan's user
+// cap (counting active memberships). Callers turn this into a 409.
+async function assertSeatAvailable(store, workspaceId, tier) {
+  const limit = TIER_USER_LIMITS[normalizeCompanyTier(tier)];
+  if (!Number.isFinite(limit) || typeof store.listMemberships !== "function") return;
+  const members = await store.listMemberships(workspaceId);
+  const active = members.filter((member) => member?.status !== "disabled").length;
+  if (active >= limit) {
+    const error = new Error(`This plan allows ${limit} users. Upgrade the plan to add more.`);
+    error.status = 409;
+    throw error;
+  }
+}
+
+// Shared "add a user to a workspace" - creates the Cognito user, sets its role,
+// writes the membership. Enforces the plan seat cap. Returns a json() response.
+// Used by both POST /workspaces/me/users (company admin, own workspace) and
+// POST /platform/companies/{id}/users (super admin, any workspace).
+async function addWorkspaceMember({ store, directory, workspaceId, tier, actorUserId, body }) {
+  const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  const role = body?.role === "company-admin" ? "company-admin" : "quotation-builder";
+  const temporaryPassword = body?.temporaryPassword;
+  if (
+    !EMAIL_PATTERN.test(email) ||
+    email.length > 320 ||
+    name.length > 120 ||
+    typeof temporaryPassword !== "string" ||
+    temporaryPassword.length < 12
+  ) {
+    return json(400, { message: "Invalid workspace user" });
+  }
+
+  try {
+    await assertSeatAvailable(store, workspaceId, tier);
+  } catch (error) {
+    if (error?.status === 409) return json(409, { message: error.message });
+    throw error;
+  }
+
+  let created;
+  try {
+    created = await directory.createUser({ email, name, temporaryPassword });
+    await directory.setRole(created.username, role);
+    const membership = {
+      userId: created.userId,
+      cognitoUsername: created.username,
+      workspaceId,
+      email,
+      name,
+      role,
+      status: "active",
+      createdAt: new Date().toISOString(),
+      createdBy: actorUserId,
+    };
+    await store.putMembership(membership);
+    return json(201, membership);
+  } catch (error) {
+    if (created?.username) await directory.deleteUser(created.username).catch(() => {});
+    if (error?.name === "UsernameExistsException") {
+      return json(409, { message: "A user with that email already exists" });
+    }
+    throw error;
+  }
+}
+
 function defaultProposalTemplate(sections, now) {
   return {
     id: `tpl-${randomUUID()}`,
@@ -1317,46 +1399,18 @@ async function handleWorkspaceUsers(event, {
   }
 
   if (path === "/workspaces/me/users" && method === "POST") {
-    const body = readBody(event);
-    const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
-    const name = typeof body?.name === "string" ? body.name.trim() : "";
-    const role = body?.role === "company-admin" ? "company-admin" : "quotation-builder";
-    const temporaryPassword = body?.temporaryPassword;
-    if (
-      !EMAIL_PATTERN.test(email) ||
-      email.length > 320 ||
-      name.length > 120 ||
-      typeof temporaryPassword !== "string" ||
-      temporaryPassword.length < 12
-    ) {
-      return json(400, { message: "Invalid workspace user" });
-    }
-
     const directory = await getUserDirectory();
-    let created;
-    try {
-      created = await directory.createUser({ email, name, temporaryPassword });
-      await directory.setRole(created.username, role);
-      const membership = {
-        userId: created.userId,
-        cognitoUsername: created.username,
-        workspaceId: actor.workspaceId,
-        email,
-        name,
-        role,
-        status: "active",
-        createdAt: new Date().toISOString(),
-        createdBy: actor.userId,
-      };
-      await store.putMembership(membership);
-      return json(201, membership);
-    } catch (error) {
-      if (created?.username) await directory.deleteUser(created.username).catch(() => {});
-      if (error?.name === "UsernameExistsException") {
-        return json(409, { message: "A user with that email already exists" });
-      }
-      throw error;
-    }
+    const workspace = typeof store.getWorkspace === "function"
+      ? await store.getWorkspace(actor.workspaceId)
+      : null;
+    return addWorkspaceMember({
+      store,
+      directory,
+      workspaceId: actor.workspaceId,
+      tier: workspace?.tier,
+      actorUserId: actor.userId,
+      body: readBody(event),
+    });
   }
 
   const userId = getEntityId(event, path, "users", "userId");
@@ -1818,7 +1872,7 @@ async function handleProposalApi(event, {
   }
 
   const signatureMatch = path.match(
-    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(resend|remind|completed-pdf))?$/,
+    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(resend|remind|completed-pdf|cancel))?$/,
   );
   if (signatureMatch) {
     const proposalId = decodeEntityId(
@@ -2036,6 +2090,22 @@ async function handleProposalApi(event, {
     let current = proposal.signatureRequest;
     if (!current || current.provider !== "signwell" || typeof current.documentId !== "string") {
       return json(404, { message: "This proposal has no SignWell signature request" });
+    }
+    if (action === "cancel" && method === "POST") {
+      // "Revise Proposal" reopened this proposal for editing. Stop an
+      // in-progress signing in SignWell so pending signers can't sign the
+      // stale version; a completed document is legally final and stays as
+      // SignWell's permanent record (nothing to do). Best-effort - the
+      // frontend clears its own signature state regardless.
+      if (isActiveSignatureRequest(current)) {
+        await signWell.client.cancelDocument(current.documentId);
+        await store.updateProposalSignature(workspaceId, proposalId, {
+          ...current,
+          status: "canceled",
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      return json(200, { ok: true });
     }
     if (action === "remind" && method === "POST") {
       if (!isActiveSignatureRequest(current)) {

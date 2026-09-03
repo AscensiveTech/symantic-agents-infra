@@ -1507,6 +1507,83 @@ test("adding a signer and initials markers cancels the old request and sends a r
   assert.deepEqual(body.recipients.map((recipient) => recipient.email), ["jane@example.com", "alex@example.com"]);
 });
 
+test("cancel action deletes an active SignWell document and marks the request canceled", async () => {
+  let proposal = {
+    id: "prp-sign",
+    name: "Out for signature",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-abc",
+      status: "sent",
+      recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "sent" }],
+      sentAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    },
+  };
+  const calls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(proposal); },
+    async updateProposalSignature(_w, _p, signatureRequest) {
+      proposal = { ...proposal, signatureRequest: structuredClone(signatureRequest) };
+      return signatureRequest;
+    },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      async cancelDocument(documentId) { calls.push(`cancel:${documentId}`); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getSignWell: async () => signWell });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests/cancel",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { ok: true });
+  assert.deepEqual(calls, ["cancel:signwell-doc-abc"]);
+  assert.equal(proposal.signatureRequest.status, "canceled");
+});
+
+test("cancel action is a no-op for an already-completed document", async () => {
+  const proposal = {
+    id: "prp-sign",
+    name: "Signed",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-done",
+      status: "completed",
+      recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "signed" }],
+      sentAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    },
+  };
+  let canceled = false;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(proposal); },
+    async updateProposalSignature() { throw new Error("should not update a completed request"); },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: { async cancelDocument() { canceled = true; } },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getSignWell: async () => signWell });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests/cancel",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(canceled, false);
+});
+
 test("completed PDF requests reconcile a missed SignWell completion webhook", async () => {
   let proposal = {
     id: "prp-sign",
@@ -2106,6 +2183,68 @@ test("super administrators can list users in a company workspace", async () => {
   assert.equal(response.statusCode, 200);
   assert.equal(body.length, 1);
   assert.equal(body[0].email, "ajm@technovate.design");
+});
+
+test("super administrators can add a user to any company workspace", async () => {
+  const memberships = [{ userId: "a", workspaceId: "workspace-technovate", role: "company-admin", status: "active" }];
+  const directoryCalls = [];
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return { workspaceId: "workspace-technovate", name: "Technovate", tier: "repository" }; },
+    async listMemberships() { return memberships; },
+    async putMembership(m) { memberships.push(m); return m; },
+  };
+  const directory = {
+    async createUser(input) { directoryCalls.push(["create", input.email]); return { userId: "new-1", username: "cog-new-1" }; },
+    async setRole(u, r) { directoryCalls.push(["role", u, r]); },
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+  const event = authenticatedEvent("POST", "/platform/companies/workspace-technovate/users", {
+    email: "New.User@technovate.design",
+    name: "New User",
+    role: "quotation-builder",
+    temporaryPassword: "Temporary123!",
+  });
+  event.pathParameters = { workspaceId: "workspace-technovate" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 201);
+  assert.equal(JSON.parse(response.body).workspaceId, "workspace-technovate");
+  assert.equal(JSON.parse(response.body).email, "new.user@technovate.design");
+  assert.deepEqual(directoryCalls, [["create", "new.user@technovate.design"], ["role", "cog-new-1", "quotation-builder"]]);
+});
+
+test("adding a user is blocked when the plan's seat limit is reached", async () => {
+  const memberships = [
+    { userId: "a", workspaceId: "w", status: "active" },
+    { userId: "b", workspaceId: "w", status: "active" },
+    { userId: "c", workspaceId: "w", status: "active" },
+  ];
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return { workspaceId: "w", tier: "basic" }; }, // Starter = 3
+    async listMemberships() { return memberships; },
+    async putMembership() { throw new Error("should not create a user past the cap"); },
+  };
+  const directory = { async createUser() { throw new Error("should not reach Cognito"); }, async setRole() {}, async deleteUser() {} };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+  const event = authenticatedEvent("POST", "/platform/companies/w/users", {
+    email: "fourth@x.com", name: "Fourth", role: "quotation-builder", temporaryPassword: "Temporary123!",
+  });
+  event.pathParameters = { workspaceId: "w" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /plan allows 3 users/);
 });
 
 test("super administrators can rename a company and change its plan", async () => {
