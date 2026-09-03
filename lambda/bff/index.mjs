@@ -1467,6 +1467,15 @@ async function handleWorkspaceUsers(event, {
     }
     await directory.deleteUser(target.cognitoUsername ?? target.email);
     await store.deleteMembership(userId);
+    // A member coming and going must never take their work with them: leave
+    // every proposal they created / owned in place, just blank the assignee so
+    // it shows as Unassigned. (assignedTo is a display-name/email string, set
+    // from the same "name" this membership carries.)
+    if (typeof store.unassignProposalsFrom === "function") {
+      await store.unassignProposalsFrom(actor.workspaceId, [target.name, target.email]).catch((error) => {
+        console.warn("Failed to unassign a removed member's proposals", { userId, error: String(error) });
+      });
+    }
     return json(200, { ok: true });
   }
 
@@ -2857,8 +2866,9 @@ export function createDynamoStore(client, commands, tableNames) {
         TableName: tableName,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
-        ...(projection
-          ? { ProjectionExpression: projection.expression, ExpressionAttributeNames: projection.names }
+        ...(projection ? { ProjectionExpression: projection.expression } : {}),
+        ...(projection && projection.names && Object.keys(projection.names).length > 0
+          ? { ExpressionAttributeNames: projection.names }
           : {}),
         ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
       }));
@@ -3348,6 +3358,31 @@ export function createDynamoStore(client, commands, tableNames) {
 
     deleteProposal(workspaceId, proposalId) {
       return deleteRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
+    },
+
+    // Clear the assignee on every proposal in a workspace currently assigned to
+    // any of `names` (a removed member's name / email). The work itself is
+    // untouched - only `assignedTo` is blanked, so the proposal just becomes
+    // "Unassigned".
+    async unassignProposalsFrom(workspaceId, names) {
+      const wanted = new Set(names.map((value) => String(value).trim().toLowerCase()).filter(Boolean));
+      if (wanted.size === 0) return 0;
+      const rows = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
+        expression: "proposalId, assignedTo",
+      });
+      let cleared = 0;
+      for (const row of rows) {
+        if (!wanted.has(String(row.assignedTo ?? "").trim().toLowerCase())) continue;
+        await client.send(new commands.UpdateItemCommand({
+          TableName: tableNames.proposals,
+          Key: marshall({ workspaceId, proposalId: row.id }),
+          UpdateExpression: "SET assignedTo = :empty, updatedAt = :now",
+          ConditionExpression: "attribute_exists(proposalId)",
+          ExpressionAttributeValues: marshall({ ":empty": "", ":now": new Date().toISOString() }),
+        }));
+        cleared += 1;
+      }
+      return cleared;
     },
 
     async listProposalTemplates(workspaceId) {
