@@ -6,6 +6,7 @@ locals {
     "POST /platform/companies/{workspaceId}/logo/upload-url",
     "POST /platform/companies/{workspaceId}/logo/complete",
     "GET /platform/companies/{workspaceId}/users",
+    "POST /platform/companies/{workspaceId}/users",
     "PATCH /platform/companies/{workspaceId}/users/{userId}",
     "GET /platform/companies/{workspaceId}/usage",
     "GET /platform/billing",
