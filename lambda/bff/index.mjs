@@ -2177,12 +2177,36 @@ async function handleProposalApi(event, {
       if (current.status !== "completed") {
         return json(409, { message: "The signed PDF is available after every signer completes the document" });
       }
-      // Just the short-lived SignWell URL (document + audit page). The app
-      // embeds it in an <object> for preview and opens it for download - it
-      // never needs the bytes, and inlining a real-size PDF as base64 here
-      // blew past Lambda's 6 MB response limit (a hard 413).
-      const url = await signWell.client.getCompletedPdfUrl(current.documentId);
-      return json(200, { url });
+      // Copy the signed PDF (document + audit page) from SignWell into our own
+      // proposal-assets bucket once, then hand the app a presigned URL to that.
+      // The app CSP blocks <object>/<iframe> (object-src / frame-src 'none'), so
+      // the preview must fetch the bytes and render them via pdf.js like the
+      // working copy - and it can't fetch SignWell's cross-origin URL directly.
+      // A completed SignWell document is immutable, so this is cached forever.
+      const signer = await getAssetSigner();
+      const signedKey = `signed/${proposalId}.pdf`;
+      if (!current.signedPdfStored) {
+        const sourceUrl = await signWell.client.getCompletedPdfUrl(current.documentId);
+        const pdfResponse = await fetch(sourceUrl);
+        if (!pdfResponse.ok) {
+          throw new SignWellRequestError(
+            `SignWell completed PDF fetch failed (${pdfResponse.status})`,
+            pdfResponse.status,
+          );
+        }
+        const pdfBytes = Buffer.from(await pdfResponse.arrayBuffer());
+        const uploadUrl = await signer.createUploadUrl(workspaceId, signedKey, "application/pdf");
+        const putResponse = await fetch(uploadUrl, {
+          method: "PUT",
+          headers: { "content-type": "application/pdf" },
+          body: pdfBytes,
+        });
+        if (!putResponse.ok) {
+          throw new Error(`Signed PDF asset upload failed (${putResponse.status})`);
+        }
+        await store.updateProposalSignature(workspaceId, proposalId, { ...current, signedPdfStored: true });
+      }
+      return json(200, { url: await signer.createDownloadUrl(workspaceId, signedKey) });
     }
     return json(404, { message: "Not found" });
   }

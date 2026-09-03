@@ -1666,7 +1666,24 @@ test("cancel action reopens a completed proposal without touching SignWell", asy
   assert.equal(body.status, "draft");
 });
 
-test("completed PDF requests reconcile a missed SignWell completion webhook", async () => {
+test("completed PDF requests reconcile a missed SignWell completion webhook", async (t) => {
+  const fetched = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    fetched.push({ url, method: init?.method ?? "GET" });
+    if (String(url).startsWith("https://s3-upload")) return { ok: true, status: 200 };
+    return { ok: true, status: 200, arrayBuffer: async () => new TextEncoder().encode("%PDF-1.4 signed").buffer };
+  });
+  const assetCalls = [];
+  const getAssetSigner = async () => ({
+    async createUploadUrl(workspaceId, key, contentType) {
+      assetCalls.push(["upload", workspaceId, key, contentType]);
+      return "https://s3-upload.example.com/signed";
+    },
+    async createDownloadUrl(workspaceId, key) {
+      assetCalls.push(["download", workspaceId, key]);
+      return `https://s3-download.example.com/${key}`;
+    },
+  });
   let proposal = {
     id: "prp-sign",
     name: "Dental modernization",
@@ -1726,6 +1743,7 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
   const handler = createHandler({
     getStore: async () => store,
     getSignWell: async () => signWell,
+    getAssetSigner,
   });
 
   const response = await handler(authenticatedEvent(
@@ -1735,8 +1753,14 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
   const body = JSON.parse(response.body);
 
   assert.equal(response.statusCode, 200);
-  assert.equal(body.url, "https://signed.example.com/completed.pdf");
+  // The signed PDF was pulled from SignWell and copied into our own bucket;
+  // the app gets a presigned URL to that, not SignWell's cross-origin one.
+  assert.equal(body.url, "https://s3-download.example.com/signed/prp-sign.pdf");
   assert.equal(body.pdfBase64, undefined);
+  assert.deepEqual(assetCalls[0], ["upload", "user-123", "signed/prp-sign.pdf", "application/pdf"]);
+  assert.ok(fetched.some((f) => f.url === "https://signed.example.com/completed.pdf"));
+  assert.ok(fetched.some((f) => f.method === "PUT"));
+  assert.equal(proposal.signatureRequest.signedPdfStored, true);
   assert.equal(proposal.signatureRequest.status, "completed");
   assert.equal(proposal.signatureRequest.lastEvent, "document_completed");
   assert.equal(proposal.signatureRequest.completedAt, "2026-08-31T17:40:00.000Z");
