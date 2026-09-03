@@ -1720,10 +1720,6 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
         assert.equal(documentId, "signwell-doc-123");
         return "https://signed.example.com/completed.pdf";
       },
-      async getCompletedPdfBase64(documentId) {
-        assert.equal(documentId, "signwell-doc-123");
-        return Buffer.from("%PDF-1.4 signed").toString("base64");
-      },
     },
   };
   const { createHandler } = await loadBff();
@@ -1740,7 +1736,7 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
 
   assert.equal(response.statusCode, 200);
   assert.equal(body.url, "https://signed.example.com/completed.pdf");
-  assert.equal(Buffer.from(body.pdfBase64, "base64").toString(), "%PDF-1.4 signed");
+  assert.equal(body.pdfBase64, undefined);
   assert.equal(proposal.signatureRequest.status, "completed");
   assert.equal(proposal.signatureRequest.lastEvent, "document_completed");
   assert.equal(proposal.signatureRequest.completedAt, "2026-08-31T17:40:00.000Z");
