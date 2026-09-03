@@ -17,6 +17,7 @@ import {
   resolveCallBlocklist,
   resolvePlan,
 } from "./receptionist-billing.mjs";
+import { buildProposalUsage, dayKey } from "./proposal-usage.mjs";
 import {
   createSignWellClient,
   SignWellRequestError,
@@ -506,6 +507,14 @@ export function createHandler({
         return json(200, await loadWorkspaceUsage(store, workspaceId));
       }
 
+      if (path === "/workspaces/me/proposal-usage" && method === "GET") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can view proposal usage" });
+        }
+        await store.ensureWorkspace(workspaceId);
+        return json(200, await loadProposalUsage(store, workspaceId));
+      }
+
       if (path === "/workspaces/me/blocked-numbers" || path.startsWith("/workspaces/me/blocked-numbers/")) {
         await store.ensureWorkspace(workspaceId);
         if (!await isCallBlocklistEnabled(store, workspaceId)) {
@@ -734,6 +743,9 @@ export function createHandler({
       if (isConditionalCheckFailed(error)) {
         return json(409, { message: "Agent already exists" });
       }
+      if (error && typeof error.statusCode === "number" && error.payload) {
+        return json(error.statusCode, error.payload);
+      }
       if (error instanceof ProviderRequestError) {
         console.error("BFF provider request failed", {
           provider: error.provider,
@@ -838,6 +850,33 @@ async function handlePlatformCompanies(event, {
 
     if (target.kind === "usage" && method === "GET") {
       return json(200, await loadWorkspaceUsageWithCost(store, target.workspaceId));
+    }
+
+    if (target.kind === "proposal-usage" && method === "GET") {
+      return json(200, await loadProposalUsage(store, target.workspaceId));
+    }
+
+    if (target.kind === "proposal-usage" && method === "PATCH") {
+      const body = readBody(event);
+      const patch = {};
+      for (const field of ["proposalsCreated", "signaturesSent"]) {
+        if (body && Object.hasOwn(body, field)) {
+          const value = body[field];
+          if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+            return json(400, { message: `${field} must be a non-negative integer` });
+          }
+          patch[field] = value;
+        }
+      }
+      if (Object.keys(patch).length === 0) {
+        return json(400, { message: "Provide proposalsCreated and/or signaturesSent" });
+      }
+      const profile = typeof store.getProfile === "function"
+        ? await store.getProfile(target.workspaceId)
+        : null;
+      const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+      await store.setProposalUsageCounter(target.workspaceId, periodKey(new Date(), tz), patch);
+      return json(200, await loadProposalUsage(store, target.workspaceId));
     }
 
     if (target.kind === "users" && method === "GET") {
@@ -1005,6 +1044,68 @@ async function loadWorkspaceUsage(store, workspaceId) {
   };
 }
 
+// Build the RapidProposal monthly usage view (proposal + signature quotas).
+async function loadProposalUsage(store, workspaceId) {
+  const [workspace, profile, counters] = await Promise.all([
+    typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
+    typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
+    typeof store.listProposalUsageCounters === "function"
+      ? store.listProposalUsageCounters(workspaceId)
+      : [],
+  ]);
+  const now = new Date();
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const tier = normalizeCompanyTier(workspace?.tier);
+  const currentMonth = periodKey(now, timezone);
+
+  const dayRows = [];
+  const monthRows = [];
+  let monthCounter = null;
+  for (const row of counters ?? []) {
+    const sk = typeof row?.period === "string" ? row.period.replace(/^proposal#/, "") : "";
+    if (/^\d{4}-\d{2}-\d{2}$/.test(sk)) {
+      dayRows.push({ ...row, day: sk });
+    } else if (/^\d{4}-\d{2}$/.test(sk)) {
+      monthRows.push({ ...row, period: sk });
+      if (sk === currentMonth) monthCounter = row;
+    }
+  }
+  return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone });
+}
+
+// Throws {status:403, error} when the workspace has hit its monthly quota for
+// `kind` ("proposals" | "signatures"). No-ops for unlimited (signing) tiers.
+async function assertProposalQuota(store, workspaceId, kind) {
+  if (typeof store.listProposalUsageCounters !== "function") return;
+  const usage = await loadProposalUsage(store, workspaceId);
+  const meter = usage[kind];
+  if (meter && meter.limit != null && meter.used >= meter.limit) {
+    const error = kind === "signatures" ? "signature_limit_reached" : "proposal_limit_reached";
+    const message = kind === "signatures"
+      ? `You've sent ${meter.used} of ${meter.limit} signature requests this month. Ask your administrator to adjust your usage.`
+      : `You've created ${meter.used} of ${meter.limit} proposals this month. Ask your administrator to adjust your usage.`;
+    const err = new Error(message);
+    err.statusCode = 403;
+    err.payload = { error, message, usage: meter };
+    throw err;
+  }
+}
+
+// Best-effort increment of a RapidProposal monthly usage counter. Never throws -
+// a lost increment is preferable to failing a create/send that already
+// succeeded; the quota check tolerates being a hair behind.
+async function recordProposalUsage(store, workspaceId, field) {
+  if (typeof store.incrementProposalUsage !== "function") return;
+  try {
+    const profile = typeof store.getProfile === "function" ? await store.getProfile(workspaceId) : null;
+    const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+    const now = new Date();
+    await store.incrementProposalUsage(workspaceId, periodKey(now, tz), dayKey(now, tz), field);
+  } catch (error) {
+    console.warn("[proposals] usage counter increment failed", { workspaceId, field, error: error?.message });
+  }
+}
+
 // Whether the premium call blocklist is available to this workspace right now.
 async function isCallBlocklistEnabled(store, workspaceId) {
   const [profile, workspace] = await Promise.all([
@@ -1063,7 +1164,24 @@ async function platformCompanySummary(store, workspace) {
     enterpriseOveragePerMinute: numberOrNullValue(workspace.enterpriseOveragePerMinute),
     callBlocklistEnabled: workspace.callBlocklistEnabled === true,
     ...(await workspaceUsageState(store, workspace)),
+    proposalUsage: await proposalUsageSummary(store, workspace.workspaceId),
   };
+}
+
+// Current-month proposal/signature usage for the companies list. Best-effort.
+async function proposalUsageSummary(store, workspaceId) {
+  try {
+    const usage = await loadProposalUsage(store, workspaceId);
+    return {
+      proposalsUsed: usage.proposals.used,
+      proposalsLimit: usage.proposals.limit,
+      signaturesUsed: usage.signatures.used,
+      signaturesLimit: usage.signatures.limit,
+      blocked: usage.blocked,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function numberOrNullValue(value) {
@@ -1094,6 +1212,7 @@ function getPlatformCompanyTarget(event, path) {
     ["user", /^\/platform\/companies\/([^/]+)\/users\/([^/]+)$/],
     ["users", /^\/platform\/companies\/([^/]+)\/users$/],
     ["usage", /^\/platform\/companies\/([^/]+)\/usage$/],
+    ["proposal-usage", /^\/platform\/companies\/([^/]+)\/proposal-usage$/],
     ["company", /^\/platform\/companies\/([^/]+)$/],
   ];
   for (const [kind, pattern] of patterns) {
@@ -1862,8 +1981,11 @@ async function handleProposalApi(event, {
     if (method === "POST") {
       const proposal = pickEntity(readBody(event), "id");
       if (!proposal) return json(400, { message: "Invalid proposal" });
+      await assertProposalQuota(store, workspaceId, "proposals");
       try {
-        return json(201, await store.createProposal(workspaceId, proposal));
+        const created = json(201, await store.createProposal(workspaceId, proposal));
+        await recordProposalUsage(store, workspaceId, "proposalsCreated");
+        return created;
       } catch (error) {
         if (isConditionalCheckFailed(error)) return json(409, { message: "Proposal already exists" });
         throw error;
@@ -1888,7 +2010,10 @@ async function handleProposalApi(event, {
       updatedAt: now,
     };
     delete copy.signatureRequest;
-    return json(201, await store.createProposal(workspaceId, copy));
+    await assertProposalQuota(store, workspaceId, "proposals");
+    const duplicated = json(201, await store.createProposal(workspaceId, copy));
+    await recordProposalUsage(store, workspaceId, "proposalsCreated");
+    return duplicated;
   }
 
   const signatureMatch = path.match(
@@ -1915,6 +2040,9 @@ async function handleProposalApi(event, {
       let previous = proposal.signatureRequest;
       if (!replacing && isActiveSignatureRequest(previous)) {
         return json(409, { message: "This proposal already has an active signature request" });
+      }
+      if (!replacing) {
+        await assertProposalQuota(store, workspaceId, "signatures");
       }
       if (replacing) {
         if (!isActiveSignatureRequest(previous)) {
@@ -2126,6 +2254,9 @@ async function handleProposalApi(event, {
         ...(replacing ? { replacedDocumentId: previous.documentId, lastResentAt: now } : {}),
       };
       await store.updateProposalSignature(workspaceId, proposalId, signatureRequest);
+      if (!replacing) {
+        await recordProposalUsage(store, workspaceId, "signaturesSent");
+      }
       return json(replacing ? 200 : 201, signatureRequest);
     }
 
@@ -3114,6 +3245,83 @@ export function createDynamoStore(client, commands, tableNames) {
         ConsistentRead: false,
       }));
       return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    // --- RapidProposal monthly usage counters (share the workspace-usage
+    // table; SK is namespaced `proposal#<YYYY-MM>` / `proposal#<YYYY-MM-DD>` so
+    // it never collides with the receptionist's bare `YYYY-MM` rows). ---
+    async getProposalUsageCounter(workspaceId, period) {
+      if (!tableNames.workspaceUsage) return null;
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.workspaceUsage,
+        Key: marshall({ workspaceId, period: `proposal#${period}` }),
+        ConsistentRead: false,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    async listProposalUsageCounters(workspaceId) {
+      if (!tableNames.workspaceUsage) return [];
+      const items = [];
+      let exclusiveStartKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tableNames.workspaceUsage,
+          KeyConditionExpression: "workspaceId = :workspaceId AND begins_with(#period, :prefix)",
+          ExpressionAttributeNames: { "#period": "period" },
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":prefix": "proposal#" }),
+          ConsistentRead: false,
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map((item) => unmarshall(item)));
+        exclusiveStartKey = result.LastEvaluatedKey;
+      } while (exclusiveStartKey);
+      return items;
+    },
+
+    async incrementProposalUsage(workspaceId, monthPeriod, dayPeriod, field) {
+      if (!tableNames.workspaceUsage) return;
+      if (field !== "proposalsCreated" && field !== "signaturesSent") {
+        throw new Error(`Unknown proposal-usage field: ${field}`);
+      }
+      const nowSec = Math.floor(Date.now() / 1000);
+      const targets = [
+        { period: `proposal#${monthPeriod}`, exp: nowSec + 18 * 30 * 24 * 60 * 60 },
+        { period: `proposal#${dayPeriod}`, exp: nowSec + 120 * 24 * 60 * 60 },
+      ];
+      for (const target of targets) {
+        await client.send(new commands.UpdateItemCommand({
+          TableName: tableNames.workspaceUsage,
+          Key: marshall({ workspaceId, period: target.period }),
+          UpdateExpression: "ADD #field :one SET expiresAt = if_not_exists(expiresAt, :exp)",
+          ExpressionAttributeNames: { "#field": field },
+          ExpressionAttributeValues: marshall({ ":one": 1, ":exp": target.exp }),
+        }));
+      }
+    },
+
+    async setProposalUsageCounter(workspaceId, period, patch) {
+      if (!tableNames.workspaceUsage) return;
+      const sets = ["expiresAt = if_not_exists(expiresAt, :exp)"];
+      const names = {};
+      const values = { ":exp": Math.floor(Date.now() / 1000) + 18 * 30 * 24 * 60 * 60 };
+      if (Number.isFinite(patch?.proposalsCreated)) {
+        sets.push("#proposalsCreated = :proposalsCreated");
+        names["#proposalsCreated"] = "proposalsCreated";
+        values[":proposalsCreated"] = Math.max(0, Math.trunc(patch.proposalsCreated));
+      }
+      if (Number.isFinite(patch?.signaturesSent)) {
+        sets.push("#signaturesSent = :signaturesSent");
+        names["#signaturesSent"] = "signaturesSent";
+        values[":signaturesSent"] = Math.max(0, Math.trunc(patch.signaturesSent));
+      }
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaceUsage,
+        Key: marshall({ workspaceId, period: `proposal#${period}` }),
+        UpdateExpression: `SET ${sets.join(", ")}`,
+        ...(Object.keys(names).length ? { ExpressionAttributeNames: names } : {}),
+        ExpressionAttributeValues: marshall(values),
+      }));
     },
 
     async listBlockedNumbers(workspaceId) {

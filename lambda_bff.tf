@@ -73,9 +73,9 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["calls"].arn
       },
       {
-        Sid      = "ReadWorkspaceUsage"
+        Sid      = "ManageWorkspaceUsage"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
         Resource = aws_dynamodb_table.control_plane["workspace_usage"].arn
       },
       {

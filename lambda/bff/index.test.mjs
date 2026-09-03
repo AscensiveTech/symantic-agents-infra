@@ -2749,6 +2749,193 @@ test("S3 image upload signer enforces content type and a 10 MB form limit", asyn
   assert.ok(policy.conditions.some((condition) => condition["Content-Type"] === "image/png"));
 });
 
+// --- RapidProposal usage quotas ------------------------------------------
+
+function usageQuotaStore(overrides = {}) {
+  const proposals = new Map();
+  const counters = new Map(); // sk -> { period, proposalsCreated, signaturesSent }
+  const bump = (sk, field, by) => {
+    const row = counters.get(sk) ?? { period: sk, proposalsCreated: 0, signaturesSent: 0 };
+    row[field] = (row[field] ?? 0) + by;
+    counters.set(sk, row);
+  };
+  return {
+    _proposals: proposals,
+    _counters: counters,
+    async ensureWorkspace() {},
+    async getProfile() { return { timezone: "UTC" }; },
+    async getWorkspace() { return { workspaceId: "user-123", tier: "repository" }; },
+    async listProposals() { return [...proposals.values()]; },
+    async createProposal(_workspaceId, proposal) {
+      proposals.set(proposal.id, structuredClone(proposal));
+      return proposal;
+    },
+    async getProposal(_workspaceId, proposalId) { return proposals.get(proposalId) ?? null; },
+    async deleteProposal(_workspaceId, proposalId) { proposals.delete(proposalId); },
+    async updateProposalSignature(_workspaceId, proposalId, signatureRequest) {
+      const current = proposals.get(proposalId) ?? { id: proposalId };
+      proposals.set(proposalId, { ...current, signatureRequest });
+      return signatureRequest;
+    },
+    async getProposalUsageCounter(_workspaceId, period) {
+      return counters.get(`proposal#${period}`) ?? null;
+    },
+    async listProposalUsageCounters() {
+      return [...counters.entries()].map(([sk, row]) => ({ ...row, period: sk }));
+    },
+    async incrementProposalUsage(_workspaceId, monthPeriod, dayPeriod, field) {
+      bump(`proposal#${monthPeriod}`, field, 1);
+      bump(`proposal#${dayPeriod}`, field, 1);
+    },
+    async setProposalUsageCounter(_workspaceId, period, patch) {
+      const sk = `proposal#${period}`;
+      const row = counters.get(sk) ?? { period: sk, proposalsCreated: 0, signaturesSent: 0 };
+      counters.set(sk, { ...row, ...patch });
+    },
+    ...overrides,
+  };
+}
+
+function seedCounter(store, period, patch) {
+  store._counters.set(`proposal#${period}`, { period: `proposal#${period}`, proposalsCreated: 0, signaturesSent: 0, ...patch });
+}
+
+const draftProposal = (id) => ({
+  id,
+  name: "Quota test",
+  status: "draft",
+  documentItems: [],
+  createdAt: "2026-09-15T00:00:00.000Z",
+  updatedAt: "2026-09-15T00:00:00.000Z",
+});
+
+test("proposal create is blocked once the monthly limit is reached and does not increment", async () => {
+  const store = usageQuotaStore();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  seedCounter(store, period, { proposalsCreated: 100 }); // repository limit
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/proposals", draftProposal("prp-blocked")));
+  assert.equal(response.statusCode, 403);
+  assert.equal(JSON.parse(response.body).error, "proposal_limit_reached");
+  assert.equal(store._proposals.has("prp-blocked"), false);
+  assert.equal(store._counters.get(`proposal#${period}`).proposalsCreated, 100);
+});
+
+test("a successful create and a duplicate each increment the monthly counter; delete does not", async () => {
+  const store = usageQuotaStore();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  await handler(authenticatedEvent("POST", "/workspaces/me/proposals", draftProposal("prp-1")));
+  await handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-1/duplicate"));
+  assert.equal(store._counters.get(`proposal#${period}`).proposalsCreated, 2);
+
+  await handler(authenticatedEvent("DELETE", "/workspaces/me/proposals/prp-1"));
+  assert.equal(store._counters.get(`proposal#${period}`).proposalsCreated, 2);
+});
+
+test("the signing (Enterprise) tier is never blocked regardless of count", async () => {
+  const store = usageQuotaStore({ async getWorkspace() { return { workspaceId: "user-123", tier: "signing" }; } });
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  seedCounter(store, period, { proposalsCreated: 99999 });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/proposals", draftProposal("prp-unl")));
+  assert.equal(response.statusCode, 201);
+});
+
+test("signature send is blocked at the monthly signature limit", async () => {
+  const store = usageQuotaStore();
+  store._proposals.set("prp-sign", { ...draftProposal("prp-sign"), signerNames: ["Jane Client"] });
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  seedCounter(store, period, { signaturesSent: 100 });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({ webhookId: "w", client: {} }),
+    getAssetSigner: async () => ({ async createDownloadUrl() { return "https://x"; } }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-sign/signature-requests",
+    {
+      assetKey: "exports/prp-sign.pdf",
+      recipients: [{ name: "Jane Client", email: "jane@example.com" }],
+      subject: "Please sign",
+      message: "Here is your proposal.",
+    },
+  ));
+  assert.equal(response.statusCode, 403);
+  assert.equal(JSON.parse(response.body).error, "signature_limit_reached");
+});
+
+test("GET /workspaces/me/proposal-usage returns the usage view for an admin and 403s a proposal-only user", async () => {
+  const store = usageQuotaStore();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  seedCounter(store, period, { proposalsCreated: 12, signaturesSent: 3 });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const ok = await handler(authenticatedEvent("GET", "/workspaces/me/proposal-usage"));
+  assert.equal(ok.statusCode, 200);
+  const body = JSON.parse(ok.body);
+  assert.equal(body.proposals.used, 12);
+  assert.equal(body.proposals.limit, 100);
+  assert.equal(body.signatures.used, 3);
+  assert.equal(body.tierLabel, "Pro");
+
+  const memberStore = {
+    ...usageQuotaStore(),
+    async getMembership(userId) {
+      return { userId, workspaceId: "user-123", role: "quotation-builder", status: "active" };
+    },
+  };
+  const memberHandler = createHandler({ getStore: async () => memberStore });
+  const denied = authenticatedEvent("GET", "/workspaces/me/proposal-usage");
+  denied.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  assert.equal((await memberHandler(denied)).statusCode, 403);
+});
+
+test("PATCH /platform/companies/{id}/proposal-usage sets an absolute count and the GET reflects it", async () => {
+  const base = usageQuotaStore();
+  const store = {
+    ...base,
+    async getMembership(userId) {
+      return { userId, workspaceId: "user-123", role: "company-admin", status: "active" };
+    },
+    async listWorkspaces() { return []; },
+  };
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  seedCounter(base, period, { proposalsCreated: 100, signaturesSent: 50 });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const bad = authenticatedEvent("PATCH", "/platform/companies/user-123/proposal-usage", { proposalsCreated: -3 });
+  bad.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(bad)).statusCode, 400);
+
+  const patch = authenticatedEvent("PATCH", "/platform/companies/user-123/proposal-usage", { proposalsCreated: 98 });
+  patch.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const patched = await handler(patch);
+  assert.equal(patched.statusCode, 200);
+  assert.equal(JSON.parse(patched.body).proposals.used, 98);
+
+  const notSuper = authenticatedEvent("PATCH", "/platform/companies/user-123/proposal-usage", { proposalsCreated: 1 });
+  notSuper.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await handler(notSuper)).statusCode, 403);
+});
+
 function authenticatedEvent(method, path, body, queryStringParameters) {
   return {
     requestContext: {
