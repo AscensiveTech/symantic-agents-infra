@@ -1507,10 +1507,13 @@ test("adding a signer and initials markers cancels the old request and sends a r
   assert.deepEqual(body.recipients.map((recipient) => recipient.email), ["jane@example.com", "alex@example.com"]);
 });
 
-test("cancel action deletes an active SignWell document and marks the request canceled", async () => {
-  let proposal = {
+test("cancel action cancels an active SignWell document and reopens the proposal for editing", async () => {
+  let stored = {
     id: "prp-sign",
     name: "Out for signature",
+    status: "completed",
+    assignedTo: "old-owner",
+    documentItems: [{ id: "a" }, { id: "b" }],
     signatureRequest: {
       provider: "signwell",
       documentId: "signwell-doc-abc",
@@ -1523,17 +1526,12 @@ test("cancel action deletes an active SignWell document and marks the request ca
   const calls = [];
   const store = {
     async ensureWorkspace() {},
-    async getProposal() { return structuredClone(proposal); },
-    async updateProposalSignature(_w, _p, signatureRequest) {
-      proposal = { ...proposal, signatureRequest: structuredClone(signatureRequest) };
-      return signatureRequest;
-    },
+    async getProposal() { return structuredClone(stored); },
+    async putProposal(_w, proposal) { stored = structuredClone(proposal); return stored; },
   };
   const signWell = {
     webhookId: "webhook-123",
-    client: {
-      async cancelDocument(documentId) { calls.push(`cancel:${documentId}`); },
-    },
+    client: { async cancelDocument(documentId) { calls.push(`cancel:${documentId}`); } },
   };
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store, getSignWell: async () => signWell });
@@ -1541,18 +1539,26 @@ test("cancel action deletes an active SignWell document and marks the request ca
   const response = await handler(authenticatedEvent(
     "POST",
     "/workspaces/me/proposals/prp-sign/signature-requests/cancel",
+    { assignedTo: "Dana Reviser" },
   ));
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(JSON.parse(response.body), { ok: true });
   assert.deepEqual(calls, ["cancel:signwell-doc-abc"]);
-  assert.equal(proposal.signatureRequest.status, "canceled");
+  const body = JSON.parse(response.body);
+  assert.equal(body.signatureRequest, undefined);
+  assert.equal(body.status, "draft");
+  assert.equal(typeof body.revisedAt, "string");
+  assert.equal(body.assignedTo, "Dana Reviser");
+  assert.equal(body.documentItems.length, 2);
+  assert.equal(stored.signatureRequest, undefined);
 });
 
-test("cancel action is a no-op for an already-completed document", async () => {
-  const proposal = {
+test("cancel action reopens a completed proposal without touching SignWell", async () => {
+  let stored = {
     id: "prp-sign",
     name: "Signed",
+    status: "completed",
+    documentItems: [],
     signatureRequest: {
       provider: "signwell",
       documentId: "signwell-doc-done",
@@ -1565,8 +1571,8 @@ test("cancel action is a no-op for an already-completed document", async () => {
   let canceled = false;
   const store = {
     async ensureWorkspace() {},
-    async getProposal() { return structuredClone(proposal); },
-    async updateProposalSignature() { throw new Error("should not update a completed request"); },
+    async getProposal() { return structuredClone(stored); },
+    async putProposal(_w, proposal) { stored = structuredClone(proposal); return stored; },
   };
   const signWell = {
     webhookId: "webhook-123",
@@ -1581,7 +1587,10 @@ test("cancel action is a no-op for an already-completed document", async () => {
   ));
 
   assert.equal(response.statusCode, 200);
-  assert.equal(canceled, false);
+  assert.equal(canceled, false); // a completed document is legally final - left as SignWell's record
+  const body = JSON.parse(response.body);
+  assert.equal(body.signatureRequest, undefined);
+  assert.equal(body.status, "draft");
 });
 
 test("completed PDF requests reconcile a missed SignWell completion webhook", async () => {
