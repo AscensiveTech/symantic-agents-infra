@@ -2092,20 +2092,30 @@ async function handleProposalApi(event, {
       return json(404, { message: "This proposal has no SignWell signature request" });
     }
     if (action === "cancel" && method === "POST") {
-      // "Revise Proposal" reopened this proposal for editing. Stop an
-      // in-progress signing in SignWell so pending signers can't sign the
-      // stale version; a completed document is legally final and stays as
-      // SignWell's permanent record (nothing to do). Best-effort - the
-      // frontend clears its own signature state regardless.
+      // "Revise Proposal" - fully reopen this proposal for editing. If a signing
+      // is still in progress, cancel the SignWell document first so pending
+      // signers can't sign the stale version. A completed document is left
+      // untouched in SignWell - it stays as the permanent record and is still
+      // downloadable by documentId. Then detach the signature request from our
+      // proposal entirely, drop it back to "draft", and reassign it to whoever
+      // clicked Revise. Returns the reopened proposal so the caller doesn't need
+      // a follow-up save (which the PATCH handler would only re-attach).
       if (isActiveSignatureRequest(current)) {
         await signWell.client.cancelDocument(current.documentId);
-        await store.updateProposalSignature(workspaceId, proposalId, {
-          ...current,
-          status: "canceled",
-          updatedAt: new Date().toISOString(),
-        });
       }
-      return json(200, { ok: true });
+      const body = readBody(event) ?? {};
+      const now = new Date().toISOString();
+      const reopened = { ...proposal };
+      delete reopened.signatureRequest;
+      Object.assign(reopened, {
+        status: "draft",
+        revisedAt: now,
+        updatedAt: now,
+        ...(typeof body.assignedTo === "string" && body.assignedTo.trim()
+          ? { assignedTo: body.assignedTo.trim() }
+          : {}),
+      });
+      return json(200, await store.putProposal(workspaceId, reopened));
     }
     if (action === "remind" && method === "POST") {
       if (!isActiveSignatureRequest(current)) {
