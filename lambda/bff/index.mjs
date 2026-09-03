@@ -1467,6 +1467,15 @@ async function handleWorkspaceUsers(event, {
     }
     await directory.deleteUser(target.cognitoUsername ?? target.email);
     await store.deleteMembership(userId);
+    // A member coming and going must never take their work with them: leave
+    // every proposal they created / owned in place, just blank the assignee so
+    // it shows as Unassigned. (assignedTo is a display-name/email string, set
+    // from the same "name" this membership carries.)
+    if (typeof store.unassignProposalsFrom === "function") {
+      await store.unassignProposalsFrom(actor.workspaceId, [target.name, target.email]).catch((error) => {
+        console.warn("Failed to unassign a removed member's proposals", { userId, error: String(error) });
+      });
+    }
     return json(200, { ok: true });
   }
 
@@ -2177,12 +2186,36 @@ async function handleProposalApi(event, {
       if (current.status !== "completed") {
         return json(409, { message: "The signed PDF is available after every signer completes the document" });
       }
-      // Just the short-lived SignWell URL (document + audit page). The app
-      // embeds it in an <object> for preview and opens it for download - it
-      // never needs the bytes, and inlining a real-size PDF as base64 here
-      // blew past Lambda's 6 MB response limit (a hard 413).
-      const url = await signWell.client.getCompletedPdfUrl(current.documentId);
-      return json(200, { url });
+      // Copy the signed PDF (document + audit page) from SignWell into our own
+      // proposal-assets bucket once, then hand the app a presigned URL to that.
+      // The app CSP blocks <object>/<iframe> (object-src / frame-src 'none'), so
+      // the preview must fetch the bytes and render them via pdf.js like the
+      // working copy - and it can't fetch SignWell's cross-origin URL directly.
+      // A completed SignWell document is immutable, so this is cached forever.
+      const signer = await getAssetSigner();
+      const signedKey = `signed/${proposalId}.pdf`;
+      if (!current.signedPdfStored) {
+        const sourceUrl = await signWell.client.getCompletedPdfUrl(current.documentId);
+        const pdfResponse = await fetch(sourceUrl);
+        if (!pdfResponse.ok) {
+          throw new SignWellRequestError(
+            `SignWell completed PDF fetch failed (${pdfResponse.status})`,
+            pdfResponse.status,
+          );
+        }
+        const pdfBytes = Buffer.from(await pdfResponse.arrayBuffer());
+        const uploadUrl = await signer.createUploadUrl(workspaceId, signedKey, "application/pdf");
+        const putResponse = await fetch(uploadUrl, {
+          method: "PUT",
+          headers: { "content-type": "application/pdf" },
+          body: pdfBytes,
+        });
+        if (!putResponse.ok) {
+          throw new Error(`Signed PDF asset upload failed (${putResponse.status})`);
+        }
+        await store.updateProposalSignature(workspaceId, proposalId, { ...current, signedPdfStored: true });
+      }
+      return json(200, { url: await signer.createDownloadUrl(workspaceId, signedKey) });
     }
     return json(404, { message: "Not found" });
   }
@@ -2833,8 +2866,9 @@ export function createDynamoStore(client, commands, tableNames) {
         TableName: tableName,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
-        ...(projection
-          ? { ProjectionExpression: projection.expression, ExpressionAttributeNames: projection.names }
+        ...(projection ? { ProjectionExpression: projection.expression } : {}),
+        ...(projection && projection.names && Object.keys(projection.names).length > 0
+          ? { ExpressionAttributeNames: projection.names }
           : {}),
         ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
       }));
@@ -3324,6 +3358,31 @@ export function createDynamoStore(client, commands, tableNames) {
 
     deleteProposal(workspaceId, proposalId) {
       return deleteRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
+    },
+
+    // Clear the assignee on every proposal in a workspace currently assigned to
+    // any of `names` (a removed member's name / email). The work itself is
+    // untouched - only `assignedTo` is blanked, so the proposal just becomes
+    // "Unassigned".
+    async unassignProposalsFrom(workspaceId, names) {
+      const wanted = new Set(names.map((value) => String(value).trim().toLowerCase()).filter(Boolean));
+      if (wanted.size === 0) return 0;
+      const rows = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
+        expression: "proposalId, assignedTo",
+      });
+      let cleared = 0;
+      for (const row of rows) {
+        if (!wanted.has(String(row.assignedTo ?? "").trim().toLowerCase())) continue;
+        await client.send(new commands.UpdateItemCommand({
+          TableName: tableNames.proposals,
+          Key: marshall({ workspaceId, proposalId: row.id }),
+          UpdateExpression: "SET assignedTo = :empty, updatedAt = :now",
+          ConditionExpression: "attribute_exists(proposalId)",
+          ExpressionAttributeValues: marshall({ ":empty": "", ":now": new Date().toISOString() }),
+        }));
+        cleared += 1;
+      }
+      return cleared;
     },
 
     async listProposalTemplates(workspaceId) {
