@@ -1,15 +1,15 @@
 variable "tools_provisioned_concurrency" {
-  description = "Provisioned concurrency for latency-sensitive Retell tool calls."
+  description = "Always-warm copies of the Retell tools Lambda (zero cold start on live calls). Right-sized to real concurrency: at current volume 1-2 covers ~100% of calls; 5+ is headroom that never gets used."
   type        = number
-  default     = 5
+  default     = 2
 
   validation {
     condition = (
-      var.tools_provisioned_concurrency >= 5 &&
+      var.tools_provisioned_concurrency >= 1 &&
       var.tools_provisioned_concurrency <= 20 &&
       floor(var.tools_provisioned_concurrency) == var.tools_provisioned_concurrency
     )
-    error_message = "tools_provisioned_concurrency must be an integer from 5 through 20."
+    error_message = "tools_provisioned_concurrency must be an integer from 1 through 20."
   }
 }
 
