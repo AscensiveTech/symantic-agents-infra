@@ -1781,14 +1781,16 @@ test("SignWell webhooks require the documented HMAC and update only the matching
     status: "sent",
     recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "pending" }],
   };
+  let signatureUpdateOpts = null;
   const store = {
     async getProposal(workspaceId, proposalId) {
       assert.equal(workspaceId, "workspace-123");
       assert.equal(proposalId, "prp-sign");
-      return { id: proposalId, signatureRequest };
+      return { id: proposalId, status: "draft", signatureRequest };
     },
-    async updateProposalSignature(_workspaceId, _proposalId, next) {
+    async updateProposalSignature(_workspaceId, _proposalId, next, opts) {
       signatureRequest = next;
+      signatureUpdateOpts = opts ?? null;
     },
   };
   const type = "document_completed";
@@ -1830,7 +1832,51 @@ test("SignWell webhooks require the documented HMAC and update only the matching
   assert.equal(signatureRequest.status, "completed");
   assert.equal(signatureRequest.completedAt, new Date(time * 1000).toISOString());
   assert.equal(signatureRequest.recipients[0].status, "signed");
+  // A fully-signed document also flips the proposal itself to completed so
+  // the UI locks it (docs/PRODUCT_SPEC.md).
+  assert.deepEqual(signatureUpdateOpts, { markProposalCompleted: true });
   assert.equal(invalid.statusCode, 401);
+});
+
+test("SignWell webhooks for a non-final event do not complete the proposal", async () => {
+  const webhookId = "webhook-123";
+  let signatureRequest = {
+    provider: "signwell",
+    documentId: "signwell-doc-123",
+    status: "sent",
+    recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "sent" }],
+  };
+  let signatureUpdateOpts;
+  const store = {
+    async getProposal(_workspaceId, proposalId) {
+      return { id: proposalId, status: "draft", signatureRequest };
+    },
+    async updateProposalSignature(_workspaceId, _proposalId, next, opts) {
+      signatureRequest = next;
+      signatureUpdateOpts = opts ?? null;
+    },
+  };
+  const type = "document_viewed";
+  const time = 1788144000;
+  const hash = createHmac("sha256", webhookId).update(`${type}@${time}`).digest("hex");
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({ webhookId, client: {} }),
+  });
+
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/webhooks/signwell" } },
+    rawPath: "/webhooks/signwell",
+    body: JSON.stringify({
+      event: { type, time, hash, related_signer: { name: "Jane Client", email: "jane@example.com" } },
+      data: { object: { id: "signwell-doc-123", metadata: { workspace_id: "workspace-123", proposal_id: "prp-sign" }, recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com" }] } },
+    }),
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(signatureRequest.status, "viewed");
+  assert.deepEqual(signatureUpdateOpts, { markProposalCompleted: false });
 });
 
 test("workspace membership shares proposal data across Cognito users", async () => {

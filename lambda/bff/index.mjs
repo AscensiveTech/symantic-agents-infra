@@ -1613,7 +1613,9 @@ async function handleSignWellWebhook(event, { getStore, getSignWell }) {
     updatedAt: new Date().toISOString(),
     ...(statusFromEvent === "completed" ? { completedAt: eventAt } : {}),
   };
-  await store.updateProposalSignature(workspaceId, proposalId, updated);
+  await store.updateProposalSignature(workspaceId, proposalId, updated, {
+    markProposalCompleted: statusFromEvent === "completed",
+  });
   return json(200, { ok: true });
 }
 
@@ -1727,8 +1729,15 @@ async function reconcileSignWellSignature({
       updatedAt: now,
       ...(status === "completed" ? { completedAt: eventAt } : {}),
     };
-    await store.updateProposalSignature(workspaceId, proposal.id, updated);
-    return { ...proposal, signatureRequest: updated };
+    const proposalCompleted = status === "completed";
+    await store.updateProposalSignature(workspaceId, proposal.id, updated, {
+      markProposalCompleted: proposalCompleted,
+    });
+    return {
+      ...proposal,
+      ...(proposalCompleted ? { status: "completed" } : {}),
+      signatureRequest: updated,
+    };
   } catch (error) {
     console.warn("SignWell reconciliation failed", {
       workspaceId,
@@ -3246,14 +3255,26 @@ export function createDynamoStore(client, commands, tableNames) {
       );
     },
 
-    async updateProposalSignature(workspaceId, proposalId, signatureRequest) {
+    async updateProposalSignature(workspaceId, proposalId, signatureRequest, { markProposalCompleted = false } = {}) {
+      const names = { "#signatureRequest": "signatureRequest" };
+      const values = { ":signatureRequest": signatureRequest };
+      let expression = "SET #signatureRequest = :signatureRequest";
+      // Once SignWell reports the document fully signed, flip the proposal
+      // itself to completed in the same write - the builder/list treat a
+      // signed proposal as locked (docs/PRODUCT_SPEC.md), and a separate
+      // round-trip could leave the two out of sync if it failed.
+      if (markProposalCompleted) {
+        names["#status"] = "status";
+        values[":completed"] = "completed";
+        expression += ", #status = :completed";
+      }
       await client.send(new commands.UpdateItemCommand({
         TableName: tableNames.proposals,
         Key: marshall({ workspaceId, proposalId }),
-        UpdateExpression: "SET #signatureRequest = :signatureRequest",
+        UpdateExpression: expression,
         ConditionExpression: "attribute_exists(proposalId)",
-        ExpressionAttributeNames: { "#signatureRequest": "signatureRequest" },
-        ExpressionAttributeValues: marshall({ ":signatureRequest": signatureRequest }),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: marshall(values),
       }));
       return signatureRequest;
     },
