@@ -2177,11 +2177,12 @@ async function handleProposalApi(event, {
       if (current.status !== "completed") {
         return json(409, { message: "The signed PDF is available after every signer completes the document" });
       }
-      const [url, pdfBase64] = await Promise.all([
-        signWell.client.getCompletedPdfUrl(current.documentId),
-        signWell.client.getCompletedPdfBase64(current.documentId).catch(() => null),
-      ]);
-      return json(200, { url, ...(pdfBase64 ? { pdfBase64 } : {}) });
+      // Just the short-lived SignWell URL (document + audit page). The app
+      // embeds it in an <object> for preview and opens it for download - it
+      // never needs the bytes, and inlining a real-size PDF as base64 here
+      // blew past Lambda's 6 MB response limit (a hard 413).
+      const url = await signWell.client.getCompletedPdfUrl(current.documentId);
+      return json(200, { url });
     }
     return json(404, { message: "Not found" });
   }

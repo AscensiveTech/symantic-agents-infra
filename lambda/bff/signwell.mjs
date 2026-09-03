@@ -116,24 +116,6 @@ export function createSignWellClient({
       }
       return result.file_url;
     },
-    // The completed PDF as raw bytes (base64), so the app can show it in the
-    // in-browser preview without the viewer's browser having to fetch a
-    // cross-origin SignWell/S3 URL (which its CORS policy blocks).
-    async getCompletedPdfBase64(documentId) {
-      const response = await fetchImpl(
-        `${root}/documents/${encodeURIComponent(documentId)}/completed_pdf?audit_page=true`,
-        { headers: { "X-Api-Key": apiKey } },
-      );
-      if (!response.ok) {
-        const text = await response.text();
-        throw new SignWellRequestError(
-          `SignWell completed PDF download failed (${response.status})`,
-          response.status,
-          text.slice(0, 500),
-        );
-      }
-      return Buffer.from(await response.arrayBuffer()).toString("base64");
-    },
   };
 }
 
