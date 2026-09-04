@@ -121,6 +121,18 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         ]
       },
       {
+        Sid      = "ManageLegalDocuments"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
+        Resource = aws_dynamodb_table.legal_documents.arn
+      },
+      {
+        Sid      = "ManageLegalAcceptances"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:BatchWriteItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.legal_acceptances.arn
+      },
+      {
         Sid    = "OnboardCompanyAtomically"
         Effect = "Allow"
         Action = ["dynamodb:TransactWriteItems"]
@@ -233,6 +245,8 @@ resource "aws_lambda_function" "bff" {
       PROPOSAL_PARTS_TABLE        = aws_dynamodb_table.control_plane["proposal_parts"].name
       PROPOSAL_TEMPLATES_TABLE    = aws_dynamodb_table.control_plane["proposal_templates"].name
       WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
+      LEGAL_DOCUMENTS_TABLE       = aws_dynamodb_table.legal_documents.name
+      LEGAL_ACCEPTANCES_TABLE     = aws_dynamodb_table.legal_acceptances.name
       COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
       CALL_ARTIFACTS_BUCKET       = aws_s3_bucket.call_artifacts.bucket
