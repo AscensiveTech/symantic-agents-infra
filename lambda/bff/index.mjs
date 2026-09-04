@@ -416,7 +416,7 @@ export function createHandler({
       if (legalResponse) return legalResponse;
       if (!isLegalPath(path) && await legalAcceptancePending(store, actor)) {
         return json(403, {
-          code: "policy_acceptance_required",
+          error: "policy_acceptance_required",
           message: "You must accept the current Terms & Conditions and Privacy Policy before continuing.",
         });
       }
@@ -1876,7 +1876,7 @@ async function handleLegal(event, { method, path, actor, store }) {
     for (const target of targets) {
       if (!target.active || target.claimed !== target.active.version) {
         return json(409, {
-          code: "version_mismatch",
+          error: "version_mismatch",
           message: "The document version has changed. Reload the acceptance screen and accept the current version.",
         });
       }

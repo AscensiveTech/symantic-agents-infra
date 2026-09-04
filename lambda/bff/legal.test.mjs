@@ -135,7 +135,7 @@ test("the gate blocks every other authenticated call until both policies are acc
 
   const blocked = await handler(authed("GET", "/workspaces/me/proposals"));
   assert.equal(blocked.statusCode, 403);
-  assert.equal(JSON.parse(blocked.body).code, "policy_acceptance_required");
+  assert.equal(JSON.parse(blocked.body).error, "policy_acceptance_required");
 
   // Accept only Terms -> still blocked on Privacy.
   const partial = await handler(authed("POST", "/workspaces/me/legal/accept", { termsVersion: "v1.0" }));
@@ -171,7 +171,7 @@ test("accepting a superseded version is rejected", async () => {
 
   const stale = await handler(authed("POST", "/workspaces/me/legal/accept", { termsVersion: "v1.0" }));
   assert.equal(stale.statusCode, 409);
-  assert.equal(JSON.parse(stale.body).code, "version_mismatch");
+  assert.equal(JSON.parse(stale.body).error, "version_mismatch");
 });
 
 test("the gate is inert for a store that has no legal tables", async () => {
