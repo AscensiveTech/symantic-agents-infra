@@ -3022,7 +3022,8 @@ test("GET /workspaces/me/proposal-payments returns a billing view for an admin, 
   assert.equal(ok.statusCode, 200);
   const body = JSON.parse(ok.body);
   assert.equal(body.monthlyPrice, 119); // Pro default
-  assert.equal(body.upcoming.prorated, true); // no payments yet
+  assert.equal(body.upcoming.amount, 119); // full price, never prorated
+  assert.match(body.upcoming.dueOn, /^\d{4}-\d{2}-\d{2}$/);
   assert.equal(Array.isArray(body.payments), true);
 
   const memberStore = {
@@ -3062,7 +3063,6 @@ test("a super admin logs a payment for a company and it shows up in that company
   assert.equal(afterLog.payments.length, 1);
   assert.equal(afterLog.payments[0].amount, 79.67);
   assert.equal(afterLog.payments[0].loggedByName, "Sulav");
-  assert.equal(afterLog.upcoming.prorated, false); // a payment now exists
   assert.equal(afterLog.upcoming.amount, 119);
 
   // The org admin for that company sees the same payment.

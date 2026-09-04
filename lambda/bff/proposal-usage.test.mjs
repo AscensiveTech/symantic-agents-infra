@@ -9,7 +9,7 @@ import {
   dayKey,
   firstOfNextMonthKey,
   limitsForTier,
-  proratePartialMonth,
+  nextBillingDate,
   resolveProposalMonthlyPrice,
   usageStateFor,
   validProposalPayment,
@@ -87,35 +87,35 @@ test("resolveProposalMonthlyPrice: tier default, then per-company override", () 
   assert.equal(resolveProposalMonthlyPrice("nonsense", {}), PROPOSAL_PLAN_PRICES.basic);
 });
 
-test("proratePartialMonth splits by remaining days inclusive of the join day", () => {
-  assert.deepEqual(proratePartialMonth(310, "2026-09-01"), { amount: 310, remaining: 30, total: 30 });
-  assert.deepEqual(proratePartialMonth(310, "2026-09-30"), { amount: 10.33, remaining: 1, total: 30 });
-  assert.deepEqual(proratePartialMonth(300, "2026-09-16"), { amount: 150, remaining: 15, total: 30 });
-});
-
 test("firstOfNextMonthKey rolls the year over", () => {
   assert.equal(firstOfNextMonthKey("2026-09"), "2026-10-01");
   assert.equal(firstOfNextMonthKey("2026-12"), "2027-01-01");
 });
 
-test("buildProposalBilling: prorated upcoming while unpaid, full month once a payment exists", () => {
+test("nextBillingDate anchors to the join day, clamped for short months, no proration", () => {
+  // today the 15th, join day 15 -> due today
+  assert.equal(nextBillingDate("2026-09-15", 15), "2026-09-15");
+  // today the 10th, join day 15 -> later this month
+  assert.equal(nextBillingDate("2026-09-10", 15), "2026-09-15");
+  // today the 20th, join day 15 -> next month
+  assert.equal(nextBillingDate("2026-09-20", 15), "2026-10-15");
+  // join day 31, February -> clamped to the 28th
+  assert.equal(nextBillingDate("2026-02-01", 31), "2026-02-28");
+  // year rollover
+  assert.equal(nextBillingDate("2026-12-20", 15), "2027-01-15");
+});
+
+test("buildProposalBilling: full monthly price due on the join day, never prorated", () => {
   const workspace = { tier: "repository", createdAt: "2026-09-16T10:00:00.000Z" };
 
-  const unpaid = buildProposalBilling(workspace, "repository", [], { now, timezone: "UTC" });
-  assert.equal(unpaid.monthlyPrice, 119);
-  assert.equal(unpaid.priceOverridden, false);
-  assert.equal(unpaid.upcoming.prorated, true);
-  assert.equal(unpaid.upcoming.dueOn, "2026-10-01");
-  assert.equal(unpaid.upcoming.amount, 59.5); // 119 * 15/30
-  assert.match(unpaid.upcoming.basis, /Prorated 2026-09-16/);
-
-  const paid = buildProposalBilling(workspace, "repository", [
-    { paymentId: "p1", paidAt: "2026-09-16", planLabel: "Pro", amount: 59.5, receivedBy: "AJ", method: "Stripe" },
-  ], { now, timezone: "UTC" });
-  assert.equal(paid.upcoming.prorated, false);
-  assert.equal(paid.upcoming.amount, 119);
-  assert.equal(paid.upcoming.dueOn, "2026-10-01");
-  assert.equal(paid.payments.length, 1);
+  const billing = buildProposalBilling(workspace, "repository", [], { now, timezone: "UTC" });
+  assert.equal(billing.monthlyPrice, 119);
+  assert.equal(billing.priceOverridden, false);
+  assert.equal(billing.upcoming.amount, 119);
+  assert.equal(billing.upcoming.billingDay, 16);
+  assert.equal(billing.upcoming.dueOn, "2026-09-16"); // now = 2026-09-15, join day 16 -> tomorrow
+  assert.equal(billing.upcoming.prorated, undefined);
+  assert.equal(billing.upcoming.basis, undefined);
 });
 
 test("buildProposalBilling honours a per-company price override", () => {

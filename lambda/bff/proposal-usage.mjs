@@ -143,29 +143,30 @@ export function resolveProposalMonthlyPrice(tier, workspace) {
   return PROPOSAL_PLAN_PRICES[PROPOSAL_LIMITS[tier] ? tier : "basic"];
 }
 
-function daysInMonthOf(dateKey) {
-  const [y, m] = dateKey.split("-").map(Number);
-  return new Date(y, m, 0).getDate();
+function daysInMonth(year, month1to12) {
+  return new Date(year, month1to12, 0).getDate();
 }
 
-function lastDayKeyOfMonth(dateKey) {
-  const [y, m] = dateKey.split("-").map(Number);
-  return `${y}-${String(m).padStart(2, "0")}-${String(daysInMonthOf(dateKey)).padStart(2, "0")}`;
-}
-
-// First day of the month AFTER the one `YYYY-MM` names.
+// First day of the month AFTER the one `YYYY-MM` names. Used for the monthly
+// USAGE-quota reset date (quota resets on the calendar 1st - unrelated to
+// billing, which anchors to the join day below).
 export function firstOfNextMonthKey(monthKey) {
   const [y, m] = monthKey.split("-").map(Number);
   return m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
 }
 
-// Prorate a monthly price across the days from `joinDayKey` to the end of that
-// month, inclusive of the join day.
-export function proratePartialMonth(monthlyPrice, joinDayKey) {
-  const total = daysInMonthOf(joinDayKey);
-  const joinDay = Number(joinDayKey.split("-")[2]);
-  const remaining = Math.max(1, Math.min(total, total - joinDay + 1));
-  return { amount: money((monthlyPrice * remaining) / total) ?? 0, remaining, total };
+// The next billing date: the join day-of-month, on or after `today`, clamped to
+// the target month's length (join on the 31st -> the 28th/30th in short months).
+// No proration - every cycle is the full monthly price.
+export function nextBillingDate(todayKey, joinDay) {
+  const [y, m, d] = todayKey.split("-").map(Number);
+  const day = Math.max(1, Math.min(31, joinDay || 1));
+  const clamped = Math.min(day, daysInMonth(y, m));
+  if (d <= clamped) return `${y}-${String(m).padStart(2, "0")}-${String(clamped).padStart(2, "0")}`;
+  const ny = m === 12 ? y + 1 : y;
+  const nm = m === 12 ? 1 : m + 1;
+  const clampedNext = Math.min(day, daysInMonth(ny, nm));
+  return `${ny}-${String(nm).padStart(2, "0")}-${String(clampedNext).padStart(2, "0")}`;
 }
 
 function normalizePayment(row) {
@@ -184,11 +185,10 @@ function normalizePayment(row) {
 
 /**
  * Build the RapidProposal billing view: the monthly price, the manually-logged
- * payment history, and a computed "upcoming payment" estimate.
+ * payment history, and the next billing date.
  *
- * Billing model: prorate from the join date for the partial first month, then
- * a full charge on the 1st of every month. The upcoming row is prorated only
- * while no payment has been logged yet.
+ * Billing model: no proration. The customer is charged the full monthly price
+ * on their join day-of-month, every month (clamped for short months).
  *
  * @param {object|null} workspace   the workspace record (createdAt = join date)
  * @param {string} tier
@@ -210,30 +210,14 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
     .filter((p) => p.paymentId && p.paidAt)
     .sort((a, b) => `${b.paidAt}#${b.paymentId}`.localeCompare(`${a.paidAt}#${a.paymentId}`));
 
-  const currentMonth = periodKey(now, tz);
   const joinDayKey = dayKey(workspace?.createdAt ?? now, tz) ?? dayKey(now, tz);
-  const joinMonth = joinDayKey.slice(0, 7);
-
-  let upcoming;
-  if (payments.length === 0) {
-    // First-ever payment: prorate the partial join month.
-    const { amount, remaining, total } = proratePartialMonth(monthlyPrice, joinDayKey);
-    upcoming = {
-      dueOn: firstOfNextMonthKey(joinMonth),
-      planLabel,
-      amount,
-      prorated: true,
-      basis: `Prorated ${joinDayKey} – ${lastDayKeyOfMonth(joinDayKey)} (${remaining}/${total} days)`,
-    };
-  } else {
-    upcoming = {
-      dueOn: firstOfNextMonthKey(currentMonth),
-      planLabel,
-      amount: monthlyPrice,
-      prorated: false,
-      basis: "Full month",
-    };
-  }
+  const joinDay = Number(joinDayKey.split("-")[2]) || 1;
+  const upcoming = {
+    dueOn: nextBillingDate(dayKey(now, tz), joinDay),
+    planLabel,
+    amount: monthlyPrice,
+    billingDay: joinDay,
+  };
 
   return { tier: normalizedTier, planLabel, monthlyPrice, priceOverridden, upcoming, payments };
 }
