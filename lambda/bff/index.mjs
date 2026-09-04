@@ -30,6 +30,15 @@ import {
   SignWellRequestError,
   verifySignWellEvent,
 } from "./signwell.mjs";
+import {
+  DEFAULT_LEGAL_DOCUMENTS,
+  isLegalDocumentType,
+  isValidLegalVersion,
+  LEGAL_DOCUMENT_TYPES,
+  LEGAL_RESPONSE_KEYS,
+  legalAcceptanceStatus,
+  parseAcceptBody,
+} from "./legal.mjs";
 
 const PROFILE_FIELDS = {
   businessType: "string",
@@ -364,6 +373,9 @@ export function createHandler({
   verifySignature = verifyRetellSignature,
   toolBaseUrl = process.env.PUBLIC_API_BASE_URL,
 } = {}) {
+  // A new handler may be backed by a different store (tests, or a config
+  // reload) - don't let the per-container active-legal cache leak across.
+  invalidateActiveLegalCache();
   return async function handle(event) {
     const method = event?.requestContext?.http?.method;
     const path = event?.rawPath ?? event?.requestContext?.http?.path;
@@ -396,6 +408,18 @@ export function createHandler({
         return json(401, { message: "Unauthorized" });
       }
       const { workspaceId } = actor;
+
+      // Terms & Conditions / Privacy Policy - the endpoints that drive the
+      // acceptance screen, then the gate that blocks everything else until the
+      // user has accepted the current versions (docs/PRODUCT_SPEC.md).
+      const legalResponse = await handleLegal(event, { method, path, actor, store });
+      if (legalResponse) return legalResponse;
+      if (!isLegalPath(path) && await legalAcceptancePending(store, actor)) {
+        return json(403, {
+          code: "policy_acceptance_required",
+          message: "You must accept the current Terms & Conditions and Privacy Policy before continuing.",
+        });
+      }
 
       const platformResponse = await handlePlatformCompanies(event, {
         method,
@@ -1754,6 +1778,155 @@ async function handleWorkspaceUsers(event, {
   }
 
   return json(404, { message: "Not found" });
+}
+
+// --- Legal acceptance (Terms & Conditions / Privacy Policy) -----------------
+
+function isLegalPath(path) {
+  return typeof path === "string"
+    && (path === "/workspaces/me/legal" || path.startsWith("/workspaces/me/legal/") || path === "/platform/legal");
+}
+
+// Seed the placeholder v1.0 documents the first time anything touches the
+// table. Idempotent (conditional writes) so concurrent cold starts are safe.
+async function ensureLegalSeeded(store) {
+  if (typeof store.getActiveLegalDocument !== "function") return;
+  let seeded = false;
+  await Promise.all(LEGAL_DOCUMENT_TYPES.map(async (documentType) => {
+    const active = await store.getActiveLegalDocument(documentType);
+    if (!active) {
+      await store.putLegalDocumentVersion(documentType, DEFAULT_LEGAL_DOCUMENTS[documentType], { seedOnly: true });
+      seeded = true;
+    }
+  }));
+  if (seeded) invalidateActiveLegalCache();
+}
+
+async function loadLegalState(store, userId) {
+  const [{ activeTerms, activePrivacy }, acceptedTerms, acceptedPrivacy] = await Promise.all([
+    getActiveLegalDocuments(store),
+    store.getLatestLegalAcceptance(userId, "TERMS_AND_CONDITIONS"),
+    store.getLatestLegalAcceptance(userId, "PRIVACY_POLICY"),
+  ]);
+  return { activeTerms, activePrivacy, acceptedTerms, acceptedPrivacy };
+}
+
+// The active documents change ~never but are read on every request by the
+// gate. A short per-container cache keeps that to one pair of GetItems a
+// minute instead of one per request; a newly published version takes effect
+// within the TTL.
+let activeLegalCache = null;
+const ACTIVE_LEGAL_TTL_MS = 60_000;
+async function getActiveLegalDocuments(store) {
+  if (activeLegalCache && activeLegalCache.expiresAt > Date.now()) return activeLegalCache.value;
+  const [activeTerms, activePrivacy] = await Promise.all([
+    store.getActiveLegalDocument("TERMS_AND_CONDITIONS"),
+    store.getActiveLegalDocument("PRIVACY_POLICY"),
+  ]);
+  const value = { activeTerms, activePrivacy };
+  activeLegalCache = { value, expiresAt: Date.now() + ACTIVE_LEGAL_TTL_MS };
+  return value;
+}
+function invalidateActiveLegalCache() {
+  activeLegalCache = null;
+}
+
+// The enforcement gate - every authenticated app request runs through this
+// before its handler. Inert until the documents table has an active version
+// (safe rollout), so deploying this never locks anyone out on its own.
+async function legalAcceptancePending(store, actor) {
+  if (typeof store.getActiveLegalDocument !== "function") return false;
+  const { activeTerms, activePrivacy } = await getActiveLegalDocuments(store);
+  if (!activeTerms && !activePrivacy) return false;
+  const [acceptedTerms, acceptedPrivacy] = await Promise.all([
+    store.getLatestLegalAcceptance(actor.userId, "TERMS_AND_CONDITIONS"),
+    store.getLatestLegalAcceptance(actor.userId, "PRIVACY_POLICY"),
+  ]);
+  return legalAcceptanceStatus({ activeTerms, activePrivacy, acceptedTerms, acceptedPrivacy }).requiresAcceptance;
+}
+
+async function handleLegal(event, { method, path, actor, store }) {
+  if (typeof store.getActiveLegalDocument !== "function") return null;
+
+  if (path === "/workspaces/me/legal" && method === "GET") {
+    await ensureLegalSeeded(store);
+    const state = await loadLegalState(store, actor.userId);
+    const documents = {};
+    for (const documentType of LEGAL_DOCUMENT_TYPES) {
+      const active = documentType === "TERMS_AND_CONDITIONS" ? state.activeTerms : state.activePrivacy;
+      documents[LEGAL_RESPONSE_KEYS[documentType]] = active
+        ? { version: active.version, title: active.title, content: active.content, effectiveFrom: active.effectiveFrom ?? null }
+        : null;
+    }
+    return json(200, { documents, ...legalAcceptanceStatus(state) });
+  }
+
+  if (path === "/workspaces/me/legal/accept" && method === "POST") {
+    await ensureLegalSeeded(store);
+    const parsed = parseAcceptBody(readBody(event));
+    if (!parsed) return json(400, { message: "Provide termsVersion and/or privacyVersion to accept" });
+
+    const state = await loadLegalState(store, actor.userId);
+    const targets = [
+      parsed.terms !== undefined ? { type: "TERMS_AND_CONDITIONS", claimed: parsed.terms, active: state.activeTerms } : null,
+      parsed.privacy !== undefined ? { type: "PRIVACY_POLICY", claimed: parsed.privacy, active: state.activePrivacy } : null,
+    ].filter(Boolean);
+
+    // A stale tab must not silently accept a superseded version.
+    for (const target of targets) {
+      if (!target.active || target.claimed !== target.active.version) {
+        return json(409, {
+          code: "version_mismatch",
+          message: "The document version has changed. Reload the acceptance screen and accept the current version.",
+        });
+      }
+    }
+
+    const acceptedAt = new Date().toISOString();
+    const ipAddress = event?.requestContext?.http?.sourceIp ?? null;
+    const userAgent = readHeader(event?.headers, "user-agent");
+    for (const target of targets) {
+      await store.recordLegalAcceptance({
+        userId: actor.userId,
+        workspaceId: actor.workspaceId,
+        documentType: target.type,
+        documentVersion: target.active.version,
+        acceptedAt,
+        ipAddress,
+        userAgent,
+      });
+    }
+    return json(200, legalAcceptanceStatus(await loadLegalState(store, actor.userId)));
+  }
+
+  // Publish a new version (super admin). The previous version rows stay for
+  // audit; every user is re-prompted because their LATEST no longer matches.
+  if (path === "/platform/legal" && method === "POST") {
+    if (!actor.roles.includes("super-admin")) return json(403, { message: "Super admin access is required" });
+    const body = readBody(event);
+    if (!body || !isLegalDocumentType(body.documentType) || !isValidLegalVersion(body.version)
+      || typeof body.title !== "string" || !body.title.trim()
+      || typeof body.content !== "string" || !body.content.trim()) {
+      return json(400, { message: "Provide documentType, version (vN.N), title, and content" });
+    }
+    try {
+      await store.putLegalDocumentVersion(body.documentType, {
+        version: body.version,
+        title: body.title.trim(),
+        content: body.content,
+        effectiveFrom: typeof body.effectiveFrom === "string" ? body.effectiveFrom : undefined,
+      });
+    } catch (error) {
+      if (error?.name === "TransactionCanceledException") {
+        return json(409, { message: "That version already exists" });
+      }
+      throw error;
+    }
+    invalidateActiveLegalCache();
+    return json(201, { documentType: body.documentType, version: body.version });
+  }
+
+  return null;
 }
 
 async function handleCompanyProfile(event, { method, path, actor, store, getAssetSigner }) {
@@ -3925,6 +4098,112 @@ export function createDynamoStore(client, commands, tableNames) {
       }));
       return result.Items?.[0] ? unmarshall(result.Items[0]) : null;
     },
+
+    // --- Legal documents & acceptance (docs/PRODUCT_SPEC.md) -----------------
+
+    // The currently active version of a legal document. Denormalized onto the
+    // sk="ACTIVE" pointer item so the acceptance status + document content is
+    // a single GetItem; the sk="v1.0" rows are the immutable version history.
+    async getActiveLegalDocument(documentType) {
+      if (!tableNames.legalDocuments) return null;
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.legalDocuments,
+        Key: marshall({ documentType, version: "ACTIVE" }),
+        // Eventually consistent: this is read on every request by the gate,
+        // and a just-published new version being a second late to enforce is
+        // harmless.
+        ConsistentRead: false,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    // Publishes a version: writes the immutable version row and repoints
+    // ACTIVE at it, atomically. Existing users are re-prompted on their next
+    // request because their LATEST acceptance no longer matches.
+    async putLegalDocumentVersion(documentType, doc, { seedOnly = false } = {}) {
+      if (!tableNames.legalDocuments) return;
+      const now = new Date().toISOString();
+      const versionItem = {
+        documentType,
+        version: doc.version,
+        title: doc.title,
+        content: doc.content,
+        effectiveFrom: doc.effectiveFrom ?? now.slice(0, 10),
+        createdAt: now,
+      };
+      const activeItem = { ...versionItem, version: "ACTIVE", updatedAt: now };
+      try {
+        await client.send(new commands.TransactWriteItemsCommand({
+          TransactItems: [
+            {
+              Put: {
+                TableName: tableNames.legalDocuments,
+                Item: marshall(versionItem),
+                // A version is immutable once written.
+                ConditionExpression: "attribute_not_exists(documentType)",
+              },
+            },
+            {
+              Put: {
+                TableName: tableNames.legalDocuments,
+                Item: marshall(activeItem),
+                // Seeding must not clobber an already-published active doc.
+                ...(seedOnly ? { ConditionExpression: "attribute_not_exists(documentType)" } : {}),
+              },
+            },
+          ],
+        }));
+      } catch (error) {
+        // A concurrent seed already wrote this version - fine.
+        if (error?.name === "TransactionCanceledException" && seedOnly) return;
+        throw error;
+      }
+    },
+
+    // The user's most recent acceptance of one document type (or null).
+    // Kept as its own overwritten LATEST# item so the status check is one
+    // GetItem per document, never a scan of the append-only history.
+    async getLatestLegalAcceptance(userId, documentType) {
+      if (!tableNames.legalAcceptances) return null;
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.legalAcceptances,
+        Key: marshall({ userId, sk: `LATEST#${documentType}` }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    // Records an acceptance: one immutable HISTORY# audit row (never
+    // overwritten) plus the overwritten LATEST# pointer.
+    async recordLegalAcceptance(record) {
+      if (!tableNames.legalAcceptances) return;
+      const historyItem = {
+        userId: record.userId,
+        sk: `HISTORY#${record.documentType}#${record.acceptedAt}`,
+        workspaceId: record.workspaceId ?? null,
+        documentType: record.documentType,
+        documentVersion: record.documentVersion,
+        acceptedAt: record.acceptedAt,
+        ipAddress: record.ipAddress ?? null,
+        userAgent: record.userAgent ?? null,
+        createdAt: new Date().toISOString(),
+      };
+      const latestItem = {
+        userId: record.userId,
+        sk: `LATEST#${record.documentType}`,
+        documentType: record.documentType,
+        documentVersion: record.documentVersion,
+        acceptedAt: record.acceptedAt,
+      };
+      await client.send(new commands.BatchWriteItemCommand({
+        RequestItems: {
+          [tableNames.legalAcceptances]: [
+            { PutRequest: { Item: marshall(historyItem) } },
+            { PutRequest: { Item: marshall(latestItem) } },
+          ],
+        },
+      }));
+    },
   };
 }
 
@@ -3945,6 +4224,8 @@ async function getDefaultStore() {
       workspaceMemberships: process.env.WORKSPACE_MEMBERSHIPS_TABLE,
       workspaceUsage: process.env.WORKSPACE_USAGE_TABLE,
       blockedNumbers: process.env.BLOCKED_NUMBERS_TABLE,
+      legalDocuments: process.env.LEGAL_DOCUMENTS_TABLE,
+      legalAcceptances: process.env.LEGAL_ACCEPTANCES_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");
