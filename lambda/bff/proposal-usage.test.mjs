@@ -39,15 +39,15 @@ test("limitsForTier falls back to basic for an unknown tier", () => {
 
 test("buildProposalUsage shapes meters, remaining, and blocked", () => {
   const usage = buildProposalUsage(
-    { proposalsCreated: 100, signaturesSent: 40 },
+    { proposalsGenerated: 100, signaturesSent: 40 },
     [
-      { day: "2026-09-14", proposalsCreated: 3, signaturesSent: 1 },
-      { day: "2026-09-15", proposalsCreated: 2, signaturesSent: 0 },
-      { day: "2026-08-30", proposalsCreated: 9, signaturesSent: 9 }, // other month, dropped
+      { day: "2026-09-14", proposalsGenerated: 3, signaturesSent: 1 },
+      { day: "2026-09-15", proposalsGenerated: 2, signaturesSent: 0 },
+      { day: "2026-08-30", proposalsGenerated: 9, signaturesSent: 9 }, // other month, dropped
     ],
     [
-      { period: "2026-09", proposalsCreated: 100, signaturesSent: 40 },
-      { period: "2026-08", proposalsCreated: 12, signaturesSent: 4 },
+      { period: "2026-09", proposalsGenerated: 100, signaturesSent: 40 },
+      { period: "2026-08", proposalsGenerated: 12, signaturesSent: 4 },
     ],
     { tier: "repository", now, timezone: "UTC" },
   );
@@ -64,7 +64,7 @@ test("buildProposalUsage shapes meters, remaining, and blocked", () => {
 
 test("buildProposalUsage treats the signing tier as unlimited and never blocked", () => {
   const usage = buildProposalUsage(
-    { proposalsCreated: 5000, signaturesSent: 5000 },
+    { proposalsGenerated: 5000, signaturesSent: 5000 },
     [],
     [],
     { tier: "signing", now, timezone: "UTC" },

@@ -882,7 +882,7 @@ async function handlePlatformCompanies(event, {
     if (target.kind === "proposal-usage" && method === "PATCH") {
       const body = readBody(event);
       const patch = {};
-      for (const field of ["proposalsCreated", "signaturesSent"]) {
+      for (const field of ["proposalsGenerated", "signaturesSent"]) {
         if (body && Object.hasOwn(body, field)) {
           const value = body[field];
           if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
@@ -892,7 +892,7 @@ async function handlePlatformCompanies(event, {
         }
       }
       if (Object.keys(patch).length === 0) {
-        return json(400, { message: "Provide proposalsCreated and/or signaturesSent" });
+        return json(400, { message: "Provide proposalsGenerated and/or signaturesSent" });
       }
       const profile = typeof store.getProfile === "function"
         ? await store.getProfile(target.workspaceId)
@@ -1146,7 +1146,7 @@ async function assertProposalQuota(store, workspaceId, kind) {
     const error = kind === "signatures" ? "signature_limit_reached" : "proposal_limit_reached";
     const message = kind === "signatures"
       ? `You've sent ${meter.used} of ${meter.limit} signature requests this month. Ask your administrator to adjust your usage.`
-      : `You've created ${meter.used} of ${meter.limit} proposals this month. Ask your administrator to adjust your usage.`;
+      : `You've generated ${meter.used} of ${meter.limit} proposals this month. Ask your administrator to adjust your usage.`;
     const err = new Error(message);
     err.statusCode = 403;
     err.payload = { error, message, usage: meter };
@@ -1167,6 +1167,29 @@ async function recordProposalUsage(store, workspaceId, field) {
   } catch (error) {
     console.warn("[proposals] usage counter increment failed", { workspaceId, field, error: error?.message });
   }
+}
+
+// Count a proposal towards the monthly quota the first time it is downloaded or
+// sent for signature. Idempotent per proposal (conditional write on
+// usageCountedAt). With enforce:true, throws a 403 when the quota is full and
+// this proposal hasn't been counted yet.
+async function countProposalGenerated(store, workspaceId, proposalId, { loaded = null, enforce = true } = {}) {
+  const proposal = loaded
+    ?? (typeof store.getProposal === "function" ? await store.getProposal(workspaceId, proposalId) : null);
+  if (!proposal) return { counted: false, reason: "missing" };
+  if (proposal.usageCountedAt) return { counted: false, reason: "already" };
+  if (enforce) await assertProposalQuota(store, workspaceId, "proposals");
+
+  const profile = typeof store.getProfile === "function" ? await store.getProfile(workspaceId) : null;
+  const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const now = new Date();
+  let marked = true;
+  if (typeof store.markProposalGenerated === "function") {
+    marked = await store.markProposalGenerated(workspaceId, proposalId, periodKey(now, tz), now.toISOString());
+  }
+  if (!marked) return { counted: false, reason: "already" };
+  await recordProposalUsage(store, workspaceId, "proposalsGenerated");
+  return { counted: true };
 }
 
 // Whether the premium call blocklist is available to this workspace right now.
@@ -2051,11 +2074,10 @@ async function handleProposalApi(event, {
     if (method === "POST") {
       const proposal = pickEntity(readBody(event), "id");
       if (!proposal) return json(400, { message: "Invalid proposal" });
-      await assertProposalQuota(store, workspaceId, "proposals");
+      // Creating a proposal is free - it only counts against the monthly quota
+      // once it is downloaded or sent for signature (see mark-generated below).
       try {
-        const created = json(201, await store.createProposal(workspaceId, proposal));
-        await recordProposalUsage(store, workspaceId, "proposalsCreated");
-        return created;
+        return json(201, await store.createProposal(workspaceId, proposal));
       } catch (error) {
         if (isConditionalCheckFailed(error)) return json(409, { message: "Proposal already exists" });
         throw error;
@@ -2080,10 +2102,19 @@ async function handleProposalApi(event, {
       updatedAt: now,
     };
     delete copy.signatureRequest;
-    await assertProposalQuota(store, workspaceId, "proposals");
-    const duplicated = json(201, await store.createProposal(workspaceId, copy));
-    await recordProposalUsage(store, workspaceId, "proposalsCreated");
-    return duplicated;
+    delete copy.usageCountedAt;
+    delete copy.usageCountedPeriod;
+    // A duplicate is a fresh draft - free until it is downloaded or sent.
+    return json(201, await store.createProposal(workspaceId, copy));
+  }
+
+  const markGeneratedMatch = path.match(/^\/workspaces\/me\/proposals\/([^/]+)\/mark-generated$/);
+  if (markGeneratedMatch && method === "POST") {
+    const proposalId = decodeEntityId(event?.pathParameters?.proposalId ?? markGeneratedMatch[1]);
+    if (!proposalId) return json(400, { message: "Invalid proposal ID" });
+    const result = await countProposalGenerated(store, workspaceId, proposalId);
+    if (result.reason === "missing") return json(404, { message: "Proposal not found" });
+    return json(200, { counted: result.counted });
   }
 
   const signatureMatch = path.match(
@@ -2113,6 +2144,9 @@ async function handleProposalApi(event, {
       }
       if (!replacing) {
         await assertProposalQuota(store, workspaceId, "signatures");
+        // Sending for signature also "generates" the proposal - so it needs a
+        // free proposal slot too, unless this proposal was already counted.
+        if (!proposal.usageCountedAt) await assertProposalQuota(store, workspaceId, "proposals");
       }
       if (replacing) {
         if (!isActiveSignatureRequest(previous)) {
@@ -2326,6 +2360,10 @@ async function handleProposalApi(event, {
       await store.updateProposalSignature(workspaceId, proposalId, signatureRequest);
       if (!replacing) {
         await recordProposalUsage(store, workspaceId, "signaturesSent");
+        // Count the proposal itself, if it wasn't already. Quota was checked
+        // above; swallow errors here so a sent signature is never unwound.
+        await countProposalGenerated(store, workspaceId, proposalId, { loaded: proposal, enforce: false })
+          .catch((error) => console.warn("[proposals] mark-generated after signature failed", { proposalId, error: error?.message }));
       }
       return json(replacing ? 200 : 201, signatureRequest);
     }
@@ -3351,7 +3389,7 @@ export function createDynamoStore(client, commands, tableNames) {
 
     async incrementProposalUsage(workspaceId, monthPeriod, dayPeriod, field) {
       if (!tableNames.workspaceUsage) return;
-      if (field !== "proposalsCreated" && field !== "signaturesSent") {
+      if (field !== "proposalsGenerated" && field !== "signaturesSent") {
         throw new Error(`Unknown proposal-usage field: ${field}`);
       }
       const nowSec = Math.floor(Date.now() / 1000);
@@ -3416,10 +3454,10 @@ export function createDynamoStore(client, commands, tableNames) {
       const sets = ["expiresAt = if_not_exists(expiresAt, :exp)"];
       const names = {};
       const values = { ":exp": Math.floor(Date.now() / 1000) + 18 * 30 * 24 * 60 * 60 };
-      if (Number.isFinite(patch?.proposalsCreated)) {
-        sets.push("#proposalsCreated = :proposalsCreated");
-        names["#proposalsCreated"] = "proposalsCreated";
-        values[":proposalsCreated"] = Math.max(0, Math.trunc(patch.proposalsCreated));
+      if (Number.isFinite(patch?.proposalsGenerated)) {
+        sets.push("#proposalsGenerated = :proposalsGenerated");
+        names["#proposalsGenerated"] = "proposalsGenerated";
+        values[":proposalsGenerated"] = Math.max(0, Math.trunc(patch.proposalsGenerated));
       }
       if (Number.isFinite(patch?.signaturesSent)) {
         sets.push("#signaturesSent = :signaturesSent");
@@ -3613,7 +3651,7 @@ export function createDynamoStore(client, commands, tableNames) {
       const records = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
         expression:
           "workspaceId, proposalId, #name, #status, clientName, clientNameSecondary, " +
-          "presentedBy, assignedTo, dueDate, createdAt, updatedAt, revisedAt, signatureRequest",
+          "presentedBy, assignedTo, dueDate, createdAt, updatedAt, revisedAt, signatureRequest, usageCountedAt",
         names: { "#name": "name", "#status": "status" },
       });
       return records.sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""));
@@ -3629,6 +3667,25 @@ export function createDynamoStore(client, commands, tableNames) {
 
     getProposal(workspaceId, proposalId) {
       return getRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
+    },
+
+    // Stamp a proposal as "counted towards the monthly quota" - the first time
+    // it is downloaded or sent for signature. Conditional so a concurrent
+    // second attempt is a no-op. Returns true only if THIS call did the write.
+    async markProposalGenerated(workspaceId, proposalId, period, at) {
+      try {
+        await client.send(new commands.UpdateItemCommand({
+          TableName: tableNames.proposals,
+          Key: marshall({ workspaceId, proposalId }),
+          UpdateExpression: "SET usageCountedAt = :at, usageCountedPeriod = :period",
+          ConditionExpression: "attribute_exists(proposalId) AND attribute_not_exists(usageCountedAt)",
+          ExpressionAttributeValues: marshall({ ":at": at, ":period": period }),
+        }));
+        return true;
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return false;
+        throw error;
+      }
     },
 
     createProposal(workspaceId, proposal) {

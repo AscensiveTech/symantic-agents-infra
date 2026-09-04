@@ -1,10 +1,12 @@
 // Monthly usage quotas for RapidProposal.
 //
-// Unlike the AI Receptionist (whose usage is re-derived from the `calls` table),
-// proposal usage is a cumulative "created this month" count that must survive
-// the proposal being deleted - so it lives in a persistent counter row in the
-// workspace-usage table, keyed `proposal#<YYYY-MM>` (and `proposal#<YYYY-MM-DD>`
-// for the daily view). Deleting a proposal never decrements.
+// A proposal counts towards the monthly quota the first time it is DOWNLOADED
+// or SENT FOR SIGNATURE - not when it is created. Drafts are free. Each proposal
+// is counted at most once, ever (stamped `usageCountedAt` on the record); the
+// unit belongs to the month of that first download/send. The count lives in a
+// persistent counter row in the workspace-usage table, keyed `proposal#<YYYY-MM>`
+// (and `proposal#<YYYY-MM-DD>` for the daily view), so deleting the proposal
+// never decrements it.
 //
 // Keep PROPOSAL_LIMITS in sync with the frontend mirror at
 // lib/domain/company.ts.
@@ -89,7 +91,7 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
   const limits = limitsForTier(normalizedTier);
   const period = periodKey(now ?? new Date(), timezone || "UTC");
 
-  const proposalsUsed = count(monthCounter?.proposalsCreated);
+  const proposalsUsed = count(monthCounter?.proposalsGenerated);
   const signaturesUsed = count(monthCounter?.signaturesSent);
 
   const proposals = meter(proposalsUsed, limits.proposals);
@@ -99,7 +101,7 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
     .filter((row) => typeof row?.day === "string" && row.day.startsWith(period))
     .map((row) => ({
       day: row.day,
-      proposals: count(row.proposalsCreated),
+      proposals: count(row.proposalsGenerated),
       signatures: count(row.signaturesSent),
     }))
     .sort((a, b) => a.day.localeCompare(b.day));
@@ -107,7 +109,7 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
   const months = (Array.isArray(monthRows) ? monthRows : [])
     .map((row) => ({
       period: row.period,
-      proposals: count(row.proposalsCreated),
+      proposals: count(row.proposalsGenerated),
       signatures: count(row.signaturesSent),
     }))
     .sort((a, b) => b.period.localeCompare(a.period))
