@@ -21,6 +21,7 @@ import {
   buildProposalBilling,
   buildProposalUsage,
   dayKey,
+  firstOfNextMonthKey,
   resolveProposalMonthlyPrice,
   validProposalPayment,
 } from "./proposal-usage.mjs";
@@ -1138,15 +1139,22 @@ async function loadProposalBilling(store, workspaceId) {
 
 // Throws {status:403, error} when the workspace has hit its monthly quota for
 // `kind` ("proposals" | "signatures"). No-ops for unlimited (signing) tiers.
+function formatResetDate(dayKeyStr) {
+  const d = new Date(`${dayKeyStr}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return dayKeyStr;
+  return d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
+}
+
 async function assertProposalQuota(store, workspaceId, kind) {
   if (typeof store.listProposalUsageCounters !== "function") return;
   const usage = await loadProposalUsage(store, workspaceId);
   const meter = usage[kind];
   if (meter && meter.limit != null && meter.used >= meter.limit) {
     const error = kind === "signatures" ? "signature_limit_reached" : "proposal_limit_reached";
+    const resetsOn = formatResetDate(firstOfNextMonthKey(usage.period));
     const message = kind === "signatures"
-      ? `You've sent ${meter.used} of ${meter.limit} signature requests this month. Ask your administrator to adjust your usage.`
-      : `You've generated ${meter.used} of ${meter.limit} proposals this month. Ask your administrator to adjust your usage.`;
+      ? `You've sent ${meter.used} of ${meter.limit} signature requests this month. This resets on ${resetsOn}; ask your administrator to raise it before then.`
+      : `You've generated ${meter.used} of ${meter.limit} proposals this month. This resets on ${resetsOn}; ask your administrator to raise it before then.`;
     const err = new Error(message);
     err.statusCode = 403;
     err.payload = { error, message, usage: meter };
