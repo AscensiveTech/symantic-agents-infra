@@ -32,6 +32,15 @@ const TIER_LABELS = { basic: "Starter", repository: "Pro", signing: "Enterprise"
 // PROPOSAL_PLAN_PRICES in lib/domain/company.ts.
 export const PROPOSAL_PLAN_PRICES = { basic: 49, repository: 119, signing: 399 };
 
+// Document-storage capacity per tier, in bytes. `null` = unlimited.
+// Mirrors PROPOSAL_STORAGE_LIMITS_GB in lib/domain/company.ts.
+const GB = 1024 ** 3;
+export const PROPOSAL_STORAGE_LIMITS = {
+  basic: 5 * GB,
+  repository: 50 * GB,
+  signing: null,
+};
+
 export function limitsForTier(tier) {
   return PROPOSAL_LIMITS[tier] ?? PROPOSAL_LIMITS.basic;
 }
@@ -86,10 +95,19 @@ function meter(used, limit) {
  * @param {Array} monthRows `{ period: 'YYYY-MM', proposalsCreated, signaturesSent }`, any months
  * @param {{tier:string, now:Date, timezone:string}} ctx
  */
-export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone }) {
+export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes = null }) {
   const normalizedTier = PROPOSAL_LIMITS[tier] ? tier : "basic";
   const limits = limitsForTier(normalizedTier);
   const period = periodKey(now ?? new Date(), timezone || "UTC");
+
+  const storageLimit = PROPOSAL_STORAGE_LIMITS[normalizedTier] ?? null;
+  const storage = typeof storageBytes === "number" && Number.isFinite(storageBytes) && storageBytes >= 0
+    ? {
+      usedBytes: Math.round(storageBytes),
+      limitBytes: storageLimit,
+      state: usageStateFor(storageBytes, storageLimit),
+    }
+    : null;
 
   const proposalsUsed = count(monthCounter?.proposalsGenerated);
   const signaturesUsed = count(monthCounter?.signaturesSent);
@@ -121,6 +139,7 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
     period,
     proposals,
     signatures,
+    storage,
     blocked: proposals.state === "reached",
     days,
     months,

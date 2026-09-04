@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   PROPOSAL_LIMITS,
   PROPOSAL_PLAN_PRICES,
+  PROPOSAL_STORAGE_LIMITS,
   buildProposalBilling,
   buildProposalUsage,
   dayKey,
@@ -79,6 +80,22 @@ test("buildProposalUsage defaults a missing counter to zero and an unknown tier 
   const usage = buildProposalUsage(null, [], [], { tier: undefined, now, timezone: "UTC" });
   assert.equal(usage.tier, "basic");
   assert.deepEqual(usage.proposals, { used: 0, limit: 25, remaining: 25, state: "ok" });
+  assert.equal(usage.storage, null); // no storageBytes provided
+});
+
+test("buildProposalUsage exposes a document-storage meter when bytes are known", () => {
+  const GB = 1024 ** 3;
+  const pro = buildProposalUsage(null, [], [], { tier: "repository", now, timezone: "UTC", storageBytes: 45 * GB });
+  assert.equal(pro.storage.limitBytes, PROPOSAL_STORAGE_LIMITS.repository);
+  assert.equal(pro.storage.usedBytes, 45 * GB);
+  assert.equal(pro.storage.state, "approaching"); // 45/50 = 90%
+
+  const starterFull = buildProposalUsage(null, [], [], { tier: "basic", now, timezone: "UTC", storageBytes: 6 * GB });
+  assert.equal(starterFull.storage.state, "reached");
+
+  const enterprise = buildProposalUsage(null, [], [], { tier: "signing", now, timezone: "UTC", storageBytes: 900 * GB });
+  assert.equal(enterprise.storage.limitBytes, null);
+  assert.equal(enterprise.storage.state, "ok");
 });
 
 test("resolveProposalMonthlyPrice: tier default, then per-company override", () => {

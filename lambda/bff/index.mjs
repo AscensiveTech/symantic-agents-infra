@@ -1095,14 +1095,49 @@ async function loadWorkspaceUsage(store, workspaceId) {
   };
 }
 
+let s3ListPromise;
+// Total bytes stored under this workspace's prefix in the proposal-assets
+// bucket - the "document storage" figure on the Billing & Usage page.
+// Best-effort: any failure (or no bucket configured) returns null and the
+// storage meter is simply hidden.
+async function getProposalStorageBytes(workspaceId) {
+  const bucket = process.env.PROPOSAL_ASSETS_BUCKET;
+  if (!bucket) return null;
+  try {
+    s3ListPromise ??= import("@aws-sdk/client-s3").then((m) => ({
+      client: new m.S3Client({ region: process.env.AWS_REGION }),
+      ListObjectsV2Command: m.ListObjectsV2Command,
+    }));
+    const { client, ListObjectsV2Command } = await s3ListPromise;
+    let total = 0;
+    let ContinuationToken;
+    let pages = 0;
+    do {
+      const res = await client.send(new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: `workspaces/${workspaceId}/`,
+        ...(ContinuationToken ? { ContinuationToken } : {}),
+      }));
+      for (const obj of res.Contents ?? []) total += Number(obj.Size) || 0;
+      ContinuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+      pages += 1;
+    } while (ContinuationToken && pages < 50);
+    return total;
+  } catch (error) {
+    console.warn("[proposals] storage size lookup failed", { workspaceId, error: error?.message });
+    return null;
+  }
+}
+
 // Build the RapidProposal monthly usage view (proposal + signature quotas).
 async function loadProposalUsage(store, workspaceId) {
-  const [workspace, profile, counters] = await Promise.all([
+  const [workspace, profile, counters, storageBytes] = await Promise.all([
     typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
     typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
     typeof store.listProposalUsageCounters === "function"
       ? store.listProposalUsageCounters(workspaceId)
       : [],
+    getProposalStorageBytes(workspaceId),
   ]);
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
@@ -1121,7 +1156,7 @@ async function loadProposalUsage(store, workspaceId) {
       if (sk === currentMonth) monthCounter = row;
     }
   }
-  return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone });
+  return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes });
 }
 
 // Build the RapidProposal billing view (monthly price + logged payment history

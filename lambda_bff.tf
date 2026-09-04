@@ -137,6 +137,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = "${aws_s3_bucket.proposal_assets.arn}/*"
       },
       {
+        Sid      = "ListProposalAssets"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.proposal_assets.arn
+      },
+      {
         Sid      = "ReadCallRecordings"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
