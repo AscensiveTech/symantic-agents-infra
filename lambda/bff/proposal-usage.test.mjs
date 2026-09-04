@@ -7,10 +7,12 @@ import {
   PROPOSAL_STORAGE_LIMITS,
   buildProposalBilling,
   buildProposalUsage,
+  buildPlanChangePreview,
   dayKey,
   firstOfNextMonthKey,
   limitsForTier,
   nextBillingDate,
+  prevBillingDate,
   resolveProposalMonthlyPrice,
   usageStateFor,
   validProposalPayment,
@@ -122,6 +124,45 @@ test("nextBillingDate anchors to the join day, clamped for short months, no pror
   assert.equal(nextBillingDate("2026-12-20", 15), "2027-01-15");
 });
 
+test("prevBillingDate finds the start of the current cycle", () => {
+  assert.equal(prevBillingDate("2026-09-20", 15), "2026-09-15");
+  assert.equal(prevBillingDate("2026-09-10", 15), "2026-08-15");
+  assert.equal(prevBillingDate("2026-09-15", 15), "2026-09-15");
+  assert.equal(prevBillingDate("2026-01-05", 15), "2025-12-15");
+});
+
+test("buildPlanChangePreview: upgrade credits unused days at the old price, charges the difference today", () => {
+  // anchor day 1, today the 16th of a 30-day month -> 15 unused days, cycle 30
+  const ws = { tier: "basic", createdAt: "2026-08-01T00:00:00Z" };
+  const p = buildPlanChangePreview(ws, "basic", "repository", { now: new Date("2026-09-16T12:00:00Z"), timezone: "UTC" });
+  assert.equal(p.fromLabel, "Starter");
+  assert.equal(p.toLabel, "Pro");
+  assert.equal(p.fromPrice, 49);
+  assert.equal(p.toPrice, 119);
+  assert.equal(p.cycleDays, 30);
+  assert.equal(p.unusedDays, 15);
+  assert.equal(p.credit, 24.5); // 49 * 15/30
+  assert.equal(p.chargeToday, 94.5); // 119 - 24.5
+  assert.equal(p.carryForwardCredit, 0);
+  assert.equal(p.newAnchorDay, 16);
+  assert.equal(p.newBillingDate, "2026-10-16");
+});
+
+test("buildPlanChangePreview: downgrade credit can exceed the new price and carries forward", () => {
+  const ws = { tier: "repository", createdAt: "2026-08-01T00:00:00Z" };
+  const p = buildPlanChangePreview(ws, "repository", "basic", { now: new Date("2026-09-16T12:00:00Z"), timezone: "UTC" });
+  assert.equal(p.credit, 59.5); // 119 * 15/30
+  assert.equal(p.chargeToday, 0); // 49 - 59.5 floored at 0
+  assert.equal(p.carryForwardCredit, 10.5);
+});
+
+test("buildPlanChangePreview: same tier is a no-op", () => {
+  const p = buildPlanChangePreview({ tier: "basic" }, "basic", "basic", { now, timezone: "UTC" });
+  assert.equal(p.noChange, true);
+  assert.equal(p.credit, 0);
+  assert.equal(p.chargeToday, 49);
+});
+
 test("buildProposalBilling: full monthly price due on the join day, never prorated", () => {
   const workspace = { tier: "repository", createdAt: "2026-09-16T10:00:00.000Z" };
 
@@ -133,6 +174,15 @@ test("buildProposalBilling: full monthly price due on the join day, never prorat
   assert.equal(billing.upcoming.dueOn, "2026-09-16"); // now = 2026-09-15, join day 16 -> tomorrow
   assert.equal(billing.upcoming.prorated, undefined);
   assert.equal(billing.upcoming.basis, undefined);
+});
+
+test("buildProposalBilling: billingAnchorDate overrides the join date and credit reduces the next charge", () => {
+  const ws = { tier: "repository", createdAt: "2026-01-03T00:00:00Z", billingAnchorDate: "2026-09-10", billingCreditBalance: 30 };
+  const billing = buildProposalBilling(ws, "repository", [], { now, timezone: "UTC" });
+  assert.equal(billing.upcoming.billingDay, 10);
+  assert.equal(billing.upcoming.dueOn, "2026-10-10"); // now 09-15, the 10th has passed -> next month
+  assert.equal(billing.upcoming.creditApplied, 30);
+  assert.equal(billing.upcoming.amount, 89); // 119 - 30
 });
 
 test("buildProposalBilling honours a per-company price override", () => {

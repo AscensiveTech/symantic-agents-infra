@@ -174,18 +174,98 @@ export function firstOfNextMonthKey(monthKey) {
   return m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
 }
 
-// The next billing date: the join day-of-month, on or after `today`, clamped to
-// the target month's length (join on the 31st -> the 28th/30th in short months).
-// No proration - every cycle is the full monthly price.
-export function nextBillingDate(todayKey, joinDay) {
+function clampDayInMonth(y, m, day) {
+  return Math.min(Math.max(1, Math.min(31, day || 1)), daysInMonth(y, m));
+}
+
+function daysBetween(fromKey, toKey) {
+  const a = Date.UTC(...fromKey.split("-").map((n, i) => (i === 1 ? Number(n) - 1 : Number(n))));
+  const b = Date.UTC(...toKey.split("-").map((n, i) => (i === 1 ? Number(n) - 1 : Number(n))));
+  return Math.round((b - a) / 86_400_000);
+}
+
+// The next billing date: the anchor day-of-month, on or after `today`, clamped
+// to the target month's length (anchor on the 31st -> the 28th/30th in short
+// months). No proration - every cycle is the full monthly price.
+export function nextBillingDate(todayKey, anchorDay) {
   const [y, m, d] = todayKey.split("-").map(Number);
-  const day = Math.max(1, Math.min(31, joinDay || 1));
-  const clamped = Math.min(day, daysInMonth(y, m));
+  const clamped = clampDayInMonth(y, m, anchorDay);
   if (d <= clamped) return `${y}-${String(m).padStart(2, "0")}-${String(clamped).padStart(2, "0")}`;
   const ny = m === 12 ? y + 1 : y;
   const nm = m === 12 ? 1 : m + 1;
-  const clampedNext = Math.min(day, daysInMonth(ny, nm));
+  const clampedNext = clampDayInMonth(ny, nm, anchorDay);
   return `${ny}-${String(nm).padStart(2, "0")}-${String(clampedNext).padStart(2, "0")}`;
+}
+
+// The start of the current billing cycle: the anchor day-of-month, on or before
+// `today`.
+export function prevBillingDate(todayKey, anchorDay) {
+  const [y, m, d] = todayKey.split("-").map(Number);
+  const clamped = clampDayInMonth(y, m, anchorDay);
+  if (d >= clamped) return `${y}-${String(m).padStart(2, "0")}-${String(clamped).padStart(2, "0")}`;
+  const py = m === 1 ? y - 1 : y;
+  const pm = m === 1 ? 12 : m - 1;
+  const clampedPrev = clampDayInMonth(py, pm, anchorDay);
+  return `${py}-${String(pm).padStart(2, "0")}-${String(clampedPrev).padStart(2, "0")}`;
+}
+
+// The day-of-month a workspace is billed on: an explicit billingAnchorDate wins,
+// else the join date (createdAt).
+export function billingAnchorDay(workspace, now, tz) {
+  const anchor = typeof workspace?.billingAnchorDate === "string" && /^\d{4}-\d{2}-\d{2}/.test(workspace.billingAnchorDate)
+    ? workspace.billingAnchorDate.slice(0, 10)
+    : (dayKey(workspace?.createdAt ?? now, tz) ?? dayKey(now, tz));
+  return Number(anchor.split("-")[2]) || 1;
+}
+
+/**
+ * Preview a super-admin plan change made on behalf of a customer: credit the
+ * unused days of the current cycle at the OLD price, apply it to the NEW plan's
+ * first charge (which is billed immediately), and re-anchor the billing cycle
+ * to today. Quota is unaffected here - it always follows the live tier.
+ *
+ * @returns {{fromTier,toTier,fromLabel,toLabel,fromPrice,toPrice,cycleDays,
+ *   unusedDays,credit,chargeToday,carryForwardCredit,newBillingDate,newAnchorDay,noChange:boolean}}
+ */
+export function buildPlanChangePreview(workspace, fromTier, toTier, { now, timezone }) {
+  const tz = timezone || "UTC";
+  const from = PROPOSAL_LIMITS[fromTier] ? fromTier : "basic";
+  const to = PROPOSAL_LIMITS[toTier] ? toTier : "basic";
+  const todayKey = dayKey(now, tz);
+  const anchorDay = billingAnchorDay(workspace, now, tz);
+
+  const cycleStart = prevBillingDate(todayKey, anchorDay);
+  const cycleEnd = nextBillingDate(todayKey, anchorDay);
+  const cycleDays = Math.max(1, daysBetween(cycleStart, cycleEnd));
+  const unusedDays = Math.max(0, Math.min(cycleDays, daysBetween(todayKey, cycleEnd)));
+
+  const fromPrice = resolveProposalMonthlyPrice(from, workspace);
+  const toPrice = resolveProposalMonthlyPrice(to, { ...workspace, tier: to });
+
+  const credit = from === to ? 0 : (money((fromPrice * unusedDays) / cycleDays) ?? 0);
+  const chargeToday = Math.max(0, money(toPrice - credit) ?? 0);
+  const carryForwardCredit = Math.max(0, money(credit - toPrice) ?? 0);
+  const newAnchorDay = Number(todayKey.split("-")[2]) || 1;
+  // today's charge covers the current cycle - the NEXT payment is a cycle out
+  const dayAfter = new Date(Date.UTC(...todayKey.split("-").map((n, i) => (i === 1 ? Number(n) - 1 : Number(n)))) + 86_400_000)
+    .toISOString().slice(0, 10);
+
+  return {
+    fromTier: from,
+    toTier: to,
+    fromLabel: TIER_LABELS[from],
+    toLabel: TIER_LABELS[to],
+    fromPrice,
+    toPrice,
+    cycleDays,
+    unusedDays,
+    credit,
+    chargeToday,
+    carryForwardCredit,
+    newBillingDate: nextBillingDate(dayAfter, newAnchorDay),
+    newAnchorDay,
+    noChange: from === to,
+  };
 }
 
 function normalizePayment(row) {
@@ -229,13 +309,16 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
     .filter((p) => p.paymentId && p.paidAt)
     .sort((a, b) => `${b.paidAt}#${b.paymentId}`.localeCompare(`${a.paidAt}#${a.paymentId}`));
 
-  const joinDayKey = dayKey(workspace?.createdAt ?? now, tz) ?? dayKey(now, tz);
-  const joinDay = Number(joinDayKey.split("-")[2]) || 1;
+  const anchorDay = billingAnchorDay(workspace, now, tz);
+  const creditBalance = Math.max(0, money(workspace?.billingCreditBalance) ?? 0);
+  const creditApplied = Math.min(creditBalance, monthlyPrice);
   const upcoming = {
-    dueOn: nextBillingDate(dayKey(now, tz), joinDay),
+    dueOn: nextBillingDate(dayKey(now, tz), anchorDay),
     planLabel,
-    amount: monthlyPrice,
-    billingDay: joinDay,
+    amount: money(monthlyPrice - creditApplied) ?? monthlyPrice,
+    billingDay: anchorDay,
+    creditBalance,
+    creditApplied,
   };
 
   return { tier: normalizedTier, planLabel, monthlyPrice, priceOverridden, upcoming, payments };

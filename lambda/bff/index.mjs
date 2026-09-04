@@ -839,16 +839,24 @@ async function handlePlatformCompanies(event, {
       const hasPlan = isPlanPatch(body);
       const hasBlocklist = body && Object.hasOwn(body, "callBlocklistEnabled");
       const hasProposalPrice = body && Object.hasOwn(body, "proposalPlanPriceOverride");
+      const hasAnchor = body && Object.hasOwn(body, "billingAnchorDate");
+      const hasCredit = body && Object.hasOwn(body, "billingCreditBalance");
       const name = typeof body?.name === "string" ? body.name.trim() : "";
       const proposalPrice = body?.proposalPlanPriceOverride;
       const proposalPriceValid = proposalPrice === null || proposalPrice === ""
         || (typeof proposalPrice === "number" && Number.isFinite(proposalPrice) && proposalPrice >= 0);
+      const anchorValid = body?.billingAnchorDate === null || body?.billingAnchorDate === ""
+        || (typeof body?.billingAnchorDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.billingAnchorDate));
+      const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
+        || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
       if (
-        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasProposalPrice) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasProposalPrice && !hasAnchor && !hasCredit) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
         (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
-        (hasProposalPrice && !proposalPriceValid)
+        (hasProposalPrice && !proposalPriceValid) ||
+        (hasAnchor && !anchorValid) ||
+        (hasCredit && !creditValid)
       ) {
         return json(400, { message: "Invalid company update" });
       }
@@ -863,6 +871,15 @@ async function handlePlatformCompanies(event, {
       if (hasProposalPrice) {
         if (proposalPrice === null || proposalPrice === "") delete updated.proposalPlanPriceOverride;
         else updated.proposalPlanPriceOverride = Math.round(proposalPrice * 100) / 100;
+      }
+      if (hasAnchor) {
+        if (!body.billingAnchorDate) delete updated.billingAnchorDate;
+        else updated.billingAnchorDate = body.billingAnchorDate;
+      }
+      if (hasCredit) {
+        const c = Number(body.billingCreditBalance);
+        if (!body.billingCreditBalance || c <= 0) delete updated.billingCreditBalance;
+        else updated.billingCreditBalance = Math.round(c * 100) / 100;
       }
       if (hasPlan) {
         updated = applyPlanPatch(updated, body, actor.userId);
@@ -1294,6 +1311,8 @@ async function platformCompanySummary(store, workspace) {
     callBlocklistEnabled: workspace.callBlocklistEnabled === true,
     proposalPlanPriceOverride: numberOrNullValue(workspace.proposalPlanPriceOverride),
     proposalMonthlyPrice: resolveProposalMonthlyPrice(normalizeCompanyTier(workspace.tier), workspace),
+    billingAnchorDate: typeof workspace.billingAnchorDate === "string" ? workspace.billingAnchorDate : null,
+    billingCreditBalance: numberOrNullValue(workspace.billingCreditBalance),
     ...(await workspaceUsageState(store, workspace)),
     proposalUsage: await proposalUsageSummary(store, workspace.workspaceId),
   };

@@ -3098,6 +3098,37 @@ test("PATCH /platform/companies/{id} accepts a per-company proposal price overri
   assert.equal(JSON.parse(res.body).proposalMonthlyPrice, 95);
 });
 
+test("PATCH /platform/companies/{id} re-anchors billing and stores a credit balance on a plan change", async () => {
+  const saved = [];
+  const store = {
+    ...usageQuotaStore(),
+    async getMembership(userId) { return { userId, workspaceId: "user-123", role: "super-admin", status: "active" }; },
+    async getWorkspace() { return { workspaceId: "user-123", tier: "basic", createdAt: "2026-08-01T00:00:00Z" }; },
+    async putWorkspace(next) { saved.push(next); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const patch = authenticatedEvent("PATCH", "/platform/companies/user-123", {
+    tier: "repository", billingAnchorDate: "2026-09-16", billingCreditBalance: 10.5,
+  });
+  patch.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(patch)).statusCode, 200);
+  assert.equal(saved[0].tier, "repository");
+  assert.equal(saved[0].billingAnchorDate, "2026-09-16");
+  assert.equal(saved[0].billingCreditBalance, 10.5);
+
+  // clearing the credit
+  const clear = authenticatedEvent("PATCH", "/platform/companies/user-123", { billingCreditBalance: 0 });
+  clear.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  await handler(clear);
+  assert.equal(Object.hasOwn(saved[1], "billingCreditBalance"), false);
+
+  const bad = authenticatedEvent("PATCH", "/platform/companies/user-123", { billingAnchorDate: "nope" });
+  bad.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(bad)).statusCode, 400);
+});
+
 function authenticatedEvent(method, path, body, queryStringParameters) {
   return {
     requestContext: {
