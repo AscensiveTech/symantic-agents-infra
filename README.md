@@ -65,6 +65,14 @@ checks the group claim and membership on every authenticated request. Company
 administrators can provision and revoke quotation-builder accounts from the
 Agents UI without storing passwords in DynamoDB.
 
+The BFF also gates every authenticated request on Terms & Conditions / Privacy
+Policy acceptance: two DynamoDB tables hold the version-controlled documents
+(`legal-documents`) and an append-only per-user acceptance audit trail
+(`legal-acceptances`). Until a user has accepted the current version of both,
+every non-legal endpoint returns `403 policy_acceptance_required`. Placeholder
+v1.0 documents seed themselves on first use; a super admin publishes new
+versions via `POST /platform/legal`, which re-prompts every user.
+
 ## Notes
 
 - `AGENT_REGISTRY_SECRET` is generated in Terraform and set on the Amplify branch (sensitive; lives in encrypted state).
