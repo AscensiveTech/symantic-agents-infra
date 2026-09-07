@@ -58,6 +58,10 @@ const MAX_COMPANY_LOGO_BYTES = 10 * 1024 * 1024;
 const MAX_DYNAMO_RECORD_BYTES = 350 * 1024;
 const WORKSPACE_ROLES = new Set(["super-admin", "company-admin", "quotation-builder"]);
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// SignWell's `expires_in` is a whole number of days from the send date
+// (minimum 1). We cap it at a year - anything longer is almost certainly a
+// mistake, and an unbounded value has no legitimate use.
+const MAX_SIGNATURE_EXPIRY_DAYS = 365;
 const PROPOSAL_SECTION_KINDS = [
   "cover",
   "agenda",
@@ -2068,6 +2072,17 @@ function validSignatureRequest(value, proposalId) {
   const subject = typeof value.subject === "string" ? value.subject.trim() : "";
   const message = typeof value.message === "string" ? value.message.trim() : "";
   if (!subject || subject.length > 255 || !message || message.length > 4000) return null;
+
+  // Days the signature request stays valid after it's sent. Omitted -> SignWell
+  // falls back to the account default. A present-but-invalid value is a bad
+  // request, not a silent fallback.
+  let expiresInDays;
+  if (value.expiresInDays !== undefined && value.expiresInDays !== null) {
+    const n = Number(value.expiresInDays);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_SIGNATURE_EXPIRY_DAYS) return null;
+    expiresInDays = n;
+  }
+
   return {
     assetKey: value.assetKey,
     recipients,
@@ -2075,6 +2090,7 @@ function validSignatureRequest(value, proposalId) {
     message,
     applySigningOrder: value.applySigningOrder === true,
     replaceSignedAcknowledged: value.replaceSignedAcknowledged === true,
+    ...(expiresInDays !== undefined ? { expiresInDays } : {}),
   };
 }
 
@@ -2257,6 +2273,9 @@ async function handleProposalApi(event, {
           previous.subject === input.subject &&
           previous.message === input.message &&
           previous.applySigningOrder === input.applySigningOrder &&
+          // A changed expiry has to go through SignWell's send call, which the
+          // in-place recipient patch never touches.
+          (previous.expiresInDays ?? null) === (input.expiresInDays ?? null) &&
           // Marker positions live only in the exported PDF; the in-place path
           // never re-uploads it, so any initials at all forces the full
           // draft-replace path (which does).
@@ -2309,6 +2328,11 @@ async function handleProposalApi(event, {
         ...(requesterEmail ? { custom_requester_email: requesterEmail } : {}),
       };
 
+      // SignWell expires the request this many days after it is sent. Only
+      // takes effect on send, so it is also passed to sendDocument below for
+      // the draft-replace path.
+      const expiryFields = input.expiresInDays ? { expires_in: input.expiresInDays } : {};
+
       const documentInput = {
         name: proposal.name || "Proposal",
         subject: input.subject,
@@ -2319,6 +2343,7 @@ async function handleProposalApi(event, {
         allow_decline: true,
         allow_reassign: true,
         ...requesterFields,
+        ...expiryFields,
         ...(embeddedTestMode ? { embedded_signing: true } : {}),
         text_tags: agreementHasSigningFields || hasInitials,
         with_signature_page: !agreementHasSigningFields,
@@ -2361,6 +2386,7 @@ async function handleProposalApi(event, {
             allow_decline: true,
             allow_reassign: true,
             ...requesterFields,
+            ...expiryFields,
             ...(embeddedTestMode ? { embedded_signing: true } : {}),
           });
           created = {
@@ -2400,6 +2426,7 @@ async function handleProposalApi(event, {
         subject: input.subject,
         message: input.message,
         applySigningOrder: input.applySigningOrder,
+        ...(input.expiresInDays ? { expiresInDays: input.expiresInDays } : {}),
         recipients: input.recipients.map((recipient, index) => {
           const id = String(index + 1);
           const providerRecipient = createdRecipients.find((item) =>

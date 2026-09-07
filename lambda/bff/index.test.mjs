@@ -1363,6 +1363,60 @@ test("the SignWell email is sent from the sender's company (or name) with their 
   assert.equal(signWellRequest.custom_requester_email, "AJM@technovate.design");
 });
 
+test("a signature request expires the SignWell document N days after sending", async () => {
+  const proposal = {
+    id: "prp-exp",
+    name: "Alpine Peak",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "agreement", kind: "agreement", hidden: false }],
+  };
+  let signWellRequest;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return proposal; },
+    async updateProposalSignature(_w, _p, signatureRequest) { return signatureRequest; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({
+      webhookId: "webhook-123",
+      client: {
+        testMode: true,
+        async createDocument(input) {
+          signWellRequest = input;
+          return { id: "signwell-doc-exp", status: "Sent", recipients: [{ id: "1", status: "sent" }] };
+        },
+      },
+    }),
+    getAssetSigner: async () => ({ async createDownloadUrl() { return "https://private.example.com/pdf"; } }),
+  });
+
+  const base = {
+    assetKey: "exports/prp-exp.pdf",
+    recipients: [{ name: "Jane Client", email: "jane@example.com" }],
+    subject: "Please sign Alpine Peak",
+    message: "Please review and sign.",
+    applySigningOrder: false,
+  };
+
+  const ok = await handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-exp/signature-requests", { ...base, expiresInDays: 30 }));
+  assert.equal(ok.statusCode, 201);
+  assert.equal(signWellRequest.expires_in, 30);
+  assert.equal(JSON.parse(ok.body).expiresInDays, 30);
+
+  // Omitted -> SignWell's own account default (no expires_in sent).
+  const noneGiven = await handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-exp/signature-requests", base));
+  assert.equal(noneGiven.statusCode, 201);
+  assert.equal("expires_in" in signWellRequest, false);
+
+  // Out of range -> bad request, nothing sent.
+  const bad = await handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-exp/signature-requests", { ...base, expiresInDays: 0 }));
+  assert.equal(bad.statusCode, 400);
+  const tooLong = await handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-exp/signature-requests", { ...base, expiresInDays: 400 }));
+  assert.equal(tooLong.statusCode, 400);
+});
+
 test("initials markers on a proposal with no agreement page still force SignWell text-tag parsing", async () => {
   let signWellRequest;
   const store = {
