@@ -232,3 +232,39 @@ test("Dynamo getActiveLegalDocument returns the published version, not the ACTIV
   assert.ok(rows.has("TERMS_AND_CONDITIONS#ACTIVE"));
   assert.ok(rows.has("TERMS_AND_CONDITIONS#v1.0"));
 });
+
+// The acceptance audit trail is a compliance record, so a partial write is not
+// an acceptable outcome: HISTORY without LATEST re-prompts the user forever,
+// LATEST without HISTORY loses the audit row for an acceptance that did happen.
+// BatchWriteItem can return UnprocessedItems *without throwing*, so this has to
+// be one transaction.
+test("Dynamo recordLegalAcceptance writes the audit row and the pointer atomically", async () => {
+  class TransactWriteItemsCommand { constructor(input) { this.input = input; } }
+  class BatchWriteItemCommand { constructor(input) { this.input = input; } }
+  const sent = [];
+  const client = { async send(command) { sent.push(command); return {}; } };
+  const { createDynamoStore } = await loadBff();
+  const store = createDynamoStore(client, { TransactWriteItemsCommand, BatchWriteItemCommand }, {
+    legalAcceptances: "legal-acceptances-table",
+  });
+
+  await store.recordLegalAcceptance({
+    userId: "user-aj",
+    workspaceId: "workspace-tech",
+    documentType: "TERMS_AND_CONDITIONS",
+    documentVersion: "v1.0",
+    acceptedAt: "2026-09-08T00:00:00.000Z",
+    ipAddress: "203.0.113.7",
+    userAgent: "Mozilla/5.0 (Test)",
+  });
+
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0] instanceof TransactWriteItemsCommand, "must be a transaction, not a batch");
+  const items = sent[0].input.TransactItems.map((entry) => entry.Put.Item.sk.S);
+  assert.deepEqual(items, ["HISTORY#TERMS_AND_CONDITIONS#2026-09-08T00:00:00.000Z", "LATEST#TERMS_AND_CONDITIONS"]);
+  // The audit row carries who/when/where - it is the compliance evidence.
+  const history = sent[0].input.TransactItems[0].Put.Item;
+  assert.equal(history.ipAddress.S, "203.0.113.7");
+  assert.equal(history.userAgent.S, "Mozilla/5.0 (Test)");
+  assert.equal(history.workspaceId.S, "workspace-tech");
+});

@@ -129,7 +129,10 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid      = "ManageLegalAcceptances"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:BatchWriteItem", "dynamodb:Query"]
+        # TransactWriteItems, not BatchWriteItem: the HISTORY audit row and the
+        # LATEST pointer are written together or not at all (see
+        # recordLegalAcceptance). Mirrors ManageLegalDocuments above.
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:TransactWriteItems", "dynamodb:Query"]
         Resource = aws_dynamodb_table.legal_acceptances.arn
       },
       {
