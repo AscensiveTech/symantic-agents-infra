@@ -4231,13 +4231,17 @@ export function createDynamoStore(client, commands, tableNames) {
         documentVersion: record.documentVersion,
         acceptedAt: record.acceptedAt,
       };
-      await client.send(new commands.BatchWriteItemCommand({
-        RequestItems: {
-          [tableNames.legalAcceptances]: [
-            { PutRequest: { Item: marshall(historyItem) } },
-            { PutRequest: { Item: marshall(latestItem) } },
-          ],
-        },
+      // Transact, not BatchWriteItem: a batch can come back partially applied
+      // via UnprocessedItems *without throwing*, and either half landing alone
+      // is a defect we'd never see. HISTORY alone and the user is re-prompted
+      // forever; LATEST alone and the compliance audit row for an acceptance
+      // that did happen is silently gone. Two items in one table, so one
+      // transaction covers it.
+      await client.send(new commands.TransactWriteItemsCommand({
+        TransactItems: [
+          { Put: { TableName: tableNames.legalAcceptances, Item: marshall(historyItem) } },
+          { Put: { TableName: tableNames.legalAcceptances, Item: marshall(latestItem) } },
+        ],
       }));
     },
   };
