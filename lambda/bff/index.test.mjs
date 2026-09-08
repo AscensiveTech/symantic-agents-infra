@@ -2190,19 +2190,33 @@ test("company administrators cannot change a super administrator", async () => {
   assert.equal(response.statusCode, 403);
 });
 
-test("removing a member unassigns their proposals instead of deleting the work", async () => {
+function removalStore(overrides = {}) {
   const unassignCalls = [];
-  const store = {
+  const deleted = [];
+  return {
+    unassignCalls,
+    deleted,
+    async getWorkspace() { return { workspaceId: "ws-1", name: "Acme", tier: "repository" }; },
     async getMembership(userId) {
       if (userId === "user-123") return { userId, workspaceId: "ws-1", role: "company-admin", status: "active" };
-      return { userId, workspaceId: "ws-1", email: "leaver@example.com", name: "Pat Leaver", role: "quotation-builder", status: "active", cognitoUsername: "leaver@example.com" };
+      if (userId === "member-x") return { userId, workspaceId: "ws-1", email: "leaver@example.com", name: "Pat Leaver", role: "quotation-builder", status: "active", cognitoUsername: "leaver@example.com" };
+      return null;
     },
-    async deleteMembership() {},
-    async unassignProposalsFrom(workspaceId, names) {
-      unassignCalls.push([workspaceId, names]);
-      return 3;
+    async listMemberships() {
+      return [
+        { userId: "user-123", workspaceId: "ws-1", role: "company-admin", status: "active" },
+        { userId: "admin-2", workspaceId: "ws-1", role: "company-admin", status: "active" },
+        { userId: "member-x", workspaceId: "ws-1", role: "quotation-builder", status: "active" },
+      ];
     },
+    async deleteMembership(userId) { deleted.push(userId); },
+    async unassignProposalsFrom(workspaceId, names) { unassignCalls.push([workspaceId, names]); return 3; },
+    ...overrides,
   };
+}
+
+test("removing a member unassigns their proposals instead of deleting the work", async () => {
+  const store = removalStore();
   const directory = { async deleteUser() {} };
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
@@ -2213,7 +2227,87 @@ test("removing a member unassigns their proposals instead of deleting the work",
   const response = await handler(event);
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(unassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"]]]);
+  assert.deepEqual(store.deleted, ["member-x"]);
+  assert.deepEqual(store.unassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"]]]);
+});
+
+test("the org-admin remove path blocks the last remaining Org Admin with an actionable message", async () => {
+  const store = removalStore({
+    async listMemberships() {
+      return [
+        { userId: "member-x", workspaceId: "ws-1", role: "company-admin", status: "active" },
+        { userId: "helper", workspaceId: "ws-1", role: "quotation-builder", status: "active" },
+      ];
+    },
+    async getMembership(userId) {
+      if (userId === "member-x") return { userId, workspaceId: "ws-1", email: "a@x.com", name: "A", role: "company-admin", status: "active" };
+      return { userId: "user-123", workspaceId: "ws-1", role: "company-admin", status: "active" };
+    },
+  });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => ({ async deleteUser() {} }) });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/users/member-x");
+  event.pathParameters = { userId: "member-x" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /at least one Org Admin/);
+  assert.deepEqual(store.deleted, []);
+});
+
+test("the org-admin remove path blocks the last remaining user", async () => {
+  const store = removalStore({
+    async listMemberships() {
+      return [{ userId: "member-x", workspaceId: "ws-1", role: "company-admin", status: "active" }];
+    },
+    async getMembership() {
+      return { userId: "member-x", workspaceId: "ws-1", email: "a@x.com", name: "A", role: "company-admin", status: "active" };
+    },
+  });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => ({ async deleteUser() {} }) });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/users/member-x");
+  event.pathParameters = { userId: "member-x" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /at least one user/);
+});
+
+test("a super admin removes a user from a company via Manage Company Accounts", async () => {
+  const store = removalStore();
+  const directory = { async deleteUser() {}, async getRoles() { return []; } };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+  const event = authenticatedEvent("DELETE", "/platform/companies/ws-1/users/member-x");
+  event.pathParameters = { workspaceId: "ws-1", userId: "member-x" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(store.deleted, ["member-x"]);
+  assert.deepEqual(store.unassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"]]]);
+});
+
+test("Manage Company Accounts remove is 403 for a non-super-admin and 403 on a super-admin target", async () => {
+  const { createHandler } = await loadBff();
+
+  const nonSuper = createHandler({ getStore: async () => removalStore(), getUserDirectory: async () => ({}) });
+  const e1 = authenticatedEvent("DELETE", "/platform/companies/ws-1/users/member-x");
+  e1.pathParameters = { workspaceId: "ws-1", userId: "member-x" };
+  e1.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await nonSuper(e1)).statusCode, 403);
+
+  const superTargetStore = removalStore({
+    async getMembership() { return { userId: "member-x", workspaceId: "ws-1", email: "s@x.com", name: "S", role: "super-admin", status: "active" }; },
+  });
+  const superHandler = createHandler({ getStore: async () => superTargetStore, getUserDirectory: async () => ({ async deleteUser() {}, async getRoles() { return ["super-admin"]; } }) });
+  const e2 = authenticatedEvent("DELETE", "/platform/companies/ws-1/users/member-x");
+  e2.pathParameters = { workspaceId: "ws-1", userId: "member-x" };
+  e2.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await superHandler(e2)).statusCode, 403);
 });
 
 test("super administrators onboard a company with an isolated default template", async () => {

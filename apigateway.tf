@@ -8,6 +8,7 @@ locals {
     "GET /platform/companies/{workspaceId}/users",
     "POST /platform/companies/{workspaceId}/users",
     "PATCH /platform/companies/{workspaceId}/users/{userId}",
+    "DELETE /platform/companies/{workspaceId}/users/{userId}",
     "GET /platform/companies/{workspaceId}/usage",
     "GET /platform/companies/{workspaceId}/proposal-usage",
     "PATCH /platform/companies/{workspaceId}/proposal-usage",

@@ -1028,6 +1028,18 @@ async function handlePlatformCompanies(event, {
       return json(200, updated);
     }
 
+    if (target.kind === "user" && method === "DELETE") {
+      const membership = await store.getMembership(target.userId);
+      if (!membership || membership.workspaceId !== target.workspaceId) {
+        return json(404, { message: "Workspace user not found" });
+      }
+      const directory = await getUserDirectory();
+      const block = await memberRemovalBlock(store, directory, target.workspaceId, membership, actor.userId);
+      if (block) return json(block.status, { message: block.message });
+      await removeWorkspaceMember(store, directory, target.workspaceId, membership);
+      return json(200, { ok: true });
+    }
+
     return json(404, { message: "Not found" });
   }
 
@@ -1687,6 +1699,45 @@ function defaultProposalTemplate(sections, now) {
   };
 }
 
+// Shared guard for removing a workspace member (org-admin Team & Access and the
+// super-admin Manage Company Accounts page both call this). Returns
+// { status, message } to reject, or null to allow. The messages tell the caller
+// exactly what to do to finish the removal.
+async function memberRemovalBlock(store, directory, workspaceId, target, actorUserId) {
+  if (target.userId === actorUserId) {
+    return { status: 409, message: "You can't remove your own account — ask another admin to remove it." };
+  }
+  const members = await store.listMemberships(workspaceId);
+  const active = members.filter((m) => m.status !== "disabled");
+  if (active.length <= 1) {
+    return { status: 409, message: "A company needs at least one user. Add another user first, then remove this one." };
+  }
+  const isSuper = target.role === "super-admin"
+    || (typeof directory.getRoles === "function"
+      && (await directory.getRoles(target.cognitoUsername ?? target.email)).includes("super-admin"));
+  if (isSuper) {
+    return { status: 403, message: "A super administrator can't be removed here." };
+  }
+  if (target.role === "company-admin"
+    && active.filter((m) => m.role === "company-admin").length <= 1) {
+    return { status: 409, message: "A company needs at least one Org Admin. Promote or add another admin first, then remove this one." };
+  }
+  return null;
+}
+
+// The removal itself: drop the Cognito account, drop the membership, and blank
+// the assignee on anything they created (proposals keep their work — assignedTo
+// is a plain name/email string, not a live account reference).
+async function removeWorkspaceMember(store, directory, workspaceId, target) {
+  await directory.deleteUser(target.cognitoUsername ?? target.email);
+  await store.deleteMembership(target.userId);
+  if (typeof store.unassignProposalsFrom === "function") {
+    await store.unassignProposalsFrom(workspaceId, [target.name, target.email]).catch((error) => {
+      console.warn("Failed to unassign a removed member's proposals", { userId: target.userId, error: String(error) });
+    });
+  }
+}
+
 async function handleWorkspaceUsers(event, {
   method,
   path,
@@ -1752,32 +1803,10 @@ async function handleWorkspaceUsers(event, {
   }
 
   if (method === "DELETE") {
-    if (userId === actor.userId) return json(409, { message: "You cannot remove your own account" });
     const directory = await getUserDirectory();
-    if (!actor.roles.includes("super-admin") && (
-      target.role === "super-admin" ||
-      (typeof directory.getRoles === "function" &&
-        (await directory.getRoles(target.cognitoUsername ?? target.email)).includes("super-admin"))
-    )) {
-      return json(403, { message: "A company administrator cannot remove a super administrator" });
-    }
-    if (target.role === "company-admin") {
-      const members = await store.listMemberships(actor.workspaceId);
-      if (members.filter((member) => member.role === "company-admin" && member.status !== "disabled").length <= 1) {
-        return json(409, { message: "Promote another company administrator first" });
-      }
-    }
-    await directory.deleteUser(target.cognitoUsername ?? target.email);
-    await store.deleteMembership(userId);
-    // A member coming and going must never take their work with them: leave
-    // every proposal they created / owned in place, just blank the assignee so
-    // it shows as Unassigned. (assignedTo is a display-name/email string, set
-    // from the same "name" this membership carries.)
-    if (typeof store.unassignProposalsFrom === "function") {
-      await store.unassignProposalsFrom(actor.workspaceId, [target.name, target.email]).catch((error) => {
-        console.warn("Failed to unassign a removed member's proposals", { userId, error: String(error) });
-      });
-    }
+    const block = await memberRemovalBlock(store, directory, actor.workspaceId, target, actor.userId);
+    if (block) return json(block.status, { message: block.message });
+    await removeWorkspaceMember(store, directory, actor.workspaceId, target);
     return json(200, { ok: true });
   }
 
