@@ -23,23 +23,23 @@ export const LEGAL_RESPONSE_KEYS = {
 export const DEFAULT_LEGAL_DOCUMENTS = {
   TERMS_AND_CONDITIONS: {
     version: "v1.0",
-    title: "Rapid Proposal — Terms & Conditions",
+    title: "Symantic — Terms & Conditions",
     effectiveFrom: "2026-09-04",
     content: [
       "PLACEHOLDER — these Terms & Conditions have not yet been reviewed by legal counsel.",
       "",
-      "1. Acceptance. By accessing Rapid Proposal you agree to these Terms & Conditions and to the Privacy Policy.",
-      "2. Use of the service. You may use Rapid Proposal only to create, manage, and send business proposals for your own organization.",
+      "1. Acceptance. By accessing Symantic you agree to these Terms & Conditions and to the Privacy Policy.",
+      "2. Use of the service. You may use Symantic only for your own organization's business purposes, including creating, managing, and sending business proposals.",
       "3. Your content. You retain ownership of the proposals, templates, and files you upload. You are responsible for their accuracy and for having the right to use them.",
       "4. Acceptable use. Do not use the service to store or send unlawful, infringing, or misleading material, and do not attempt to disrupt or gain unauthorized access to the service.",
       "5. Availability. The service is provided \"as is\". We aim for high availability but do not guarantee uninterrupted access.",
-      "6. Changes. We may update these Terms & Conditions. When we do, you will be asked to accept the new version before continuing to use Rapid Proposal.",
-      "7. Contact. Questions about these terms can be sent to your Rapid Proposal administrator.",
+      "6. Changes. We may update these Terms & Conditions. When we do, you will be asked to accept the new version before continuing to use Symantic.",
+      "7. Contact. Questions about these terms can be sent to your Symantic administrator.",
     ].join("\n"),
   },
   PRIVACY_POLICY: {
     version: "v1.0",
-    title: "Rapid Proposal — Privacy Policy",
+    title: "Symantic — Privacy Policy",
     effectiveFrom: "2026-09-04",
     content: [
       "PLACEHOLDER — this Privacy Policy has not yet been reviewed by legal counsel.",
@@ -47,9 +47,9 @@ export const DEFAULT_LEGAL_DOCUMENTS = {
       "1. What we collect. Account information (name, email, company), the proposal content you create, and basic technical data such as IP address and browser type.",
       "2. How we use it. To provide and secure the service, to generate and deliver your proposals, and to keep an audit record of policy acceptance.",
       "3. Sharing. Proposal PDFs are shared with the e-signature provider (SignWell) only when you send a proposal for signature. We do not sell personal data.",
-      "4. Retention. Account and proposal data is retained for as long as your organization uses Rapid Proposal. Policy-acceptance audit records are retained for legal and compliance purposes.",
-      "5. Your choices. Contact your Rapid Proposal administrator to access, correct, or delete your personal data, subject to applicable law.",
-      "6. Changes. We may update this Privacy Policy. When we do, you will be asked to accept the new version before continuing to use Rapid Proposal.",
+      "4. Retention. Account and proposal data is retained for as long as your organization uses Symantic. Policy-acceptance audit records are retained for legal and compliance purposes.",
+      "5. Your choices. Contact your Symantic administrator to access, correct, or delete your personal data, subject to applicable law.",
+      "6. Changes. We may update this Privacy Policy. When we do, you will be asked to accept the new version before continuing to use Symantic.",
     ].join("\n"),
   },
 };
