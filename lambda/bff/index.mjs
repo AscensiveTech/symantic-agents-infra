@@ -4141,7 +4141,14 @@ export function createDynamoStore(client, commands, tableNames) {
         // harmless.
         ConsistentRead: false,
       }));
-      return result.Item ? unmarshall(result.Item) : null;
+      if (!result.Item) return null;
+      // `version` is the range key, so the pointer row carries the literal
+      // "ACTIVE" there and the real version number in `activeVersion`. Callers
+      // want the version they can quote back on accept, never the sentinel -
+      // returning "ACTIVE" made the client POST termsVersion:"ACTIVE", which
+      // fails validation, so nobody could ever accept anything.
+      const item = unmarshall(result.Item);
+      return { ...item, version: item.activeVersion ?? item.version };
     },
 
     // Publishes a version: writes the immutable version row and repoints
@@ -4158,7 +4165,9 @@ export function createDynamoStore(client, commands, tableNames) {
         effectiveFrom: doc.effectiveFrom ?? now.slice(0, 10),
         createdAt: now,
       };
-      const activeItem = { ...versionItem, version: "ACTIVE", updatedAt: now };
+      // version: "ACTIVE" is the pointer's range key, so the real version has
+      // to survive alongside it - see getActiveLegalDocument.
+      const activeItem = { ...versionItem, version: "ACTIVE", activeVersion: doc.version, updatedAt: now };
       try {
         await client.send(new commands.TransactWriteItemsCommand({
           TransactItems: [

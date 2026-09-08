@@ -18,16 +18,15 @@ export const LEGAL_RESPONSE_KEYS = {
 
 // Seeded once, the first time the legal endpoint or the gate runs against an
 // empty table (a conditional write, so concurrent cold starts can't double it).
-// PLACEHOLDER TEXT - not legal advice. Replace the content and bump the version
-// (POST /platform/legal, super admin) before relying on this in production.
+// This text is a starting point, not legal advice, and has not been reviewed by
+// counsel. Replace it and bump the version (POST /platform/legal, super admin)
+// before relying on it in production.
 export const DEFAULT_LEGAL_DOCUMENTS = {
   TERMS_AND_CONDITIONS: {
     version: "v1.0",
     title: "Symantic — Terms & Conditions",
     effectiveFrom: "2026-09-04",
     content: [
-      "PLACEHOLDER — these Terms & Conditions have not yet been reviewed by legal counsel.",
-      "",
       "1. Acceptance. By accessing Symantic you agree to these Terms & Conditions and to the Privacy Policy.",
       "2. Use of the service. You may use Symantic only for your own organization's business purposes, including creating, managing, and sending business proposals.",
       "3. Your content. You retain ownership of the proposals, templates, and files you upload. You are responsible for their accuracy and for having the right to use them.",
@@ -42,8 +41,6 @@ export const DEFAULT_LEGAL_DOCUMENTS = {
     title: "Symantic — Privacy Policy",
     effectiveFrom: "2026-09-04",
     content: [
-      "PLACEHOLDER — this Privacy Policy has not yet been reviewed by legal counsel.",
-      "",
       "1. What we collect. Account information (name, email, company), the proposal content you create, and basic technical data such as IP address and browser type.",
       "2. How we use it. To provide and secure the service, to generate and deliver your proposals, and to keep an audit record of policy acceptance.",
       "3. Sharing. Proposal PDFs are shared with the e-signature provider (SignWell) only when you send a proposal for signature. We do not sell personal data.",

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { legalAcceptanceStatus, parseAcceptBody } from "./legal.mjs";
+import { isValidLegalVersion, legalAcceptanceStatus, parseAcceptBody } from "./legal.mjs";
 
 async function loadBff() {
   return import("./index.mjs");
@@ -121,7 +121,7 @@ test("GET /workspaces/me/legal seeds v1.0 and reports acceptance required for a 
   assert.equal(body.requiresAcceptance, true);
   assert.equal(body.currentTermsVersion, "v1.0");
   assert.equal(body.currentPrivacyVersion, "v1.0");
-  assert.ok(body.documents.termsAndConditions.content.includes("PLACEHOLDER"));
+  assert.ok(body.documents.termsAndConditions.content.includes("1. Acceptance."));
   assert.ok(body.documents.privacyPolicy.title.includes("Privacy Policy"));
 });
 
@@ -186,4 +186,49 @@ test("the gate is inert for a store that has no legal tables", async () => {
   const handler = createHandler({ getStore: async () => store });
   const res = await handler(authed("GET", "/workspaces/me/proposals"));
   assert.equal(res.statusCode, 200);
+});
+
+// The in-memory legalStore() above models the *intent* - its ACTIVE entry keeps
+// the real version - which is exactly why the real Dynamo store's round-trip
+// went untested and shipped broken: it wrote version:"ACTIVE" over the pointer
+// row's version, so GET /workspaces/me/legal reported currentTermsVersion
+// "ACTIVE", the client posted that back, parseAcceptBody rejected it as not a
+// vN.N string, and every user got a 400 they couldn't get past. Exercise the
+// real store here.
+test("Dynamo getActiveLegalDocument returns the published version, not the ACTIVE sentinel", async () => {
+  class GetItemCommand { constructor(input) { this.input = input; } }
+  class TransactWriteItemsCommand { constructor(input) { this.input = input; } }
+  const rows = new Map();
+  const client = {
+    async send(command) {
+      if (command instanceof TransactWriteItemsCommand) {
+        for (const { Put } of command.input.TransactItems) {
+          rows.set(`${Put.Item.documentType.S}#${Put.Item.version.S}`, Put.Item);
+        }
+        return {};
+      }
+      const key = command.input.Key;
+      return { Item: rows.get(`${key.documentType.S}#${key.version.S}`) };
+    },
+  };
+  const { createDynamoStore } = await loadBff();
+  const store = createDynamoStore(client, { GetItemCommand, TransactWriteItemsCommand }, {
+    legalDocuments: "legal-documents-table",
+  });
+
+  await store.putLegalDocumentVersion("TERMS_AND_CONDITIONS", {
+    version: "v1.0",
+    title: "Symantic — Terms & Conditions",
+    content: "Terms.",
+    effectiveFrom: "2026-09-04",
+  });
+
+  const active = await store.getActiveLegalDocument("TERMS_AND_CONDITIONS");
+  assert.equal(active.version, "v1.0");
+  assert.equal(active.title, "Symantic — Terms & Conditions");
+  // A version the client can quote back on accept.
+  assert.ok(isValidLegalVersion(active.version));
+  // The pointer row itself still keys on the sentinel.
+  assert.ok(rows.has("TERMS_AND_CONDITIONS#ACTIVE"));
+  assert.ok(rows.has("TERMS_AND_CONDITIONS#v1.0"));
 });
