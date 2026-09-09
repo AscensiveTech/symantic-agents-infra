@@ -423,6 +423,53 @@ function isWorkspaceAdmin(actor) {
   return actor.roles.includes("company-admin") || actor.roles.includes("super-admin");
 }
 
+// Explicit product entitlements.
+//
+// Access used to be inferred entirely from Cognito group membership: admin
+// implied BOTH products, so a company that only bought RapidProposal still had
+// admins who could reach the Receptionist product. Roles say what a person may
+// do inside a product; entitlements say which products the company bought.
+// They are different questions and were being answered by the same field.
+//
+// Absent `entitlements` means unrestricted - exactly today's behaviour - so
+// existing workspaces are unaffected until someone sets them deliberately.
+// Once the object exists it is opt-in: a product not listed true is not sold.
+const PRODUCT_KEYS = ["receptionist", "rapidProposal"];
+
+function workspaceEntitlements(workspace) {
+  const raw = workspace?.entitlements;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return Object.fromEntries(PRODUCT_KEYS.map((key) => [key, raw[key] === true]));
+}
+
+function isProductEntitled(workspace, product) {
+  const entitlements = workspaceEntitlements(workspace);
+  return entitlements === null || entitlements[product] === true;
+}
+
+function isValidEntitlements(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.entries(value).every(([key, on]) => PRODUCT_KEYS.includes(key) && typeof on === "boolean");
+}
+
+// Which product a request belongs to, or null for shared surfaces (profile,
+// company settings, the legal endpoints, the product catalog) which stay
+// reachable regardless of what was bought.
+function productForPath(path) {
+  if (typeof path !== "string") return null;
+  if (isProposalPath(path)) return "rapidProposal";
+  if ([
+    "/workspaces/me/agents",
+    "/workspaces/me/calls",
+    "/workspaces/me/blocked-numbers",
+    "/workspaces/me/usage",
+    "/calendars/",
+  ].some((prefix) => path.startsWith(prefix))) {
+    return "receptionist";
+  }
+  return null;
+}
+
 function isProposalPath(path) {
   return typeof path === "string" && [
     "/workspaces/me/proposals",
@@ -546,6 +593,20 @@ export function createHandler({
 
       if (actor.roles.includes("quotation-builder") && !isWorkspaceAdmin(actor) && !isProposalPath(path)) {
         return json(403, { message: "Quotation builders can only access proposal features" });
+      }
+
+      // Roles decide what you may do inside a product; entitlements decide
+      // which products the company has. Being an admin is not evidence of
+      // having bought Receptionist.
+      const requestedProduct = productForPath(path);
+      if (requestedProduct && typeof store.getWorkspace === "function") {
+        const workspace = await store.getWorkspace(workspaceId);
+        if (!isProductEntitled(workspace, requestedProduct)) {
+          return json(403, {
+            error: "product_not_entitled",
+            message: "Your organization does not have access to this product. Contact your administrator.",
+          });
+        }
       }
 
       const proposalResponse = await handleProposalApi(event, {
@@ -958,6 +1019,7 @@ async function handlePlatformCompanies(event, {
     if (target.kind === "company" && method === "PATCH") {
       const body = readBody(event);
       const hasName = body && Object.hasOwn(body, "name");
+      const hasEntitlements = body && Object.hasOwn(body, "entitlements");
       const hasTier = body && Object.hasOwn(body, "tier");
       const hasPlan = isPlanPatch(body);
       const hasBlocklist = body && Object.hasOwn(body, "callBlocklistEnabled");
@@ -976,7 +1038,8 @@ async function handlePlatformCompanies(event, {
       const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
         || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
       if (
-        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasProposalPrice && !hasAnchor && !hasCredit) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
+        (hasEntitlements && !isValidEntitlements(body.entitlements)) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
         (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
@@ -990,6 +1053,10 @@ async function handlePlatformCompanies(event, {
         ...workspace,
         ...(hasName ? { name } : {}),
         ...(hasTier ? { tier: body.tier } : {}),
+        // Which products this company bought. Setting it at all switches the
+        // workspace from "unrestricted" to opt-in, so send every product you
+        // intend them to keep.
+        ...(hasEntitlements ? { entitlements: body.entitlements } : {}),
         ...(hasBlocklist ? { callBlocklistEnabled: body.callBlocklistEnabled } : {}),
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
@@ -1132,6 +1199,7 @@ async function handlePlatformCompanies(event, {
         directory,
         workspaceId: target.workspaceId,
         tier: workspace.tier,
+        entitlements: workspaceEntitlements(workspace),
         actorUserId: actor.userId,
         body: readBody(event),
       });

@@ -4413,3 +4413,56 @@ test("concurrent sends for the same proposal create exactly one SignWell documen
   // And the claim is not left behind wedging future sends.
   assert.equal(claim, null);
 });
+
+// Product access used to come entirely from Cognito groups: company-admin
+// implied BOTH products, so a company that only bought RapidProposal still had
+// admins who could reach Receptionist. Roles say what you may do inside a
+// product; entitlements say which products were sold.
+test("entitlements gate products independently of role", async () => {
+  const workspaces = new Map();
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership(userId) {
+      return { userId, workspaceId: "ws-1", role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return workspaces.get("ws-1"); },
+    async listProposals() { return []; },
+    async listAgents() { return []; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const admin = (method, path) => handler({
+    requestContext: {
+      authorizer: { jwt: { claims: { sub: "user-1", "cognito:groups": "company-admin" } } },
+      http: { method, path },
+    },
+    rawPath: path,
+  });
+
+  // No entitlements recorded: unrestricted, exactly as before. Existing
+  // workspaces must not change behaviour until someone sets them.
+  workspaces.set("ws-1", { workspaceId: "ws-1", name: "Legacy Co" });
+  assert.notEqual((await admin("GET", "/workspaces/me/agents")).statusCode, 403);
+  assert.notEqual((await admin("GET", "/workspaces/me/proposals")).statusCode, 403);
+
+  // Bought RapidProposal only. Same admin, same roles - Receptionist is now
+  // refused, proposals still work.
+  workspaces.set("ws-1", {
+    workspaceId: "ws-1",
+    name: "Proposals Only Co",
+    entitlements: { rapidProposal: true, receptionist: false },
+  });
+  const receptionist = await admin("GET", "/workspaces/me/agents");
+  assert.equal(receptionist.statusCode, 403);
+  assert.equal(JSON.parse(receptionist.body).error, "product_not_entitled");
+  assert.notEqual((await admin("GET", "/workspaces/me/proposals")).statusCode, 403);
+
+  // A product left out of the object entirely is not sold - the object is
+  // opt-in once it exists.
+  workspaces.set("ws-1", { workspaceId: "ws-1", name: "Receptionist Co", entitlements: { receptionist: true } });
+  assert.equal((await admin("GET", "/workspaces/me/proposals")).statusCode, 403);
+  assert.notEqual((await admin("GET", "/workspaces/me/agents")).statusCode, 403);
+
+  // Shared surfaces stay reachable regardless of what was bought.
+  assert.notEqual((await admin("GET", "/workspaces/me/profile")).statusCode, 403);
+});
