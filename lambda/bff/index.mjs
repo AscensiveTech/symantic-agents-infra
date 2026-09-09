@@ -3277,11 +3277,18 @@ async function handleProposalApi(event, {
       let proposal = await store.getProposal(workspaceId, proposalId);
       if (proposal && isActiveSignatureRequest(proposal.signatureRequest)) {
         const signWell = await getSignWell();
+        // ?refresh=1 is the user pressing "Refresh Status". Without it the
+        // 30s throttle silently returns the cached row and makes no SignWell
+        // call at all, so the button looked like it worked and did nothing.
+        // Background reads stay throttled - only an explicit ask pays for a
+        // provider round trip.
+        const refreshRequested = event?.queryStringParameters?.refresh === "1";
         proposal = await reconcileSignWellSignature({
           proposal,
           workspaceId,
           store,
           client: signWell.client,
+          force: refreshRequested,
         });
       }
       return proposal ? json(200, proposal) : json(404, { message: "Proposal not found" });

@@ -4236,3 +4236,63 @@ test("Dynamo countProposals uses Select COUNT without shipping item bodies", asy
   assert.equal(inputs[0].Select, "COUNT");
   assert.equal(inputs[0].ProjectionExpression, undefined);
 });
+
+// "Refresh Status" in the signature dialog is a GET on the proposal. Without
+// ?refresh=1 the 30s reconciliation throttle returned the cached DynamoDB row
+// and made no SignWell call, so the button looked like it worked and did
+// nothing. Background reads must stay throttled; an explicit ask must not be.
+test("GET proposal only forces a SignWell sync when refresh=1 is asked for", async () => {
+  const justSynced = new Date().toISOString();
+  const baseProposal = {
+    id: "prp-refresh",
+    name: "Refresh me",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-refresh",
+      status: "sent",
+      recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "sent" }],
+      lastProviderSyncAt: justSynced,
+    },
+  };
+  let getDocumentCalls = 0;
+  // No getMembership: resolveActor then uses the pre-shared-workspaces test
+  // path (workspaceId === userId), like the other SignWell tests here.
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(baseProposal); },
+    async updateProposalSignature(workspaceId, proposalId, signatureRequest) { return signatureRequest; },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      async getDocument(documentId) {
+        getDocumentCalls += 1;
+        return {
+          id: documentId,
+          status: "Completed",
+          metadata: { workspace_id: "user-123", proposal_id: "prp-refresh" },
+          recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "completed" }],
+        };
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getSignWell: async () => signWell });
+
+  // Synced a moment ago: a plain read stays inside the throttle window.
+  const throttled = await handler(authenticatedEvent("GET", "/workspaces/me/proposals/prp-refresh"));
+  assert.equal(throttled.statusCode, 200);
+  assert.equal(getDocumentCalls, 0);
+  assert.equal(JSON.parse(throttled.body).signatureRequest.status, "sent");
+
+  // The user pressed Refresh Status - go to SignWell regardless of the window.
+  const forced = await handler(authenticatedEvent(
+    "GET",
+    "/workspaces/me/proposals/prp-refresh",
+    undefined,
+    { refresh: "1" },
+  ));
+  assert.equal(forced.statusCode, 200);
+  assert.equal(getDocumentCalls, 1);
+  assert.equal(JSON.parse(forced.body).signatureRequest.status, "completed");
+});
