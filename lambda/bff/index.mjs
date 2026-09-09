@@ -1390,11 +1390,18 @@ async function getProposalStorageBreakdown(store, workspaceId) {
     const proposals = typeof store.listProposals === "function" ? await store.listProposals(workspaceId) : [];
     const stateById = new Map(proposals.map((p) => [p.proposalId, proposalStorageBucket(p)]));
     const byState = { openInProgress: 0, closed: 0, signed: 0, deleted: 0, unattributed };
+    // Bytes under proposals/<id>/ whose proposal row no longer exists: leftovers
+    // from a hard delete that predates the asset-cleanup step. They are not the
+    // customer's live usage, so they are excluded from both the breakdown and
+    // the headline total (a separate sweep reclaims the space).
+    let orphaned = 0;
     for (const [pid, size] of bytesByProposal) {
-      const state = stateById.get(pid) ?? "openInProgress";
+      const state = stateById.get(pid);
+      if (!state) { orphaned += size; continue; }
       byState[state] += size;
     }
-    return { total, byState };
+    const accountedTotal = byState.openInProgress + byState.closed + byState.signed + byState.deleted + byState.unattributed;
+    return { total: accountedTotal, byState, orphaned, rawTotal: total };
   } catch (error) {
     console.warn("[proposals] storage breakdown failed", { workspaceId, error: error?.message });
     return null;
