@@ -102,16 +102,19 @@ const RECEPTIONIST_VOICE_CATALOG = [
   { voiceId: "11labs-Paola", name: "Paola", gender: "female", provider: "ElevenLabs" },
   { voiceId: "11labs-Brian", name: "Brian", gender: "male", provider: "ElevenLabs" },
   { voiceId: "11labs-Noah", name: "Noah", gender: "male", provider: "ElevenLabs" },
-  { voiceId: "retell-Cimo", name: "Adrian", gender: "male", provider: "Retell" },
+  { voiceId: "11labs-Adrian", name: "Adrian", gender: "male", provider: "ElevenLabs" },
 ];
 
 export function curateReceptionistVoices(voices) {
   const available = Array.isArray(voices) ? voices : [];
   return RECEPTIONIST_VOICE_CATALOG.map((fallback) => {
-    const match = available.find((voice) =>
-      voice?.voice_id === fallback.voiceId ||
-      String(voice?.voice_name ?? "").toLowerCase() === fallback.name.toLowerCase()
-    );
+    // Retell can publish several providers/locales under the same display name.
+    // Prefer the curated ID so Hailey does not accidentally resolve to a
+    // localized voice just because that entry appears earlier in the API list.
+    const match = available.find((voice) => voice?.voice_id === fallback.voiceId) ??
+      available.find((voice) =>
+        String(voice?.voice_name ?? "").toLowerCase() === fallback.name.toLowerCase()
+      );
     if (!match) return fallback;
     return {
       voiceId: match.voice_id ?? fallback.voiceId,

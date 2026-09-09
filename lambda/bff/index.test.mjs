@@ -108,14 +108,22 @@ test("voice catalog returns the curated six and knowledge uploads are workspace 
     getProviders: async () => ({
       retell: {
         async listVoices() {
-          return [{
-            voice_id: "11labs-Hailey",
-            voice_name: "Hailey",
-            gender: "female",
-            provider: "elevenlabs",
-            accent: "American",
-            preview_audio_url: "https://audio.example.com/hailey.wav",
-          }];
+          return [
+            {
+              voice_id: "localized-Hailey",
+              voice_name: "Hailey",
+              gender: "female",
+              provider: "localized",
+            },
+            {
+              voice_id: "11labs-Hailey",
+              voice_name: "Hailey",
+              gender: "female",
+              provider: "elevenlabs",
+              accent: "American",
+              preview_audio_url: "https://audio.example.com/hailey.wav",
+            },
+          ];
         },
       },
     }),
@@ -132,6 +140,7 @@ test("voice catalog returns the curated six and knowledge uploads are workspace 
   assert.equal(voiceResponse.statusCode, 200);
   assert.equal(voices.length, 6);
   assert.deepEqual(voices.filter(({ gender }) => gender === "female").map(({ name }) => name), ["Hailey", "Grace", "Paola"]);
+  assert.equal(voices[0].voiceId, "11labs-Hailey");
   assert.equal(voices[0].previewAudioUrl, "https://audio.example.com/hailey.wav");
 
   const key = "knowledge-base/123e4567-e89b-42d3-a456-426614174000/policy.txt";
