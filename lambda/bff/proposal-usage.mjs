@@ -95,7 +95,20 @@ function meter(used, limit) {
  * @param {Array} monthRows `{ period: 'YYYY-MM', proposalsCreated, signaturesSent }`, any months
  * @param {{tier:string, now:Date, timezone:string}} ctx
  */
-export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes = null, storageByState = null }) {
+function addDayKey(key, n) {
+  const [y, m, d] = key.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d) + n * 86_400_000);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+
+// The billing cycle a given day falls in: [start, end) anchored on anchorDay.
+function cycleBoundsFor(dayKeyValue, anchorDay) {
+  const start = prevBillingDate(dayKeyValue, anchorDay);
+  const end = nextBillingDate(addDayKey(start, 1), anchorDay);
+  return { start, end };
+}
+
+export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, anchorDay = 1, storageBytes = null, storageByState = null }) {
   const normalizedTier = PROPOSAL_LIMITS[tier] ? tier : "basic";
   const limits = limitsForTier(normalizedTier);
   const period = periodKey(now ?? new Date(), timezone || "UTC");
@@ -119,20 +132,50 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
     }
     : null;
 
-  const proposalsUsed = count(monthCounter?.proposalsGenerated);
-  const signaturesUsed = count(monthCounter?.signaturesSent);
+  // Everything here is keyed to the billing cycle (anchorDay), not the calendar
+  // month, because a workspace can start its cycle on any day. The quota is a
+  // per-cycle allowance, so "used" is the sum of this cycle's daily counters
+  // (not the vestigial monthly counter).
+  const tz = timezone || "UTC";
+  const todayKey = dayKey(now ?? new Date(), tz);
+  const { start: cycleStart, end: cycleEnd } = cycleBoundsFor(todayKey, anchorDay);
+
+  const rowByDay = new Map(
+    (Array.isArray(dayRows) ? dayRows : [])
+      .filter((row) => typeof row?.day === "string" && /^\d{4}-\d{2}-\d{2}$/.test(row.day))
+      .map((row) => [row.day, row]),
+  );
+
+  // One entry per day of the current cycle up to today - days with no activity
+  // are included with zero counts so the chart shows an empty bar for them.
+  const days = [];
+  let proposalsUsed = 0;
+  let signaturesUsed = 0;
+  for (let k = cycleStart; k < cycleEnd && k <= todayKey; k = addDayKey(k, 1)) {
+    const row = rowByDay.get(k);
+    const p = count(row?.proposalsGenerated);
+    const s = count(row?.signaturesSent);
+    proposalsUsed += p;
+    signaturesUsed += s;
+    days.push({ day: k, proposals: p, signatures: s });
+  }
+  void monthCounter;
 
   const proposals = meter(proposalsUsed, limits.proposals);
   const signatures = meter(signaturesUsed, limits.signatures);
 
-  const days = (Array.isArray(dayRows) ? dayRows : [])
-    .filter((row) => typeof row?.day === "string" && row.day.startsWith(period))
-    .map((row) => ({
-      day: row.day,
-      proposals: count(row.proposalsGenerated),
-      signatures: count(row.signaturesSent),
-    }))
-    .sort((a, b) => a.day.localeCompare(b.day));
+  // History aggregated by billing cycle (most recent first).
+  const cycleAgg = new Map();
+  for (const [day, row] of rowByDay) {
+    const { start, end } = cycleBoundsFor(day, anchorDay);
+    const agg = cycleAgg.get(start) ?? { start, end, proposals: 0, signatures: 0 };
+    agg.proposals += count(row.proposalsGenerated);
+    agg.signatures += count(row.signaturesSent);
+    cycleAgg.set(start, agg);
+  }
+  const cycles = [...cycleAgg.values()]
+    .sort((a, b) => b.start.localeCompare(a.start))
+    .slice(0, 6);
 
   const months = (Array.isArray(monthRows) ? monthRows : [])
     .map((row) => ({
@@ -151,7 +194,9 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
     signatures,
     storage,
     blocked: proposals.state === "reached",
+    cycle: { start: cycleStart, end: cycleEnd },
     days,
+    cycles,
     months,
   };
 }

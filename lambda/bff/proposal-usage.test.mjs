@@ -40,13 +40,17 @@ test("limitsForTier falls back to basic for an unknown tier", () => {
   assert.deepEqual(limitsForTier("nonsense"), PROPOSAL_LIMITS.basic);
 });
 
-test("buildProposalUsage shapes meters, remaining, and blocked", () => {
+test("buildProposalUsage shapes meters (summed over the billing cycle), remaining, and blocked", () => {
+  const bigCycle = [];
+  // 100 proposals + 40 signatures spread across the current (Sep) cycle.
+  for (let d = 1; d <= 15; d += 1) {
+    bigCycle.push({ day: `2026-09-${String(d).padStart(2, "0")}`, proposalsGenerated: d <= 10 ? 10 : 0, signaturesSent: d <= 8 ? 5 : 0 });
+  }
   const usage = buildProposalUsage(
-    { proposalsGenerated: 100, signaturesSent: 40 },
+    { proposalsGenerated: 999, signaturesSent: 999 }, // vestigial monthly counter, ignored
     [
-      { day: "2026-09-14", proposalsGenerated: 3, signaturesSent: 1 },
-      { day: "2026-09-15", proposalsGenerated: 2, signaturesSent: 0 },
-      { day: "2026-08-30", proposalsGenerated: 9, signaturesSent: 9 }, // other month, dropped
+      ...bigCycle,
+      { day: "2026-08-30", proposalsGenerated: 9, signaturesSent: 9 }, // prior cycle
     ],
     [
       { period: "2026-09", proposalsGenerated: 100, signaturesSent: 40 },
@@ -61,8 +65,44 @@ test("buildProposalUsage shapes meters, remaining, and blocked", () => {
   assert.deepEqual(usage.proposals, { used: 100, limit: 100, remaining: 0, state: "reached" });
   assert.deepEqual(usage.signatures, { used: 40, limit: 100, remaining: 60, state: "ok" });
   assert.equal(usage.blocked, true);
-  assert.deepEqual(usage.days.map((d) => d.day), ["2026-09-14", "2026-09-15"]);
+  // Default anchor day 1 -> cycle is 2026-09-01 .. 2026-10-01; every day up to
+  // "now" (the 15th) is present, zero-filled, and the 08-30 row is a prior cycle.
+  assert.equal(usage.days.length, 15);
+  assert.equal(usage.days[0].day, "2026-09-01");
+  assert.equal(usage.days[14].day, "2026-09-15");
+  assert.deepEqual(usage.days.find((d) => d.day === "2026-09-05"), { day: "2026-09-05", proposals: 10, signatures: 5 });
+  assert.deepEqual(usage.days.find((d) => d.day === "2026-09-14"), { day: "2026-09-14", proposals: 0, signatures: 0 });
+  assert.ok(!usage.days.some((d) => d.day === "2026-08-30"));
+  assert.deepEqual(usage.cycle, { start: "2026-09-01", end: "2026-10-01" });
+  // History by billing cycle: the Sep cycle (100 proposals) and the Aug cycle (9).
+  assert.deepEqual(usage.cycles.map((c) => [c.start, c.proposals, c.signatures]), [
+    ["2026-09-01", 100, 40],
+    ["2026-08-01", 9, 9],
+  ]);
   assert.deepEqual(usage.months.map((m) => m.period), ["2026-09", "2026-08"]);
+});
+
+test("buildProposalUsage buckets days and history by a non-1st billing anchor", () => {
+  const usage = buildProposalUsage(
+    { proposalsGenerated: 4, signaturesSent: 0 },
+    [
+      { day: "2026-09-08", proposalsGenerated: 2, signaturesSent: 1 },
+      { day: "2026-09-12", proposalsGenerated: 1, signaturesSent: 0 },
+      { day: "2026-08-20", proposalsGenerated: 7, signaturesSent: 3 },
+    ],
+    [],
+    { tier: "repository", now, timezone: "UTC", anchorDay: 9 },
+  );
+  // now = 2026-09-15, anchor 9 -> current cycle 2026-09-09 .. 2026-10-09.
+  assert.deepEqual(usage.cycle, { start: "2026-09-09", end: "2026-10-09" });
+  assert.equal(usage.days[0].day, "2026-09-09");
+  assert.equal(usage.days.at(-1).day, "2026-09-15");
+  assert.deepEqual(usage.days.find((d) => d.day === "2026-09-12"), { day: "2026-09-12", proposals: 1, signatures: 0 });
+  // 09-08 is in the prior cycle (2026-08-09 .. 2026-09-09), with the 08-20 row.
+  assert.deepEqual(usage.cycles.map((c) => [c.start, c.end, c.proposals]), [
+    ["2026-09-09", "2026-10-09", 1],
+    ["2026-08-09", "2026-09-09", 9],
+  ]);
 });
 
 test("buildProposalUsage treats the signing tier as unlimited and never blocked", () => {

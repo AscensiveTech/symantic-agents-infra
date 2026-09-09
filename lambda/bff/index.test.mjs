@@ -3083,11 +3083,22 @@ function usageQuotaStore(overrides = {}) {
 
 function seedCounter(store, period, patch) {
   store._counters.set(`proposal#${period}`, { period: `proposal#${period}`, proposalsGenerated: 0, signaturesSent: 0, ...patch });
+  // Meters now sum the billing cycle's DAILY rows (the anchor day defaults to
+  // "today" with no workspace override, so today == cycle start). Mirror a
+  // current-month seed onto today's row so "seed at the limit" still blocks.
+  if (period === currentPeriod()) {
+    const day = currentDay();
+    store._counters.set(`proposal#${day}`, { period: `proposal#${day}`, proposalsGenerated: 0, signaturesSent: 0, ...patch });
+  }
 }
 
 function currentPeriod() {
   const n = new Date();
   return `${n.getUTCFullYear()}-${String(n.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+function currentDay() {
+  const n = new Date();
+  return `${n.getUTCFullYear()}-${String(n.getUTCMonth() + 1).padStart(2, "0")}-${String(n.getUTCDate()).padStart(2, "0")}`;
 }
 function generatedCount(store) {
   return store._counters.get(`proposal#${currentPeriod()}`)?.proposalsGenerated ?? 0;

@@ -18,6 +18,7 @@ import {
   resolvePlan,
 } from "./receptionist-billing.mjs";
 import {
+  billingAnchorDay,
   buildProposalBilling,
   buildProposalUsage,
   dayKey,
@@ -1043,7 +1044,24 @@ async function handlePlatformCompanies(event, {
         ? await store.getProfile(target.workspaceId)
         : null;
       const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-      await store.setProposalUsageCounter(target.workspaceId, periodKey(new Date(), tz), patch);
+      // The meter now sums the billing cycle's DAILY counters, so land an
+      // absolute override by adjusting today's row until the cycle-to-date
+      // total equals the requested value.
+      const now = new Date();
+      const todayKey = dayKey(now, tz);
+      const currentUsage = await loadProposalUsage(store, target.workspaceId);
+      const todayRow = typeof store.getProposalUsageCounter === "function"
+        ? (await store.getProposalUsageCounter(target.workspaceId, todayKey)) ?? {}
+        : {};
+      const dayPatch = {};
+      for (const field of Object.keys(patch)) {
+        const meterKey = field === "proposalsGenerated" ? "proposals" : "signatures";
+        const others = (currentUsage[meterKey]?.used ?? 0) - (Number(todayRow[field]) || 0);
+        dayPatch[field] = Math.max(0, patch[field] - Math.max(0, others));
+      }
+      await store.setProposalUsageCounter(target.workspaceId, todayKey, dayPatch);
+      // Keep the (now vestigial) monthly counter in step for any legacy reader.
+      await store.setProposalUsageCounter(target.workspaceId, periodKey(now, tz), patch);
       return json(200, await loadProposalUsage(store, target.workspaceId));
     }
 
@@ -1481,7 +1499,8 @@ async function loadProposalUsage(store, workspaceId) {
       if (sk === currentMonth) monthCounter = row;
     }
   }
-  return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes, storageByState });
+  const anchorDay = billingAnchorDay(workspace, now, timezone);
+  return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, anchorDay, storageBytes, storageByState });
 }
 
 // Build the RapidProposal billing view (monthly price + logged payment history
@@ -1511,10 +1530,10 @@ async function assertProposalQuota(store, workspaceId, kind) {
   const meter = usage[kind];
   if (meter && meter.limit != null && meter.used >= meter.limit) {
     const error = kind === "signatures" ? "signature_limit_reached" : "proposal_limit_reached";
-    const resetsOn = formatResetDate(firstOfNextMonthKey(usage.period));
+    const resetsOn = formatResetDate(usage.cycle?.end ?? firstOfNextMonthKey(usage.period));
     const message = kind === "signatures"
-      ? `You've sent ${meter.used} of ${meter.limit} signature requests this month. This resets on ${resetsOn}; ask your administrator to raise it before then.`
-      : `You've generated ${meter.used} of ${meter.limit} proposals this month. This resets on ${resetsOn}; ask your administrator to raise it before then.`;
+      ? `You've sent ${meter.used} of ${meter.limit} signature requests this billing cycle. This resets on ${resetsOn}; ask your administrator to raise it before then.`
+      : `You've generated ${meter.used} of ${meter.limit} proposals this billing cycle. This resets on ${resetsOn}; ask your administrator to raise it before then.`;
     const err = new Error(message);
     err.statusCode = 403;
     err.payload = { error, message, usage: meter };
@@ -1948,6 +1967,12 @@ async function addWorkspaceMember({ store, directory, workspaceId, tier, actorUs
     if (created?.username) await directory.deleteUser(created.username).catch(() => {});
     if (error?.name === "UsernameExistsException") {
       return json(409, { message: "A user with that email already exists" });
+    }
+    if (error?.name === "InvalidPasswordException") {
+      return json(400, { message: "That temporary password doesn't meet the requirements: at least 12 characters with an uppercase letter, a lowercase letter, a number, and a symbol." });
+    }
+    if (error?.name === "InvalidParameterException") {
+      return json(400, { message: "That user couldn't be created - check the email address and temporary password and try again." });
     }
     throw error;
   }
