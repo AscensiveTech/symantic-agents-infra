@@ -3273,6 +3273,122 @@ test("signature send is blocked when the proposal quota is full and the proposal
   assert.equal(JSON.parse(res.body).error, "proposal_limit_reached");
 });
 
+// A resend that changes the signers (or message / expiry / order, or carries
+// initials) makes SignWell mint a brand-new document and cancel the old one -
+// SignWell bills that as a new document, so it costs one signature credit. A
+// plain reminder or an email-only recipient patch reuses the same document and
+// costs nothing.
+
+function resendSignWellStub(calls = []) {
+  return {
+    getSignWell: async () => ({
+      webhookId: "w",
+      client: {
+        testMode: false,
+        async getDocument() {
+          return {
+            id: "signwell-doc-old",
+            status: "Sent",
+            metadata: { workspace_id: "user-123", proposal_id: "prp-sign" },
+            recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "sent" }],
+          };
+        },
+        async createDocument(input) { calls.push("create"); return { id: "signwell-doc-new", status: "Created", recipients: input.recipients }; },
+        async deleteDocument(id) { calls.push(`delete:${id}`); },
+        async sendDocument(id) {
+          calls.push(`send:${id}`);
+          return { id, status: "Sent", recipients: [
+            { id: "1", email: "jane@example.com", status: "sent" },
+            { id: "2", email: "alex@example.com", status: "sent" },
+          ] };
+        },
+        async updateRecipients(id, recipients) { calls.push(`patch:${id}`); return { id, recipients }; },
+      },
+    }),
+    getAssetSigner: async () => ({ async createDownloadUrl() { return "https://x/export.pdf"; } }),
+  };
+}
+
+const activeRequestProposal = (id) => ({
+  ...draftProposal(id),
+  signerNames: ["Jane Client"],
+  signatureRequest: {
+    provider: "signwell",
+    documentId: "signwell-doc-old",
+    status: "sent",
+    testMode: false,
+    subject: "Please sign",
+    message: "Here is your proposal.",
+    applySigningOrder: false,
+    recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "sent" }],
+    sentAt: "2026-09-01T00:00:00.000Z",
+    updatedAt: "2026-09-01T00:00:00.000Z",
+  },
+  usageCountedAt: "2026-09-01T00:00:00.000Z",
+  usageCountedPeriod: "2026-09",
+});
+
+function resendEvent(recipients) {
+  return authenticatedEvent("POST", "/workspaces/me/proposals/prp-sign/signature-requests/resend", {
+    assetKey: "exports/prp-sign.pdf",
+    recipients,
+    subject: "Please sign",
+    message: "Here is your proposal.",
+    applySigningOrder: false,
+  });
+}
+
+test("a resend that mints a new SignWell document counts another signature request, never another proposal", async () => {
+  const store = usageQuotaStore();
+  store._proposals.set("prp-sign", activeRequestProposal("prp-sign"));
+  const calls = [];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ ...resendSignWellStub(calls), getStore: async () => store });
+
+  const res = await handler(resendEvent([
+    { name: "Jane Client", email: "jane@example.com" },
+    { name: "Alex Client", email: "alex@example.com" },
+  ]));
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(calls, ["create", "delete:signwell-doc-old", "send:signwell-doc-new"]);
+  assert.equal(store._counters.get(`proposal#${currentPeriod()}`).signaturesSent, 1);
+  assert.equal(generatedCount(store), 0); // proposal was already counted; never re-counted
+});
+
+test("an email-only resend reuses the SignWell document and counts nothing", async () => {
+  const store = usageQuotaStore();
+  store._proposals.set("prp-sign", activeRequestProposal("prp-sign"));
+  const calls = [];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ ...resendSignWellStub(calls), getStore: async () => store });
+
+  const res = await handler(resendEvent([{ name: "Jane Client", email: "jane-new@example.com" }]));
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(calls, ["patch:signwell-doc-old"]);
+  assert.equal(store._counters.get(`proposal#${currentPeriod()}`)?.signaturesSent ?? 0, 0);
+  assert.equal(generatedCount(store), 0);
+});
+
+test("a signer-changing resend is blocked when the signature quota is full", async () => {
+  const store = usageQuotaStore();
+  store._proposals.set("prp-sign", activeRequestProposal("prp-sign"));
+  seedCounter(store, currentPeriod(), { signaturesSent: 100 });
+  const calls = [];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ ...resendSignWellStub(calls), getStore: async () => store });
+
+  const res = await handler(resendEvent([
+    { name: "Jane Client", email: "jane@example.com" },
+    { name: "Alex Client", email: "alex@example.com" },
+  ]));
+
+  assert.equal(res.statusCode, 403);
+  assert.equal(JSON.parse(res.body).error, "signature_limit_reached");
+  assert.equal(calls.includes("create"), false); // no SignWell document created
+});
+
 test("GET /workspaces/me/proposal-usage returns the usage view for an admin and 403s a proposal-only user", async () => {
   const store = usageQuotaStore();
   const now = new Date();

@@ -2910,6 +2910,11 @@ async function handleProposalApi(event, {
         if (previousRecipients.some((recipient) => recipient.status === "signed") && !input.replaceSignedAcknowledged) {
           return json(409, { message: "A signer has already signed. Confirm that those signatures will not carry into the replacement request." });
         }
+        // A resend that reaches here (the in-place recipient patch already
+        // returned) spins up a brand-new SignWell document, which SignWell bills
+        // as a new document - so it needs a free signature slot just like a
+        // first send. The !replacing branch asserted this above.
+        await assertProposalQuota(store, workspaceId, "signatures");
       }
 
       const signer = await getAssetSigner();
@@ -3054,8 +3059,13 @@ async function handleProposalApi(event, {
         ...(replacing ? { replacedDocumentId: previous.documentId, lastResentAt: now } : {}),
       };
       await store.updateProposalSignature(workspaceId, proposalId, signatureRequest);
+      // Every send that reaches here created a new SignWell document - a first
+      // send, or a resend that changed signers / message / expiry / order or
+      // carries initials. A plain reminder and an email-only recipient patch
+      // return earlier and never get here. SignWell bills a new document for
+      // each, so each one consumes a signature credit.
+      await recordProposalUsage(store, workspaceId, "signaturesSent");
       if (!replacing) {
-        await recordProposalUsage(store, workspaceId, "signaturesSent");
         // Count the proposal itself, if it wasn't already. Quota was checked
         // above; swallow errors here so a sent signature is never unwound.
         await countProposalGenerated(store, workspaceId, proposalId, { loaded: proposal, enforce: false })
