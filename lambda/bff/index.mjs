@@ -1526,37 +1526,90 @@ function formatResetDate(dayKeyStr) {
   return d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
 }
 
+// The 403 a full quota produces. Shared so the pre-flight check and the atomic
+// reservation below can't drift apart in wording or shape.
+function proposalQuotaError(kind, meter, usage) {
+  const error = kind === "signatures" ? "signature_limit_reached" : "proposal_limit_reached";
+  const resetsOn = formatResetDate(usage?.cycle?.end ?? firstOfNextMonthKey(usage?.period));
+  const used = meter?.used ?? 0;
+  const limit = meter?.limit ?? 0;
+  const message = kind === "signatures"
+    ? `You've sent ${used} of ${limit} signature requests this billing cycle. This resets on ${resetsOn}; ask your administrator to raise it before then.`
+    : `You've generated ${used} of ${limit} proposals this billing cycle. This resets on ${resetsOn}; ask your administrator to raise it before then.`;
+  const err = new Error(message);
+  err.statusCode = 403;
+  err.payload = { error, message, usage: meter };
+  return err;
+}
+
+// A pre-flight read, kept so an obviously-full quota fails before any work
+// starts. It is NOT the enforcement point - reserveProposalQuota is, because
+// this read can already be stale by the time the counter is written.
 async function assertProposalQuota(store, workspaceId, kind) {
   if (typeof store.listProposalUsageCounters !== "function") return;
   const usage = await loadProposalUsage(store, workspaceId);
   const meter = usage[kind];
   if (meter && meter.limit != null && meter.used >= meter.limit) {
-    const error = kind === "signatures" ? "signature_limit_reached" : "proposal_limit_reached";
-    const resetsOn = formatResetDate(usage.cycle?.end ?? firstOfNextMonthKey(usage.period));
-    const message = kind === "signatures"
-      ? `You've sent ${meter.used} of ${meter.limit} signature requests this billing cycle. This resets on ${resetsOn}; ask your administrator to raise it before then.`
-      : `You've generated ${meter.used} of ${meter.limit} proposals this billing cycle. This resets on ${resetsOn}; ask your administrator to raise it before then.`;
-    const err = new Error(message);
-    err.statusCode = 403;
-    err.payload = { error, message, usage: meter };
-    throw err;
+    throw proposalQuotaError(kind, meter, usage);
   }
 }
 
-// Best-effort increment of a RapidProposal monthly usage counter. Never throws -
-// a lost increment is preferable to failing a create/send that already
-// succeeded; the quota check tolerates being a hair behind.
-async function recordProposalUsage(store, workspaceId, field) {
-  if (typeof store.incrementProposalUsage !== "function") return;
+const USAGE_FIELD_BY_KIND = { proposals: "proposalsGenerated", signatures: "signaturesSent" };
+
+async function proposalUsagePeriods(store, workspaceId) {
+  const profile = typeof store.getProfile === "function" ? await store.getProfile(workspaceId) : null;
+  const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const now = new Date();
+  return { month: periodKey(now, tz), day: dayKey(now, tz) };
+}
+
+// Claims one unit of quota BEFORE the work happens, and lets DynamoDB do the
+// enforcing: the increment is conditional on the counter still being under the
+// ceiling, so two concurrent requests at limit-1 cannot both get through.
+//
+// This replaces a check-then-act pair (assertProposalQuota, do the work, then a
+// best-effort increment that swallowed every error). That was racy in the gap
+// between the two, and a dropped increment under-counted permanently, so the
+// quota drifted open. Reserving first also means a crash mid-operation
+// over-counts rather than under-counting - the safe direction for a limit.
+//
+// Throws the same 403 the pre-flight does, so callers and clients are unchanged.
+async function reserveProposalQuota(store, workspaceId, kind, { enforce = true } = {}) {
+  if (typeof store.incrementProposalUsage !== "function") return null;
+  const field = USAGE_FIELD_BY_KIND[kind];
+  if (!field) throw new Error(`Unknown proposal quota kind: ${kind}`);
+
+  const usage = await loadProposalUsage(store, workspaceId);
+  const meter = usage[kind];
+  // enforce:false still counts - it just doesn't gate. Used where the caller
+  // has already paid for this slot under a different meter.
+  const limit = enforce && meter && meter.limit != null ? meter.limit : null;
+  const periods = await proposalUsagePeriods(store, workspaceId);
+  const granted = await store.incrementProposalUsage(workspaceId, periods.month, periods.day, field, { limit });
+  if (granted) return { field, periods };
+
+  throw proposalQuotaError(kind, meter, usage);
+}
+
+// Give a reservation back when the work it was claimed for did not happen.
+// Best-effort by design: over-counting is the safe direction, and throwing here
+// would mask the original failure the caller is already handling.
+async function releaseProposalQuota(store, workspaceId, reservation) {
+  if (!reservation || typeof store.incrementProposalUsage !== "function") return;
   try {
-    const profile = typeof store.getProfile === "function" ? await store.getProfile(workspaceId) : null;
-    const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-    const now = new Date();
-    await store.incrementProposalUsage(workspaceId, periodKey(now, tz), dayKey(now, tz), field);
+    await store.incrementProposalUsage(
+      workspaceId,
+      reservation.periods.month,
+      reservation.periods.day,
+      reservation.field,
+      { delta: -1 },
+    );
   } catch (error) {
-    console.warn("[proposals] usage counter increment failed", { workspaceId, field, error: error?.message });
+    console.warn("[proposals] could not release a usage reservation", { workspaceId, error: error?.message });
   }
 }
+
+
 
 // Count a proposal towards the monthly quota the first time it is downloaded or
 // sent for signature. Idempotent per proposal (conditional write on
@@ -1567,18 +1620,29 @@ async function countProposalGenerated(store, workspaceId, proposalId, { loaded =
     ?? (typeof store.getProposal === "function" ? await store.getProposal(workspaceId, proposalId) : null);
   if (!proposal) return { counted: false, reason: "missing" };
   if (proposal.usageCountedAt) return { counted: false, reason: "already" };
-  if (enforce) await assertProposalQuota(store, workspaceId, "proposals");
 
-  const profile = typeof store.getProfile === "function" ? await store.getProfile(workspaceId) : null;
-  const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-  const now = new Date();
-  let marked = true;
-  if (typeof store.markProposalGenerated === "function") {
-    marked = await store.markProposalGenerated(workspaceId, proposalId, periodKey(now, tz), now.toISOString());
+  // Reserve the slot before marking, so the ceiling is enforced by a
+  // conditional write rather than by a read that can already be stale.
+  const reservation = await reserveProposalQuota(store, workspaceId, "proposals", { enforce });
+  try {
+    const profile = typeof store.getProfile === "function" ? await store.getProfile(workspaceId) : null;
+    const tz = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+    const now = new Date();
+    let marked = true;
+    if (typeof store.markProposalGenerated === "function") {
+      marked = await store.markProposalGenerated(workspaceId, proposalId, periodKey(now, tz), now.toISOString());
+    }
+    if (!marked) {
+      // A concurrent request counted this same proposal first - our reservation
+      // belongs to nobody, so hand it back.
+      await releaseProposalQuota(store, workspaceId, reservation);
+      return { counted: false, reason: "already" };
+    }
+    return { counted: true };
+  } catch (error) {
+    await releaseProposalQuota(store, workspaceId, reservation);
+    throw error;
   }
-  if (!marked) return { counted: false, reason: "already" };
-  await recordProposalUsage(store, workspaceId, "proposalsGenerated");
-  return { counted: true };
 }
 
 // Whether the premium call blocklist is available to this workspace right now.
@@ -2933,251 +2997,264 @@ async function handleProposalApi(event, {
       if (!replacing && isActiveSignatureRequest(previous)) {
         return json(409, { message: "This proposal already has an active signature request" });
       }
-      if (!replacing) {
-        await assertProposalQuota(store, workspaceId, "signatures");
-        // Sending for signature also "generates" the proposal - so it needs a
-        // free proposal slot too, unless this proposal was already counted.
-        if (!proposal.usageCountedAt) await assertProposalQuota(store, workspaceId, "proposals");
-      }
-      if (replacing) {
-        if (!isActiveSignatureRequest(previous)) {
-          return json(409, { message: "Only an active signature request can be edited and resent" });
+      // Reserved before any SignWell call and handed back on every exit that
+      // didn't actually send. A read-only check raced: two sends arriving
+      // together both saw room and both went through.
+      let signatureReservation = null;
+      let signatureSent = false;
+      try {
+        if (!replacing) {
+          signatureReservation = await reserveProposalQuota(store, workspaceId, "signatures");
+          // Sending for signature also "generates" the proposal - so it needs a
+          // free proposal slot too, unless this proposal was already counted.
+          if (!proposal.usageCountedAt) await assertProposalQuota(store, workspaceId, "proposals");
         }
-        const reconciled = await reconcileSignWellSignature({
-          proposal,
-          workspaceId,
-          store,
-          client: signWell.client,
-          force: true,
-        });
-        previous = reconciled.signatureRequest;
-        if (!isActiveSignatureRequest(previous)) {
-          return json(409, { message: "This signature request is no longer active. Refresh its status before sending another request." });
-        }
-      }
-      const agreementHasSigningFields = hasAgreementSigningFields(
-        proposal,
-        input.recipients,
-      );
-      const hasInitials = proposalHasInitialFields(proposal);
-      if (proposal.documentItems?.some((item) => item?.kind === "agreement" && !item.hidden) && !agreementHasSigningFields) {
-        return json(409, {
-          message: "The generated PDF signer names do not match these recipients. Save the signer names and regenerate the PDF first.",
-        });
-      }
-
-      if (replacing) {
-        const previousRecipients = Array.isArray(previous.recipients) ? previous.recipients : [];
-        const sameNames = previousRecipients.length === input.recipients.length && previousRecipients.every(
-          (recipient, index) => recipient.name?.trim().toLowerCase() === input.recipients[index]?.name.toLowerCase(),
-        );
-        const changedRecipients = sameNames
-          ? input.recipients.flatMap((recipient, index) => {
-            const old = previousRecipients[index];
-            return old?.email?.trim().toLowerCase() === recipient.email
-              ? []
-              : [{ id: old.id, name: recipient.name, email: recipient.email, index }];
-          })
-          : [];
-        const canUpdateRecipientsInPlace =
-          sameNames &&
-          changedRecipients.length > 0 &&
-          changedRecipients.every(({ index }) => ["pending", "sent", "bounced"].includes(previousRecipients[index]?.status)) &&
-          previous.subject === input.subject &&
-          previous.message === input.message &&
-          previous.applySigningOrder === input.applySigningOrder &&
-          // A changed expiry has to go through SignWell's send call, which the
-          // in-place recipient patch never touches.
-          (previous.expiresInDays ?? null) === (input.expiresInDays ?? null) &&
-          // Marker positions live only in the exported PDF; the in-place path
-          // never re-uploads it, so any initials at all forces the full
-          // draft-replace path (which does).
-          !hasInitials;
-        if (canUpdateRecipientsInPlace) {
-          await signWell.client.updateRecipients(
-            previous.documentId,
-            changedRecipients.map(({ id, name, email }) => ({ id, name, email })),
-          );
-          const now = new Date().toISOString();
-          const updated = {
-            ...previous,
-            recipients: previousRecipients.map((recipient, index) => ({
-              ...recipient,
-              name: input.recipients[index].name,
-              email: input.recipients[index].email,
-              ...(changedRecipients.some((changed) => changed.index === index) ? { status: "sent" } : {}),
-            })),
-            lastResentAt: now,
-            updatedAt: now,
-          };
-          await store.updateProposalSignature(workspaceId, proposalId, updated);
-          return json(200, updated);
-        }
-        if (previousRecipients.some((recipient) => recipient.status === "signed") && !input.replaceSignedAcknowledged) {
-          return json(409, { message: "A signer has already signed. Confirm that those signatures will not carry into the replacement request." });
-        }
-        // A resend that reaches here (the in-place recipient patch already
-        // returned) spins up a brand-new SignWell document, which SignWell bills
-        // as a new document - so it needs a free signature slot just like a
-        // first send. The !replacing branch asserted this above.
-        await assertProposalQuota(store, workspaceId, "signatures");
-      }
-
-      const signer = await getAssetSigner();
-      const fileUrl = await signer.createDownloadUrl(workspaceId, input.assetKey);
-      const embeddedTestMode = signWell.client.testMode === true;
-
-      // Make the SignWell email come from the sender, not the SignWell
-      // account owner: the company name (falling back to the sender's own
-      // name) drives the "X sent you a document" line, and the sender's
-      // email becomes the reply-to. SignWell's per-request "custom requester"
-      // does both with no separate sender provisioning; the envelope From
-      // stays SignWell's sending domain either way.
-      const senderWorkspace = typeof store.getWorkspace === "function"
-        ? await store.getWorkspace(workspaceId)
-        : null;
-      const requesterName =
-        (senderWorkspace?.name || "").trim() ||
-        (actor?.membership?.name || "").trim() ||
-        undefined;
-      const requesterEmail = (actor?.membership?.email || "").trim() || undefined;
-      const requesterFields = {
-        ...(requesterName ? { custom_requester_name: requesterName } : {}),
-        ...(requesterEmail ? { custom_requester_email: requesterEmail } : {}),
-      };
-
-      // SignWell expires the request this many days after it is sent. Only
-      // takes effect on send, so it is also passed to sendDocument below for
-      // the draft-replace path.
-      const expiryFields = input.expiresInDays ? { expires_in: input.expiresInDays } : {};
-
-      const documentInput = {
-        name: proposal.name || "Proposal",
-        subject: input.subject,
-        message: input.message,
-        draft: replacing,
-        reminders: true,
-        apply_signing_order: input.applySigningOrder,
-        allow_decline: true,
-        allow_reassign: true,
-        ...requesterFields,
-        ...expiryFields,
-        ...(embeddedTestMode ? { embedded_signing: true } : {}),
-        text_tags: agreementHasSigningFields || hasInitials,
-        with_signature_page: !agreementHasSigningFields,
-        files: [{
-          name: proposalPdfFilename(proposal.name),
-          file_url: fileUrl,
-        }],
-        recipients: input.recipients.map((recipient, index) => ({
-          id: String(index + 1),
-          name: recipient.name,
-          email: recipient.email,
-          delivery_method: "email",
-          // Embedded recipients default to email delivery being disabled in
-          // SignWell. Test mode uses embedding only to expose a safe signing
-          // URL, so opt back into the same notification email as live mode.
-          ...(embeddedTestMode ? { send_email: true } : {}),
-        })),
-        metadata: {
-          workspaceId,
-          proposalId,
-          source: "rapidproposal",
-        },
-      };
-      let created = await signWell.client.createDocument(documentInput);
-      if (typeof created?.id !== "string" || !created.id) {
-        throw new SignWellRequestError("SignWell did not return a document ID");
-      }
-      if (replacing) {
-        const draftId = created.id;
-        let previousCanceled = false;
-        try {
-          await signWell.client.deleteDocument(previous.documentId);
-          previousCanceled = true;
-          const sent = await signWell.client.sendDocument(draftId, {
-            name: proposal.name || "Proposal",
-            subject: input.subject,
-            message: input.message,
-            reminders: true,
-            apply_signing_order: input.applySigningOrder,
-            allow_decline: true,
-            allow_reassign: true,
-            ...requesterFields,
-            ...expiryFields,
-            ...(embeddedTestMode ? { embedded_signing: true } : {}),
-          });
-          created = {
-            ...created,
-            ...sent,
-            id: draftId,
-            recipients: Array.isArray(sent?.recipients) ? sent.recipients : created.recipients,
-          };
-        } catch (error) {
-          try { await signWell.client.deleteDocument(draftId); } catch { /* best-effort draft cleanup */ }
-          if (previousCanceled) {
-            await store.updateProposalSignature(workspaceId, proposalId, {
-              ...previous,
-              status: "canceled",
-              lastEvent: "document_replaced",
-              lastEventAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            });
+        if (replacing) {
+          if (!isActiveSignatureRequest(previous)) {
+            return json(409, { message: "Only an active signature request can be edited and resent" });
           }
-          throw error;
+          const reconciled = await reconcileSignWellSignature({
+            proposal,
+            workspaceId,
+            store,
+            client: signWell.client,
+            force: true,
+          });
+          previous = reconciled.signatureRequest;
+          if (!isActiveSignatureRequest(previous)) {
+            return json(409, { message: "This signature request is no longer active. Refresh its status before sending another request." });
+          }
         }
-      }
-      const now = new Date().toISOString();
-      const createdStatus = normalizeSignWellStatus(created.status, "sent");
-      const createdRecipients = Array.isArray(created.recipients) ? created.recipients : [];
-      const testSigningUrl = embeddedTestMode && Array.isArray(created.recipients)
-        ? created.recipients.find((recipient) =>
-          typeof recipient?.embedded_signing_url === "string" && recipient.embedded_signing_url
-        )?.embedded_signing_url
-        : null;
-      const signatureRequest = {
-        provider: "signwell",
-        documentId: created.id,
-        status: createdStatus === "created" ? "sent" : createdStatus,
-        testMode: created.test_mode === true || signWell.client.testMode === true,
-        ...(testSigningUrl ? { testSigningUrl } : {}),
-        subject: input.subject,
-        message: input.message,
-        applySigningOrder: input.applySigningOrder,
-        ...(input.expiresInDays ? { expiresInDays: input.expiresInDays } : {}),
-        recipients: input.recipients.map((recipient, index) => {
-          const id = String(index + 1);
-          const providerRecipient = createdRecipients.find((item) =>
-            item?.id === id || item?.email?.trim().toLowerCase() === recipient.email
+        const agreementHasSigningFields = hasAgreementSigningFields(
+          proposal,
+          input.recipients,
+        );
+        const hasInitials = proposalHasInitialFields(proposal);
+        if (proposal.documentItems?.some((item) => item?.kind === "agreement" && !item.hidden) && !agreementHasSigningFields) {
+          return json(409, {
+            message: "The generated PDF signer names do not match these recipients. Save the signer names and regenerate the PDF first.",
+          });
+        }
+
+        if (replacing) {
+          const previousRecipients = Array.isArray(previous.recipients) ? previous.recipients : [];
+          const sameNames = previousRecipients.length === input.recipients.length && previousRecipients.every(
+            (recipient, index) => recipient.name?.trim().toLowerCase() === input.recipients[index]?.name.toLowerCase(),
           );
-          const fallbackStatus = embeddedTestMode || (input.applySigningOrder && index > 0)
-            ? "pending"
-            : "sent";
-          return {
-            id,
+          const changedRecipients = sameNames
+            ? input.recipients.flatMap((recipient, index) => {
+              const old = previousRecipients[index];
+              return old?.email?.trim().toLowerCase() === recipient.email
+                ? []
+                : [{ id: old.id, name: recipient.name, email: recipient.email, index }];
+            })
+            : [];
+          const canUpdateRecipientsInPlace =
+            sameNames &&
+            changedRecipients.length > 0 &&
+            changedRecipients.every(({ index }) => ["pending", "sent", "bounced"].includes(previousRecipients[index]?.status)) &&
+            previous.subject === input.subject &&
+            previous.message === input.message &&
+            previous.applySigningOrder === input.applySigningOrder &&
+            // A changed expiry has to go through SignWell's send call, which the
+            // in-place recipient patch never touches.
+            (previous.expiresInDays ?? null) === (input.expiresInDays ?? null) &&
+            // Marker positions live only in the exported PDF; the in-place path
+            // never re-uploads it, so any initials at all forces the full
+            // draft-replace path (which does).
+            !hasInitials;
+          if (canUpdateRecipientsInPlace) {
+            await signWell.client.updateRecipients(
+              previous.documentId,
+              changedRecipients.map(({ id, name, email }) => ({ id, name, email })),
+            );
+            const now = new Date().toISOString();
+            const updated = {
+              ...previous,
+              recipients: previousRecipients.map((recipient, index) => ({
+                ...recipient,
+                name: input.recipients[index].name,
+                email: input.recipients[index].email,
+                ...(changedRecipients.some((changed) => changed.index === index) ? { status: "sent" } : {}),
+              })),
+              lastResentAt: now,
+              updatedAt: now,
+            };
+            await store.updateProposalSignature(workspaceId, proposalId, updated);
+            return json(200, updated);
+          }
+          if (previousRecipients.some((recipient) => recipient.status === "signed") && !input.replaceSignedAcknowledged) {
+            return json(409, { message: "A signer has already signed. Confirm that those signatures will not carry into the replacement request." });
+          }
+          // A resend that reaches here (the in-place recipient patch already
+          // returned) spins up a brand-new SignWell document, which SignWell bills
+          // as a new document - so it needs a free signature slot just like a
+          // first send. Reserved, not just asserted, for the same reason: the
+          // in-place patch returns before this, so only billable resends pay.
+          signatureReservation = await reserveProposalQuota(store, workspaceId, "signatures");
+        }
+
+        const signer = await getAssetSigner();
+        const fileUrl = await signer.createDownloadUrl(workspaceId, input.assetKey);
+        const embeddedTestMode = signWell.client.testMode === true;
+
+        // Make the SignWell email come from the sender, not the SignWell
+        // account owner: the company name (falling back to the sender's own
+        // name) drives the "X sent you a document" line, and the sender's
+        // email becomes the reply-to. SignWell's per-request "custom requester"
+        // does both with no separate sender provisioning; the envelope From
+        // stays SignWell's sending domain either way.
+        const senderWorkspace = typeof store.getWorkspace === "function"
+          ? await store.getWorkspace(workspaceId)
+          : null;
+        const requesterName =
+          (senderWorkspace?.name || "").trim() ||
+          (actor?.membership?.name || "").trim() ||
+          undefined;
+        const requesterEmail = (actor?.membership?.email || "").trim() || undefined;
+        const requesterFields = {
+          ...(requesterName ? { custom_requester_name: requesterName } : {}),
+          ...(requesterEmail ? { custom_requester_email: requesterEmail } : {}),
+        };
+
+        // SignWell expires the request this many days after it is sent. Only
+        // takes effect on send, so it is also passed to sendDocument below for
+        // the draft-replace path.
+        const expiryFields = input.expiresInDays ? { expires_in: input.expiresInDays } : {};
+
+        const documentInput = {
+          name: proposal.name || "Proposal",
+          subject: input.subject,
+          message: input.message,
+          draft: replacing,
+          reminders: true,
+          apply_signing_order: input.applySigningOrder,
+          allow_decline: true,
+          allow_reassign: true,
+          ...requesterFields,
+          ...expiryFields,
+          ...(embeddedTestMode ? { embedded_signing: true } : {}),
+          text_tags: agreementHasSigningFields || hasInitials,
+          with_signature_page: !agreementHasSigningFields,
+          files: [{
+            name: proposalPdfFilename(proposal.name),
+            file_url: fileUrl,
+          }],
+          recipients: input.recipients.map((recipient, index) => ({
+            id: String(index + 1),
             name: recipient.name,
             email: recipient.email,
-            status: normalizeSignWellRecipientStatus(providerRecipient?.status, fallbackStatus),
-          };
-        }),
-        sentAt: now,
-        updatedAt: now,
-        ...(replacing ? { replacedDocumentId: previous.documentId, lastResentAt: now } : {}),
-      };
-      await store.updateProposalSignature(workspaceId, proposalId, signatureRequest);
-      // Every send that reaches here created a new SignWell document - a first
-      // send, or a resend that changed signers / message / expiry / order or
-      // carries initials. A plain reminder and an email-only recipient patch
-      // return earlier and never get here. SignWell bills a new document for
-      // each, so each one consumes a signature credit.
-      await recordProposalUsage(store, workspaceId, "signaturesSent");
-      if (!replacing) {
-        // Count the proposal itself, if it wasn't already. Quota was checked
-        // above; swallow errors here so a sent signature is never unwound.
-        await countProposalGenerated(store, workspaceId, proposalId, { loaded: proposal, enforce: false })
-          .catch((error) => console.warn("[proposals] mark-generated after signature failed", { proposalId, error: error?.message }));
+            delivery_method: "email",
+            // Embedded recipients default to email delivery being disabled in
+            // SignWell. Test mode uses embedding only to expose a safe signing
+            // URL, so opt back into the same notification email as live mode.
+            ...(embeddedTestMode ? { send_email: true } : {}),
+          })),
+          metadata: {
+            workspaceId,
+            proposalId,
+            source: "rapidproposal",
+          },
+        };
+        let created = await signWell.client.createDocument(documentInput);
+        if (typeof created?.id !== "string" || !created.id) {
+          throw new SignWellRequestError("SignWell did not return a document ID");
+        }
+        if (replacing) {
+          const draftId = created.id;
+          let previousCanceled = false;
+          try {
+            await signWell.client.deleteDocument(previous.documentId);
+            previousCanceled = true;
+            const sent = await signWell.client.sendDocument(draftId, {
+              name: proposal.name || "Proposal",
+              subject: input.subject,
+              message: input.message,
+              reminders: true,
+              apply_signing_order: input.applySigningOrder,
+              allow_decline: true,
+              allow_reassign: true,
+              ...requesterFields,
+              ...expiryFields,
+              ...(embeddedTestMode ? { embedded_signing: true } : {}),
+            });
+            created = {
+              ...created,
+              ...sent,
+              id: draftId,
+              recipients: Array.isArray(sent?.recipients) ? sent.recipients : created.recipients,
+            };
+          } catch (error) {
+            try { await signWell.client.deleteDocument(draftId); } catch { /* best-effort draft cleanup */ }
+            if (previousCanceled) {
+              await store.updateProposalSignature(workspaceId, proposalId, {
+                ...previous,
+                status: "canceled",
+                lastEvent: "document_replaced",
+                lastEventAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+            throw error;
+          }
+        }
+        const now = new Date().toISOString();
+        const createdStatus = normalizeSignWellStatus(created.status, "sent");
+        const createdRecipients = Array.isArray(created.recipients) ? created.recipients : [];
+        const testSigningUrl = embeddedTestMode && Array.isArray(created.recipients)
+          ? created.recipients.find((recipient) =>
+            typeof recipient?.embedded_signing_url === "string" && recipient.embedded_signing_url
+          )?.embedded_signing_url
+          : null;
+        const signatureRequest = {
+          provider: "signwell",
+          documentId: created.id,
+          status: createdStatus === "created" ? "sent" : createdStatus,
+          testMode: created.test_mode === true || signWell.client.testMode === true,
+          ...(testSigningUrl ? { testSigningUrl } : {}),
+          subject: input.subject,
+          message: input.message,
+          applySigningOrder: input.applySigningOrder,
+          ...(input.expiresInDays ? { expiresInDays: input.expiresInDays } : {}),
+          recipients: input.recipients.map((recipient, index) => {
+            const id = String(index + 1);
+            const providerRecipient = createdRecipients.find((item) =>
+              item?.id === id || item?.email?.trim().toLowerCase() === recipient.email
+            );
+            const fallbackStatus = embeddedTestMode || (input.applySigningOrder && index > 0)
+              ? "pending"
+              : "sent";
+            return {
+              id,
+              name: recipient.name,
+              email: recipient.email,
+              status: normalizeSignWellRecipientStatus(providerRecipient?.status, fallbackStatus),
+            };
+          }),
+          sentAt: now,
+          updatedAt: now,
+          ...(replacing ? { replacedDocumentId: previous.documentId, lastResentAt: now } : {}),
+        };
+        await store.updateProposalSignature(workspaceId, proposalId, signatureRequest);
+        // Every send that reaches here created a new SignWell document - a first
+        // send, or a resend that changed signers / message / expiry / order or
+        // carries initials. A plain reminder and an email-only recipient patch
+        // return earlier and never get here. SignWell bills a new document for
+        // each, so each one consumes a signature credit - already reserved above,
+        // so there is nothing to increment now.
+        signatureSent = true;
+        if (!replacing) {
+          // Count the proposal itself, if it wasn't already. enforce:false
+          // because rejecting now would unwind nothing - the document is out.
+          await countProposalGenerated(store, workspaceId, proposalId, { loaded: proposal, enforce: false })
+            .catch((error) => console.warn("[proposals] mark-generated after signature failed", { proposalId, error: error?.message }));
+        }
+        return json(replacing ? 200 : 201, signatureRequest);
+      } finally {
+        // Covers the 409 early-returns and any SignWell failure alike: if
+        // nothing was sent, the slot goes back.
+        if (!signatureSent) await releaseProposalQuota(store, workspaceId, signatureReservation);
       }
-      return json(replacing ? 200 : 201, signatureRequest);
     }
 
     let current = proposal.signatureRequest;
@@ -4321,25 +4398,46 @@ export function createDynamoStore(client, commands, tableNames) {
       return items;
     },
 
-    async incrementProposalUsage(workspaceId, monthPeriod, dayPeriod, field) {
-      if (!tableNames.workspaceUsage) return;
+    // `limit` turns the month row into the actual enforcement point: the
+    // increment only lands while the counter is still below the ceiling, so two
+    // concurrent requests at limit-1 cannot both succeed. Returns false when the
+    // ceiling blocked it. Without a limit this is a plain increment (rollback,
+    // and tiers with no cap).
+    //
+    // The day row is reporting only and is never conditional - it must not be
+    // able to reject a request the month row already allowed.
+    async incrementProposalUsage(workspaceId, monthPeriod, dayPeriod, field, { limit = null, delta = 1 } = {}) {
+      if (!tableNames.workspaceUsage) return true;
       if (field !== "proposalsGenerated" && field !== "signaturesSent") {
         throw new Error(`Unknown proposal-usage field: ${field}`);
       }
       const nowSec = Math.floor(Date.now() / 1000);
-      const targets = [
-        { period: `proposal#${monthPeriod}`, exp: nowSec + 18 * 30 * 24 * 60 * 60 },
-        { period: `proposal#${dayPeriod}`, exp: nowSec + 120 * 24 * 60 * 60 },
-      ];
-      for (const target of targets) {
+      const gated = Number.isFinite(limit);
+      try {
         await client.send(new commands.UpdateItemCommand({
           TableName: tableNames.workspaceUsage,
-          Key: marshall({ workspaceId, period: target.period }),
-          UpdateExpression: "ADD #field :one SET expiresAt = if_not_exists(expiresAt, :exp)",
+          Key: marshall({ workspaceId, period: `proposal#${monthPeriod}` }),
+          UpdateExpression: "ADD #field :delta SET expiresAt = if_not_exists(expiresAt, :exp)",
+          ...(gated ? { ConditionExpression: "attribute_not_exists(#field) OR #field < :limit" } : {}),
           ExpressionAttributeNames: { "#field": field },
-          ExpressionAttributeValues: marshall({ ":one": 1, ":exp": target.exp }),
+          ExpressionAttributeValues: marshall({
+            ":delta": delta,
+            ":exp": nowSec + 18 * 30 * 24 * 60 * 60,
+            ...(gated ? { ":limit": limit } : {}),
+          }),
         }));
+      } catch (error) {
+        if (gated && isConditionalCheckFailed(error)) return false;
+        throw error;
       }
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaceUsage,
+        Key: marshall({ workspaceId, period: `proposal#${dayPeriod}` }),
+        UpdateExpression: "ADD #field :delta SET expiresAt = if_not_exists(expiresAt, :exp)",
+        ExpressionAttributeNames: { "#field": field },
+        ExpressionAttributeValues: marshall({ ":delta": delta, ":exp": nowSec + 120 * 24 * 60 * 60 }),
+      }));
+      return true;
     },
 
     async listProposalPayments(workspaceId) {
