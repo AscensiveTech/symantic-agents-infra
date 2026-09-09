@@ -2258,6 +2258,54 @@ test("company administrators cannot change a super administrator", async () => {
   assert.equal(response.statusCode, 403);
 });
 
+test("any workspace user can change their own display name via /users/me", async () => {
+  const saved = [];
+  const nameUpdates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership(userId) {
+      return { userId, cognitoUsername: "ajm@x.com", email: "ajm@x.com", workspaceId: "workspace-123", role: "quotation-builder", status: "active", name: "AJM" };
+    },
+    async putMembership(m) { saved.push(m); },
+  };
+  const directory = {
+    async updateName(username, name) { nameUpdates.push([username, name]); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+  const event = authenticatedEvent("PATCH", "/workspaces/me/users/me", { name: "  AJM Full Name  " });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved[0].name, "AJM Full Name");
+  assert.deepEqual(nameUpdates, [["ajm@x.com", "AJM Full Name"]]);
+});
+
+test("a super admin can rename any company user from the platform surface", async () => {
+  const saved = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getWorkspace() { return { workspaceId: "workspace-9", tier: "repository" }; },
+    async getMembership(userId) {
+      return { userId, cognitoUsername: "u@x.com", email: "u@x.com", workspaceId: "workspace-9", role: "quotation-builder", status: "active", name: "Old" };
+    },
+    async listMemberships() { return []; },
+    async putMembership(m) { saved.push(m); },
+  };
+  const directory = { async getRoles() { return []; }, async updateName() {}, async setRole() { assert.fail("role must not change"); } };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+  const event = authenticatedEvent("PATCH", "/platform/companies/workspace-9/users/user-7", { name: "New Name" });
+  event.pathParameters = { workspaceId: "workspace-9", userId: "user-7" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved[0].name, "New Name");
+  assert.equal(saved[0].role, "quotation-builder");
+});
+
 function removalStore(overrides = {}) {
   const unassignCalls = [];
   const deleted = [];

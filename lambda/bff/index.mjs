@@ -1119,9 +1119,18 @@ async function handlePlatformCompanies(event, {
 
     if (target.kind === "user" && method === "PATCH") {
       const body = readBody(event);
+      const hasRole = body && Object.hasOwn(body, "role");
+      const hasName = body && Object.hasOwn(body, "name");
       const role = body?.role;
-      if (!["company-admin", "quotation-builder"].includes(role)) {
+      const name = typeof body?.name === "string" ? body.name.trim() : "";
+      if (!hasRole && !hasName) {
+        return json(400, { message: "Provide a role and/or a name to update." });
+      }
+      if (hasRole && !["company-admin", "quotation-builder"].includes(role)) {
         return json(400, { message: "Invalid workspace role" });
+      }
+      if (hasName && (name.length < 1 || name.length > 120)) {
+        return json(400, { message: "Enter a name (1-120 characters)." });
       }
       const membership = await store.getMembership(target.userId);
       if (!membership || membership.workspaceId !== target.workspaceId) {
@@ -1131,10 +1140,11 @@ async function handlePlatformCompanies(event, {
       const directoryRoles = typeof directory.getRoles === "function"
         ? await directory.getRoles(membership.cognitoUsername ?? membership.email)
         : [];
-      if (membership.role === "super-admin" || directoryRoles.includes("super-admin")) {
+      // A super admin's name can still be corrected here; only their role is protected.
+      if (hasRole && (membership.role === "super-admin" || directoryRoles.includes("super-admin"))) {
         return json(403, { message: "A super administrator role cannot be changed here" });
       }
-      if (membership.role === "company-admin" && role !== "company-admin") {
+      if (hasRole && membership.role === "company-admin" && role !== "company-admin") {
         const members = await store.listMemberships(target.workspaceId);
         const activeAdmins = members.filter((member) => (
           member.role === "company-admin" && member.status !== "disabled"
@@ -1143,10 +1153,14 @@ async function handlePlatformCompanies(event, {
           return json(409, { message: "Promote another company administrator first" });
         }
       }
-      await directory.setRole(membership.cognitoUsername ?? membership.email, role);
+      if (hasRole) await directory.setRole(membership.cognitoUsername ?? membership.email, role);
+      if (hasName && typeof directory.updateName === "function") {
+        await directory.updateName(membership.cognitoUsername ?? membership.email, name).catch(() => {});
+      }
       const updated = {
         ...membership,
-        role,
+        ...(hasRole ? { role } : {}),
+        ...(hasName ? { name } : {}),
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
       };
@@ -1996,6 +2010,24 @@ async function handleWorkspaceUsers(event, {
   getUserDirectory,
 }) {
   if (typeof path !== "string" || !path.startsWith("/workspaces/me/users")) return null;
+
+  // Anyone can change their OWN display name from Team & Access - no admin
+  // rights needed. Everything else on this surface stays admin-only.
+  if (path === "/workspaces/me/users/me" && method === "PATCH") {
+    const body = readBody(event);
+    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    if (name.length < 1 || name.length > 120) return json(400, { message: "Enter a name (1-120 characters)." });
+    const self = await store.getMembership(actor.userId);
+    if (!self || self.workspaceId !== actor.workspaceId) return json(404, { message: "Workspace user not found" });
+    const directory = await getUserDirectory();
+    if (typeof directory.updateName === "function") {
+      await directory.updateName(self.cognitoUsername ?? self.email, name).catch(() => {});
+    }
+    const updated = { ...self, name, updatedAt: new Date().toISOString() };
+    await store.putMembership(updated);
+    return json(200, updated);
+  }
+
   if (!isWorkspaceAdmin(actor)) return json(403, { message: "Company administrator access is required" });
 
   if (path === "/workspaces/me/users" && method === "GET") {
@@ -2026,11 +2058,18 @@ async function handleWorkspaceUsers(event, {
 
   if (method === "PATCH") {
     const body = readBody(event);
+    const hasRole = body && Object.hasOwn(body, "role");
+    const hasName = body && Object.hasOwn(body, "name");
     const role = body?.role;
-    if (
-      !["company-admin", "quotation-builder"].includes(role)
-    ) {
+    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    if (!hasRole && !hasName) {
+      return json(400, { message: "Provide a role and/or a name to update." });
+    }
+    if (hasRole && !["company-admin", "quotation-builder"].includes(role)) {
       return json(400, { message: "Invalid workspace role" });
+    }
+    if (hasName && (name.length < 1 || name.length > 120)) {
+      return json(400, { message: "Enter a name (1-120 characters)." });
     }
     const directory = await getUserDirectory();
     if (!actor.roles.includes("super-admin") && (
@@ -2040,14 +2079,22 @@ async function handleWorkspaceUsers(event, {
     )) {
       return json(403, { message: "A company administrator cannot change a super administrator" });
     }
-    if (target.role === "company-admin" && role !== "company-admin") {
+    if (hasRole && target.role === "company-admin" && role !== "company-admin") {
       const members = await store.listMemberships(actor.workspaceId);
       if (members.filter((member) => member.role === "company-admin" && member.status !== "disabled").length <= 1) {
         return json(409, { message: "Promote another company administrator first" });
       }
     }
-    await directory.setRole(target.cognitoUsername ?? target.email, role);
-    const updated = { ...target, role, updatedAt: new Date().toISOString() };
+    if (hasRole) await directory.setRole(target.cognitoUsername ?? target.email, role);
+    if (hasName && typeof directory.updateName === "function") {
+      await directory.updateName(target.cognitoUsername ?? target.email, name).catch(() => {});
+    }
+    const updated = {
+      ...target,
+      ...(hasRole ? { role } : {}),
+      ...(hasName ? { name } : {}),
+      updatedAt: new Date().toISOString(),
+    };
     await store.putMembership(updated);
     return json(200, updated);
   }
@@ -4878,6 +4925,16 @@ export function createCognitoDirectory(client, commands, userPoolId) {
       await client.send(new commands.AdminDeleteUserCommand({
         UserPoolId: userPoolId,
         Username: username,
+      }));
+    },
+
+    // Change a user's display name (the Cognito `name` attribute, which also
+    // flows into their JWT `name` claim on next token refresh).
+    async updateName(username, name) {
+      await client.send(new commands.AdminUpdateUserAttributesCommand({
+        UserPoolId: userPoolId,
+        Username: username,
+        UserAttributes: [{ Name: "name", Value: name }],
       }));
     },
   };
