@@ -166,13 +166,22 @@ export function createRetellClient({
         : { body: JSON.stringify(options.body) }),
     }, "Retell");
 
+  const retellFormRequest = (path, form) =>
+    requestJson(fetchImpl, `${RETELL_BASE_URL}${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form,
+    }, "Retell");
+
   async function createLlm({ greeting, config }) {
     const result = await retellRequest("/create-retell-llm", {
       method: "POST",
       body: {
+        start_speaker: "agent",
         begin_message: greeting,
         general_prompt: config.prompt,
         general_tools: config.tools,
+        knowledge_base_ids: config.knowledgeBaseIds ?? [],
       },
     });
     return required(result?.llm_id, "Retell llm_id");
@@ -182,9 +191,11 @@ export function createRetellClient({
     await retellRequest(`/update-retell-llm/${encodeURIComponent(llmId)}`, {
       method: "PATCH",
       body: {
+        start_speaker: "agent",
         begin_message: greeting,
         general_prompt: config.prompt,
         general_tools: config.tools,
+        knowledge_base_ids: config.knowledgeBaseIds ?? [],
       },
     });
   }
@@ -207,6 +218,34 @@ export function createRetellClient({
   }
 
   return {
+    async listVoices() {
+      const voices = await retellRequest("/list-voices");
+      return Array.isArray(voices) ? voices : [];
+    },
+
+    async createKnowledgeBase({ name, texts = [], files = [] }) {
+      const form = new FormData();
+      form.append("knowledge_base_name", required(name, "knowledgeBaseName").slice(0, 39));
+      if (texts.length) form.append("knowledge_base_texts", JSON.stringify(texts));
+      for (const file of files) {
+        const blob = new Blob([file.data], {
+          type: file.contentType || "application/octet-stream",
+        });
+        form.append("knowledge_base_files", blob, required(file.name, "knowledgeBaseFileName"));
+      }
+      const created = await retellFormRequest("/create-knowledge-base", form);
+      return {
+        knowledgeBaseId: required(created?.knowledge_base_id, "Retell knowledge_base_id"),
+        status: stringOrUndefined(created?.status) ?? "in_progress",
+      };
+    },
+
+    async deleteKnowledgeBase(knowledgeBaseId) {
+      await retellRequest(`/delete-knowledge-base/${encodeURIComponent(required(knowledgeBaseId, "knowledgeBaseId"))}`, {
+        method: "DELETE",
+      });
+    },
+
     async upsertAgent({
       retellAgentId,
       symanticAgentId,
@@ -464,8 +503,15 @@ function isSymanticAgentName(agentName, symanticAgentId) {
 }
 
 async function findAgentBySymanticId(retellRequest, symanticAgentId) {
-  const listed = await retellRequest("/list-agents");
-  const agents = Array.isArray(listed) ? listed : listed?.agents ?? [];
+  const listed = await retellRequest("/v2/list-agents?limit=1000", {
+    method: "POST",
+    body: {
+      filter_criteria: {
+        channel: { op: "eq", value: "voice" },
+      },
+    },
+  });
+  const agents = Array.isArray(listed) ? listed : listed?.items ?? listed?.agents ?? [];
   return agents.find((candidate) =>
     isSymanticAgentName(candidate?.agent_name, symanticAgentId)
   ) ?? null;

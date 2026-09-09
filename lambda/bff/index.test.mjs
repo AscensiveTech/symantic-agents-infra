@@ -100,6 +100,50 @@ test("GET profile ensures the workspace and returns its profile", async () => {
   ]);
 });
 
+test("voice catalog returns the curated six and knowledge uploads are workspace scoped", async () => {
+  const signed = [];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => ({}),
+    getProviders: async () => ({
+      retell: {
+        async listVoices() {
+          return [{
+            voice_id: "11labs-Hailey",
+            voice_name: "Hailey",
+            gender: "female",
+            provider: "elevenlabs",
+            accent: "American",
+            preview_audio_url: "https://audio.example.com/hailey.wav",
+          }];
+        },
+      },
+    }),
+    getKnowledgeSigner: async () => ({
+      async createUploadUrl(workspaceId, key, contentType) {
+        signed.push([workspaceId, key, contentType]);
+        return "https://upload.example.com/signed";
+      },
+    }),
+  });
+
+  const voiceResponse = await handler(authenticatedEvent("GET", "/workspaces/me/retell/voices"));
+  const voices = JSON.parse(voiceResponse.body);
+  assert.equal(voiceResponse.statusCode, 200);
+  assert.equal(voices.length, 6);
+  assert.deepEqual(voices.filter(({ gender }) => gender === "female").map(({ name }) => name), ["Hailey", "Grace", "Paola"]);
+  assert.equal(voices[0].previewAudioUrl, "https://audio.example.com/hailey.wav");
+
+  const key = "knowledge-base/123e4567-e89b-42d3-a456-426614174000/policy.txt";
+  const uploadResponse = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/knowledge-assets/upload-url",
+    { key, contentType: "text/plain", bytes: 1024 },
+  ));
+  assert.equal(uploadResponse.statusCode, 200);
+  assert.deepEqual(signed, [["user-123", key, "text/plain"]]);
+});
+
 test("PUT profile rejects an invalid body before accessing DynamoDB", async () => {
   const getStore = () => {
     throw new Error("store should not be loaded");
@@ -503,6 +547,7 @@ test("Dynamo agent updates preserve provider foreign keys", async () => {
 test("POST activate provisions the DID before syncing Retell and keeps Symantic route ids", async () => {
   const events = [];
   const agent = receptionistAgent();
+  agent.configuration.knowledgeBaseText = "Appointments require 24 hours notice for cancellation.";
   const profile = receptionistProfile();
   const store = {
     async ensureWorkspace() {},
@@ -545,6 +590,10 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
       },
     },
     retell: {
+      async createKnowledgeBase(input) {
+        events.push(["createKnowledgeBase", input]);
+        return { knowledgeBaseId: "knowledge-base-123", status: "in_progress" };
+      },
       async upsertAgent(input) {
         events.push(["retell", input]);
         return { retellAgentId: "retell-agent-123" };
@@ -588,6 +637,16 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   const retellInput = events.find(([name]) => name === "retell")[1];
   assert.equal(retellInput.symanticAgentId, "agent-123");
   assert.match(retellInput.config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
+  assert.deepEqual(retellInput.config.knowledgeBaseIds, ["knowledge-base-123"]);
+  assert.deepEqual(events.find(([name]) => name === "createKnowledgeBase")[1].texts, [{
+    title: "Customer-provided knowledge",
+    text: "Appointments require 24 hours notice for cancellation.",
+  }]);
+  assert.ok(events.some(([name, , , updates]) =>
+    name === "updateAgentRuntime" &&
+    updates?.retellKnowledgeBaseId === "knowledge-base-123" &&
+    typeof updates?.retellKnowledgeBaseFingerprint === "string"
+  ));
   assert.ok(retellInput.config.tools.filter(({ type }) => type === "custom").every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")
   ));

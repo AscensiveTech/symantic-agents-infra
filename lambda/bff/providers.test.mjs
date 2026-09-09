@@ -94,7 +94,7 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push([String(url), init]);
-    if (String(url).endsWith("/list-agents")) {
+    if (String(url).includes("/v2/list-agents")) {
       return response([]);
     }
     if (String(url).endsWith("/create-retell-llm")) {
@@ -124,12 +124,17 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
   assert.deepEqual(result, {
     retellAgentId: "retell-agent-123",
   });
-  assert.equal(calls[0][0], "https://api.retellai.com/list-agents");
+  assert.equal(calls[0][0], "https://api.retellai.com/v2/list-agents?limit=1000");
+  assert.deepEqual(JSON.parse(calls[0][1].body), {
+    filter_criteria: { channel: { op: "eq", value: "voice" } },
+  });
   assert.equal(calls[1][0], "https://api.retellai.com/create-retell-llm");
   assert.deepEqual(JSON.parse(calls[1][1].body), {
+    start_speaker: "agent",
     begin_message: "Thanks for calling.",
     general_prompt: "Compiled prompt",
     general_tools: config.tools,
+    knowledge_base_ids: [],
   });
   assert.equal(calls[2][0], "https://api.retellai.com/create-agent");
   assert.deepEqual(JSON.parse(calls[2][1].body), {
@@ -184,11 +189,43 @@ test("Retell imports a Telnyx DID and binds it to the synced agent", async () =>
   });
 });
 
+test("Retell lists voices and creates a multipart knowledge base", async () => {
+  const calls = [];
+  const client = createRetellClient({
+    apiKey: "retell-key",
+    fetchImpl: async (url, init = {}) => {
+      calls.push([String(url), init]);
+      if (String(url).endsWith("/list-voices")) {
+        return response([{ voice_id: "11labs-Hailey", voice_name: "Hailey", gender: "female" }]);
+      }
+      return response({ knowledge_base_id: "knowledge_base-123", status: "in_progress" }, 201);
+    },
+  });
+
+  assert.equal((await client.listVoices())[0].voice_id, "11labs-Hailey");
+  const created = await client.createKnowledgeBase({
+    name: "Symantic agent-123",
+    texts: [{ title: "Customer-provided knowledge", text: "Open weekdays." }],
+    files: [{ name: "policies.txt", contentType: "text/plain", data: new TextEncoder().encode("Policy") }],
+  });
+
+  assert.deepEqual(created, { knowledgeBaseId: "knowledge_base-123", status: "in_progress" });
+  assert.equal(calls[1][0], "https://api.retellai.com/create-knowledge-base");
+  assert.equal(calls[1][1].headers.Authorization, "Bearer retell-key");
+  assert.equal(calls[1][1].headers["Content-Type"], undefined);
+  assert.equal(calls[1][1].body.get("knowledge_base_name"), "Symantic agent-123");
+  assert.equal(
+    calls[1][1].body.get("knowledge_base_texts"),
+    JSON.stringify([{ title: "Customer-provided knowledge", text: "Open weekdays." }]),
+  );
+  assert.equal(calls[1][1].body.get("knowledge_base_files").name, "policies.txt");
+});
+
 test("Retell upsert reuses a Symantic-named agent instead of creating another", async () => {
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push([String(url), init]);
-    if (String(url).endsWith("/list-agents")) {
+    if (String(url).includes("/v2/list-agents")) {
       return response([{
         agent_id: "retell-existing",
         agent_name: "Symantic agent-123 · Maya",
@@ -219,7 +256,7 @@ test("Retell upsert reuses a Symantic-named agent instead of creating another", 
   assert.deepEqual(result, {
     retellAgentId: "retell-existing",
   });
-  assert.equal(calls[0][0], "https://api.retellai.com/list-agents");
+  assert.equal(calls[0][0], "https://api.retellai.com/v2/list-agents?limit=1000");
   assert.equal(
     calls[1][0],
     "https://api.retellai.com/update-retell-llm/llm-existing",
@@ -238,7 +275,7 @@ test("Retell upsert looks up by Symantic name after a stored agent id 404s", asy
     if (String(url).includes("/get-agent/")) {
       return response({ message: "not found" }, 404);
     }
-    if (String(url).endsWith("/list-agents")) {
+    if (String(url).includes("/v2/list-agents")) {
       return response({
         agents: [{
           agent_id: "retell-recovered",
@@ -276,7 +313,7 @@ test("Retell upsert looks up by Symantic name after a stored agent id 404s", asy
     calls[0][0],
     "https://api.retellai.com/get-agent/retell-stale",
   );
-  assert.equal(calls[1][0], "https://api.retellai.com/list-agents");
+  assert.equal(calls[1][0], "https://api.retellai.com/v2/list-agents?limit=1000");
   assert.ok(!calls.some(([url]) => url.endsWith("/create-agent")));
 });
 
@@ -377,7 +414,7 @@ test("Retell agent body carries the call-handling settings from config.retellAge
     apiKey: "retell-key",
     fetchImpl: async (url, init = {}) => {
       calls.push([String(url), init]);
-      if (String(url).endsWith("/list-agents")) return response([], 200);
+      if (String(url).includes("/v2/list-agents")) return response([], 200);
       if (String(url).endsWith("/create-retell-llm")) return response({ llm_id: "llm-1" }, 201);
       return response({ agent_id: "retell-agent-1" }, 201);
     },

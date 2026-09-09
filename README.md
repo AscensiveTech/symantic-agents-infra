@@ -109,6 +109,14 @@ Intended production mapping:
 
 Do not put API keys or SIP credentials in Terraform variables, source files, or committed examples. See the current Retell Telnyx/custom-telephony guides before live setup because SIP IP allowlists and provider settings can change.
 
+## Retell receptionist voices and knowledge bases
+
+The authenticated BFF exposes a curated receptionist catalog at `GET /workspaces/me/retell/voices`. It refreshes metadata and preview audio from Retell's `GET /list-voices` API while keeping the product choice fixed at Hailey plus two other female voices and three male voices. Agent drafts store the Retell `voice_id`, so no secret-side label mapping is required for these choices.
+
+Customer knowledge files upload directly to the private, workspace-scoped knowledge-assets S3 bucket through `POST /workspaces/me/knowledge-assets/upload-url`; the browser never receives the Retell API key. The product accepts Retell-supported document extensions, up to 25 files, 50 MB per file, and 100 MB total. Direct text is stored in the agent configuration with the uploaded file metadata.
+
+On test or activation, the BFF hashes the text and file metadata. If the hash changed, it downloads the workspace objects, creates a new Retell knowledge base with `POST /create-knowledge-base`, and places its ID in the Retell LLM's `knowledge_base_ids`. The old Retell knowledge base is deleted only after the agent update succeeds. An unchanged hash reuses the current knowledge base, which prevents duplicate sources across repeated tests.
+
 ## SignWell proposal signing
 
 Terraform creates the SignWell secret and the public, HMAC-verified webhook

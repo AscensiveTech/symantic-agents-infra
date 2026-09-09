@@ -33,6 +33,8 @@ locals {
     "PUT /workspaces/me/agents/{agentId}",
     "POST /workspaces/me/agents/{agentId}/activate",
     "POST /workspaces/me/agents/{agentId}/start-test-call",
+    "GET /workspaces/me/retell/voices",
+    "POST /workspaces/me/knowledge-assets/upload-url",
     "GET /workspaces/me/usage",
     "GET /workspaces/me/proposal-usage",
     "GET /workspaces/me/proposal-payments",

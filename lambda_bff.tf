@@ -127,8 +127,8 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.legal_documents.arn
       },
       {
-        Sid      = "ManageLegalAcceptances"
-        Effect   = "Allow"
+        Sid    = "ManageLegalAcceptances"
+        Effect = "Allow"
         # TransactWriteItems, not BatchWriteItem: the HISTORY audit row and the
         # LATEST pointer are written together or not at all (see
         # recordLegalAcceptance). Mirrors ManageLegalDocuments above.
@@ -162,6 +162,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
         Resource = "${aws_s3_bucket.call_artifacts.arn}/*"
+      },
+      {
+        Sid      = "ManageKnowledgeAssets"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.knowledge_assets.arn}/*"
       },
     ]
   })
@@ -224,11 +230,10 @@ resource "aws_lambda_function" "bff" {
   runtime       = "nodejs20.x"
   handler       = "index.handler"
   architectures = ["arm64"]
-  # Memory = CPU on Lambda. At 256 MB (~0.15 vCPU on Graviton) the proposals
-  # list ran 4-7 s. Since GET /workspaces/me/proposals returns a ~12-field
-  # projection (not whole proposal bodies), that call is ~20 ms; 512 MB
-  # (~0.3 vCPU) covers it with cold-start headroom. Actual memory used ~160 MB.
-  memory_size = 512
+  # Memory = CPU on Lambda. Knowledge-base sync can temporarily hold up to the
+  # product's 100 MB upload allowance while constructing Retell multipart data,
+  # so keep enough heap and network CPU headroom for that path.
+  memory_size = 1024
   timeout     = 29
 
   filename         = data.archive_file.bff.output_path
@@ -253,6 +258,7 @@ resource "aws_lambda_function" "bff" {
       COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
       CALL_ARTIFACTS_BUCKET       = aws_s3_bucket.call_artifacts.bucket
+      KNOWLEDGE_ASSETS_BUCKET     = aws_s3_bucket.knowledge_assets.bucket
       RETELL_SECRET_ARN           = aws_secretsmanager_secret.providers["retell"].arn
       TELNYX_SECRET_ARN           = aws_secretsmanager_secret.providers["telnyx"].arn
       SIGNWELL_SECRET_ARN         = aws_secretsmanager_secret.providers["signwell"].arn

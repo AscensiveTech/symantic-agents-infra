@@ -61,9 +61,12 @@ const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PROPOSAL_ASSET_KEY_PATTERN = /^(templates|proposals|exports)\/[A-Za-z0-9_./-]+\.pdf$/;
+const KNOWLEDGE_ASSET_KEY_PATTERN = /^knowledge-base\/[0-9a-f-]{36}\/[A-Za-z0-9._-]+\.(?:bmp|csv|doc|docx|eml|epub|heic|html|jpe?g|md|msg|odt|org|p7s|pdf|png|ppt|pptx|rst|rtf|tiff|txt|tsv|xls|xlsx|xml)$/i;
 const COMPANY_LOGO_KEY_PATTERN = /^company\/logo-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_CONTENT_TYPE_PATTERN = /^image\/[A-Za-z0-9][A-Za-z0-9.+-]*$/;
 const MAX_COMPANY_LOGO_BYTES = 10 * 1024 * 1024;
+const MAX_KNOWLEDGE_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_KNOWLEDGE_TOTAL_BYTES = 100 * 1024 * 1024;
 const MAX_DYNAMO_RECORD_BYTES = 350 * 1024;
 const WORKSPACE_ROLES = new Set(["super-admin", "company-admin", "quotation-builder"]);
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -91,6 +94,34 @@ function json(statusCode, body) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   };
+}
+
+const RECEPTIONIST_VOICE_CATALOG = [
+  { voiceId: "11labs-Hailey", name: "Hailey", gender: "female", provider: "ElevenLabs" },
+  { voiceId: "11labs-Grace", name: "Grace", gender: "female", provider: "ElevenLabs" },
+  { voiceId: "11labs-Paola", name: "Paola", gender: "female", provider: "ElevenLabs" },
+  { voiceId: "11labs-Brian", name: "Brian", gender: "male", provider: "ElevenLabs" },
+  { voiceId: "11labs-Noah", name: "Noah", gender: "male", provider: "ElevenLabs" },
+  { voiceId: "retell-Cimo", name: "Adrian", gender: "male", provider: "Retell" },
+];
+
+export function curateReceptionistVoices(voices) {
+  const available = Array.isArray(voices) ? voices : [];
+  return RECEPTIONIST_VOICE_CATALOG.map((fallback) => {
+    const match = available.find((voice) =>
+      voice?.voice_id === fallback.voiceId ||
+      String(voice?.voice_name ?? "").toLowerCase() === fallback.name.toLowerCase()
+    );
+    if (!match) return fallback;
+    return {
+      voiceId: match.voice_id ?? fallback.voiceId,
+      name: match.voice_name ?? fallback.name,
+      gender: String(match.gender ?? fallback.gender).toLowerCase() === "male" ? "male" : "female",
+      provider: match.provider ?? fallback.provider,
+      ...(match.accent ? { accent: match.accent } : {}),
+      ...(match.preview_audio_url ? { previewAudioUrl: match.preview_audio_url } : {}),
+    };
+  });
 }
 
 function readBody(event) {
@@ -213,7 +244,8 @@ function pickAgent(value, routeAgentId) {
     (value.configuration !== undefined && (
       !value.configuration ||
       typeof value.configuration !== "object" ||
-      Array.isArray(value.configuration)
+      Array.isArray(value.configuration) ||
+      !isValidKnowledgeConfiguration(value.configuration)
     ))
   ) {
     return null;
@@ -227,6 +259,34 @@ function pickAgent(value, routeAgentId) {
     capabilities: value.capabilities,
     ...(value.configuration === undefined ? {} : { configuration: value.configuration }),
   };
+}
+
+function isValidKnowledgeConfiguration(configuration) {
+  if (
+    configuration.knowledgeBaseText !== undefined &&
+    (typeof configuration.knowledgeBaseText !== "string" || configuration.knowledgeBaseText.length > 100_000)
+  ) return false;
+  if (configuration.knowledgeBaseFiles === undefined) return true;
+  if (!Array.isArray(configuration.knowledgeBaseFiles) || configuration.knowledgeBaseFiles.length > 25) {
+    return false;
+  }
+  let totalBytes = 0;
+  for (const file of configuration.knowledgeBaseFiles) {
+    if (
+      !file ||
+      typeof file !== "object" ||
+      typeof file.id !== "string" ||
+      typeof file.name !== "string" ||
+      typeof file.key !== "string" ||
+      !KNOWLEDGE_ASSET_KEY_PATTERN.test(file.key) ||
+      typeof file.contentType !== "string" ||
+      !Number.isInteger(file.size) ||
+      file.size <= 0 ||
+      file.size > MAX_KNOWLEDGE_FILE_BYTES
+    ) return false;
+    totalBytes += file.size;
+  }
+  return totalBytes <= MAX_KNOWLEDGE_TOTAL_BYTES;
 }
 
 function getAgentId(event, path) {
@@ -370,6 +430,7 @@ export function createHandler({
   getStore = getDefaultStore,
   getUserDirectory = getDefaultUserDirectory,
   getAssetSigner = getDefaultAssetSigner,
+  getKnowledgeSigner = getDefaultKnowledgeSigner,
   getRecordingSigner = getDefaultRecordingSigner,
   getProviders = getDefaultProviders,
   getRetellApiKey = getDefaultRetellApiKey,
@@ -510,6 +571,30 @@ export function createHandler({
       if (path === "/workspaces/me/profile" && method === "GET") {
         await store.ensureWorkspace(workspaceId);
         return json(200, await store.getProfile(workspaceId));
+      }
+
+      if (path === "/workspaces/me/retell/voices" && method === "GET") {
+        const providers = await getProviders();
+        return json(200, curateReceptionistVoices(await providers.retell.listVoices()));
+      }
+
+      if (path === "/workspaces/me/knowledge-assets/upload-url" && method === "POST") {
+        const body = readBody(event);
+        if (
+          !KNOWLEDGE_ASSET_KEY_PATTERN.test(body?.key ?? "") ||
+          !Number.isInteger(body?.bytes) ||
+          body.bytes <= 0 ||
+          body.bytes > MAX_KNOWLEDGE_FILE_BYTES ||
+          typeof body?.contentType !== "string" ||
+          body.contentType.length > 200
+        ) {
+          return json(400, { message: "Invalid knowledge file upload" });
+        }
+        const signer = await getKnowledgeSigner();
+        return json(200, {
+          url: await signer.createUploadUrl(workspaceId, body.key, body.contentType),
+          key: body.key,
+        });
       }
 
       if (path === "/workspaces/me/agents" && method === "GET") {
@@ -659,6 +744,7 @@ export function createHandler({
           profile,
           store,
           providers,
+          getKnowledgeSigner,
           toolBaseUrl,
           phoneStatus: "active",
         });
@@ -713,6 +799,7 @@ export function createHandler({
           profile,
           store,
           providers,
+          getKnowledgeSigner,
           toolBaseUrl,
           phoneStatus: agent.status === "active" ? "active" : "draft",
         });
@@ -3014,6 +3101,7 @@ async function syncReceptionistRuntime({
   profile,
   store,
   providers,
+  getKnowledgeSigner,
   toolBaseUrl,
   phoneStatus,
 }) {
@@ -3044,22 +3132,53 @@ async function syncReceptionistRuntime({
     toolBaseUrl,
     voiceId,
   });
-  const synced = await providers.retell.upsertAgent({
-    retellAgentId: agent.retellAgentId,
-    symanticAgentId: agentId,
-    agentName: agent?.configuration?.name ?? agent.name,
-    greeting: agent?.configuration?.greeting ?? "",
-    config,
+  const knowledge = await syncKnowledgeBase({
+    workspaceId,
+    agentId,
+    agent,
+    providers,
+    getKnowledgeSigner,
   });
+  config.knowledgeBaseIds = knowledge.knowledgeBaseId
+    ? [knowledge.knowledgeBaseId]
+    : [];
+  let synced;
   try {
+    synced = await providers.retell.upsertAgent({
+      retellAgentId: agent.retellAgentId,
+      symanticAgentId: agentId,
+      agentName: agent?.configuration?.name ?? agent.name,
+      greeting: agent?.configuration?.greeting ?? "",
+      config,
+    });
+  } catch (error) {
+    if (knowledge.created && knowledge.knowledgeBaseId) {
+      await providers.retell.deleteKnowledgeBase(knowledge.knowledgeBaseId).catch(() => {});
+    }
+    throw error;
+  }
+  try {
+    const runtimeUpdates = { retellAgentId: synced.retellAgentId };
+    if (knowledge.fingerprint || knowledge.previousKnowledgeBaseId) {
+      runtimeUpdates.retellKnowledgeBaseId = knowledge.knowledgeBaseId;
+      runtimeUpdates.retellKnowledgeBaseFingerprint = knowledge.fingerprint;
+    }
     await store.updateAgentRuntime(
       workspaceId,
       agentId,
-      { retellAgentId: synced.retellAgentId },
+      runtimeUpdates,
     );
   } catch (error) {
     if (isConditionalCheckFailed(error)) throw error;
     console.error("Failed to persist retellAgentId after Retell upsert", error);
+  }
+  if (
+    knowledge.previousKnowledgeBaseId &&
+    knowledge.previousKnowledgeBaseId !== knowledge.knowledgeBaseId
+  ) {
+    await providers.retell.deleteKnowledgeBase(knowledge.previousKnowledgeBaseId).catch((error) => {
+      console.error("Failed to delete superseded Retell knowledge base", error);
+    });
   }
   if (!phoneNumber.retellPhoneNumberId) {
     const imported = await providers.retell.importPhoneNumber({
@@ -3098,6 +3217,85 @@ async function syncReceptionistRuntime({
   return {
     phoneNumber,
     retellAgentId: synced.retellAgentId,
+  };
+}
+
+async function syncKnowledgeBase({
+  workspaceId,
+  agentId,
+  agent,
+  providers,
+  getKnowledgeSigner,
+}) {
+  const knowledgeText = typeof agent?.configuration?.knowledgeBaseText === "string"
+    ? agent.configuration.knowledgeBaseText.trim()
+    : "";
+  const fileMetadata = Array.isArray(agent?.configuration?.knowledgeBaseFiles)
+    ? agent.configuration.knowledgeBaseFiles.filter((file) =>
+      file &&
+      typeof file.name === "string" &&
+      typeof file.key === "string" &&
+      KNOWLEDGE_ASSET_KEY_PATTERN.test(file.key) &&
+      typeof file.contentType === "string" &&
+      Number.isInteger(file.size) &&
+      file.size > 0 &&
+      file.size <= MAX_KNOWLEDGE_FILE_BYTES
+    )
+    : [];
+  const previousKnowledgeBaseId = typeof agent?.retellKnowledgeBaseId === "string"
+    ? agent.retellKnowledgeBaseId
+    : null;
+  if (fileMetadata.reduce((total, file) => total + file.size, 0) > MAX_KNOWLEDGE_TOTAL_BYTES) {
+    throw new Error("Knowledge files exceed the 100 MB total limit");
+  }
+  const fingerprint = knowledgeText || fileMetadata.length
+    ? createHash("sha256").update(JSON.stringify({
+      text: knowledgeText,
+      files: fileMetadata.map(({ key, name, contentType, size }) => ({ key, name, contentType, size })),
+    })).digest("hex")
+    : null;
+
+  if (!fingerprint) {
+    return { knowledgeBaseId: null, fingerprint: null, previousKnowledgeBaseId, created: false };
+  }
+  if (
+    previousKnowledgeBaseId &&
+    fingerprint === agent?.retellKnowledgeBaseFingerprint
+  ) {
+    return {
+      knowledgeBaseId: previousKnowledgeBaseId,
+      fingerprint,
+      previousKnowledgeBaseId,
+      created: false,
+    };
+  }
+
+  const files = [];
+  if (fileMetadata.length) {
+    const signer = await getKnowledgeSigner();
+    for (const file of fileMetadata) {
+      const url = await signer.createDownloadUrl(workspaceId, file.key);
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Unable to read knowledge file ${file.name} (${response.status})`);
+      }
+      files.push({
+        name: file.name,
+        contentType: file.contentType,
+        data: new Uint8Array(await response.arrayBuffer()),
+      });
+    }
+  }
+  const created = await providers.retell.createKnowledgeBase({
+    name: `Symantic ${agentId}`.slice(0, 39),
+    texts: knowledgeText ? [{ title: "Customer-provided knowledge", text: knowledgeText }] : [],
+    files,
+  });
+  return {
+    knowledgeBaseId: created.knowledgeBaseId,
+    fingerprint,
+    previousKnowledgeBaseId,
+    created: true,
   };
 }
 
@@ -3337,6 +3535,8 @@ function toPublicAgent(item) {
     agentId,
     retellAgentId: _retellAgentId,
     retellLlmId: _retellLlmId,
+    retellKnowledgeBaseId: _retellKnowledgeBaseId,
+    retellKnowledgeBaseFingerprint: _retellKnowledgeBaseFingerprint,
     telnyxNumberId: _telnyxNumberId,
     telnyxPhoneNumber: _telnyxPhoneNumber,
     ...agent
@@ -4436,6 +4636,22 @@ async function getDefaultRecordingSigner() {
     },
   }));
   return recordingSignerPromise;
+}
+
+let knowledgeSignerPromise;
+async function getDefaultKnowledgeSigner() {
+  const bucket = process.env.KNOWLEDGE_ASSETS_BUCKET;
+  if (!bucket) throw new Error("KNOWLEDGE_ASSETS_BUCKET is required");
+  knowledgeSignerPromise ??= Promise.resolve(createS3AssetSigner({
+    bucket,
+    region: process.env.AWS_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      sessionToken: process.env.AWS_SESSION_TOKEN,
+    },
+  }));
+  return knowledgeSignerPromise;
 }
 
 export function createS3AssetSigner({ bucket, region, credentials, now = () => new Date() }) {
