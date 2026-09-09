@@ -28,7 +28,7 @@ export const DEFAULT_LEGAL_DOCUMENTS = {
     effectiveFrom: "2026-09-01",
     content: [
       "Effective date: September 1, 2026",
-      "Provided by: AscensiveTech (the \"Company\", \"we\", \"us\"). RapidProposal is part of the Symantic platform and is hosted through our partner, Symantic.ai.",
+      "Provided by: AscensiveTech (the \"Company\", \"we\", \"us\"). RapidProposal is a product of AscensiveTech and is hosted on infrastructure operated by AscensiveTech's technology partner, Symantic.ai.",
       "Governing law: United States, State of Maryland",
       "",
       "1. Acceptance",
@@ -79,7 +79,7 @@ export const DEFAULT_LEGAL_DOCUMENTS = {
       "These Terms are governed by the laws of the State of Maryland, USA, without regard to conflict-of-law principles.",
       "",
       "15. Intellectual Property",
-      "RapidProposal's software, design, and platform are owned by AscensiveTech and its partner Symantic.ai. Nothing in these Terms transfers any ownership of the platform itself to you.",
+      "RapidProposal, including its software and design, is owned by AscensiveTech. It runs on infrastructure operated by AscensiveTech's technology partner, Symantic.ai, which does not thereby acquire any ownership of RapidProposal. Nothing in these Terms transfers any ownership of RapidProposal to you.",
       "",
       "16. General Terms",
       "These Terms are the entire agreement between you and us regarding RapidProposal. If any provision is found unenforceable, the remaining provisions stay in effect. Our failure to enforce a provision is not a waiver of it. You may not assign these Terms without our consent; we may assign them freely.",
@@ -97,7 +97,7 @@ export const DEFAULT_LEGAL_DOCUMENTS = {
     effectiveFrom: "2026-09-01",
     content: [
       "Effective date: September 1, 2026",
-      "Provided by: AscensiveTech (\"Company\", \"we\", \"us\"). RapidProposal is part of the Symantic platform, hosted through our partner, Symantic.ai.",
+      "Provided by: AscensiveTech (\"Company\", \"we\", \"us\"). RapidProposal is a product of AscensiveTech, hosted on infrastructure operated by our technology partner, Symantic.ai.",
       "",
       "This Privacy Policy is informational. You can read and download it at any time, but unlike our Terms & Conditions, you are not asked to separately accept or reject it.",
       "",

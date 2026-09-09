@@ -72,6 +72,7 @@ locals {
     "POST /workspaces/me/proposal-assets/upload-url",
     "POST /workspaces/me/proposal-assets/download-url",
     "GET /workspaces/me/users",
+    "GET /workspaces/me/users/{userId}",
     "POST /workspaces/me/users",
     "PATCH /workspaces/me/users/{userId}",
     "DELETE /workspaces/me/users/{userId}",

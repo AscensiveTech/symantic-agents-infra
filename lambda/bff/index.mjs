@@ -2028,6 +2028,14 @@ async function handleWorkspaceUsers(event, {
     return json(200, updated);
   }
 
+  // Any user can read their OWN membership - the shell uses it for the
+  // display name so a super-admin rename shows up without a re-login.
+  if (path === "/workspaces/me/users/me" && method === "GET") {
+    const self = await store.getMembership(actor.userId);
+    if (!self || self.workspaceId !== actor.workspaceId) return json(404, { message: "Workspace user not found" });
+    return json(200, self);
+  }
+
   if (!isWorkspaceAdmin(actor)) return json(403, { message: "Company administrator access is required" });
 
   if (path === "/workspaces/me/users" && method === "GET") {
