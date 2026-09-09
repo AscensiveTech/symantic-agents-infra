@@ -27,8 +27,6 @@ export const DEFAULT_LEGAL_DOCUMENTS = {
     title: "RapidProposal — Terms & Conditions",
     effectiveFrom: "2026-09-01",
     content: [
-      "This is a starting draft and should be reviewed by counsel before it is relied upon.",
-      "",
       "Effective date: September 1, 2026",
       "Provided by: AscensiveTech (the \"Company\", \"we\", \"us\"). RapidProposal is part of the Symantic platform and is hosted through our partner, Symantic.ai.",
       "Governing law: United States, State of Maryland",
