@@ -1254,6 +1254,7 @@ async function getProposalStorageBytes(workspaceId) {
     s3ListPromise ??= import("@aws-sdk/client-s3").then((m) => ({
       client: new m.S3Client({ region: process.env.AWS_REGION }),
       ListObjectsV2Command: m.ListObjectsV2Command,
+      DeleteObjectsCommand: m.DeleteObjectsCommand,
     }));
     const { client, ListObjectsV2Command } = await s3ListPromise;
     let total = 0;
@@ -1273,6 +1274,50 @@ async function getProposalStorageBytes(workspaceId) {
   } catch (error) {
     console.warn("[proposals] storage size lookup failed", { workspaceId, error: error?.message });
     return null;
+  }
+}
+
+// Best-effort removal of a single proposal's stored PDFs when it is
+// permanently deleted (from the "Deleted" bucket on Billing & Usage). Shared
+// template assets are left alone - only this proposal's own keys are removed.
+// Any failure is swallowed: the DynamoDB row is already gone, an orphaned
+// object just counts against storage until a later sweep.
+async function deleteProposalAssets(workspaceId, proposalId) {
+  const bucket = process.env.PROPOSAL_ASSETS_BUCKET;
+  if (!bucket || !workspaceId || !proposalId) return;
+  try {
+    s3ListPromise ??= import("@aws-sdk/client-s3").then((m) => ({
+      client: new m.S3Client({ region: process.env.AWS_REGION }),
+      ListObjectsV2Command: m.ListObjectsV2Command,
+      DeleteObjectsCommand: m.DeleteObjectsCommand,
+    }));
+    const { client, ListObjectsV2Command, DeleteObjectsCommand } = await s3ListPromise;
+    const base = `workspaces/${workspaceId}/`;
+    const keys = new Set([
+      `${base}exports/${proposalId}.pdf`,
+      `${base}signed/${proposalId}.pdf`,
+    ]);
+    let ContinuationToken;
+    let pages = 0;
+    do {
+      const res = await client.send(new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: `${base}proposals/${proposalId}/`,
+        ...(ContinuationToken ? { ContinuationToken } : {}),
+      }));
+      for (const obj of res.Contents ?? []) if (obj.Key) keys.add(obj.Key);
+      ContinuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+      pages += 1;
+    } while (ContinuationToken && pages < 50);
+    const list = [...keys];
+    for (let i = 0; i < list.length; i += 1000) {
+      await client.send(new DeleteObjectsCommand({
+        Bucket: bucket,
+        Delete: { Objects: list.slice(i, i + 1000).map((Key) => ({ Key })), Quiet: true },
+      }));
+    }
+  } catch (error) {
+    console.warn("[proposals] asset cleanup failed", { workspaceId, proposalId, error: error?.message });
   }
 }
 
@@ -2873,7 +2918,9 @@ async function handleProposalApi(event, {
       }
     }
     if (method === "DELETE") {
+      // Permanent delete (soft-delete / "Canceled" is a PATCH of canceledAt).
       await store.deleteProposal(workspaceId, proposalId);
+      await deleteProposalAssets(workspaceId, proposalId);
       return json(200, { ok: true });
     }
   }
