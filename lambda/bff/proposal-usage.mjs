@@ -95,7 +95,7 @@ function meter(used, limit) {
  * @param {Array} monthRows `{ period: 'YYYY-MM', proposalsCreated, signaturesSent }`, any months
  * @param {{tier:string, now:Date, timezone:string}} ctx
  */
-export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes = null }) {
+export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes = null, storageByState = null }) {
   const normalizedTier = PROPOSAL_LIMITS[tier] ? tier : "basic";
   const limits = limitsForTier(normalizedTier);
   const period = periodKey(now ?? new Date(), timezone || "UTC");
@@ -106,6 +106,16 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
       usedBytes: Math.round(storageBytes),
       limitBytes: storageLimit,
       state: usageStateFor(storageBytes, storageLimit),
+      // iPhone-style segmented bar, by document STATE (not signing status).
+      byState: storageByState && typeof storageByState === "object"
+        ? {
+          openInProgress: Math.max(0, Math.round(storageByState.openInProgress ?? 0)),
+          closed: Math.max(0, Math.round(storageByState.closed ?? 0)),
+          signed: Math.max(0, Math.round(storageByState.signed ?? 0)),
+          deleted: Math.max(0, Math.round(storageByState.deleted ?? 0)),
+          unattributed: Math.max(0, Math.round(storageByState.unattributed ?? 0)),
+        }
+        : null,
     }
     : null;
 
@@ -269,17 +279,36 @@ export function buildPlanChangePreview(workspace, fromTier, toTier, { now, timez
 }
 
 function normalizePayment(row) {
+  const str = (v) => (typeof v === "string" ? v : "");
   return {
-    paymentId: typeof row?.paymentId === "string" ? row.paymentId : "",
-    paidAt: typeof row?.paidAt === "string" ? row.paidAt : "",
-    planLabel: typeof row?.planLabel === "string" ? row.planLabel : "",
+    paymentId: str(row?.paymentId),
+    paidAt: str(row?.paidAt),
+    planLabel: str(row?.planLabel),
     amount: money(row?.amount) ?? 0,
-    receivedBy: typeof row?.receivedBy === "string" ? row.receivedBy : "",
-    method: typeof row?.method === "string" ? row.method : "",
-    note: typeof row?.note === "string" ? row.note : "",
-    loggedByName: typeof row?.loggedByName === "string" ? row.loggedByName : "",
-    createdAt: typeof row?.createdAt === "string" ? row.createdAt : "",
+    receivedBy: str(row?.receivedBy),
+    method: str(row?.method),
+    note: str(row?.note),
+    loggedByName: str(row?.loggedByName),
+    createdAt: str(row?.createdAt),
+    // Soft-delete: a canceled payment stays in the history as a struck-through
+    // entry and no longer counts toward received totals.
+    canceledAt: str(row?.canceledAt),
+    canceledByName: str(row?.canceledByName),
+    cancelReason: str(row?.cancelReason),
+    editedAt: str(row?.editedAt),
+    editedByName: str(row?.editedByName),
+    editReason: str(row?.editReason),
   };
+}
+
+// A payment record is editable / cancelable for one year from its paidAt date.
+export function paymentWithinEditWindow(paidAt, now = new Date()) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(paidAt ?? "")) return false;
+  const paid = new Date(`${paidAt}T00:00:00Z`);
+  if (Number.isNaN(paid.getTime())) return false;
+  const oneYearLater = new Date(paid);
+  oneYearLater.setUTCFullYear(oneYearLater.getUTCFullYear() + 1);
+  return now.getTime() <= oneYearLater.getTime();
 }
 
 /**
@@ -312,13 +341,21 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
   const anchorDay = billingAnchorDay(workspace, now, tz);
   const creditBalance = Math.max(0, money(workspace?.billingCreditBalance) ?? 0);
   const creditApplied = Math.min(creditBalance, monthlyPrice);
+  // A billing start date that hasn't arrived yet: the first charge is that
+  // exact date (not the recurring day-of-month), for the full price.
+  const today = dayKey(now, tz);
+  const startDate = typeof workspace?.billingAnchorDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(workspace.billingAnchorDate)
+    ? workspace.billingAnchorDate
+    : null;
+  const notStarted = startDate != null && startDate > today;
   const upcoming = {
-    dueOn: nextBillingDate(dayKey(now, tz), anchorDay),
+    dueOn: notStarted ? startDate : nextBillingDate(today, anchorDay),
     planLabel,
-    amount: money(monthlyPrice - creditApplied) ?? monthlyPrice,
+    amount: notStarted ? monthlyPrice : (money(monthlyPrice - creditApplied) ?? monthlyPrice),
     billingDay: anchorDay,
     creditBalance,
-    creditApplied,
+    creditApplied: notStarted ? 0 : creditApplied,
+    notStarted,
   };
 
   return { tier: normalizedTier, planLabel, monthlyPrice, priceOverridden, upcoming, payments };

@@ -15,6 +15,7 @@ locals {
     "GET /platform/companies/{workspaceId}/proposal-payments",
     "POST /platform/companies/{workspaceId}/proposal-payments",
     "DELETE /platform/companies/{workspaceId}/proposal-payments/{paymentId}",
+    "PATCH /platform/companies/{workspaceId}/proposal-payments/{paymentId}",
     "GET /platform/billing",
     "POST /platform/legal",
     "GET /workspaces/me/legal",

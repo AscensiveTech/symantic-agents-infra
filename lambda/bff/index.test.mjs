@@ -2411,6 +2411,7 @@ test("super administrators onboard a company with an isolated default template",
     adminName: "AJM",
     temporaryPassword: "Temporary123!",
     tier: "repository",
+    billingAnchorDate: "2099-01-01",
     allowedProposalSections: ["cover", "agenda", "parts", "closing"],
     defaultTemplateSections: ["cover", "agenda", "closing"],
   });
@@ -3288,10 +3289,21 @@ test("a super admin logs a payment for a company and it shows up in that company
   assert.equal(JSON.parse(orgView.body).payments.length, 1);
 
   const paymentId = afterLog.payments[0].paymentId;
-  const del = authenticatedEvent("DELETE", `/platform/companies/user-123/proposal-payments/${paymentId}`, undefined, { paidAt: "2026-09-10" });
+  // A reason is required.
+  const noReason = authenticatedEvent("DELETE", `/platform/companies/user-123/proposal-payments/${paymentId}`, undefined, { paidAt: "2026-09-10" });
+  noReason.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(noReason)).statusCode, 400);
+
+  // Soft delete - the record stays as a cancelled entry.
+  const del = authenticatedEvent("DELETE", `/platform/companies/user-123/proposal-payments/${paymentId}`, { reason: "duplicate of the Sept invoice" }, { paidAt: "2026-09-10" });
   del.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
-  assert.equal((await handler(del)).statusCode, 200);
-  assert.equal(store._payments.size, 0);
+  const afterDel = await handler(del);
+  assert.equal(afterDel.statusCode, 200);
+  const delBody = JSON.parse(afterDel.body);
+  assert.equal(store._payments.size, 1);
+  assert.equal(delBody.payments.length, 1);
+  assert.ok(delBody.payments[0].canceledAt);
+  assert.equal(delBody.payments[0].cancelReason, "duplicate of the Sept invoice");
 });
 
 test("PATCH /platform/companies/{id} accepts a per-company proposal price override", async () => {

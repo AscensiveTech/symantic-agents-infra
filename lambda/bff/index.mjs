@@ -22,6 +22,7 @@ import {
   buildProposalUsage,
   dayKey,
   firstOfNextMonthKey,
+  paymentWithinEditWindow,
   resolveProposalMonthlyPrice,
   validProposalPayment,
 } from "./proposal-usage.mjs";
@@ -963,8 +964,11 @@ async function handlePlatformCompanies(event, {
       const proposalPrice = body?.proposalPlanPriceOverride;
       const proposalPriceValid = proposalPrice === null || proposalPrice === ""
         || (typeof proposalPrice === "number" && Number.isFinite(proposalPrice) && proposalPrice >= 0);
+      const anchorTodayKey = new Date().toISOString().slice(0, 10);
       const anchorValid = body?.billingAnchorDate === null || body?.billingAnchorDate === ""
-        || (typeof body?.billingAnchorDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.billingAnchorDate));
+        || (typeof body?.billingAnchorDate === "string"
+          && /^\d{4}-\d{2}-\d{2}$/.test(body.billingAnchorDate)
+          && body.billingAnchorDate >= anchorTodayKey);
       const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
         || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
       if (
@@ -1056,12 +1060,39 @@ async function handlePlatformCompanies(event, {
       return json(201, await loadProposalBilling(store, target.workspaceId));
     }
 
-    if (target.kind === "proposal-payment" && method === "DELETE") {
+    if (target.kind === "proposal-payment" && (method === "DELETE" || method === "PATCH")) {
       const paidAt = event?.queryStringParameters?.paidAt;
       if (typeof paidAt !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(paidAt)) {
         return json(400, { message: "paidAt query parameter is required" });
       }
-      await store.deleteProposalPayment(target.workspaceId, paidAt, target.paymentId);
+      if (!paymentWithinEditWindow(paidAt)) {
+        return json(409, { message: "Payments can only be changed for a year after the payment date." });
+      }
+      const existing = (typeof store.listProposalPayments === "function"
+        ? await store.listProposalPayments(target.workspaceId)
+        : []).find((p) => p.paymentId === target.paymentId && p.paidAt === paidAt);
+      if (!existing) return json(404, { message: "Payment not found" });
+      const body = readBody(event) || {};
+      const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+      if (!reason || reason.length > 500) {
+        return json(400, { message: "A short comment about the change is required." });
+      }
+      const nowIso = new Date().toISOString();
+      const actorName = actor.membership?.name || actor.userId;
+      let next;
+      if (method === "DELETE") {
+        // Soft delete - keep the record, mark it canceled.
+        next = { ...existing, canceledAt: nowIso, canceledByName: actorName, canceledByUserId: actor.userId, cancelReason: reason };
+      } else {
+        const patch = {};
+        for (const field of ["planLabel", "amount", "receivedBy", "method", "note"]) {
+          if (Object.hasOwn(body, field)) patch[field] = body[field];
+        }
+        const merged = validProposalPayment({ ...existing, ...patch });
+        if (!merged) return json(400, { message: "Invalid payment fields." });
+        next = { ...existing, ...merged, editedAt: nowIso, editedByName: actorName, editReason: reason };
+      }
+      await store.putProposalPayment(target.workspaceId, next);
       return json(200, await loadProposalBilling(store, target.workspaceId));
     }
 
@@ -1145,6 +1176,12 @@ async function handlePlatformCompanies(event, {
   const tier = body?.tier ?? "basic";
   const allowedSections = normalizeProposalSections(body?.allowedProposalSections);
   const defaultSections = normalizeProposalSections(body?.defaultTemplateSections);
+  // The super admin must set when billing starts for the new company; it can
+  // be today or any future date (a changeable picker in the edit drawer moves
+  // it later). Format YYYY-MM-DD.
+  const billingAnchorDate = typeof body?.billingAnchorDate === "string" ? body.billingAnchorDate.trim() : "";
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const billingAnchorValid = /^\d{4}-\d{2}-\d{2}$/.test(billingAnchorDate) && billingAnchorDate >= todayKey;
   if (
     name.length < 2 ||
     name.length > 120 ||
@@ -1154,6 +1191,7 @@ async function handlePlatformCompanies(event, {
     typeof temporaryPassword !== "string" ||
     temporaryPassword.length < 12 ||
     !COMPANY_TIERS.has(tier) ||
+    !billingAnchorValid ||
     !allowedSections ||
     !defaultSections ||
     defaultSections.some((section) => !allowedSections.includes(section))
@@ -1168,6 +1206,7 @@ async function handlePlatformCompanies(event, {
     name,
     tier,
     allowedProposalSections: allowedSections,
+    billingAnchorDate,
     createdAt: now,
     createdBy: actor.userId,
   };
@@ -1277,6 +1316,72 @@ async function getProposalStorageBytes(workspaceId) {
   }
 }
 
+// Which "document state" bucket a proposal's stored bytes count towards on
+// the iPhone-style storage bar (deliberately by state, not signing status):
+//   openInProgress = being written / out for signature / partially signed
+//   closed         = closed out by hand (status "completed", no e-signature)
+//   signed         = fully executed via SignWell
+//   deleted        = soft-deleted ("Canceled"), still restorable
+function proposalStorageBucket(proposal) {
+  if (proposal?.canceledAt) return "deleted";
+  if (proposal?.signatureRequest?.status === "completed") return "signed";
+  if (proposal?.status === "completed") return "closed";
+  return "openInProgress";
+}
+
+// Total stored bytes for this workspace, split by document state. Best-effort:
+// any failure (or no bucket) returns null and the segmented bar is hidden.
+// Bytes on keys that don't belong to a single proposal (shared template
+// uploads) land in `unattributed`.
+async function getProposalStorageBreakdown(store, workspaceId) {
+  const bucket = process.env.PROPOSAL_ASSETS_BUCKET;
+  if (!bucket) return null;
+  try {
+    s3ListPromise ??= import("@aws-sdk/client-s3").then((m) => ({
+      client: new m.S3Client({ region: process.env.AWS_REGION }),
+      ListObjectsV2Command: m.ListObjectsV2Command,
+      DeleteObjectsCommand: m.DeleteObjectsCommand,
+    }));
+    const { client, ListObjectsV2Command } = await s3ListPromise;
+    const base = `workspaces/${workspaceId}/`;
+    const bytesByProposal = new Map();
+    let unattributed = 0;
+    let total = 0;
+    let ContinuationToken;
+    let pages = 0;
+    do {
+      const res = await client.send(new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: base,
+        ...(ContinuationToken ? { ContinuationToken } : {}),
+      }));
+      for (const obj of res.Contents ?? []) {
+        const size = Number(obj.Size) || 0;
+        total += size;
+        const rest = (obj.Key ?? "").slice(base.length);
+        const match = rest.match(/^(?:proposals\/([^/]+)\/|(?:exports|signed)\/([^/]+)\.pdf$)/);
+        const pid = match?.[1] ?? match?.[2];
+        if (pid) bytesByProposal.set(pid, (bytesByProposal.get(pid) ?? 0) + size);
+        else unattributed += size;
+      }
+      ContinuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+      pages += 1;
+    } while (ContinuationToken && pages < 50);
+
+    const proposals = typeof store.listProposals === "function" ? await store.listProposals(workspaceId) : [];
+    const stateById = new Map(proposals.map((p) => [p.proposalId, proposalStorageBucket(p)]));
+    const byState = { openInProgress: 0, closed: 0, signed: 0, deleted: 0, unattributed };
+    for (const [pid, size] of bytesByProposal) {
+      const state = stateById.get(pid) ?? "openInProgress";
+      byState[state] += size;
+    }
+    return { total, byState };
+  } catch (error) {
+    console.warn("[proposals] storage breakdown failed", { workspaceId, error: error?.message });
+    return null;
+  }
+}
+
 // Best-effort removal of a single proposal's stored PDFs when it is
 // permanently deleted (from the "Deleted" bucket on Billing & Usage). Shared
 // template assets are left alone - only this proposal's own keys are removed.
@@ -1323,14 +1428,16 @@ async function deleteProposalAssets(workspaceId, proposalId) {
 
 // Build the RapidProposal monthly usage view (proposal + signature quotas).
 async function loadProposalUsage(store, workspaceId) {
-  const [workspace, profile, counters, storageBytes] = await Promise.all([
+  const [workspace, profile, counters, storageBreakdown] = await Promise.all([
     typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
     typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
     typeof store.listProposalUsageCounters === "function"
       ? store.listProposalUsageCounters(workspaceId)
       : [],
-    getProposalStorageBytes(workspaceId),
+    getProposalStorageBreakdown(store, workspaceId),
   ]);
+  const storageBytes = storageBreakdown ? storageBreakdown.total : null;
+  const storageByState = storageBreakdown ? storageBreakdown.byState : null;
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
   const tier = normalizeCompanyTier(workspace?.tier);
@@ -1348,7 +1455,7 @@ async function loadProposalUsage(store, workspaceId) {
       if (sk === currentMonth) monthCounter = row;
     }
   }
-  return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes });
+  return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, storageBytes, storageByState });
 }
 
 // Build the RapidProposal billing view (monthly price + logged payment history
@@ -1503,6 +1610,8 @@ async function proposalUsageSummary(store, workspaceId) {
       signaturesUsed: usage.signatures.used,
       signaturesLimit: usage.signatures.limit,
       blocked: usage.blocked,
+      storageUsedBytes: usage.storage ? usage.storage.usedBytes : null,
+      storageLimitBytes: usage.storage ? usage.storage.limitBytes : null,
     };
   } catch {
     return null;
@@ -4192,7 +4301,7 @@ export function createDynamoStore(client, commands, tableNames) {
       const records = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
         expression:
           "workspaceId, proposalId, #name, #status, clientName, clientNameSecondary, " +
-          "presentedBy, assignedTo, dueDate, createdAt, updatedAt, revisedAt, signatureRequest, usageCountedAt",
+          "presentedBy, assignedTo, dueDate, createdAt, updatedAt, revisedAt, canceledAt, signatureRequest, usageCountedAt",
         names: { "#name": "name", "#status": "status" },
       });
       return records.sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""));
