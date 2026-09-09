@@ -2382,11 +2382,11 @@ test("super admin publishes a maintenance notice and it becomes visible only ins
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
 
-  const past = new Date(Date.now() - 3600_000).toISOString();
+  const nowish = new Date(Date.now() - 60_000).toISOString(); // within the 5-min grace
   const future = new Date(Date.now() + 3600_000).toISOString();
 
   const put = await handler(superEvent("PUT", "/platform/system/notice", {
-    title: "Scheduled maintenance", body: "The app will be down 2-3am ET.", startAt: past, endAt: future,
+    title: "Scheduled maintenance", body: "The app will be down 2-3am ET.", startAt: nowish, endAt: future,
   }));
   assert.equal(put.statusCode, 200);
   assert.ok(JSON.parse(put.body).notice.version);
@@ -2408,13 +2408,21 @@ test("maintenance notice PUT validates lengths and dates; clears on empty", asyn
   const store = noticeStore();
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
-  const start = new Date().toISOString();
+  const start = new Date(Date.now() + 60_000).toISOString();
   const end = new Date(Date.now() + 3600_000).toISOString();
 
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "x".repeat(121), body: "ok", startAt: start, endAt: end }))).statusCode, 400);
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "y".repeat(701), startAt: start, endAt: end }))).statusCode, 400);
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: "nonsense", endAt: end }))).statusCode, 400);
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: end, endAt: start }))).statusCode, 400);
+  // start in the past
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: new Date(Date.now() - 3600_000).toISOString(), endAt: end }))).statusCode, 400);
+  // end in the past
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: new Date(Date.now() - 7200_000).toISOString(), endAt: new Date(Date.now() - 3600_000).toISOString() }))).statusCode, 400);
+  // window longer than 7 days
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: start, endAt: new Date(Date.now() + 8 * 24 * 3600_000).toISOString() }))).statusCode, 400);
+  // a valid window in the near future succeeds
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: start, endAt: end }))).statusCode, 200);
 
   const cleared = await handler(superEvent("PUT", "/platform/system/notice", { title: "", body: "" }));
   assert.equal(cleared.statusCode, 200);

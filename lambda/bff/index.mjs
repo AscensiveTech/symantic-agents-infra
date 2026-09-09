@@ -2446,7 +2446,13 @@ async function handleSystemNotice(event, { method, path, actor, store }) {
       const end = new Date(endAt);
       if (Number.isNaN(start.getTime())) return json(400, { message: "Provide a valid start date and time." });
       if (Number.isNaN(end.getTime())) return json(400, { message: "Provide a valid end date and time." });
-      if (end <= start) return json(400, { message: "The end must be after the start." });
+      const nowMs = Date.now();
+      const GRACE_MS = 5 * 60_000; // allow "starts now" despite request latency / clock skew
+      const MAX_WINDOW_MS = 7 * 24 * 60 * 60_000;
+      if (start.getTime() < nowMs - GRACE_MS) return json(400, { message: "The start must not be in the past." });
+      if (end.getTime() <= start.getTime()) return json(400, { message: "The end must be after the start." });
+      if (end.getTime() < nowMs) return json(400, { message: "The end must not be in the past." });
+      if (end.getTime() - start.getTime() > MAX_WINDOW_MS) return json(400, { message: "The notice can run for at most 7 days." });
 
       const record = {
         title,
