@@ -105,6 +105,30 @@ test("buildProposalUsage buckets days and history by a non-1st billing anchor", 
   ]);
 });
 
+test("the daily chart always reconciles with the current-cycle history row, even with a future-dated row", () => {
+  const usage = buildProposalUsage(
+    null,
+    [
+      { day: "2026-09-03", proposalsGenerated: 2, signaturesSent: 1 },
+      { day: "2026-09-15", proposalsGenerated: 3, signaturesSent: 2 }, // == today
+      { day: "2026-09-20", proposalsGenerated: 4, signaturesSent: 4 }, // AFTER today, still in-cycle (clock/tz skew)
+    ],
+    [],
+    { tier: "repository", now, timezone: "UTC" }, // now = 2026-09-15, anchor 1 -> cycle Sep 1..Oct 1
+  );
+  const dayProposals = usage.days.reduce((sum, d) => sum + d.proposals, 0);
+  const daySignatures = usage.days.reduce((sum, d) => sum + d.signatures, 0);
+  // chart sum == meter == current-cycle Usage History row; the 09-20 row is excluded from all three.
+  assert.equal(dayProposals, 5);
+  assert.equal(daySignatures, 3);
+  assert.equal(usage.proposals.used, 5);
+  assert.equal(usage.signatures.used, 3);
+  assert.deepEqual(
+    [usage.cycles[0].proposals, usage.cycles[0].signatures],
+    [dayProposals, daySignatures],
+  );
+});
+
 test("buildProposalUsage treats the signing tier as unlimited and never blocked", () => {
   const usage = buildProposalUsage(
     { proposalsGenerated: 5000, signaturesSent: 5000 },

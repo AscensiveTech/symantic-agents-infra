@@ -164,18 +164,25 @@ export function buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now
   const proposals = meter(proposalsUsed, limits.proposals);
   const signatures = meter(signaturesUsed, limits.signatures);
 
-  // History aggregated by billing cycle (most recent first).
+  // History aggregated by billing cycle (most recent first). The CURRENT cycle's
+  // row is exactly the meter totals (which are the sum of `days`), so the daily
+  // chart always reconciles with its Usage History row - even if a stray daily
+  // row is dated after `todayKey` but still inside the cycle (clock/timezone
+  // skew), which the `days` loop drops but a blind bucket-by-cycle would keep.
+  // Earlier cycles are aggregated from their own daily rows.
   const cycleAgg = new Map();
   for (const [day, row] of rowByDay) {
+    if (day >= cycleStart) continue; // current cycle handled explicitly below
     const { start, end } = cycleBoundsFor(day, anchorDay);
     const agg = cycleAgg.get(start) ?? { start, end, proposals: 0, signatures: 0 };
     agg.proposals += count(row.proposalsGenerated);
     agg.signatures += count(row.signaturesSent);
     cycleAgg.set(start, agg);
   }
-  const cycles = [...cycleAgg.values()]
-    .sort((a, b) => b.start.localeCompare(a.start))
-    .slice(0, 6);
+  const cycles = [
+    { start: cycleStart, end: cycleEnd, proposals: proposalsUsed, signatures: signaturesUsed },
+    ...[...cycleAgg.values()].sort((a, b) => b.start.localeCompare(a.start)),
+  ].slice(0, 6);
 
   const months = (Array.isArray(monthRows) ? monthRows : [])
     .map((row) => ({

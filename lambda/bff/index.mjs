@@ -485,6 +485,8 @@ export function createHandler({
       // user has accepted the current versions (docs/PRODUCT_SPEC.md).
       const legalResponse = await handleLegal(event, { method, path, actor, store });
       if (legalResponse) return legalResponse;
+      const noticeResponse = await handleSystemNotice(event, { method, path, actor, store });
+      if (noticeResponse) return noticeResponse;
       if (!isLegalPath(path) && await legalAcceptancePending(store, actor)) {
         return json(403, {
           error: "policy_acceptance_required",
@@ -2170,7 +2172,11 @@ async function handleWorkspaceUsers(event, {
 function isLegalPath(path) {
   return typeof path === "string"
     && (path === "/workspaces/me/legal" || path.startsWith("/workspaces/me/legal/")
-      || path === "/workspaces/me/legal-acceptances" || path === "/platform/legal");
+      || path === "/workspaces/me/legal-acceptances" || path === "/platform/legal"
+      // The maintenance notice must be visible even before a user has accepted
+      // the T&C (e.g. "the app is down at 2am" while they're on the accept
+      // screen), so its routes bypass the acceptance gate too.
+      || path === "/system/notice" || path === "/platform/system/notice");
 }
 
 // The T&C / Privacy acceptance evidence for one workspace: current + first
@@ -2362,6 +2368,100 @@ async function handleLegal(event, { method, path, actor, store }) {
     }
     invalidateActiveLegalCache();
     return json(201, { documentType: body.documentType, version: body.version });
+  }
+
+  return null;
+}
+
+// --- Maintenance / deployment notice ---------------------------------------
+// A single super-admin-authored banner (title + body + a [startAt, endAt] show
+// window), stored like a legal doc so it can be published without a deploy.
+
+let systemNoticeCache = null;
+const SYSTEM_NOTICE_TTL_MS = 30_000;
+function invalidateSystemNoticeCache() { systemNoticeCache = null; }
+
+function publicSystemNotice(record, now = new Date()) {
+  if (!record || record.cleared) return null;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  const body = typeof record.body === "string" ? record.body.trim() : "";
+  if (!title || !body) return null;
+  const start = record.startAt ? new Date(record.startAt) : null;
+  const end = record.endAt ? new Date(record.endAt) : null;
+  if (start && !Number.isNaN(start.getTime()) && now < start) return null;
+  if (end && !Number.isNaN(end.getTime()) && now > end) return null;
+  return {
+    title,
+    body,
+    startAt: record.startAt ?? null,
+    endAt: record.endAt ?? null,
+    version: record.activeVersion ?? record.updatedAt ?? null,
+  };
+}
+
+async function handleSystemNotice(event, { method, path, actor, store }) {
+  if (typeof store.getSystemNotice !== "function") return null;
+
+  if (path === "/system/notice" && method === "GET") {
+    if (!systemNoticeCache || systemNoticeCache.expiresAt <= Date.now()) {
+      systemNoticeCache = { record: await store.getSystemNotice(), expiresAt: Date.now() + SYSTEM_NOTICE_TTL_MS };
+    }
+    return json(200, { notice: publicSystemNotice(systemNoticeCache.record) });
+  }
+
+  if (path === "/platform/system/notice") {
+    if (!actor.roles.includes("super-admin")) return json(403, { message: "Super admin access is required" });
+
+    if (method === "GET") {
+      const record = await store.getSystemNotice();
+      return json(200, { notice: record && !record.cleared ? {
+        title: record.title ?? "",
+        body: record.body ?? "",
+        startAt: record.startAt ?? null,
+        endAt: record.endAt ?? null,
+        version: record.activeVersion ?? null,
+        updatedAt: record.updatedAt ?? null,
+        updatedByName: record.updatedByName ?? null,
+      } : null });
+    }
+
+    if (method === "PUT") {
+      const body = readBody(event) ?? {};
+      const title = typeof body.title === "string" ? body.title.trim() : "";
+      const text = typeof body.body === "string" ? body.body.trim() : "";
+      const now = new Date().toISOString();
+
+      // Empty title AND body clears the notice.
+      if (!title && !text) {
+        await store.putSystemNotice({ cleared: true, updatedAt: now, updatedByName: actor.membership?.name ?? null });
+        invalidateSystemNoticeCache();
+        return json(200, { notice: null });
+      }
+      if (!title || title.length > 120) return json(400, { message: "Provide a title (1-120 characters)." });
+      if (!text || text.length > 700) return json(400, { message: "Provide a message (1-700 characters)." });
+
+      const startAt = typeof body.startAt === "string" ? body.startAt : "";
+      const endAt = typeof body.endAt === "string" ? body.endAt : "";
+      const start = new Date(startAt);
+      const end = new Date(endAt);
+      if (Number.isNaN(start.getTime())) return json(400, { message: "Provide a valid start date and time." });
+      if (Number.isNaN(end.getTime())) return json(400, { message: "Provide a valid end date and time." });
+      if (end <= start) return json(400, { message: "The end must be after the start." });
+
+      const record = {
+        title,
+        body: text,
+        startAt: start.toISOString(),
+        endAt: end.toISOString(),
+        activeVersion: now,
+        updatedAt: now,
+        updatedByName: actor.membership?.name ?? null,
+        cleared: false,
+      };
+      await store.putSystemNotice(record);
+      invalidateSystemNoticeCache();
+      return json(200, { notice: { ...record, version: record.activeVersion } });
+    }
   }
 
   return null;
@@ -4776,6 +4876,26 @@ export function createDynamoStore(client, commands, tableNames) {
           ExpressionAttributeValues: marshall({ ":r": now }),
         })).catch(() => {});
       }
+    },
+
+    // The global maintenance / deployment notice - a single row in the legal
+    // documents table (documentType "SYSTEM_NOTICE", version "ACTIVE"). No
+    // acceptance, no history: a super admin just overwrites it.
+    async getSystemNotice() {
+      if (!tableNames.legalDocuments) return null;
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.legalDocuments,
+        Key: marshall({ documentType: "SYSTEM_NOTICE", version: "ACTIVE" }),
+        ConsistentRead: false,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+    async putSystemNotice(record) {
+      if (!tableNames.legalDocuments) return;
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.legalDocuments,
+        Item: marshall({ ...record, documentType: "SYSTEM_NOTICE", version: "ACTIVE" }),
+      }));
     },
 
     // The user's most recent acceptance of one document type (or null).

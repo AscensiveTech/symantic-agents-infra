@@ -2348,6 +2348,92 @@ test("a super admin can rename any company user from the platform surface", asyn
   assert.equal(saved[0].role, "quotation-builder");
 });
 
+// --- Maintenance / deployment notice --------------------------------------
+
+function noticeStore(initial = null) {
+  let record = initial;
+  return {
+    _get: () => record,
+    async ensureWorkspace() {},
+    async getWorkspace() { return { workspaceId: "workspace-9", tier: "repository" }; },
+    async getMembership(userId) { return { userId, workspaceId: "workspace-9", role: "company-admin", status: "active", name: "Sam Super" }; },
+    async listMemberships() { return []; },
+    async getActiveLegalDocument() { return null; },
+    async getLatestLegalAcceptance() { return null; },
+    async getSystemNotice() { return record; },
+    async putSystemNotice(next) { record = { ...next, documentType: "SYSTEM_NOTICE", version: "ACTIVE" }; },
+  };
+}
+
+function superEvent(method, path, body) {
+  const event = authenticatedEvent(method, path, body);
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  return event;
+}
+
+function memberEvent(method, path, body) {
+  const event = authenticatedEvent(method, path, body);
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  return event;
+}
+
+test("super admin publishes a maintenance notice and it becomes visible only inside its window", async () => {
+  const store = noticeStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const past = new Date(Date.now() - 3600_000).toISOString();
+  const future = new Date(Date.now() + 3600_000).toISOString();
+
+  const put = await handler(superEvent("PUT", "/platform/system/notice", {
+    title: "Scheduled maintenance", body: "The app will be down 2-3am ET.", startAt: past, endAt: future,
+  }));
+  assert.equal(put.statusCode, 200);
+  assert.ok(JSON.parse(put.body).notice.version);
+
+  const inWindow = await handler(memberEvent("GET", "/system/notice"));
+  assert.equal(inWindow.statusCode, 200);
+  assert.equal(JSON.parse(inWindow.body).notice.title, "Scheduled maintenance");
+
+  // shift the window entirely into the future -> hidden
+  const soon = new Date(Date.now() + 1800_000).toISOString();
+  await handler(superEvent("PUT", "/platform/system/notice", {
+    title: "Scheduled maintenance", body: "The app will be down 2-3am ET.", startAt: soon, endAt: future,
+  }));
+  const beforeStart = await handler(memberEvent("GET", "/system/notice"));
+  assert.equal(JSON.parse(beforeStart.body).notice, null);
+});
+
+test("maintenance notice PUT validates lengths and dates; clears on empty", async () => {
+  const store = noticeStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const start = new Date().toISOString();
+  const end = new Date(Date.now() + 3600_000).toISOString();
+
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "x".repeat(121), body: "ok", startAt: start, endAt: end }))).statusCode, 400);
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "y".repeat(701), startAt: start, endAt: end }))).statusCode, 400);
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: "nonsense", endAt: end }))).statusCode, 400);
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: end, endAt: start }))).statusCode, 400);
+
+  const cleared = await handler(superEvent("PUT", "/platform/system/notice", { title: "", body: "" }));
+  assert.equal(cleared.statusCode, 200);
+  assert.equal(JSON.parse(cleared.body).notice, null);
+  assert.equal(store._get().cleared, true);
+});
+
+test("maintenance notice platform routes are super-admin only", async () => {
+  const store = noticeStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const get = authenticatedEvent("GET", "/platform/system/notice");
+  get.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await handler(get)).statusCode, 403);
+  const put = authenticatedEvent("PUT", "/platform/system/notice", { title: "a", body: "b", startAt: new Date().toISOString(), endAt: new Date(Date.now() + 1000).toISOString() });
+  put.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await handler(put)).statusCode, 403);
+});
+
 function removalStore(overrides = {}) {
   const unassignCalls = [];
   const deleted = [];
