@@ -2111,7 +2111,12 @@ async function ensureLegalSeeded(store) {
   await Promise.all(LEGAL_DOCUMENT_TYPES.map(async (documentType) => {
     const active = await store.getActiveLegalDocument(documentType);
     if (!active) {
-      await store.putLegalDocumentVersion(documentType, DEFAULT_LEGAL_DOCUMENTS[documentType], { seedOnly: true });
+      const doc = DEFAULT_LEGAL_DOCUMENTS[documentType];
+      await store.putLegalDocumentVersion(
+        documentType,
+        { ...doc, contentHash: await legalContentHash(doc.content) },
+        { seedOnly: true },
+      );
       seeded = true;
     }
   }));

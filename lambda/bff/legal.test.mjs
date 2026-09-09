@@ -121,7 +121,8 @@ test("GET /workspaces/me/legal seeds v1.0 and reports acceptance required for a 
   assert.equal(body.requiresAcceptance, true);
   assert.equal(body.currentTermsVersion, "v1.0");
   assert.equal(body.currentPrivacyVersion, "v1.0");
-  assert.ok(body.documents.termsAndConditions.content.includes("1. Acceptance."));
+  assert.ok(body.documents.termsAndConditions.content.includes("1. Acceptance"));
+  assert.ok(body.documents.termsAndConditions.title.includes("Terms & Conditions"));
   assert.ok(body.documents.privacyPolicy.title.includes("Privacy Policy"));
 });
 
