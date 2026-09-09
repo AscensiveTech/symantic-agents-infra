@@ -3315,6 +3315,9 @@ async function handleProposalApi(event, {
           ? { assignedTo: body.assignedTo.trim() }
           : {}),
       });
+      // Bump the rev so an editor holding the pre-revise copy conflicts on
+      // save instead of quietly reinstating the signed version.
+      reopened.rev = (Number.isFinite(proposal.rev) ? proposal.rev : 0) + 1;
       return json(200, await store.putProposal(workspaceId, reopened));
     }
     if (action === "remind" && method === "POST") {
@@ -3411,7 +3414,27 @@ async function handleProposalApi(event, {
         const updated = { ...proposal };
         if (current.signatureRequest) updated.signatureRequest = current.signatureRequest;
         else delete updated.signatureRequest;
-        return json(200, await store.putProposal(workspaceId, updated));
+
+        // Optimistic concurrency. The client echoes back the `rev` it loaded;
+        // the write only lands if the stored record is still on that rev.
+        // Without this, PATCH replaced the whole record and whoever saved
+        // second silently erased the other editor's work.
+        const expectedRev = Number.isFinite(proposal.rev) ? proposal.rev : null;
+        updated.rev = (Number.isFinite(current.rev) ? current.rev : 0) + 1;
+        try {
+          return json(200, await store.putProposal(workspaceId, updated, { expectedRev }));
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            // The record still exists (we read it above), so a failed condition
+            // here means the rev moved: somebody else saved in between.
+            return json(409, {
+              error: "proposal_conflict",
+              message: "Someone else saved this proposal while you were editing. Reload to get their changes before saving again.",
+              proposal: current,
+            });
+          }
+          throw error;
+        }
       } catch (error) {
         if (isConditionalCheckFailed(error)) return json(404, { message: "Proposal not found" });
         throw error;
@@ -4190,12 +4213,13 @@ export function createDynamoStore(client, commands, tableNames) {
     return result.Item ? toPublicEntity(unmarshall(result.Item), keyField) : null;
   }
 
-  async function putRecord(tableName, keyField, workspaceId, record, conditionExpression) {
+  async function putRecord(tableName, keyField, workspaceId, record, conditionExpression, expressionValues) {
     const { id, workspaceId: _workspaceId, ...value } = record;
     await client.send(new commands.PutItemCommand({
       TableName: tableName,
       Item: marshall({ workspaceId, [keyField]: id, ...value }),
       ...(conditionExpression ? { ConditionExpression: conditionExpression } : {}),
+      ...(expressionValues ? { ExpressionAttributeValues: marshall(expressionValues) } : {}),
     }));
     return record;
   }
@@ -4760,13 +4784,24 @@ export function createDynamoStore(client, commands, tableNames) {
       );
     },
 
-    putProposal(workspaceId, proposal) {
+    // `expectedRev` turns this into a compare-and-swap. Without it the write is
+    // last-write-wins: PATCH replaces the whole record, so whichever of two
+    // concurrent editors saved second silently erased the other's changes.
+    //
+    // Absent expectedRev keeps the old unconditional behaviour, which is what
+    // a client that predates `rev` sends. Those writes still bump rev, so an
+    // up-to-date client editing alongside an old one is still protected.
+    putProposal(workspaceId, proposal, { expectedRev = null } = {}) {
+      const guarded = Number.isFinite(expectedRev);
       return putRecord(
         tableNames.proposals,
         "proposalId",
         workspaceId,
         proposal,
-        "attribute_exists(proposalId)",
+        guarded
+          ? "attribute_exists(proposalId) AND (attribute_not_exists(rev) OR rev = :expectedRev)"
+          : "attribute_exists(proposalId)",
+        guarded ? { ":expectedRev": expectedRev } : null,
       );
     },
 
