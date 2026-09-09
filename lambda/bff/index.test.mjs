@@ -2282,6 +2282,48 @@ test("any workspace user can change their own display name via /users/me", async
   assert.deepEqual(nameUpdates, [["ajm@x.com", "AJM Full Name"]]);
 });
 
+test("a user records their first-run tour completion via /users/me", async () => {
+  const saved = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership(userId) {
+      return { userId, cognitoUsername: "u@x.com", email: "u@x.com", workspaceId: "workspace-123", role: "quotation-builder", status: "active", name: "U" };
+    },
+    async putMembership(m) { saved.push(m); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => ({}) });
+  const event = authenticatedEvent("PATCH", "/workspaces/me/users/me", { tourCompleted: true });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  assert.equal(typeof saved[0].tourCompletedAt, "string");
+  assert.equal(saved[0].name, "U"); // unchanged
+
+  // A GET reflects it.
+  store.getMembership = async (userId) => ({ userId, workspaceId: "workspace-123", role: "quotation-builder", status: "active", name: "U", tourCompletedAt: saved[0].tourCompletedAt });
+  const get = authenticatedEvent("GET", "/workspaces/me/users/me");
+  get.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  const body = JSON.parse((await handler(get)).body);
+  assert.equal(body.tourCompletedAt, saved[0].tourCompletedAt);
+});
+
+test("PATCH /workspaces/me/users/me with an empty body is a 400", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership(userId) {
+      return { userId, email: "u@x.com", workspaceId: "workspace-123", role: "quotation-builder", status: "active", name: "U" };
+    },
+    async putMembership() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => ({}) });
+  const event = authenticatedEvent("PATCH", "/workspaces/me/users/me", {});
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  assert.equal((await handler(event)).statusCode, 400);
+});
+
 test("a super admin can rename any company user from the platform surface", async () => {
   const saved = [];
   const store = {

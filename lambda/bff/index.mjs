@@ -2043,19 +2043,34 @@ async function handleWorkspaceUsers(event, {
 }) {
   if (typeof path !== "string" || !path.startsWith("/workspaces/me/users")) return null;
 
-  // Anyone can change their OWN display name from Team & Access - no admin
-  // rights needed. Everything else on this surface stays admin-only.
+  // Anyone can update their OWN membership - their display name (from Team &
+  // Access) and their first-run tour completion flag. No admin rights needed;
+  // everything else on this surface stays admin-only.
   if (path === "/workspaces/me/users/me" && method === "PATCH") {
     const body = readBody(event);
-    const name = typeof body?.name === "string" ? body.name.trim() : "";
-    if (name.length < 1 || name.length > 120) return json(400, { message: "Enter a name (1-120 characters)." });
     const self = await store.getMembership(actor.userId);
     if (!self || self.workspaceId !== actor.workspaceId) return json(404, { message: "Workspace user not found" });
-    const directory = await getUserDirectory();
-    if (typeof directory.updateName === "function") {
-      await directory.updateName(self.cognitoUsername ?? self.email, name).catch(() => {});
+
+    const patch = {};
+    if (Object.hasOwn(body ?? {}, "name")) {
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      if (name.length < 1 || name.length > 120) return json(400, { message: "Enter a name (1-120 characters)." });
+      patch.name = name;
     }
-    const updated = { ...self, name, updatedAt: new Date().toISOString() };
+    if (body?.tourCompleted === true) {
+      patch.tourCompletedAt = self.tourCompletedAt ?? new Date().toISOString();
+    }
+    if (Object.keys(patch).length === 0) {
+      return json(400, { message: "Provide a name and/or tourCompleted." });
+    }
+
+    if (typeof patch.name === "string") {
+      const directory = await getUserDirectory();
+      if (typeof directory.updateName === "function") {
+        await directory.updateName(self.cognitoUsername ?? self.email, patch.name).catch(() => {});
+      }
+    }
+    const updated = { ...self, ...patch, updatedAt: new Date().toISOString() };
     await store.putMembership(updated);
     return json(200, updated);
   }
