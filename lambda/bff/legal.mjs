@@ -24,7 +24,7 @@ export const LEGAL_RESPONSE_KEYS = {
 export const DEFAULT_LEGAL_DOCUMENTS = {
   TERMS_AND_CONDITIONS: {
     version: "v1.0",
-    title: "RapidProposal — Terms & Conditions",
+    title: "RapidProposal - Terms & Conditions",
     effectiveFrom: "2026-09-01",
     content: [
       "Effective date: September 1, 2026",
@@ -93,7 +93,7 @@ export const DEFAULT_LEGAL_DOCUMENTS = {
   },
   PRIVACY_POLICY: {
     version: "v1.0",
-    title: "RapidProposal — Privacy Policy",
+    title: "RapidProposal - Privacy Policy",
     effectiveFrom: "2026-09-01",
     content: [
       "Effective date: September 1, 2026",
