@@ -123,7 +123,8 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid      = "ManageLegalDocuments"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
+        # UpdateItem stamps replacedAt on the outgoing version when a new one is published.
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
         Resource = aws_dynamodb_table.legal_documents.arn
       },
       {
@@ -131,8 +132,9 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Effect = "Allow"
         # TransactWriteItems, not BatchWriteItem: the HISTORY audit row and the
         # LATEST pointer are written together or not at all (see
-        # recordLegalAcceptance). Mirrors ManageLegalDocuments above.
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:TransactWriteItems", "dynamodb:Query"]
+        # recordLegalAcceptance). Mirrors ManageLegalDocuments above. Scan is
+        # for the per-company acceptance-evidence table (listWorkspaceLegalAcceptances).
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:TransactWriteItems", "dynamodb:Query", "dynamodb:Scan"]
         Resource = aws_dynamodb_table.legal_acceptances.arn
       },
       {

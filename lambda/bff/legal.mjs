@@ -84,6 +84,21 @@ export function legalAcceptanceStatus({ activeTerms, activePrivacy, acceptedTerm
   };
 }
 
+// Whitespace-normalized document body, so a re-publish that only changes
+// indentation / trailing spaces isn't treated as a real change.
+export function normalizeLegalContent(content) {
+  return String(content ?? "").replace(/\r\n/g, "\n").replace(/[ \t]+$/gm, "").trim();
+}
+
+// A short content fingerprint. A re-publish whose body hashes to the current
+// active version's hash does NOT bump the version, so users are not
+// re-prompted for a no-op change (the user's requirement).
+export async function legalContentHash(content) {
+  const bytes = new TextEncoder().encode(normalizeLegalContent(content));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 const VERSION_PATTERN = /^v\d+(\.\d+){0,2}$/;
 
 export function isValidLegalVersion(value) {

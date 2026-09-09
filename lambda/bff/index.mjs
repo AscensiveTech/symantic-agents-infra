@@ -38,6 +38,7 @@ import {
   LEGAL_DOCUMENT_TYPES,
   LEGAL_RESPONSE_KEYS,
   legalAcceptanceStatus,
+  legalContentHash,
   parseAcceptBody,
 } from "./legal.mjs";
 
@@ -1015,6 +1016,10 @@ async function handlePlatformCompanies(event, {
       return json(200, await loadWorkspaceUsageWithCost(store, target.workspaceId));
     }
 
+    if (target.kind === "legal-acceptances" && method === "GET") {
+      return json(200, { acceptances: await buildLegalAcceptanceEvidence(store, target.workspaceId) });
+    }
+
     if (target.kind === "proposal-usage" && method === "GET") {
       return json(200, await loadProposalUsage(store, target.workspaceId));
     }
@@ -1649,6 +1654,7 @@ function getPlatformCompanyTarget(event, path) {
     ["proposal-usage", /^\/platform\/companies\/([^/]+)\/proposal-usage$/],
     ["proposal-payments", /^\/platform\/companies\/([^/]+)\/proposal-payments$/],
     ["proposal-payment", /^\/platform\/companies\/([^/]+)\/proposal-payments\/([A-Za-z0-9._-]{1,64})$/],
+    ["legal-acceptances", /^\/platform\/companies\/([^/]+)\/legal-acceptances$/],
     ["company", /^\/platform\/companies\/([^/]+)$/],
   ];
   for (const [kind, pattern] of patterns) {
@@ -2061,7 +2067,40 @@ async function handleWorkspaceUsers(event, {
 
 function isLegalPath(path) {
   return typeof path === "string"
-    && (path === "/workspaces/me/legal" || path.startsWith("/workspaces/me/legal/") || path === "/platform/legal");
+    && (path === "/workspaces/me/legal" || path.startsWith("/workspaces/me/legal/")
+      || path === "/workspaces/me/legal-acceptances" || path === "/platform/legal");
+}
+
+// The T&C / Privacy acceptance evidence for one workspace: current + first
+// acceptance per user, including users whose membership has since been
+// deleted (their denormalized name/email on the row, tagged "removed").
+async function buildLegalAcceptanceEvidence(store, workspaceId) {
+  if (typeof store.listWorkspaceLegalAcceptances !== "function") return [];
+  const [rows, members] = await Promise.all([
+    store.listWorkspaceLegalAcceptances(workspaceId),
+    typeof store.listMemberships === "function" ? store.listMemberships(workspaceId) : [],
+  ]);
+  const memberById = new Map((members ?? []).map((m) => [m.userId, m]));
+  const byUser = new Map();
+  for (const row of rows) {
+    const entry = byUser.get(row.userId) ?? {
+      userId: row.userId,
+      userName: row.userName ?? memberById.get(row.userId)?.name ?? null,
+      userEmail: row.userEmail ?? memberById.get(row.userId)?.email ?? null,
+      membershipStatus: memberById.has(row.userId) ? "active" : "removed",
+    };
+    if (row.documentType === "TERMS_AND_CONDITIONS") {
+      entry.termsVersion = row.documentVersion ?? null;
+      entry.termsAcceptedAt = row.acceptedAt ?? null;
+      entry.termsFirstAcceptedAt = row.firstAcceptedAt ?? row.acceptedAt ?? null;
+    } else if (row.documentType === "PRIVACY_POLICY") {
+      entry.privacyVersion = row.documentVersion ?? null;
+      entry.privacyAcceptedAt = row.acceptedAt ?? null;
+      entry.privacyFirstAcceptedAt = row.firstAcceptedAt ?? row.acceptedAt ?? null;
+    }
+    byUser.set(row.userId, entry);
+  }
+  return [...byUser.values()].sort((a, b) => (a.userName ?? a.userEmail ?? "").localeCompare(b.userName ?? b.userEmail ?? ""));
 }
 
 // Seed the placeholder v1.0 documents the first time anything touches the
@@ -2138,6 +2177,11 @@ async function handleLegal(event, { method, path, actor, store }) {
     return json(200, { documents, ...legalAcceptanceStatus(state) });
   }
 
+  if (path === "/workspaces/me/legal-acceptances" && method === "GET") {
+    if (!isWorkspaceAdmin(actor)) return json(403, { message: "Company administrator access is required" });
+    return json(200, { acceptances: await buildLegalAcceptanceEvidence(store, actor.workspaceId) });
+  }
+
   if (path === "/workspaces/me/legal/accept" && method === "POST") {
     await ensureLegalSeeded(store);
     const parsed = parseAcceptBody(readBody(event));
@@ -2166,6 +2210,8 @@ async function handleLegal(event, { method, path, actor, store }) {
       await store.recordLegalAcceptance({
         userId: actor.userId,
         workspaceId: actor.workspaceId,
+        userName: actor.membership?.name ?? null,
+        userEmail: actor.membership?.email ?? null,
         documentType: target.type,
         documentVersion: target.active.version,
         acceptedAt,
@@ -2186,11 +2232,19 @@ async function handleLegal(event, { method, path, actor, store }) {
       || typeof body.content !== "string" || !body.content.trim()) {
       return json(400, { message: "Provide documentType, version (vN.N), title, and content" });
     }
+    const contentHash = await legalContentHash(body.content);
+    // No-op guard: if the body is unchanged from the active version, don't
+    // publish a new version and don't re-prompt anyone.
+    const currentActive = await store.getActiveLegalDocument(body.documentType);
+    if (currentActive?.contentHash && currentActive.contentHash === contentHash) {
+      return json(200, { documentType: body.documentType, version: currentActive.version, unchanged: true });
+    }
     try {
       await store.putLegalDocumentVersion(body.documentType, {
         version: body.version,
         title: body.title.trim(),
         content: body.content,
+        contentHash,
         effectiveFrom: typeof body.effectiveFrom === "string" ? body.effectiveFrom : undefined,
       });
     } catch (error) {
@@ -4545,13 +4599,28 @@ export function createDynamoStore(client, commands, tableNames) {
     async putLegalDocumentVersion(documentType, doc, { seedOnly = false } = {}) {
       if (!tableNames.legalDocuments) return;
       const now = new Date().toISOString();
+      // The outgoing active version, so we can stamp its replacedAt afterwards
+      // (the DB-only historical archive of every T&C / Privacy body, by
+      // createdAt / modifiedAt / replacedAt).
+      let previousVersion = null;
+      if (!seedOnly) {
+        const current = await client.send(new commands.GetItemCommand({
+          TableName: tableNames.legalDocuments,
+          Key: marshall({ documentType, version: "ACTIVE" }),
+        })).catch(() => null);
+        const item = current?.Item ? unmarshall(current.Item) : null;
+        previousVersion = item?.activeVersion ?? null;
+      }
       const versionItem = {
         documentType,
         version: doc.version,
         title: doc.title,
         content: doc.content,
+        contentHash: doc.contentHash ?? null,
         effectiveFrom: doc.effectiveFrom ?? now.slice(0, 10),
         createdAt: now,
+        modifiedAt: now,
+        replacedAt: null,
       };
       // version: "ACTIVE" is the pointer's range key, so the real version has
       // to survive alongside it - see getActiveLegalDocument.
@@ -4582,6 +4651,14 @@ export function createDynamoStore(client, commands, tableNames) {
         if (error?.name === "TransactionCanceledException" && seedOnly) return;
         throw error;
       }
+      if (previousVersion && previousVersion !== doc.version) {
+        await client.send(new commands.UpdateItemCommand({
+          TableName: tableNames.legalDocuments,
+          Key: marshall({ documentType, version: previousVersion }),
+          UpdateExpression: "SET replacedAt = :r",
+          ExpressionAttributeValues: marshall({ ":r": now }),
+        })).catch(() => {});
+      }
     },
 
     // The user's most recent acceptance of one document type (or null).
@@ -4597,14 +4674,46 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    // Every user's LATEST acceptance rows for one workspace - the evidence
+    // table on the company profile. Small volume (one pair of rows per user
+    // who ever accepted), so a filtered Scan is fine; rows survive the user's
+    // membership being deleted, which is the point.
+    async listWorkspaceLegalAcceptances(workspaceId) {
+      if (!tableNames.legalAcceptances) return [];
+      const rows = [];
+      let ExclusiveStartKey;
+      let pages = 0;
+      do {
+        const result = await client.send(new commands.ScanCommand({
+          TableName: tableNames.legalAcceptances,
+          FilterExpression: "workspaceId = :ws AND begins_with(sk, :latest)",
+          ExpressionAttributeValues: marshall({ ":ws": workspaceId, ":latest": "LATEST#" }),
+          ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
+        }));
+        for (const item of result.Items ?? []) rows.push(unmarshall(item));
+        ExclusiveStartKey = result.LastEvaluatedKey;
+        pages += 1;
+      } while (ExclusiveStartKey && pages < 25);
+      return rows;
+    },
+
     // Records an acceptance: one immutable HISTORY# audit row (never
     // overwritten) plus the overwritten LATEST# pointer.
     async recordLegalAcceptance(record) {
       if (!tableNames.legalAcceptances) return;
+      // First-ever acceptance is written once and never overwritten - it's
+      // proof the user accepted the very first time, alongside the current
+      // acceptance. Name/email are denormalized so a removed user's evidence
+      // row is still readable after their membership is deleted.
+      const existingLatest = await this.getLatestLegalAcceptance(record.userId, record.documentType);
+      const firstAcceptedAt = existingLatest?.firstAcceptedAt ?? record.acceptedAt;
+      const firstAcceptedVersion = existingLatest?.firstAcceptedVersion ?? record.documentVersion;
       const historyItem = {
         userId: record.userId,
         sk: `HISTORY#${record.documentType}#${record.acceptedAt}`,
         workspaceId: record.workspaceId ?? null,
+        userName: record.userName ?? null,
+        userEmail: record.userEmail ?? null,
         documentType: record.documentType,
         documentVersion: record.documentVersion,
         acceptedAt: record.acceptedAt,
@@ -4615,9 +4724,14 @@ export function createDynamoStore(client, commands, tableNames) {
       const latestItem = {
         userId: record.userId,
         sk: `LATEST#${record.documentType}`,
+        workspaceId: record.workspaceId ?? null,
+        userName: record.userName ?? existingLatest?.userName ?? null,
+        userEmail: record.userEmail ?? existingLatest?.userEmail ?? null,
         documentType: record.documentType,
         documentVersion: record.documentVersion,
         acceptedAt: record.acceptedAt,
+        firstAcceptedAt,
+        firstAcceptedVersion,
       };
       // Transact, not BatchWriteItem: a batch can come back partially applied
       // via UnprocessedItems *without throwing*, and either half landing alone

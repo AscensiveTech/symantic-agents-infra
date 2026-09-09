@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isValidLegalVersion, legalAcceptanceStatus, parseAcceptBody } from "./legal.mjs";
+import { isValidLegalVersion, legalAcceptanceStatus, legalContentHash, normalizeLegalContent, parseAcceptBody } from "./legal.mjs";
 
 async function loadBff() {
   return import("./index.mjs");
@@ -241,10 +241,11 @@ test("Dynamo getActiveLegalDocument returns the published version, not the ACTIV
 test("Dynamo recordLegalAcceptance writes the audit row and the pointer atomically", async () => {
   class TransactWriteItemsCommand { constructor(input) { this.input = input; } }
   class BatchWriteItemCommand { constructor(input) { this.input = input; } }
+  class GetItemCommand { constructor(input) { this.input = input; } }
   const sent = [];
   const client = { async send(command) { sent.push(command); return {}; } };
   const { createDynamoStore } = await loadBff();
-  const store = createDynamoStore(client, { TransactWriteItemsCommand, BatchWriteItemCommand }, {
+  const store = createDynamoStore(client, { TransactWriteItemsCommand, BatchWriteItemCommand, GetItemCommand }, {
     legalAcceptances: "legal-acceptances-table",
   });
 
@@ -258,13 +259,23 @@ test("Dynamo recordLegalAcceptance writes the audit row and the pointer atomical
     userAgent: "Mozilla/5.0 (Test)",
   });
 
-  assert.equal(sent.length, 1);
-  assert.ok(sent[0] instanceof TransactWriteItemsCommand, "must be a transaction, not a batch");
-  const items = sent[0].input.TransactItems.map((entry) => entry.Put.Item.sk.S);
+  const transaction = sent.find((c) => c instanceof TransactWriteItemsCommand);
+  assert.ok(transaction, "must be a transaction, not a batch");
+  assert.ok(!sent.some((c) => c instanceof BatchWriteItemCommand));
+  const items = transaction.input.TransactItems.map((entry) => entry.Put.Item.sk.S);
   assert.deepEqual(items, ["HISTORY#TERMS_AND_CONDITIONS#2026-09-08T00:00:00.000Z", "LATEST#TERMS_AND_CONDITIONS"]);
   // The audit row carries who/when/where - it is the compliance evidence.
-  const history = sent[0].input.TransactItems[0].Put.Item;
+  const history = transaction.input.TransactItems[0].Put.Item;
   assert.equal(history.ipAddress.S, "203.0.113.7");
   assert.equal(history.userAgent.S, "Mozilla/5.0 (Test)");
   assert.equal(history.workspaceId.S, "workspace-tech");
+});
+
+test("legalContentHash ignores whitespace-only changes but not real edits", async () => {
+  const a = await legalContentHash("1. Terms.\n2. Privacy.");
+  const b = await legalContentHash("1. Terms.   \n2. Privacy.\n\n");
+  const c = await legalContentHash("1. Terms.\n2. Privacy Policy.");
+  assert.equal(a, b, "trailing whitespace / blank lines don't count as a change");
+  assert.notEqual(a, c, "a real wording change produces a different hash");
+  assert.equal(normalizeLegalContent("x  \r\n y \n"), "x\n y");
 });
