@@ -3204,9 +3204,16 @@ function usageQuotaStore(overrides = {}) {
     async listProposalUsageCounters() {
       return [...counters.entries()].map(([sk, row]) => ({ ...row, period: sk }));
     },
-    async incrementProposalUsage(_workspaceId, monthPeriod, dayPeriod, field) {
-      bump(`proposal#${monthPeriod}`, field, 1);
-      bump(`proposal#${dayPeriod}`, field, 1);
+    // Mirrors the real store: the month row is the enforcement point, gated on
+    // `#field < :limit`, and returns whether the increment landed. The day row
+    // is reporting only and never gates.
+    async incrementProposalUsage(_workspaceId, monthPeriod, dayPeriod, field, { limit = null, delta = 1 } = {}) {
+      const monthKey = `proposal#${monthPeriod}`;
+      const used = counters.get(monthKey)?.[field] ?? 0;
+      if (Number.isFinite(limit) && used >= limit) return false;
+      bump(monthKey, field, delta);
+      bump(`proposal#${dayPeriod}`, field, delta);
+      return true;
     },
     async setProposalUsageCounter(_workspaceId, period, patch) {
       const sk = `proposal#${period}`;
@@ -4295,4 +4302,46 @@ test("GET proposal only forces a SignWell sync when refresh=1 is asked for", asy
   assert.equal(forced.statusCode, 200);
   assert.equal(getDocumentCalls, 1);
   assert.equal(JSON.parse(forced.body).signatureRequest.status, "completed");
+});
+
+// Quota used to be check-then-act: read the counter, do the work, then a
+// best-effort increment that swallowed every error. Two requests arriving
+// together at limit-1 both read "room available" and both went through, and a
+// dropped increment under-counted permanently so the limit drifted open.
+// Enforcement now happens in the conditional write itself.
+test("two concurrent mark-generated calls cannot both take the last proposal slot", async () => {
+  const store = usageQuotaStore();
+  store._proposals.set("prp-a", draftProposal("prp-a"));
+  store._proposals.set("prp-b", draftProposal("prp-b"));
+  // 99 of 100 used: exactly one of the two below may succeed.
+  seedCounter(store, currentPeriod(), { proposalsGenerated: 99 });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const [a, b] = await Promise.all([
+    handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-a/mark-generated")),
+    handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-b/mark-generated")),
+  ]);
+
+  assert.deepEqual([a.statusCode, b.statusCode].sort(), [200, 403], "exactly one should win the last slot");
+  assert.equal(generatedCount(store), 100, "the counter must never pass the limit");
+  const rejected = a.statusCode === 403 ? a : b;
+  assert.equal(JSON.parse(rejected.body).error, "proposal_limit_reached");
+});
+
+test("a reservation is released when the proposal turns out to be already counted", async () => {
+  const store = usageQuotaStore();
+  store._proposals.set("prp-raced", draftProposal("prp-raced"));
+  // markProposalGenerated reports "someone else already counted this".
+  store.markProposalGenerated = async () => false;
+  seedCounter(store, currentPeriod(), { proposalsGenerated: 10 });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/proposals/prp-raced/mark-generated"));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).counted, false);
+  // The slot we reserved but did not use must go back, not leak.
+  assert.equal(generatedCount(store), 10);
 });
