@@ -462,7 +462,7 @@ export function createHandler({
       }
 
       if (path === "/webhooks/signwell" && method === "POST") {
-        return await handleSignWellWebhook(event, { getStore, getSignWell });
+        return await handleSignWellWebhook(event, { getStore, getSignWell, getAssetSigner });
       }
 
       const subject = event?.requestContext?.authorizer?.jwt?.claims?.sub;
@@ -2601,7 +2601,7 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
   return json(404, { message: "Not found" });
 }
 
-async function handleSignWellWebhook(event, { getStore, getSignWell }) {
+async function handleSignWellWebhook(event, { getStore, getSignWell, getAssetSigner }) {
   const payload = readBody(event);
   const signWell = await getSignWell();
   if (!verifySignWellEvent(payload, signWell.webhookId)) {
@@ -2681,6 +2681,32 @@ async function handleSignWellWebhook(event, { getStore, getSignWell }) {
   await store.updateProposalSignature(workspaceId, proposalId, updated, {
     markProposalCompleted: statusFromEvent === "completed",
   });
+
+  // Take our own copy the moment it is signed, rather than waiting for someone
+  // to open the download. Until this runs the only copy of a legally binding
+  // document lives with SignWell.
+  //
+  // Best-effort: the webhook must still 200 or SignWell retries the whole
+  // event, and the on-demand download archives it too, so a failure here
+  // delays the copy rather than losing it.
+  if (statusFromEvent === "completed" && typeof getAssetSigner === "function") {
+    try {
+      await archiveCompletedPdf({
+        workspaceId,
+        proposalId,
+        signatureRequest: updated,
+        store,
+        client: signWell.client,
+        signer: await getAssetSigner(),
+      });
+    } catch (error) {
+      console.warn("[signwell] could not archive the signed PDF on completion", {
+        workspaceId,
+        proposalId,
+        error: error?.message,
+      });
+    }
+  }
   return json(200, { ok: true });
 }
 
@@ -2727,6 +2753,54 @@ function isActiveSignatureRequest(request) {
   return request?.provider === "signwell" &&
     typeof request.documentId === "string" &&
     !TERMINAL_SIGNATURE_STATUSES.has(request.status);
+}
+
+
+// Where a signed PDF lives, once. Keyed by SignWell document id, not just by
+// proposal: a proposal that is revised and re-signed produces a second, equally
+// binding document, and the old key would have been overwritten by it.
+// Pre-documentId archives used the flat key, so honour that for anything
+// already stored under it.
+function signedPdfKey(proposalId, documentId) {
+  return `signed/${proposalId}/${documentId}.pdf`;
+}
+
+function signedSourceKey(proposalId, signatureRequest) {
+  return signatureRequest?.signedPdfKey ?? signedPdfKey(proposalId, signatureRequest?.documentId);
+}
+
+// Pull the signed PDF out of SignWell and into our own bucket. Until this runs
+// the only copy of a legally binding document lives with the provider, behind
+// their retention policy, our API key and their uptime.
+//
+// Idempotent via signedPdfStored, so the webhook and an on-demand download can
+// both call it and only the first does the work.
+async function archiveCompletedPdf({ workspaceId, proposalId, signatureRequest, store, client, signer }) {
+  if (!signatureRequest?.documentId || signatureRequest.signedPdfStored) return signatureRequest;
+  if (typeof client?.getCompletedPdfUrl !== "function" || typeof signer?.createUploadUrl !== "function") {
+    return signatureRequest;
+  }
+  const key = signedPdfKey(proposalId, signatureRequest.documentId);
+  const sourceUrl = await client.getCompletedPdfUrl(signatureRequest.documentId);
+  const pdfResponse = await fetch(sourceUrl);
+  if (!pdfResponse.ok) {
+    throw new SignWellRequestError(
+      `SignWell completed PDF fetch failed (${pdfResponse.status})`,
+      pdfResponse.status,
+    );
+  }
+  const pdfBytes = Buffer.from(await pdfResponse.arrayBuffer());
+  const uploadUrl = await signer.createUploadUrl(workspaceId, key, "application/pdf");
+  const putResponse = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/pdf" },
+    body: pdfBytes,
+  });
+  if (!putResponse.ok) throw new Error(`Signed PDF asset upload failed (${putResponse.status})`);
+
+  const stored = { ...signatureRequest, signedPdfStored: true, signedPdfKey: key, signedPdfStoredAt: new Date().toISOString() };
+  await store.updateProposalSignature(workspaceId, proposalId, stored);
+  return stored;
 }
 
 const SIGNWELL_SYNC_INTERVAL_MS = 30_000;
@@ -2978,7 +3052,7 @@ async function handleProposalApi(event, {
   }
 
   const signatureMatch = path.match(
-    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(resend|remind|completed-pdf|cancel))?$/,
+    /^\/workspaces\/me\/proposals\/([^/]+)\/signature-requests(?:\/(resend|remind|completed-pdf|cancel|signed-documents))?$/,
   );
   if (signatureMatch) {
     const proposalId = decodeEntityId(
@@ -3288,6 +3362,26 @@ async function handleProposalApi(event, {
     }
 
     let current = proposal.signatureRequest;
+
+    // Archived documents outlive the live request: after a revise there is no
+    // signatureRequest at all, but the proposal WAS signed and that PDF has to
+    // stay reachable. Served from our own bucket, so it does not depend on
+    // SignWell still holding the document.
+    if (action === "signed-documents" && method === "GET") {
+      const archived = (Array.isArray(proposal.signatureHistory) ? proposal.signatureHistory : [])
+        .concat(current ? [current] : [])
+        .filter((entry) => entry?.status === "completed" && entry.signedPdfStored);
+      const signer = await getAssetSigner();
+      return json(200, {
+        documents: await Promise.all(archived.map(async (entry) => ({
+          documentId: entry.documentId,
+          completedAt: entry.completedAt ?? null,
+          supersededAt: entry.supersededAt ?? null,
+          url: await signer.createDownloadUrl(workspaceId, signedSourceKey(proposalId, entry)),
+        }))),
+      });
+    }
+
     if (!current || current.provider !== "signwell" || typeof current.documentId !== "string") {
       return json(404, { message: "This proposal has no SignWell signature request" });
     }
@@ -3295,8 +3389,8 @@ async function handleProposalApi(event, {
       // "Revise Proposal" - fully reopen this proposal for editing. If a signing
       // is still in progress, cancel the SignWell document first so pending
       // signers can't sign the stale version. A completed document is left
-      // untouched in SignWell - it stays as the permanent record and is still
-      // downloadable by documentId. Then detach the signature request from our
+      // untouched in SignWell, and our archived copy of it stays reachable via
+      // GET .../signed-documents. Then detach the signature request from our
       // proposal entirely, drop it back to "draft", and reassign it to whoever
       // clicked Revise. Returns the reopened proposal so the caller doesn't need
       // a follow-up save (which the PATCH handler would only re-attach).
@@ -3307,6 +3401,21 @@ async function handleProposalApi(event, {
       const now = new Date().toISOString();
       const reopened = { ...proposal };
       delete reopened.signatureRequest;
+      // Revising used to drop the signature request outright - and the
+      // documentId with it. The comment above claimed the completed document
+      // was "still downloadable by documentId", but nothing held that id any
+      // more, so POST .../completed-pdf 404'd and a signed proposal became
+      // unreachable from the app the moment someone revised it.
+      //
+      // Keep the superseded request, so the archived PDF (signedPdfKey) and
+      // the provider's copy both stay addressable. Append-only: a proposal can
+      // be revised and re-signed any number of times and each round is a
+      // separate binding document.
+      const history = Array.isArray(proposal.signatureHistory) ? proposal.signatureHistory : [];
+      reopened.signatureHistory = [
+        ...history,
+        { ...current, supersededAt: now, supersededBy: actor.userId },
+      ];
       Object.assign(reopened, {
         status: "draft",
         revisedAt: now,
@@ -3354,29 +3463,17 @@ async function handleProposalApi(event, {
       // working copy - and it can't fetch SignWell's cross-origin URL directly.
       // A completed SignWell document is immutable, so this is cached forever.
       const signer = await getAssetSigner();
-      const signedKey = `signed/${proposalId}.pdf`;
       if (!current.signedPdfStored) {
-        const sourceUrl = await signWell.client.getCompletedPdfUrl(current.documentId);
-        const pdfResponse = await fetch(sourceUrl);
-        if (!pdfResponse.ok) {
-          throw new SignWellRequestError(
-            `SignWell completed PDF fetch failed (${pdfResponse.status})`,
-            pdfResponse.status,
-          );
-        }
-        const pdfBytes = Buffer.from(await pdfResponse.arrayBuffer());
-        const uploadUrl = await signer.createUploadUrl(workspaceId, signedKey, "application/pdf");
-        const putResponse = await fetch(uploadUrl, {
-          method: "PUT",
-          headers: { "content-type": "application/pdf" },
-          body: pdfBytes,
+        await archiveCompletedPdf({
+          workspaceId,
+          proposalId,
+          signatureRequest: current,
+          store,
+          client: signWell.client,
+          signer,
         });
-        if (!putResponse.ok) {
-          throw new Error(`Signed PDF asset upload failed (${putResponse.status})`);
-        }
-        await store.updateProposalSignature(workspaceId, proposalId, { ...current, signedPdfStored: true });
       }
-      return json(200, { url: await signer.createDownloadUrl(workspaceId, signedKey) });
+      return json(200, { url: await signer.createDownloadUrl(workspaceId, signedSourceKey(proposalId, current)) });
     }
     return json(404, { message: "Not found" });
   }
@@ -3414,6 +3511,11 @@ async function handleProposalApi(event, {
         const updated = { ...proposal };
         if (current.signatureRequest) updated.signatureRequest = current.signatureRequest;
         else delete updated.signatureRequest;
+        // Same for the superseded-signature archive: it is the record of
+        // documents that were actually signed, so a client save must never be
+        // able to drop or rewrite it.
+        if (Array.isArray(current.signatureHistory)) updated.signatureHistory = current.signatureHistory;
+        else delete updated.signatureHistory;
 
         // Optimistic concurrency. The client echoes back the `rev` it loaded;
         // the write only lands if the stored record is still on that rev.

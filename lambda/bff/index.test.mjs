@@ -1877,9 +1877,11 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
   assert.equal(response.statusCode, 200);
   // The signed PDF was pulled from SignWell and copied into our own bucket;
   // the app gets a presigned URL to that, not SignWell's cross-origin one.
-  assert.equal(body.url, "https://s3-download.example.com/signed/prp-sign.pdf");
+  // Keyed by SignWell document id: a revised-and-re-signed proposal produces a
+  // second, equally binding document that must not overwrite the first.
+  assert.equal(body.url, "https://s3-download.example.com/signed/prp-sign/signwell-doc-123.pdf");
   assert.equal(body.pdfBase64, undefined);
-  assert.deepEqual(assetCalls[0], ["upload", "user-123", "signed/prp-sign.pdf", "application/pdf"]);
+  assert.deepEqual(assetCalls[0], ["upload", "user-123", "signed/prp-sign/signwell-doc-123.pdf", "application/pdf"]);
   assert.ok(fetched.some((f) => f.url === "https://signed.example.com/completed.pdf"));
   assert.ok(fetched.some((f) => f.method === "PUT"));
   assert.equal(proposal.signatureRequest.signedPdfStored, true);
@@ -4479,4 +4481,118 @@ test("a client that sends no rev still saves, and still advances the rev", async
 
   assert.equal(response.statusCode, 200);
   assert.equal(stored.rev, 1);
+});
+
+// Signed PDFs used to be archived lazily - only when someone first opened the
+// download - so between signing and that first click, the only copy of a
+// legally binding document lived with SignWell. And revising deleted the
+// signature request outright, taking documentId with it, so the signed PDF
+// became unreachable from the app entirely.
+test("a completion webhook archives the signed PDF immediately, and a revise keeps it reachable", async () => {
+  let proposal = {
+    id: "prp-archive",
+    name: "Signed once",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-archive",
+      status: "sent",
+      recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "sent" }],
+    },
+  };
+  const uploads = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(proposal); },
+    async putProposal(_workspaceId, next) { proposal = structuredClone(next); return proposal; },
+    async updateProposalSignature(_workspaceId, _proposalId, signatureRequest) {
+      proposal = { ...proposal, signatureRequest: structuredClone(signatureRequest) };
+      return signatureRequest;
+    },
+    async findProposalBySignatureDocument() {
+      return { workspaceId: "user-123", proposal: structuredClone(proposal) };
+    },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      async getDocument(documentId) {
+        return {
+          id: documentId,
+          status: "Completed",
+          metadata: { workspace_id: "user-123", proposal_id: "prp-archive" },
+          recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "completed" }],
+        };
+      },
+      async getCompletedPdfUrl() { return "https://signwell.example.com/completed.pdf"; },
+      async cancelDocument() {},
+    },
+  };
+  const signer = {
+    async createUploadUrl(_workspaceId, key) { uploads.push(key); return "https://s3-upload.example.com/put"; },
+    async createDownloadUrl(_workspaceId, key) { return `https://s3-download.example.com/${key}`; },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => (init?.method === "PUT"
+    ? { ok: true, status: 200 }
+    : { ok: true, status: 200, async arrayBuffer() { return new ArrayBuffer(8); } });
+
+  try {
+    const { createHandler } = await loadBff();
+    const handler = createHandler({
+      getStore: async () => store,
+      getSignWell: async () => signWell,
+      getAssetSigner: async () => signer,
+    });
+
+    const type = "document_completed";
+    const time = 1_788_144_000;
+    const webhook = await handler({
+      requestContext: { http: { method: "POST", path: "/webhooks/signwell" } },
+      rawPath: "/webhooks/signwell",
+      body: JSON.stringify({
+        event: {
+          type,
+          time,
+          hash: createHmac("sha256", "webhook-123").update(`${type}@${time}`).digest("hex"),
+          related_signer: { name: "Jane", email: "jane@example.com" },
+        },
+        data: {
+          object: {
+            id: "signwell-doc-archive",
+            status: "Completed",
+            metadata: { workspace_id: "user-123", proposal_id: "prp-archive" },
+            recipients: [{ id: "1", name: "Jane", email: "jane@example.com", status: "completed" }],
+          },
+        },
+      }),
+    });
+    assert.equal(webhook.statusCode, 200);
+    // Archived on completion, not on first download, and keyed by document id.
+    assert.deepEqual(uploads, ["signed/prp-archive/signwell-doc-archive.pdf"]);
+    assert.equal(proposal.signatureRequest.signedPdfStored, true);
+
+    // Revise: the signature request is detached, but the signed document is kept.
+    const revised = await handler(authenticatedEvent(
+      "POST",
+      "/workspaces/me/proposals/prp-archive/signature-requests/cancel",
+      {},
+    ));
+    assert.equal(revised.statusCode, 200);
+    assert.equal(proposal.signatureRequest, undefined);
+    assert.equal(proposal.signatureHistory.length, 1);
+    assert.equal(proposal.signatureHistory[0].documentId, "signwell-doc-archive");
+
+    const archived = await handler(authenticatedEvent(
+      "GET",
+      "/workspaces/me/proposals/prp-archive/signature-requests/signed-documents",
+    ));
+    assert.equal(archived.statusCode, 200);
+    const { documents } = JSON.parse(archived.body);
+    assert.equal(documents.length, 1);
+    assert.equal(documents[0].documentId, "signwell-doc-archive");
+    assert.equal(documents[0].url, "https://s3-download.example.com/signed/prp-archive/signwell-doc-archive.pdf");
+    assert.ok(documents[0].supersededAt);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

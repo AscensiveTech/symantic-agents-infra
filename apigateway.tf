@@ -62,6 +62,8 @@ locals {
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/remind",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/cancel",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/completed-pdf",
+    # Archived signed PDFs, including ones superseded by a later revise.
+    "GET /workspaces/me/proposals/{proposalId}/signature-requests/signed-documents",
     "GET /workspaces/me/proposal-templates",
     "POST /workspaces/me/proposal-templates",
     "GET /workspaces/me/proposal-templates/{templateId}",
