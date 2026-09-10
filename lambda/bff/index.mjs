@@ -2731,6 +2731,11 @@ function isActiveSignatureRequest(request) {
 
 const SIGNWELL_SYNC_INTERVAL_MS = 30_000;
 
+// How long a send claim stays valid. Long enough to cover a slow SignWell
+// create+send, short enough that a lambda killed mid-send doesn't wedge the
+// proposal for long.
+const SIGNATURE_SEND_CLAIM_TTL_MS = 2 * 60_000;
+
 async function reconcileSignWellSignature({
   proposal,
   workspaceId,
@@ -2997,6 +3002,24 @@ async function handleProposalApi(event, {
       if (!replacing && isActiveSignatureRequest(previous)) {
         return json(409, { message: "This proposal already has an active signature request" });
       }
+      // Take the send mutex before anything that costs money or mails the
+      // customer. The 409 above is a read-then-act check: two requests that
+      // arrive together both see no active request, both pass it, and both
+      // create a real SignWell document - two emails to the signer, two billed
+      // sends, and one orphan our record never points at (so it can't even be
+      // cancelled). Same for a client retry after a timeout.
+      const claimId = randomUUID();
+      if (typeof store.claimSignatureSend === "function") {
+        const claimed = await store.claimSignatureSend(
+          workspaceId,
+          proposalId,
+          { claimId, claimedAt: new Date().toISOString(), actor: actor.userId },
+          new Date(Date.now() - SIGNATURE_SEND_CLAIM_TTL_MS).toISOString(),
+        );
+        if (!claimed) {
+          return json(409, { message: "This proposal is already being sent for signature. Wait for that to finish before trying again." });
+        }
+      }
       // Reserved before any SignWell call and handed back on every exit that
       // didn't actually send. A read-only check raced: two sends arriving
       // together both saw room and both went through.
@@ -3254,6 +3277,13 @@ async function handleProposalApi(event, {
         // Covers the 409 early-returns and any SignWell failure alike: if
         // nothing was sent, the slot goes back.
         if (!signatureSent) await releaseProposalQuota(store, workspaceId, signatureReservation);
+        // The claim is always released - the send is finished either way, and
+        // the record now carries the real signatureRequest, which is what
+        // blocks the next send.
+        if (typeof store.releaseSignatureSendClaim === "function") {
+          await store.releaseSignatureSendClaim(workspaceId, proposalId, claimId)
+            .catch((error) => console.warn("[proposals] could not release the send claim", { proposalId, error: error?.message }));
+        }
       }
     }
 
@@ -4738,6 +4768,47 @@ export function createDynamoStore(client, commands, tableNames) {
         proposal,
         "attribute_exists(proposalId)",
       );
+    },
+
+    // A short-lived mutex on "this proposal is being sent for signature right
+    // now". Taken before any SignWell call so a double-submit, a client retry
+    // after a timeout, or two tabs cannot each create a real document and mail
+    // the customer twice. Conditional, so exactly one caller wins.
+    //
+    // `staleBefore` lets an abandoned claim (lambda killed mid-send) be taken
+    // over instead of wedging the proposal forever. ISO-8601 sorts
+    // lexicographically, which is why a string compare is safe here.
+    async claimSignatureSend(workspaceId, proposalId, claim, staleBefore) {
+      if (!tableNames.proposals) return true;
+      try {
+        await client.send(new commands.UpdateItemCommand({
+          TableName: tableNames.proposals,
+          Key: marshall({ workspaceId, proposalId }),
+          UpdateExpression: "SET signatureSendClaim = :claim",
+          ConditionExpression: "attribute_exists(proposalId) AND (attribute_not_exists(signatureSendClaim) OR signatureSendClaim.claimedAt < :stale)",
+          ExpressionAttributeValues: marshall({ ":claim": claim, ":stale": staleBefore }),
+        }));
+        return true;
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return false;
+        throw error;
+      }
+    },
+
+    async releaseSignatureSendClaim(workspaceId, proposalId, claimId) {
+      if (!tableNames.proposals) return;
+      try {
+        await client.send(new commands.UpdateItemCommand({
+          TableName: tableNames.proposals,
+          Key: marshall({ workspaceId, proposalId }),
+          UpdateExpression: "REMOVE signatureSendClaim",
+          // Only drop our own claim - never one a later caller took over.
+          ConditionExpression: "signatureSendClaim.claimId = :claimId",
+          ExpressionAttributeValues: marshall({ ":claimId": claimId }),
+        }));
+      } catch (error) {
+        if (!isConditionalCheckFailed(error)) throw error;
+      }
     },
 
     async updateProposalSignature(workspaceId, proposalId, signatureRequest, { markProposalCompleted = false } = {}) {

@@ -4345,3 +4345,71 @@ test("a reservation is released when the proposal turns out to be already counte
   // The slot we reserved but did not use must go back, not leak.
   assert.equal(generatedCount(store), 10);
 });
+
+// The only thing standing between a double-submit and two real SignWell
+// documents was a read-then-act 409: both requests read "no active signature
+// request", both passed, both created a document. That means two emails to the
+// signer, two billed sends, and an orphan our record never points at - so it
+// can't even be cancelled. A conditional claim now settles it in DynamoDB.
+test("concurrent sends for the same proposal create exactly one SignWell document", async () => {
+  const proposals = new Map([["prp-dup", { id: "prp-dup", name: "Only once", status: "draft" }]]);
+  let claim = null;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal(_workspaceId, proposalId) {
+      const found = proposals.get(proposalId);
+      return found ? structuredClone(found) : null;
+    },
+    async updateProposalSignature(_workspaceId, proposalId, signatureRequest) {
+      proposals.set(proposalId, { ...proposals.get(proposalId), signatureRequest });
+      return signatureRequest;
+    },
+    // Mirrors the real conditional write: first caller wins, later ones are
+    // refused until the claim is released or goes stale.
+    async claimSignatureSend(_workspaceId, _proposalId, next, staleBefore) {
+      if (claim && claim.claimedAt >= staleBefore) return false;
+      claim = next;
+      return true;
+    },
+    async releaseSignatureSendClaim(_workspaceId, _proposalId, claimId) {
+      if (claim?.claimId === claimId) claim = null;
+    },
+  };
+  let created = 0;
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      async createDocument() {
+        created += 1;
+        // Slow enough that the second request is inside the window.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { id: `signwell-doc-${created}`, status: "Sent", recipients: [{ id: "1", status: "sent" }] };
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => signWell,
+    getAssetSigner: async () => ({ async createDownloadUrl() { return "https://example.com/proposal.pdf"; } }),
+  });
+
+  const send = () => handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-dup/signature-requests",
+    {
+      assetKey: "exports/prp-dup.pdf",
+      recipients: [{ name: "Jane Client", email: "jane@example.com" }],
+      subject: "Please sign",
+      message: "Please review and sign.",
+      applySigningOrder: false,
+    },
+  ));
+
+  const [a, b] = await Promise.all([send(), send()]);
+
+  assert.equal(created, 1, "only one SignWell document may be created");
+  assert.deepEqual([a.statusCode, b.statusCode].sort(), [201, 409]);
+  // And the claim is not left behind wedging future sends.
+  assert.equal(claim, null);
+});
