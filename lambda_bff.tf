@@ -121,8 +121,8 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         ]
       },
       {
-        Sid      = "ManageLegalDocuments"
-        Effect   = "Allow"
+        Sid    = "ManageLegalDocuments"
+        Effect = "Allow"
         # UpdateItem stamps replacedAt on the outgoing version when a new one is published.
         Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
         Resource = aws_dynamodb_table.legal_documents.arn

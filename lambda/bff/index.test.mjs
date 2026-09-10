@@ -4416,6 +4416,73 @@ test("concurrent sends for the same proposal create exactly one SignWell documen
   assert.equal(claim, null);
 });
 
+// PATCH replaces the whole proposal record, and the only guard was
+// `attribute_exists(proposalId)` - an existence check, not a version check. So
+// two people editing the same proposal was last-write-wins: the second save
+// silently erased the first, with no error and nothing to notice it by.
+test("a save based on a stale copy is rejected instead of erasing the other editor's work", async () => {
+  let stored = { id: "prp-shared", name: "Original", status: "draft", rev: 4 };
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(stored); },
+    async putProposal(_workspaceId, proposal, { expectedRev = null } = {}) {
+      // Mirrors the real conditional write.
+      if (Number.isFinite(expectedRev) && Number.isFinite(stored.rev) && stored.rev !== expectedRev) {
+        const error = new Error("The conditional request failed");
+        error.name = "ConditionalCheckFailedException";
+        throw error;
+      }
+      stored = structuredClone(proposal);
+      return stored;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  // Both editors loaded rev 4. The first save wins and moves it to rev 5.
+  const first = await handler(authenticatedEvent("PATCH", "/workspaces/me/proposals/prp-shared", {
+    id: "prp-shared", name: "Edited by A", status: "draft", rev: 4,
+  }));
+  assert.equal(first.statusCode, 200);
+  assert.equal(JSON.parse(first.body).rev, 5);
+  assert.equal(stored.name, "Edited by A");
+
+  // The second still thinks it is on rev 4 - it must not clobber A.
+  const second = await handler(authenticatedEvent("PATCH", "/workspaces/me/proposals/prp-shared", {
+    id: "prp-shared", name: "Edited by B", status: "draft", rev: 4,
+  }));
+  assert.equal(second.statusCode, 409);
+  const conflict = JSON.parse(second.body);
+  assert.equal(conflict.error, "proposal_conflict");
+  assert.equal(conflict.proposal.name, "Edited by A", "the winning version comes back so the client can merge");
+  assert.equal(stored.name, "Edited by A", "A's work survives");
+
+  // Reloading and saving on the current rev works.
+  const retry = await handler(authenticatedEvent("PATCH", "/workspaces/me/proposals/prp-shared", {
+    id: "prp-shared", name: "Edited by B", status: "draft", rev: 5,
+  }));
+  assert.equal(retry.statusCode, 200);
+  assert.equal(stored.name, "Edited by B");
+});
+
+test("a client that sends no rev still saves, and still advances the rev", async () => {
+  let stored = { id: "prp-old-client", name: "Original", status: "draft" };
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(stored); },
+    async putProposal(_workspaceId, proposal) { stored = structuredClone(proposal); return stored; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/proposals/prp-old-client", {
+    id: "prp-old-client", name: "Saved without a rev", status: "draft",
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(stored.rev, 1);
+});
+
 // Signed PDFs used to be archived lazily - only when someone first opened the
 // download - so between signing and that first click, the only copy of a
 // legally binding document lived with SignWell. And revising deleted the
