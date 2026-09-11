@@ -3501,6 +3501,10 @@ async function handleProposalApi(event, {
       ];
       Object.assign(reopened, {
         status: "draft",
+        // Un-cancel too: a proposal revised out of a soft-delete (possibly
+        // hand-marked Completed to close out a dead-end signature) comes back
+        // as a plain, live draft - never stuck showing Canceled.
+        canceledAt: null,
         revisedAt: now,
         updatedAt: now,
         ...(typeof body.assignedTo === "string" && body.assignedTo.trim()
