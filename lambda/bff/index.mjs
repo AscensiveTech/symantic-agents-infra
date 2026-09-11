@@ -1287,6 +1287,8 @@ async function handlePlatformCompanies(event, {
   const adminName = typeof body?.adminName === "string" ? body.adminName.trim() : "";
   const temporaryPassword = body?.temporaryPassword;
   const tier = body?.tier ?? "basic";
+  const hasEntitlements = body && Object.hasOwn(body, "entitlements");
+  const entitlements = body?.entitlements;
   const allowedSections = normalizeProposalSections(body?.allowedProposalSections);
   const defaultSections = normalizeProposalSections(body?.defaultTemplateSections);
   // The super admin must set when billing starts for the new company; it can
@@ -1304,6 +1306,7 @@ async function handlePlatformCompanies(event, {
     typeof temporaryPassword !== "string" ||
     temporaryPassword.length < 12 ||
     !COMPANY_TIERS.has(tier) ||
+    (hasEntitlements && (!isValidEntitlements(entitlements) || !PRODUCT_KEYS.some((key) => entitlements[key] === true))) ||
     !billingAnchorValid ||
     !allowedSections ||
     !defaultSections ||
@@ -1318,6 +1321,7 @@ async function handlePlatformCompanies(event, {
     workspaceId,
     name,
     tier,
+    ...(hasEntitlements ? { entitlements } : {}),
     allowedProposalSections: allowedSections,
     billingAnchorDate,
     createdAt: now,
@@ -1350,6 +1354,7 @@ async function handlePlatformCompanies(event, {
       name,
       createdAt: now,
       allowedProposalSections: allowedSections,
+      entitlements: workspaceEntitlements(workspace),
       tier,
       userCount: 1,
       proposalCount: 0,
@@ -1765,6 +1770,7 @@ async function platformCompanySummary(store, workspace) {
       workspace.allowedProposalSections,
       PROPOSAL_SECTION_KINDS,
     ),
+    entitlements: workspaceEntitlements(workspace),
     tier: normalizeCompanyTier(workspace.tier),
     userCount: members.filter((member) => member.status !== "disabled").length,
     proposalCount,
@@ -2220,7 +2226,10 @@ async function handleWorkspaceUsers(event, {
   if (path === "/workspaces/me/users/me" && method === "GET") {
     const self = await store.getMembership(actor.userId);
     if (!self || self.workspaceId !== actor.workspaceId) return json(404, { message: "Workspace user not found" });
-    return json(200, self);
+    const workspace = typeof store.getWorkspace === "function"
+      ? await store.getWorkspace(actor.workspaceId)
+      : null;
+    return json(200, { ...self, entitlements: workspaceEntitlements(workspace) });
   }
 
   if (!isWorkspaceAdmin(actor)) return json(403, { message: "Company administrator access is required" });
