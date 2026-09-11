@@ -2291,6 +2291,9 @@ test("a user records their first-run tour completion via /users/me", async () =>
     async getMembership(userId) {
       return { userId, cognitoUsername: "u@x.com", email: "u@x.com", workspaceId: "workspace-123", role: "quotation-builder", status: "active", name: "U" };
     },
+    async getWorkspace() {
+      return { workspaceId: "workspace-123", entitlements: { receptionist: false, rapidProposal: true } };
+    },
     async putMembership(m) { saved.push(m); },
   };
   const { createHandler } = await loadBff();
@@ -2309,6 +2312,7 @@ test("a user records their first-run tour completion via /users/me", async () =>
   get.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
   const body = JSON.parse((await handler(get)).body);
   assert.equal(body.tourCompletedAt, saved[0].tourCompletedAt);
+  assert.deepEqual(body.entitlements, { receptionist: false, rapidProposal: true });
 });
 
 test("PATCH /workspaces/me/users/me with an empty body is a 400", async () => {
@@ -2597,6 +2601,7 @@ test("super administrators onboard a company with an isolated default template",
     adminName: "AJM",
     temporaryPassword: "Temporary123!",
     tier: "repository",
+    entitlements: { receptionist: false, rapidProposal: true },
     billingAnchorDate: "2099-01-01",
     allowedProposalSections: ["cover", "agenda", "parts", "closing"],
     defaultTemplateSections: ["cover", "agenda", "closing"],
@@ -2611,6 +2616,8 @@ test("super administrators onboard a company with an isolated default template",
   assert.equal(body.templateCount, 1);
   assert.equal(bundle.workspace.name, "Technovate Design");
   assert.equal(bundle.workspace.tier, "repository");
+  assert.deepEqual(bundle.workspace.entitlements, { receptionist: false, rapidProposal: true });
+  assert.deepEqual(body.entitlements, { receptionist: false, rapidProposal: true });
   assert.deepEqual(bundle.workspace.allowedProposalSections, ["cover", "agenda", "parts", "closing"]);
   assert.equal(bundle.membership.email, "ajm@technovate.design");
   assert.equal(bundle.membership.role, "company-admin");
@@ -2852,7 +2859,11 @@ test("super administrators can rename a company and change its plan", async () =
   const event = authenticatedEvent(
     "PATCH",
     "/platform/companies/workspace-technovate",
-    { name: "Technovate Design", tier: "signing" },
+    {
+      name: "Technovate Design",
+      tier: "signing",
+      entitlements: { receptionist: true, rapidProposal: true },
+    },
   );
   event.pathParameters = { workspaceId: "workspace-technovate" };
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
@@ -2863,8 +2874,10 @@ test("super administrators can rename a company and change its plan", async () =
   assert.equal(response.statusCode, 200);
   assert.equal(saved.name, "Technovate Design");
   assert.equal(saved.tier, "signing");
+  assert.deepEqual(saved.entitlements, { receptionist: true, rapidProposal: true });
   assert.equal(body.name, "Technovate Design");
   assert.equal(body.tier, "signing");
+  assert.deepEqual(body.entitlements, { receptionist: true, rapidProposal: true });
 });
 
 test("super administrators can update a company user's role", async () => {
