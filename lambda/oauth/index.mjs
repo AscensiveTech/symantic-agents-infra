@@ -1,5 +1,10 @@
 import { randomBytes } from "node:crypto";
 
+export const PROVIDER_LABELS = Object.freeze({
+  "google-calendar": "Google Calendar",
+  "microsoft-365-calendar": "Microsoft 365 Calendar",
+});
+
 export const PROVIDERS = Object.freeze({
   "google-calendar": {
     authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -481,7 +486,7 @@ export function createHandler(options = {}) {
         if (!identity) return json(401, { message: "Unauthorized" });
         const baseUrl = requireAbsoluteUrl(redirectBaseUrl, "OAuth redirect base URL");
         const callbackUri = `${baseUrl}/oauth/${provider}/callback`;
-        const secret = normalizeSecret(await getOAuthSecret(provider));
+        const secret = await loadProviderSecret(getOAuthSecret, provider);
         const state = randomState();
         const returnTo = sanitizeReturnTo(
           event?.queryStringParameters?.returnTo,
@@ -534,7 +539,7 @@ export function createHandler(options = {}) {
             );
           }
 
-          const secret = normalizeSecret(await getOAuthSecret(provider));
+          const secret = await loadProviderSecret(getOAuthSecret, provider);
           const providerClient = getProviderClient(provider);
           const tokens = await providerClient.exchangeCode({
             code,
@@ -732,7 +737,7 @@ export function createHandler(options = {}) {
         }
         const baseUrl = requireAbsoluteUrl(redirectBaseUrl, "OAuth redirect base URL");
         const callbackUri = `${baseUrl}/oauth/${provider}/callback`;
-        const secret = normalizeSecret(await getOAuthSecret(provider));
+        const secret = await loadProviderSecret(getOAuthSecret, provider);
         const oauthState = randomState();
         await (await getStateStore()).put({
           state: oauthState,
@@ -795,7 +800,7 @@ export function createHandler(options = {}) {
             "provider_not_connected",
           );
         }
-        const secret = normalizeSecret(await getOAuthSecret(provider));
+        const secret = await loadProviderSecret(getOAuthSecret, provider);
         const tokenCrypto = await getTokenCrypto();
         const refreshToken = await tokenCrypto.decryptToken({
           encryptedToken: current.encryptedRefreshToken,
@@ -1057,6 +1062,40 @@ function normalizeSecret(secret) {
     throw new Error("OAuth secret must contain clientId and clientSecret");
   }
   return { clientId, clientSecret };
+}
+
+// Terraform creates an empty secret shell for every provider, so "credentials
+// were never filled in" is a normal setup state, not a server fault. Report it
+// as something an administrator can act on instead of a blank 500.
+async function loadProviderSecret(getOAuthSecret, provider) {
+  let secret;
+  try {
+    secret = await getOAuthSecret(provider);
+  } catch (error) {
+    if (error?.name === "ResourceNotFoundException") {
+      throw providerNotConfigured(provider, error);
+    }
+    throw error;
+  }
+  try {
+    return normalizeSecret(secret);
+  } catch (error) {
+    throw providerNotConfigured(provider, error);
+  }
+}
+
+function providerNotConfigured(provider, cause) {
+  console.error("Calendar provider is not configured", {
+    provider,
+    name: cause?.name,
+    message: cause?.message,
+  });
+  return new OAuthRequestError(
+    `${PROVIDER_LABELS[provider] ?? provider} is not set up yet. ` +
+      "Ask your administrator to finish configuring it.",
+    503,
+    "provider_not_configured",
+  );
 }
 
 function normalizeTokenResponse(tokens, provider) {
