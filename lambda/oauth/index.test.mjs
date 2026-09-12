@@ -390,6 +390,38 @@ test("start preserves the safe integrations return route", async () => {
   );
 });
 
+// Terraform creates an empty secret shell per provider, so an unconfigured
+// provider is a normal setup state. It surfaced as a blank 500 in dev.
+test("an unconfigured provider reports setup needed, not an internal error", async () => {
+  const missingVersion = Object.assign(
+    new Error("Secrets Manager can't find the specified secret value"),
+    { name: "ResourceNotFoundException" },
+  );
+  const cases = [
+    ["secret shell with no version", async () => { throw missingVersion; }],
+    ["placeholder secret with no credentials", async () => ({})],
+  ];
+
+  for (const [label, getOAuthSecret] of cases) {
+    const handler = createHandler({
+      getStateStore: async () => createInMemoryStateStore(),
+      getConnectionStore: async () => createInMemoryConnectionStore(),
+      getOAuthSecret,
+      redirectBaseUrl: "https://api.example.com",
+      appUrl: "https://agents.example.com",
+    });
+
+    const response = await handler(
+      authenticatedEvent("GET", "/oauth/microsoft-365-calendar/start"),
+    );
+    const body = JSON.parse(response.body);
+
+    assert.equal(response.statusCode, 503, label);
+    assert.equal(body.code, "provider_not_configured", label);
+    assert.match(body.message, /Microsoft 365 Calendar is not set up yet/);
+  }
+});
+
 test("google callback preserves an existing refresh token when Google omits one", async () => {
   const stateStore = createInMemoryStateStore();
   await stateStore.put({
