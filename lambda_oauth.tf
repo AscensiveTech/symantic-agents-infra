@@ -29,6 +29,48 @@ resource "aws_dynamodb_table" "oauth_states" {
   }
 }
 
+// A calendar invitation lets a non-admin - possibly someone with no account at
+// all - authorize their own calendar from a shareable link. The id is the only
+// credential on the public page, so rows expire on their own via TTL.
+resource "aws_dynamodb_table" "calendar_invites" {
+  name         = "${local.name_prefix}-calendar-invites"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "inviteId"
+
+  attribute {
+    name = "inviteId"
+    type = "S"
+  }
+
+  attribute {
+    name = "workspaceId"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "workspaceId-index"
+    hash_key        = "workspaceId"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-calendar-invites"
+  }
+}
+
 resource "aws_iam_role" "oauth_lambda" {
   name = "${local.name_prefix}-oauth-lambda"
 
@@ -79,6 +121,22 @@ resource "aws_iam_role_policy" "oauth_runtime" {
         Resource = aws_dynamodb_table.workspace_memberships.arn
       },
       {
+        Sid    = "ManageCalendarInvites"
+        Effect = "Allow"
+        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Resource = [
+          aws_dynamodb_table.calendar_invites.arn,
+          "${aws_dynamodb_table.calendar_invites.arn}/index/*",
+        ]
+      },
+      {
+        # Read-only, and only to show the company name on the public invite page.
+        Sid      = "ReadWorkspaceName"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["workspaces"].arn
+      },
+      {
         Sid    = "ReadOAuthSecrets"
         Effect = "Allow"
         Action = ["secretsmanager:GetSecretValue"]
@@ -126,6 +184,9 @@ resource "aws_lambda_function" "oauth" {
       OAUTH_STATE_TTL_SECONDS     = "600"
       OAUTH_STATES_TABLE          = aws_dynamodb_table.oauth_states.name
       CALENDAR_CONNECTIONS_TABLE  = aws_dynamodb_table.control_plane["calendar_connections"].name
+      CALENDAR_INVITES_TABLE      = aws_dynamodb_table.calendar_invites.name
+      CALENDAR_INVITE_TTL_DAYS    = "7"
+      WORKSPACES_TABLE            = aws_dynamodb_table.control_plane["workspaces"].name
       WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
       CALENDAR_TOKENS_KMS_KEY_ID  = aws_kms_key.calendar_tokens.arn
       GOOGLE_OAUTH_SECRET_ARN     = aws_secretsmanager_secret.providers["google-oauth"].arn
@@ -159,6 +220,17 @@ locals {
     "POST /calendars/select",
     "GET /calendars/connection",
     "DELETE /calendars/connection",
+    "POST /calendars/invites",
+    "GET /calendars/invites",
+    "DELETE /calendars/invites/{inviteId}",
+  ])
+
+  # The invitee may have no account at all, so the landing page and the
+  # authorization it starts are reached with the invite id alone. Both are
+  # guarded in the handler: the id is 32 random bytes, single-use, and expires.
+  oauth_public_routes = toset([
+    "GET /calendars/invites/{inviteId}",
+    "GET /calendars/invites/{inviteId}/start",
   ])
 }
 
@@ -175,6 +247,15 @@ resource "aws_apigatewayv2_route" "oauth_authorized" {
 resource "aws_apigatewayv2_route" "oauth_callback" {
   api_id             = aws_apigatewayv2_api.bff.id
   route_key          = "GET /oauth/{provider}/callback"
+  authorization_type = "NONE"
+  target             = "integrations/${aws_apigatewayv2_integration.oauth.id}"
+}
+
+resource "aws_apigatewayv2_route" "calendar_invite_public" {
+  for_each = local.oauth_public_routes
+
+  api_id             = aws_apigatewayv2_api.bff.id
+  route_key          = each.value
   authorization_type = "NONE"
   target             = "integrations/${aws_apigatewayv2_integration.oauth.id}"
 }

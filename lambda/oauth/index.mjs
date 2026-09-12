@@ -21,6 +21,12 @@ export const PROVIDERS = Object.freeze({
 
 const DEFAULT_RETURN_TO = "/agents/new/connections";
 const DEFAULT_STATE_TTL_SECONDS = 600;
+const DEFAULT_INVITE_TTL_DAYS = 7;
+const INVITE_PATH_PREFIX = "/connect-calendar";
+// Invite ids are the only credential on the public connect page, so they must
+// be unguessable; this matches the entropy of the OAuth state token.
+const INVITE_ID_PATTERN = /^[A-Za-z0-9_-]{22,}$/;
+const ADMIN_ROLES = new Set(["company-admin", "super-admin"]);
 
 class OAuthRequestError extends Error {
   constructor(message, statusCode = 400, code = "invalid_request") {
@@ -177,12 +183,14 @@ export function createInMemoryConnectionStore(initialRecords = []) {
           "provider_not_connected",
         );
       }
+      const timestamp = new Date().toISOString();
       const next = {
         ...current,
         selectedCalendarId: calendarId,
         calendarTimezone,
         connectionState: "connected",
-        updatedAt: new Date().toISOString(),
+        lastSyncedAt: timestamp,
+        updatedAt: timestamp,
       };
       records.set(workspaceId, next);
       return cloneRecord(next);
@@ -220,6 +228,96 @@ export function createInMemoryConnectionStore(initialRecords = []) {
       };
       records.set(workspaceId, next);
       return cloneRecord(next);
+    },
+  };
+}
+
+// A calendar invite lets someone who is not a workspace admin - and who may not
+// have an account at all - authorize their own calendar. The admin never sees
+// the invitee's credentials, only that the connection completed.
+export function createInMemoryInviteStore(initialRecords = []) {
+  const records = new Map(initialRecords.map((record) => [record.inviteId, { ...record }]));
+  return {
+    async put(record) {
+      records.set(record.inviteId, { ...record });
+      return { ...record };
+    },
+    async get(inviteId) {
+      const record = records.get(inviteId);
+      return record ? { ...record } : null;
+    },
+    async listByWorkspace(workspaceId) {
+      return [...records.values()]
+        .filter((record) => record.workspaceId === workspaceId)
+        .map((record) => ({ ...record }));
+    },
+    async setStatus(inviteId, workspaceId, status, extra = {}) {
+      const record = records.get(inviteId);
+      if (!record || record.workspaceId !== workspaceId) return null;
+      const next = { ...record, status, ...extra };
+      records.set(inviteId, next);
+      return { ...next };
+    },
+  };
+}
+
+export function createDynamoInviteStore(client, commands, tableName) {
+  return {
+    async put(record) {
+      await client.send(new commands.PutItemCommand({
+        TableName: tableName,
+        Item: marshall(record),
+      }));
+      return record;
+    },
+    async get(inviteId) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableName,
+        Key: marshall({ inviteId }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+    async listByWorkspace(workspaceId) {
+      const invites = [];
+      let exclusiveStartKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tableName,
+          IndexName: "workspaceId-index",
+          KeyConditionExpression: "workspaceId = :workspaceId",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        }));
+        invites.push(...(result.Items ?? []).map((item) => unmarshall(item)));
+        exclusiveStartKey = result.LastEvaluatedKey;
+      } while (exclusiveStartKey);
+      return invites;
+    },
+    // The workspace condition is what stops one workspace's admin from
+    // revoking or completing another workspace's invite by id alone.
+    async setStatus(inviteId, workspaceId, status, extra = {}) {
+      const values = { ":status": status, ":workspaceId": workspaceId };
+      const sets = ["#status = :status"];
+      for (const [key, value] of Object.entries(extra)) {
+        values[`:${key}`] = value;
+        sets.push(`${key} = :${key}`);
+      }
+      try {
+        const result = await client.send(new commands.UpdateItemCommand({
+          TableName: tableName,
+          Key: marshall({ inviteId }),
+          UpdateExpression: `SET ${sets.join(", ")}`,
+          ConditionExpression: "workspaceId = :workspaceId",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: marshall(values),
+          ReturnValues: "ALL_NEW",
+        }));
+        return unmarshall(result.Attributes);
+      } catch (error) {
+        if (error?.name === "ConditionalCheckFailedException") return null;
+        throw error;
+      }
     },
   };
 }
@@ -319,6 +417,21 @@ export function createProviderClient(provider, { fetchImpl = globalThis.fetch } 
       }
       return listMicrosoftCalendars(fetchImpl, accessToken);
     },
+    // Which provider account these tokens belong to, so an admin can confirm
+    // whose calendar is attached without ever seeing their credentials.
+    // Google's primary calendar id is the account's email address, so reading
+    // it here avoids requesting a userinfo scope we would otherwise not need.
+    async getAccountEmail({ accessToken, calendars }) {
+      if (provider === "google-calendar") {
+        return calendars?.find(({ primary }) => primary)?.id ?? null;
+      }
+      const me = await getProviderJson(
+        fetchImpl,
+        "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName",
+        accessToken,
+      );
+      return me?.mail ?? me?.userPrincipalName ?? null;
+    },
   };
 }
 
@@ -327,6 +440,8 @@ export function createHandler(options = {}) {
     getStateStore = getDefaultStateStore,
     getConnectionStore = getDefaultConnectionStore,
     getMembershipStore = getDefaultMembershipStore,
+    getInviteStore = getDefaultInviteStore,
+    getWorkspaceStore = getDefaultWorkspaceStore,
     getOAuthSecret = getDefaultOAuthSecret,
     getTokenCrypto = getDefaultTokenCrypto,
     getProviderClient = (provider) => createProviderClient(provider),
@@ -334,9 +449,24 @@ export function createHandler(options = {}) {
     appUrl = process.env.APP_URL,
     stateTtlSeconds = Number(process.env.OAUTH_STATE_TTL_SECONDS) ||
       DEFAULT_STATE_TTL_SECONDS,
+    inviteTtlDays = Number(process.env.CALENDAR_INVITE_TTL_DAYS) ||
+      DEFAULT_INVITE_TTL_DAYS,
     now = Date.now,
     randomState = () => randomBytes(32).toString("base64url"),
   } = options;
+
+  async function requireAdminIdentity(event, membershipStore) {
+    const identity = await resolveIdentity(event, membershipStore);
+    if (!identity) throw new OAuthRequestError("Unauthorized", 401, "unauthorized");
+    if (!isWorkspaceAdmin(identity)) {
+      throw new OAuthRequestError(
+        "Only a workspace administrator can manage calendar invitations",
+        403,
+        "forbidden",
+      );
+    }
+    return identity;
+  }
 
   return async function handle(event) {
     const method = event?.requestContext?.http?.method;
@@ -450,9 +580,16 @@ export function createHandler(options = {}) {
             );
           }
 
+          const accountEmail = await readAccountEmail(providerClient, {
+            accessToken: tokens.accessToken,
+            calendars,
+          });
+          const connectedAtIso = new Date(now()).toISOString();
+
           const connection = {
             workspaceId: stateRecord.workspaceId,
             provider,
+            accountEmail,
             selectedCalendarId: selected?.id ?? null,
             calendarTimezone: selected?.timezone || "UTC",
             availableCalendars: calendars.map(toPublicCalendar),
@@ -462,12 +599,38 @@ export function createHandler(options = {}) {
               ? tokens.scopes
               : [...PROVIDERS[provider].scopes],
             connectionState: "connected",
-            updatedAt: new Date(now()).toISOString(),
+            connectedAt: existing?.provider === provider && existing.connectedAt
+              ? existing.connectedAt
+              : connectedAtIso,
+            lastSyncedAt: connectedAtIso,
+            updatedAt: connectedAtIso,
             ...(provider === "microsoft-365-calendar" && tokens.tid
               ? { tid: tokens.tid }
               : {}),
           };
           await connectionStore.save(connection);
+          // Records that the invited person finished, so the admin sees the
+          // connection without ever handling their credentials. Done after the
+          // connection is saved: a failure here must not lose the connection.
+          if (stateRecord.inviteId) {
+            try {
+              await (await getInviteStore()).setStatus(
+                stateRecord.inviteId,
+                stateRecord.workspaceId,
+                "completed",
+                {
+                  completedAt: connectedAtIso,
+                  completedProvider: provider,
+                  completedAccountEmail: accountEmail ?? "",
+                },
+              );
+            } catch (error) {
+              console.error("Calendar invite completion could not be recorded", {
+                name: error?.name,
+                message: error?.message,
+              });
+            }
+          }
           return redirect(buildAppRedirect(appUrl, stateRecord.returnTo, {
             calendar: "connected",
             provider,
@@ -483,6 +646,116 @@ export function createHandler(options = {}) {
             reason: error instanceof OAuthRequestError ? error.code : "oauth_failed",
           }));
         }
+      }
+
+      if (path === "/calendars/invites" && method === "POST") {
+        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const inviteId = randomState();
+        const createdAt = new Date(now()).toISOString();
+        const invite = {
+          inviteId,
+          workspaceId: identity.workspaceId,
+          // Denormalised so the public landing page can name the company
+          // without exposing the workspace record to an anonymous caller.
+          workspaceName: await lookupWorkspaceName(
+            await getWorkspaceStore(),
+            identity.workspaceId,
+          ),
+          inviteeLabel: readInviteeLabel(readBody(event)),
+          status: "pending",
+          createdAt,
+          createdByUserId: identity.userId,
+          createdByName: identity.displayName,
+          expiresAt: Math.floor(now() / 1000) + inviteTtlDays * 86_400,
+        };
+        await (await getInviteStore()).put(invite);
+        return json(201, {
+          ...toPublicInviteAdmin(invite),
+          url: buildInviteUrl(appUrl, inviteId),
+        });
+      }
+
+      if (path === "/calendars/invites" && method === "GET") {
+        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const invites = await (await getInviteStore())
+          .listByWorkspace(identity.workspaceId);
+        return json(200, {
+          invites: invites
+            .map((invite) => ({
+              ...toPublicInviteAdmin(invite),
+              url: buildInviteUrl(appUrl, invite.inviteId),
+            }))
+            .sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? "")),
+        });
+      }
+
+      const inviteMatch = path.match(/^\/calendars\/invites\/([^/]+)$/);
+      const inviteStartMatch = path.match(/^\/calendars\/invites\/([^/]+)\/start$/);
+
+      if (method === "DELETE" && inviteMatch) {
+        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const inviteId = requireInviteId(inviteMatch[1]);
+        const revoked = await (await getInviteStore())
+          .setStatus(inviteId, identity.workspaceId, "revoked", {
+            revokedAt: new Date(now()).toISOString(),
+          });
+        if (!revoked) {
+          throw new OAuthRequestError("Invite not found", 404, "invite_not_found");
+        }
+        return json(200, toPublicInviteAdmin(revoked));
+      }
+
+      // Public: the invitee has only the link, and must not need an account.
+      if (method === "GET" && inviteMatch) {
+        const inviteId = requireInviteId(inviteMatch[1]);
+        const invite = await (await getInviteStore()).get(inviteId);
+        const state = inviteState(invite, now);
+        return json(state === "not_found" ? 404 : 200, {
+          status: state,
+          // Deliberately minimal: no workspace id, no creator identity.
+          workspaceName: state === "pending" ? invite.workspaceName ?? null : null,
+          providers: state === "pending" ? Object.keys(PROVIDERS) : [],
+        });
+      }
+
+      if (method === "GET" && inviteStartMatch) {
+        const inviteId = requireInviteId(inviteStartMatch[1]);
+        const provider = requireProvider(event?.queryStringParameters?.provider);
+        const invite = await (await getInviteStore()).get(inviteId);
+        const state = inviteState(invite, now);
+        if (state !== "pending") {
+          throw new OAuthRequestError(
+            "This invitation is no longer valid",
+            410,
+            `invite_${state}`,
+          );
+        }
+        const baseUrl = requireAbsoluteUrl(redirectBaseUrl, "OAuth redirect base URL");
+        const callbackUri = `${baseUrl}/oauth/${provider}/callback`;
+        const secret = normalizeSecret(await getOAuthSecret(provider));
+        const oauthState = randomState();
+        await (await getStateStore()).put({
+          state: oauthState,
+          workspaceId: invite.workspaceId,
+          // consumeOAuthState requires a non-empty userId; an invited person may
+          // have no account at all, so the invite itself is the identity.
+          userId: `invite:${inviteId}`,
+          inviteId,
+          provider,
+          redirectUri: callbackUri,
+          // Fixed server-side rather than taken from the caller: this endpoint
+          // is unauthenticated, so it must not accept a caller-chosen return.
+          returnTo: `${INVITE_PATH_PREFIX}/${inviteId}`,
+          expiresAt: Math.floor(now() / 1000) + stateTtlSeconds,
+        });
+        return json(200, {
+          authorizeUrl: buildAuthorizationUrl({
+            provider,
+            clientId: secret.clientId,
+            redirectUri: callbackUri,
+            state: oauthState,
+          }),
+        });
       }
 
       if (path === "/calendars/connection" && method === "GET") {
@@ -608,6 +881,16 @@ function getProviderConfig(provider) {
   return config;
 }
 
+// The account label is display-only: a provider hiccup reading it must never
+// cost the customer the calendar connection they just authorized.
+async function readAccountEmail(providerClient, input) {
+  try {
+    return await providerClient.getAccountEmail(input) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function requireProvider(provider) {
   getProviderConfig(provider);
   return provider;
@@ -627,16 +910,93 @@ async function resolveIdentity(event, membershipStore) {
     claims?.email ??
     sub;
   if (typeof userId !== "string" || userId.length === 0) return null;
+  const roles = claimGroups(claims?.["cognito:groups"]);
+  const displayName = typeof claims?.name === "string" && claims.name.trim()
+    ? claims.name.trim()
+    : userId;
 
   if (!membershipStore || typeof membershipStore.getMembership !== "function") {
-    return { workspaceId: sub, userId };
+    return { workspaceId: sub, userId, roles, displayName };
   }
   const membership = await membershipStore.getMembership(sub);
   if (!membership || membership.status === "disabled") return null;
   if (typeof membership.workspaceId !== "string" || membership.workspaceId.length === 0) {
     return null;
   }
-  return { workspaceId: membership.workspaceId, userId };
+  return { workspaceId: membership.workspaceId, userId, roles, displayName };
+}
+
+// Mirrors the BFF's parser: API Gateway exposes cognito:groups as an array, a
+// JSON array string, or a bracketed comma-delimited string depending on setup.
+function claimGroups(value) {
+  if (Array.isArray(value)) return value.filter((group) => typeof group === "string");
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return parsed.filter((group) => typeof group === "string");
+  } catch {
+    // Fall through to the comma-delimited form.
+  }
+  return value.replace(/^\[|\]$/g, "").split(",")
+    .map((group) => group.trim().replace(/^['"]|['"]$/g, ""))
+    .filter(Boolean);
+}
+
+function isWorkspaceAdmin(identity) {
+  return identity.roles.some((role) => ADMIN_ROLES.has(role));
+}
+
+function requireInviteId(value) {
+  if (typeof value !== "string" || !INVITE_ID_PATTERN.test(value)) {
+    throw new OAuthRequestError("Invalid invitation", 404, "invite_not_found");
+  }
+  return value;
+}
+
+function readInviteeLabel(body) {
+  const raw = body?.inviteeLabel;
+  if (typeof raw !== "string") return "";
+  return raw.trim().slice(0, 200);
+}
+
+/** "pending" is the only state that may start an authorization. */
+function inviteState(invite, now) {
+  if (!invite) return "not_found";
+  if (invite.status === "revoked") return "revoked";
+  if (invite.status === "completed") return "completed";
+  if (Number(invite.expiresAt) <= Math.floor(now() / 1000)) return "expired";
+  return "pending";
+}
+
+function buildInviteUrl(appUrl, inviteId) {
+  const base = requireAbsoluteUrl(appUrl, "App URL");
+  return `${base}${INVITE_PATH_PREFIX}/${inviteId}`;
+}
+
+// Never exposes the raw invite token holder's identity beyond the workspace.
+function toPublicInviteAdmin(invite) {
+  return {
+    inviteId: invite.inviteId,
+    inviteeLabel: invite.inviteeLabel ?? "",
+    status: invite.status,
+    createdAt: invite.createdAt,
+    createdByName: invite.createdByName ?? null,
+    expiresAt: invite.expiresAt,
+    completedAt: invite.completedAt ?? null,
+    completedProvider: invite.completedProvider ?? null,
+    completedAccountEmail: invite.completedAccountEmail ?? null,
+  };
+}
+
+async function lookupWorkspaceName(workspaceStore, workspaceId) {
+  if (!workspaceStore?.getWorkspace) return null;
+  try {
+    const workspace = await workspaceStore.getWorkspace(workspaceId);
+    return typeof workspace?.name === "string" ? workspace.name : null;
+  } catch {
+    // A missing display name must not block issuing the invitation.
+    return null;
+  }
 }
 
 function readBody(event) {
@@ -657,8 +1017,13 @@ function sanitizeReturnTo(candidate) {
   }
   try {
     const parsed = new URL(candidate, "https://local.invalid");
+    // The invite landing page is public, so its path carries the invite id.
+    // Constrained to the id character set so it cannot smuggle a longer path.
+    const inviteReturn = parsed.pathname.startsWith(`${INVITE_PATH_PREFIX}/`) &&
+      INVITE_ID_PATTERN.test(parsed.pathname.slice(INVITE_PATH_PREFIX.length + 1));
     const allowedPath = parsed.pathname === DEFAULT_RETURN_TO ||
-      parsed.pathname === "/integrations";
+      parsed.pathname === "/integrations" ||
+      inviteReturn;
     if (
       parsed.origin !== "https://local.invalid" ||
       !allowedPath
@@ -967,7 +1332,7 @@ export function createDynamoConnectionStore(client, commands, tableName) {
         UpdateExpression:
           "SET selectedCalendarId = :calendarId, " +
           "calendarTimezone = :timezone, connectionState = :connected, " +
-          "updatedAt = :updatedAt",
+          "lastSyncedAt = :updatedAt, updatedAt = :updatedAt",
         ConditionExpression: "provider = :provider AND connectionState = :connected",
         ExpressionAttributeValues: marshall({
           ":calendarId": calendarId,
@@ -1031,6 +1396,8 @@ let awsRuntimePromise;
 let stateStorePromise;
 let connectionStorePromise;
 let membershipStorePromise;
+let inviteStorePromise;
+let workspaceStorePromise;
 let tokenCryptoPromise;
 const secretPromises = new Map();
 
@@ -1090,6 +1457,35 @@ async function getDefaultMembershipStore() {
     ),
   );
   return membershipStorePromise;
+}
+
+async function getDefaultInviteStore() {
+  inviteStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) => {
+    if (!process.env.CALENDAR_INVITES_TABLE) {
+      throw new Error("CALENDAR_INVITES_TABLE is required");
+    }
+    return createDynamoInviteStore(
+      dynamoClient,
+      dynamodb,
+      process.env.CALENDAR_INVITES_TABLE,
+    );
+  });
+  return inviteStorePromise;
+}
+
+// Read-only, and only for the workspace's display name on the invite page.
+async function getDefaultWorkspaceStore() {
+  if (!process.env.WORKSPACES_TABLE) return null;
+  workspaceStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) => ({
+    async getWorkspace(workspaceId) {
+      const result = await dynamoClient.send(new dynamodb.GetItemCommand({
+        TableName: process.env.WORKSPACES_TABLE,
+        Key: marshall({ workspaceId }),
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+  }));
+  return workspaceStorePromise;
 }
 
 async function getDefaultTokenCrypto() {

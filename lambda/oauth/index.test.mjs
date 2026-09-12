@@ -7,6 +7,7 @@ import {
   consumeOAuthState,
   createHandler,
   createInMemoryConnectionStore,
+  createInMemoryInviteStore,
   createInMemoryMembershipStore,
   createInMemoryStateStore,
   createProviderClient,
@@ -95,6 +96,47 @@ test("microsoft calendar listing stays within Calendars.ReadWrite scope", async 
     timezone: "UTC",
     primary: true,
   }]);
+});
+
+test("google reads the connected account from the primary calendar, not a userinfo scope", async () => {
+  const requests = [];
+  const providerClient = createProviderClient("google-calendar", {
+    fetchImpl: async (url) => {
+      requests.push(url);
+      throw new Error("Google must not make a network call for the account email");
+    },
+  });
+
+  const accountEmail = await providerClient.getAccountEmail({
+    accessToken: "access-token",
+    calendars: [
+      { id: "shared@example.com", primary: false },
+      { id: "owner@example.com", primary: true },
+    ],
+  });
+
+  assert.equal(accountEmail, "owner@example.com");
+  assert.deepEqual(requests, []);
+});
+
+test("microsoft reads the connected account from the profile it already has scope for", async () => {
+  const requests = [];
+  const providerClient = createProviderClient("microsoft-365-calendar", {
+    fetchImpl: async (url) => {
+      requests.push(url);
+      return new Response(
+        JSON.stringify({ mail: "owner@example.com", userPrincipalName: "owner@tenant" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  });
+
+  const accountEmail = await providerClient.getAccountEmail({ accessToken: "access-token" });
+
+  assert.equal(accountEmail, "owner@example.com");
+  assert.deepEqual(requests, [
+    "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName",
+  ]);
 });
 
 test("refresh tokens round-trip through KMS with workspace and provider context", async () => {
@@ -411,6 +453,9 @@ test("google callback preserves an existing refresh token when Google omits one"
   assert.deepEqual(await connections.get(workspaceId), {
     workspaceId,
     provider: "google-calendar",
+    // This fake provider client predates getAccountEmail; the connection must
+    // still be saved rather than lost over a display-only label.
+    accountEmail: null,
     selectedCalendarId: "primary-calendar",
     calendarTimezone: "America/New_York",
     availableCalendars: [{
@@ -423,6 +468,8 @@ test("google callback preserves an existing refresh token when Google omits one"
     tokenVersion: 4,
     scopes: ["new-scope"],
     connectionState: "connected",
+    connectedAt: "2027-01-15T08:00:00.000Z",
+    lastSyncedAt: "2027-01-15T08:00:00.000Z",
     updatedAt: "2027-01-15T08:00:00.000Z",
   });
 });
@@ -491,6 +538,7 @@ test("callback auto-selects the primary calendar and still exposes the rest for 
   assert.equal(callback.statusCode, 302);
   assert.deepEqual(JSON.parse(connection.body), {
     provider: "google-calendar",
+    accountEmail: null,
     // Primary calendar auto-selected; the customer can still switch via
     // /calendars/select (covered separately) or the wizard's Connections step.
     selectedCalendarId: "calendar-a",
@@ -498,6 +546,8 @@ test("callback auto-selects the primary calendar and still exposes the rest for 
     tokenVersion: 1,
     scopes: ["calendar"],
     connectionState: "connected",
+    connectedAt: "2027-01-15T08:00:00.000Z",
+    lastSyncedAt: "2027-01-15T08:00:00.000Z",
     updatedAt: "2027-01-15T08:00:00.000Z",
     availableCalendars: calendars,
   });
@@ -568,6 +618,214 @@ test("calendar adapter preserves the Task 7 operation surface", () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Calendar invitations: an admin issues a link, someone else authorizes their
+// own calendar with it, and the admin only ever sees that it completed.
+// ---------------------------------------------------------------------------
+
+const inviteId = "invite-token-that-is-long-enough-abc";
+
+function inviteHandler({
+  invites = createInMemoryInviteStore(),
+  stateStore = createInMemoryStateStore(),
+  connections = createInMemoryConnectionStore(),
+  now = () => 1_800_000_000_000,
+} = {}) {
+  return {
+    invites,
+    stateStore,
+    connections,
+    handler: createHandler({
+      getStateStore: async () => stateStore,
+      getConnectionStore: async () => connections,
+      getInviteStore: async () => invites,
+      getWorkspaceStore: async () => ({
+        getWorkspace: async () => ({ workspaceId, name: "Arc Dental" }),
+      }),
+      getOAuthSecret: async () => ({ clientId: "client-id", clientSecret: "client-secret" }),
+      getTokenCrypto: async () => ({
+        encryptToken: async () => "encrypted-token",
+        decryptToken: async () => "refresh-token",
+      }),
+      getProviderClient: () => ({
+        exchangeCode: async () => ({
+          accessToken: "access-token",
+          refreshToken: "refresh-token",
+          scopes: ["calendar"],
+        }),
+        listCalendars: async () => [
+          { id: "invitee@example.com", name: "Invitee", timezone: "UTC", primary: true },
+        ],
+        getAccountEmail: async ({ calendars }) => calendars.find((c) => c.primary)?.id ?? null,
+      }),
+      redirectBaseUrl: "https://api.example.com",
+      appUrl: "https://agents.example.com",
+      now,
+    }),
+  };
+}
+
+test("only a workspace admin can issue a calendar invitation", async () => {
+  const { handler } = inviteHandler();
+
+  const forbidden = await handler(authenticatedEvent("POST", "/calendars/invites", {}));
+  const unauthorized = await handler(event("POST", "/calendars/invites", {}));
+
+  assert.equal(forbidden.statusCode, 403);
+  assert.equal(JSON.parse(forbidden.body).code, "forbidden");
+  assert.equal(unauthorized.statusCode, 401);
+});
+
+test("an issued invitation returns a shareable link the admin can send by any means", async () => {
+  const { handler, invites } = inviteHandler();
+
+  const created = await handler(
+    adminEvent("POST", "/calendars/invites", { inviteeLabel: "Front desk – Jane" }),
+  );
+  const body = JSON.parse(created.body);
+
+  assert.equal(created.statusCode, 201);
+  assert.equal(body.status, "pending");
+  assert.equal(body.inviteeLabel, "Front desk – Jane");
+  assert.equal(body.createdByName, "Dana Admin");
+  assert.ok(body.url.startsWith("https://agents.example.com/connect-calendar/"));
+  // The link is the credential, so it must not be a guessable id.
+  assert.ok(body.url.split("/").pop().length >= 22);
+  const stored = await invites.listByWorkspace(workspaceId);
+  assert.equal(stored.length, 1);
+});
+
+test("the public invite page names the company without leaking workspace internals", async () => {
+  const { handler, invites } = inviteHandler();
+  await invites.put({
+    inviteId,
+    workspaceId,
+    workspaceName: "Arc Dental",
+    status: "pending",
+    createdByUserId: "person@example.com",
+    createdByName: "Dana Admin",
+    expiresAt: 1_900_000_000,
+  });
+
+  const response = await handler(event("GET", `/calendars/invites/${inviteId}`));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.status, "pending");
+  assert.equal(body.workspaceName, "Arc Dental");
+  assert.deepEqual(body.providers, ["google-calendar", "microsoft-365-calendar"]);
+  assert.equal(body.workspaceId, undefined);
+  assert.equal(body.createdByUserId, undefined);
+  assert.equal(body.createdByName, undefined);
+});
+
+test("an invited authorization is bound to the inviting workspace and cannot be redirected elsewhere", async () => {
+  const { handler, invites, stateStore } = inviteHandler();
+  await invites.put({
+    inviteId,
+    workspaceId,
+    status: "pending",
+    expiresAt: 1_900_000_000,
+  });
+
+  const response = await handler(event(
+    "GET",
+    `/calendars/invites/${inviteId}/start`,
+    undefined,
+    // This endpoint is unauthenticated, so a caller-supplied return must be ignored.
+    { provider: "google-calendar", returnTo: "https://evil.example.com/steal" },
+  ));
+  const authorizeUrl = new URL(JSON.parse(response.body).authorizeUrl);
+  const record = await stateStore.peek(authorizeUrl.searchParams.get("state"));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(record.workspaceId, workspaceId);
+  assert.equal(record.inviteId, inviteId);
+  assert.equal(record.returnTo, `/connect-calendar/${inviteId}`);
+});
+
+test("a revoked, completed, or expired invitation cannot start an authorization", async () => {
+  const cases = [
+    ["revoked", { status: "revoked", expiresAt: 1_900_000_000 }],
+    ["completed", { status: "completed", expiresAt: 1_900_000_000 }],
+    ["expired", { status: "pending", expiresAt: 1_000 }],
+  ];
+  for (const [expected, attributes] of cases) {
+    const { handler, invites } = inviteHandler();
+    await invites.put({ inviteId, workspaceId, ...attributes });
+
+    const response = await handler(event(
+      "GET",
+      `/calendars/invites/${inviteId}/start`,
+      undefined,
+      { provider: "google-calendar" },
+    ));
+
+    assert.equal(response.statusCode, 410, expected);
+    assert.equal(JSON.parse(response.body).code, `invite_${expected}`);
+  }
+});
+
+test("completing an invitation connects the calendar and reports back to the admin", async () => {
+  const { handler, invites, stateStore, connections } = inviteHandler();
+  await invites.put({
+    inviteId,
+    workspaceId,
+    status: "pending",
+    createdByName: "Dana Admin",
+    expiresAt: 1_900_000_000,
+  });
+  await stateStore.put({
+    state: "invited-state",
+    workspaceId,
+    userId: `invite:${inviteId}`,
+    inviteId,
+    provider: "google-calendar",
+    redirectUri,
+    returnTo: `/connect-calendar/${inviteId}`,
+    expiresAt: 1_900_000_000,
+  });
+
+  const callback = await handler(event(
+    "GET",
+    "/oauth/google-calendar/callback",
+    undefined,
+    { code: "authorization-code", state: "invited-state" },
+  ));
+  const connection = await connections.get(workspaceId);
+  const listed = JSON.parse(
+    (await handler(adminEvent("GET", "/calendars/invites"))).body,
+  ).invites[0];
+
+  assert.equal(callback.statusCode, 302);
+  assert.equal(
+    callback.headers.location,
+    `https://agents.example.com/connect-calendar/${inviteId}?calendar=connected&provider=google-calendar`,
+  );
+  // The invitee's calendar is attached to the workspace that invited them.
+  assert.equal(connection.workspaceId, workspaceId);
+  assert.equal(connection.accountEmail, "invitee@example.com");
+  assert.equal(listed.status, "completed");
+  assert.equal(listed.completedAccountEmail, "invitee@example.com");
+  // The admin sees the outcome, never the invitee's tokens.
+  assert.equal(listed.encryptedRefreshToken, undefined);
+});
+
+test("an admin cannot revoke another workspace's invitation", async () => {
+  const { handler, invites } = inviteHandler();
+  await invites.put({
+    inviteId,
+    workspaceId: "someone-elses-workspace",
+    status: "pending",
+    expiresAt: 1_900_000_000,
+  });
+
+  const response = await handler(adminEvent("DELETE", `/calendars/invites/${inviteId}`));
+
+  assert.equal(response.statusCode, 404);
+  assert.equal((await invites.get(inviteId)).status, "pending");
+});
+
 function event(method, path, body, queryStringParameters) {
   return {
     requestContext: { http: { method, path } },
@@ -575,6 +833,13 @@ function event(method, path, body, queryStringParameters) {
     body: body === undefined ? undefined : JSON.stringify(body),
     queryStringParameters,
   };
+}
+
+function adminEvent(method, path, body, queryStringParameters) {
+  const value = authenticatedEvent(method, path, body, queryStringParameters);
+  value.requestContext.authorizer.jwt.claims["cognito:groups"] = "[company-admin]";
+  value.requestContext.authorizer.jwt.claims.name = "Dana Admin";
+  return value;
 }
 
 function authenticatedEvent(method, path, body, queryStringParameters) {
