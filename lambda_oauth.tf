@@ -123,7 +123,7 @@ resource "aws_iam_role_policy" "oauth_runtime" {
       {
         Sid    = "ManageCalendarInvites"
         Effect = "Allow"
-        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query"]
         Resource = [
           aws_dynamodb_table.calendar_invites.arn,
           "${aws_dynamodb_table.calendar_invites.arn}/index/*",
@@ -222,6 +222,7 @@ locals {
     "DELETE /calendars/connection",
     "POST /calendars/invites",
     "GET /calendars/invites",
+    "POST /calendars/invites/{inviteId}/revoke",
     "DELETE /calendars/invites/{inviteId}",
   ])
 

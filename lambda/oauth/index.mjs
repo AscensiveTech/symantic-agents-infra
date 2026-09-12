@@ -263,6 +263,12 @@ export function createInMemoryInviteStore(initialRecords = []) {
       records.set(inviteId, next);
       return { ...next };
     },
+    async remove(inviteId, workspaceId) {
+      const record = records.get(inviteId);
+      if (!record || record.workspaceId !== workspaceId) return false;
+      records.delete(inviteId);
+      return true;
+    },
   };
 }
 
@@ -321,6 +327,20 @@ export function createDynamoInviteStore(client, commands, tableName) {
         return unmarshall(result.Attributes);
       } catch (error) {
         if (error?.name === "ConditionalCheckFailedException") return null;
+        throw error;
+      }
+    },
+    async remove(inviteId, workspaceId) {
+      try {
+        await client.send(new commands.DeleteItemCommand({
+          TableName: tableName,
+          Key: marshall({ inviteId }),
+          ConditionExpression: "workspaceId = :workspaceId",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        }));
+        return true;
+      } catch (error) {
+        if (error?.name === "ConditionalCheckFailedException") return false;
         throw error;
       }
     },
@@ -655,6 +675,17 @@ export function createHandler(options = {}) {
 
       if (path === "/calendars/invites" && method === "POST") {
         const identity = await requireAdminIdentity(event, await getMembershipStore());
+        // A workspace books into exactly one calendar, so two people racing to
+        // connect is meaningless - whoever finishes last would silently win.
+        const existing = await (await getInviteStore())
+          .listByWorkspace(identity.workspaceId);
+        if (existing.some((invite) => inviteState(invite, now) === "pending")) {
+          throw new OAuthRequestError(
+            "An invitation is already open. Revoke it before creating another.",
+            409,
+            "invite_already_pending",
+          );
+        }
         const inviteId = randomState();
         const createdAt = new Date(now()).toISOString();
         const invite = {
@@ -696,10 +727,11 @@ export function createHandler(options = {}) {
 
       const inviteMatch = path.match(/^\/calendars\/invites\/([^/]+)$/);
       const inviteStartMatch = path.match(/^\/calendars\/invites\/([^/]+)\/start$/);
+      const inviteRevokeMatch = path.match(/^\/calendars\/invites\/([^/]+)\/revoke$/);
 
-      if (method === "DELETE" && inviteMatch) {
+      if (method === "POST" && inviteRevokeMatch) {
         const identity = await requireAdminIdentity(event, await getMembershipStore());
-        const inviteId = requireInviteId(inviteMatch[1]);
+        const inviteId = requireInviteId(inviteRevokeMatch[1]);
         const revoked = await (await getInviteStore())
           .setStatus(inviteId, identity.workspaceId, "revoked", {
             revokedAt: new Date(now()).toISOString(),
@@ -708,6 +740,28 @@ export function createHandler(options = {}) {
           throw new OAuthRequestError("Invite not found", 404, "invite_not_found");
         }
         return json(200, toPublicInviteAdmin(revoked));
+      }
+
+      // Permanent, and deliberately not available while an invitation is still
+      // live: revoking first kills the link, so the record cannot be erased
+      // while the link it represents still works.
+      if (method === "DELETE" && inviteMatch) {
+        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const inviteId = requireInviteId(inviteMatch[1]);
+        const store = await getInviteStore();
+        const invite = await store.get(inviteId);
+        if (!invite || invite.workspaceId !== identity.workspaceId) {
+          throw new OAuthRequestError("Invite not found", 404, "invite_not_found");
+        }
+        if (inviteState(invite, now) === "pending") {
+          throw new OAuthRequestError(
+            "Revoke this invitation before deleting it",
+            409,
+            "invite_still_pending",
+          );
+        }
+        await store.remove(inviteId, identity.workspaceId);
+        return json(204, null);
       }
 
       // Public: the invitee has only the link, and must not need an account.

@@ -843,6 +843,92 @@ test("completing an invitation connects the calendar and reports back to the adm
   assert.equal(listed.encryptedRefreshToken, undefined);
 });
 
+// The workspace books into exactly one calendar, so a second open invitation
+// would just mean whoever finishes last silently wins the slot.
+test("only one invitation can be open at a time", async () => {
+  const { handler, invites } = inviteHandler();
+
+  const first = await handler(adminEvent("POST", "/calendars/invites", { inviteeLabel: "Jane" }));
+  const second = await handler(adminEvent("POST", "/calendars/invites", { inviteeLabel: "Sam" }));
+
+  assert.equal(first.statusCode, 201);
+  assert.equal(second.statusCode, 409);
+  assert.equal(JSON.parse(second.body).code, "invite_already_pending");
+  assert.equal((await invites.listByWorkspace(workspaceId)).length, 1);
+});
+
+test("revoking frees the slot so a fresh invitation can be issued", async () => {
+  const { handler } = inviteHandler();
+  const created = JSON.parse(
+    (await handler(adminEvent("POST", "/calendars/invites", {}))).body,
+  );
+
+  const revoked = await handler(
+    adminEvent("POST", `/calendars/invites/${created.inviteId}/revoke`),
+  );
+  const replacement = await handler(adminEvent("POST", "/calendars/invites", {}));
+
+  assert.equal(revoked.statusCode, 200);
+  assert.equal(JSON.parse(revoked.body).status, "revoked");
+  assert.equal(replacement.statusCode, 201);
+});
+
+test("an expired invitation does not keep the slot occupied", async () => {
+  const { handler, invites } = inviteHandler();
+  await invites.put({ inviteId, workspaceId, status: "pending", expiresAt: 1_000 });
+
+  const response = await handler(adminEvent("POST", "/calendars/invites", {}));
+
+  assert.equal(response.statusCode, 201);
+});
+
+test("deleting is refused while the invitation is still live", async () => {
+  const { handler, invites } = inviteHandler();
+  await invites.put({
+    inviteId,
+    workspaceId,
+    status: "pending",
+    expiresAt: 1_900_000_000,
+  });
+
+  const response = await handler(adminEvent("DELETE", `/calendars/invites/${inviteId}`));
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(JSON.parse(response.body).code, "invite_still_pending");
+  // The record must survive, because its link is still usable.
+  assert.ok(await invites.get(inviteId));
+});
+
+test("a revoked invitation can be deleted for good", async () => {
+  const { handler, invites } = inviteHandler();
+  await invites.put({
+    inviteId,
+    workspaceId,
+    status: "revoked",
+    expiresAt: 1_900_000_000,
+  });
+
+  const response = await handler(adminEvent("DELETE", `/calendars/invites/${inviteId}`));
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(await invites.get(inviteId), null);
+});
+
+test("an admin cannot delete another workspace's invitation", async () => {
+  const { handler, invites } = inviteHandler();
+  await invites.put({
+    inviteId,
+    workspaceId: "someone-elses-workspace",
+    status: "revoked",
+    expiresAt: 1_900_000_000,
+  });
+
+  const response = await handler(adminEvent("DELETE", `/calendars/invites/${inviteId}`));
+
+  assert.equal(response.statusCode, 404);
+  assert.ok(await invites.get(inviteId));
+});
+
 test("an admin cannot revoke another workspace's invitation", async () => {
   const { handler, invites } = inviteHandler();
   await invites.put({
@@ -852,7 +938,9 @@ test("an admin cannot revoke another workspace's invitation", async () => {
     expiresAt: 1_900_000_000,
   });
 
-  const response = await handler(adminEvent("DELETE", `/calendars/invites/${inviteId}`));
+  const response = await handler(
+    adminEvent("POST", `/calendars/invites/${inviteId}/revoke`),
+  );
 
   assert.equal(response.statusCode, 404);
   assert.equal((await invites.get(inviteId)).status, "pending");
