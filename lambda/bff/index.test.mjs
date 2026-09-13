@@ -4877,6 +4877,68 @@ test("most-asked-questions scoped to one agent only analyzes that agent's calls"
   assert.equal(summarizeCalls[0][0].callId, "c1");
 });
 
+test("most-asked-questions uses the company's own Anthropic key when the super admin has set one", async () => {
+  const { createHandler } = await loadBff();
+  const store = mostAskedStore({
+    async getWorkspace() {
+      return { workspaceId: "user-123", mostAskedQuestionsEnabled: true, anthropicApiKey: "sk-ant-company-specific-key" };
+    },
+  });
+  const overridesSeen = [];
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      anthropic: {
+        async summarizeMostAskedQuestions({ apiKeyOverride }) {
+          overridesSeen.push(apiKeyOverride);
+          return { questions: [], model: "claude-haiku-4-5-20251001", usage: { inputTokens: 0, outputTokens: 0 }, costCents: 0 };
+        },
+      },
+    }),
+  });
+
+  await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30 }));
+  assert.deepEqual(overridesSeen, ["sk-ant-company-specific-key"]);
+});
+
+test("PATCH company anthropicApiKey is accepted, stored, and never echoed back raw", async () => {
+  const { createHandler } = await loadBff();
+  let saved;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async getWorkspace() {
+      return {
+        workspaceId: "workspace-technovate",
+        name: "Technovate",
+        tier: "growth",
+        createdAt: "2026-08-19T00:00:00.000Z",
+      };
+    },
+    async putWorkspace(workspace) {
+      saved = workspace;
+      return workspace;
+    },
+    async listMemberships() { return []; },
+    async listProposals() { return []; },
+    async listProposalTemplates() { return []; },
+  };
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("PATCH", "/platform/companies/workspace-technovate", {
+    anthropicApiKey: "sk-ant-a-real-looking-key-1234",
+  });
+  event.pathParameters = { workspaceId: "workspace-technovate" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.anthropicApiKeyConfigured, true);
+  assert.equal(body.anthropicApiKey, undefined, "the raw key must never round-trip back to the client");
+  assert.equal(saved.anthropicApiKey, "sk-ant-a-real-looking-key-1234");
+});
+
 test("GET most-asked-questions returns entitled:false with no digests for a non-premium workspace", async () => {
   const { createHandler } = await loadBff();
   const store = mostAskedStore({ async getWorkspace() { return { workspaceId: "user-123" }; } });

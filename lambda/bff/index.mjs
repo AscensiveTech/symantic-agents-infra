@@ -1120,6 +1120,7 @@ async function handlePlatformCompanies(event, {
       const hasPlan = isPlanPatch(body);
       const hasBlocklist = body && Object.hasOwn(body, "callBlocklistEnabled");
       const hasMostAskedQuestions = body && Object.hasOwn(body, "mostAskedQuestionsEnabled");
+      const hasAnthropicApiKey = body && Object.hasOwn(body, "anthropicApiKey");
       const hasProposalPrice = body && Object.hasOwn(body, "proposalPlanPriceOverride");
       const hasAnchor = body && Object.hasOwn(body, "billingAnchorDate");
       const hasCredit = body && Object.hasOwn(body, "billingCreditBalance");
@@ -1134,13 +1135,16 @@ async function handlePlatformCompanies(event, {
           && body.billingAnchorDate >= anchorTodayKey);
       const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
         || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
+      const anthropicApiKeyValid = body?.anthropicApiKey === null || body?.anthropicApiKey === ""
+        || (typeof body?.anthropicApiKey === "string" && body.anthropicApiKey.trim().length >= 20);
       if (
-        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasAnthropicApiKey && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
         (hasEntitlements && !isValidEntitlements(body.entitlements)) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
         (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
         (hasMostAskedQuestions && typeof body.mostAskedQuestionsEnabled !== "boolean") ||
+        (hasAnthropicApiKey && !anthropicApiKeyValid) ||
         (hasProposalPrice && !proposalPriceValid) ||
         (hasAnchor && !anchorValid) ||
         (hasCredit && !creditValid)
@@ -1160,6 +1164,11 @@ async function handlePlatformCompanies(event, {
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
       };
+      if (hasAnthropicApiKey) {
+        const trimmed = typeof body.anthropicApiKey === "string" ? body.anthropicApiKey.trim() : "";
+        if (!trimmed) delete updated.anthropicApiKey;
+        else updated.anthropicApiKey = trimmed;
+      }
       if (hasProposalPrice) {
         if (proposalPrice === null || proposalPrice === "") delete updated.proposalPlanPriceOverride;
         else updated.proposalPlanPriceOverride = Math.round(proposalPrice * 100) / 100;
@@ -1853,7 +1862,17 @@ async function generateMostAskedQuestionsDigest({ store, providers, workspaceId,
     return { questions: [], callsAnalyzed: 0, costCents: 0 };
   }
 
-  const result = await providers.anthropic.summarizeMostAskedQuestions({ calls: eligible });
+  // Each company can be given its own Anthropic account/key (pasted in by a
+  // super admin on the Client Companies page, per-workspace on the
+  // workspace record) so usage and cost sit on that company's own account
+  // instead of a single shared platform key - fall back to the shared
+  // ANTHROPIC_SECRET_ARN key only when a workspace hasn't been given one.
+  const workspace = typeof store.getWorkspace === "function" ? await store.getWorkspace(workspaceId) : null;
+  const apiKeyOverride = typeof workspace?.anthropicApiKey === "string" && workspace.anthropicApiKey
+    ? workspace.anthropicApiKey
+    : undefined;
+
+  const result = await providers.anthropic.summarizeMostAskedQuestions({ calls: eligible, apiKeyOverride });
   const digestId = `digest-${randomUUID()}`;
   const record = {
     workspaceId,
@@ -1930,6 +1949,9 @@ async function platformCompanySummary(store, workspace) {
     enterpriseOveragePerMinute: numberOrNullValue(workspace.enterpriseOveragePerMinute),
     callBlocklistEnabled: workspace.callBlocklistEnabled === true,
     mostAskedQuestionsEnabled: workspace.mostAskedQuestionsEnabled === true,
+    // Never return the raw key once stored - only whether one is set, so it
+    // never round-trips back into a browser response after being pasted in.
+    anthropicApiKeyConfigured: typeof workspace.anthropicApiKey === "string" && workspace.anthropicApiKey.length > 0,
     proposalPlanPriceOverride: numberOrNullValue(workspace.proposalPlanPriceOverride),
     proposalMonthlyPrice: resolveProposalMonthlyPrice(normalizeCompanyTier(workspace.tier), workspace),
     billingAnchorDate: typeof workspace.billingAnchorDate === "string" ? workspace.billingAnchorDate : null,
@@ -6202,7 +6224,10 @@ export async function getDefaultProviders() {
     // ANTHROPIC_SECRET_ARN configured - only entitled workspaces ever reach
     // this call.
     anthropic: {
-      async summarizeMostAskedQuestions(args) {
+      async summarizeMostAskedQuestions({ apiKeyOverride, ...args }) {
+        if (apiKeyOverride) {
+          return createAnthropicClient({ apiKey: apiKeyOverride }).summarizeMostAskedQuestions(args);
+        }
         const secret = await getProviderSecret(process.env.ANTHROPIC_SECRET_ARN, "Anthropic");
         return createAnthropicClient({
           apiKey: readApiKey(secret, "Anthropic"),
