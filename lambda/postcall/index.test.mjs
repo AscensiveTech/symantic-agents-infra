@@ -40,6 +40,46 @@ test("extractCallerNameFromTranscript finds a self-introduction and rejects junk
   );
 });
 
+test("call_started writes a minimal ongoing row without touching usage or recordings", async () => {
+  let persisted;
+  let usageIncremented = false;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async upsertCall(record) {
+        persisted = structuredClone(record);
+        return { record, created: true, previous: null };
+      },
+    }),
+    getRecordingStore: async () => null,
+    getUsageStore: async () => ({
+      async getTimezone() { return "America/New_York"; },
+      async increment() { usageIncremented = true; },
+    }),
+  });
+
+  const response = await handler(callStartedEvent({
+    call_id: "retell-call-started",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    from_number: "+17035550100",
+    to_number: "+17035550177",
+    direction: "inbound",
+    start_timestamp: Date.parse("2026-09-30T23:30:00-04:00"),
+  }));
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(persisted.workspaceId, "workspace-123");
+  assert.equal(persisted.agentId, "agent-123");
+  assert.equal(persisted.retellCallId, "retell-call-started");
+  assert.equal(persisted.callerNumber, "+17035550100");
+  assert.equal(persisted.direction, "inbound");
+  assert.equal(typeof persisted.startedAt, "string");
+  assert.equal(persisted.durationMs, undefined);
+  assert.equal(persisted.endedAt, undefined);
+  assert.equal(usageIncremented, false);
+});
+
 test("call_analyzed falls back to the transcript for the caller name and flags the source", async () => {
   let persistedCall;
   const handler = createHandler({
@@ -70,9 +110,14 @@ test("call_analyzed falls back to the transcript for the caller name and flags t
 
 test("a newly-created call increments the workspace usage counter once", async () => {
   const increments = [];
+  let billedDurationMs;
   const store = {
-    async upsertCall() {
-      return { record: {}, created: true };
+    async upsertCall(record) {
+      const previous = billedDurationMs != null ? { durationMs: billedDurationMs } : null;
+      if (typeof record.durationMs === "number" && record.durationMs > 0) {
+        billedDurationMs = record.durationMs;
+      }
+      return { record, created: !previous, previous };
     },
   };
   const usageStore = {
@@ -102,10 +147,55 @@ test("a newly-created call increments the workspace usage counter once", async (
     { workspaceId: "workspace-123", period: "2026-09", minutes: 2 },
   ]);
 
-  // A second webhook for the same call (not created) must not double-count.
-  store.upsertCall = async () => ({ record: {}, created: false });
+  // A second webhook for the same call, already carrying the same billed
+  // duration, must not double-count.
   await handler(callAnalyzedEvent(call));
   assert.equal(increments.length, 1);
+});
+
+test("a call_started write (no duration yet) does not bill minutes, but the following call_ended does", async () => {
+  const increments = [];
+  let billedDurationMs;
+  const store = {
+    async upsertCall(record) {
+      const previous = billedDurationMs != null ? { durationMs: billedDurationMs } : null;
+      if (typeof record.durationMs === "number" && record.durationMs > 0) {
+        billedDurationMs = record.durationMs;
+      }
+      return { record, created: !previous, previous };
+    },
+  };
+  const usageStore = {
+    async getTimezone() {
+      return "America/New_York";
+    },
+    async increment(workspaceId, period, minutes) {
+      increments.push({ workspaceId, period, minutes });
+    },
+  };
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => store,
+    getRecordingStore: async () => null,
+    getUsageStore: async () => usageStore,
+  });
+  const call = {
+    call_id: "retell-call-live",
+    metadata: { workspaceId: "workspace-123" },
+    start_timestamp: Date.parse("2026-09-30T23:30:00-04:00"),
+    transcript_with_tool_calls: [],
+  };
+  await handler(callStartedEvent(call));
+  assert.equal(increments.length, 0);
+
+  await handler(callEndedEvent({
+    ...call,
+    end_timestamp: Date.parse("2026-09-30T23:31:30-04:00"),
+  }));
+  assert.deepEqual(increments, [
+    { workspaceId: "workspace-123", period: "2026-09", minutes: 2 },
+  ]);
 });
 
 test("invalid signature returns 401 without persisting the call", async () => {
@@ -699,6 +789,10 @@ function callEndedEvent(call) {
 
 function callAnalyzedEvent(call) {
   return webhookEvent("call_analyzed", call);
+}
+
+function callStartedEvent(call) {
+  return webhookEvent("call_started", call);
 }
 
 function webhookEvent(eventName, call) {

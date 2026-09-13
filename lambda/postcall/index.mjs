@@ -127,8 +127,8 @@ export function createHandler({
       return json(400, { message: "Invalid JSON body" });
     }
     const eventType = payload?.event;
-    if (eventType !== "call_ended" && eventType !== "call_analyzed") {
-      return json(400, { message: "A call_ended or call_analyzed payload is required" });
+    if (eventType !== "call_started" && eventType !== "call_ended" && eventType !== "call_analyzed") {
+      return json(400, { message: "A call_started, call_ended, or call_analyzed payload is required" });
     }
     const call = payload.call;
     if (!call || typeof call !== "object" || Array.isArray(call)) {
@@ -159,6 +159,39 @@ export function createHandler({
     }
     const timestamp = new Date(now()).toISOString();
     const callId = stableId("call", workspaceId, retellCallId);
+
+    // A minimal row the moment the call begins - Call History can show it as
+    // "ongoing" (no endedAt yet) instead of only appearing once it's over.
+    // call_ended/call_analyzed fill the rest in later via the same upsert,
+    // which already merges rather than overwrites. Deliberately skips
+    // recording capture, transcript/tool-log processing, and the usage
+    // counter (there is no duration yet) - none of that exists this early.
+    if (eventType === "call_started") {
+      try {
+        store ??= await getStore();
+        await store.upsertCall({
+          workspaceId,
+          callId,
+          retellCallId,
+          agentId,
+          direction: stringValue(call.direction),
+          callerNumber: callerNumber(call),
+          startedAt: timestampValue(call.start_timestamp) ?? timestamp,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+        return noContent();
+      } catch (error) {
+        console.error("Post-call call_started ingest failed", {
+          name: error?.name,
+          message: error?.message,
+          workspaceId,
+          callId,
+        });
+        return json(500, { message: "Post-call ingest failed" });
+      }
+    }
+
     const summary = summarizeCall(call, toolLog);
     const analysis = call.call_analysis && typeof call.call_analysis === "object"
       ? call.call_analysis
@@ -232,9 +265,15 @@ export function createHandler({
       const upsert = (await store.upsertCall(record)) ?? {};
       await backfillToolRecords(store, { ...record, toolLog });
       // Maintain the per-cycle usage counter that gates the inbound hard stop.
-      // Only the first (item-creating) write of a call increments it, so the
-      // call_ended + call_analyzed webhooks stay idempotent.
-      if (upsert.created) {
+      // Keyed on "this write is the first one carrying a real duration" -
+      // NOT "this write created the item" - a call_started write creates the
+      // item with no duration yet, so gating on `created` would either
+      // double-count (if call_started billed 0 min and counted as "first")
+      // or silently skip billing entirely (call_ended would then see
+      // created: false and never increment). Idempotent either way: a call
+      // whose duration was already billed by an earlier write is skipped.
+      const alreadyBilled = typeof upsert.previous?.durationMs === "number" && upsert.previous.durationMs > 0;
+      if (!alreadyBilled && typeof record.durationMs === "number" && record.durationMs > 0) {
         await incrementUsageCounter({
           getUsageStore,
           store,
@@ -755,7 +794,11 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
         ExpressionAttributeValues: marshall(values),
         ReturnValues: "ALL_OLD",
       }));
-      return { record, created: !result.Attributes };
+      return {
+        record,
+        created: !result.Attributes,
+        previous: result.Attributes ? unmarshall(result.Attributes) : null,
+      };
     },
 
     async upsertAppointment(record) {
