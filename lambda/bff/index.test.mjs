@@ -4939,6 +4939,32 @@ test("PATCH company anthropicApiKey is accepted, stored, and never echoed back r
   assert.equal(saved.anthropicApiKey, "sk-ant-a-real-looking-key-1234");
 });
 
+test("most-asked-questions always reads the authenticated actor's own workspace, ignoring any workspaceId in the request body", async () => {
+  const { createHandler } = await loadBff();
+  const seenWorkspaceIds = [];
+  const store = mostAskedStore({
+    async listCalls(workspaceId) {
+      seenWorkspaceIds.push(workspaceId);
+      return [{ callId: "c1", agentId: "agent-1", startedAt: new Date().toISOString(), callSummary: "hi" }];
+    },
+  });
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      anthropic: { async summarizeMostAskedQuestions() { return { questions: [], model: "m", usage: { inputTokens: 0, outputTokens: 0 }, costCents: 0 }; } },
+    }),
+  });
+
+  // authenticatedEvent's sub claim is "user-123" - a malicious/confused body
+  // trying to name a different workspace must never redirect the read there.
+  await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", {
+    windowDays: 30,
+    workspaceId: "someone-elses-workspace",
+  }));
+
+  assert.deepEqual(seenWorkspaceIds, ["user-123"]);
+});
+
 test("GET most-asked-questions returns entitled:false with no digests for a non-premium workspace", async () => {
   const { createHandler } = await loadBff();
   const store = mostAskedStore({ async getWorkspace() { return { workspaceId: "user-123" }; } });

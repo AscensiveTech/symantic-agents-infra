@@ -505,7 +505,7 @@ export function createAnthropicClient({
 
       const prompt = `Below are excerpts from ${calls.length} customer phone calls to a small business's AI receptionist. Identify the most frequently asked questions or topics across these calls.
 
-Respond with ONLY a JSON array (no prose, no markdown fences) of up to 8 objects, ranked by frequency, each shaped as:
+Respond with ONLY a JSON array (no prose, no markdown fences) of up to 25 objects, ranked by frequency, each shaped as:
 {"question": "a clear, generalized version of the question", "count": <number of calls that asked something like this>, "exampleQuote": "a short representative quote from one call", "suggestedKnowledgeBaseAddition": "one sentence suggesting what content to add to the knowledge base to answer this automatically"}
 
 Calls:
