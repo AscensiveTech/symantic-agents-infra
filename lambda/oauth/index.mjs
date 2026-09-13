@@ -692,13 +692,15 @@ export function createHandler(options = {}) {
 
       if (path === "/calendars/invites" && method === "POST") {
         const identity = await requireAdminIdentity(event, await getMembershipStore());
-        // A workspace books into exactly one calendar, so two people racing to
-        // connect is meaningless - whoever finishes last would silently win.
+        const agentId = requireAgentId(readBody(event)?.agentId);
+        // Each agent books into exactly one calendar, so two people racing to
+        // connect the SAME agent is meaningless - whoever finishes last would
+        // silently win. A different agent's invite can still be pending.
         const existing = await (await getInviteStore())
           .listByWorkspace(identity.workspaceId);
-        if (existing.some((invite) => inviteState(invite, now) === "pending")) {
+        if (existing.some((invite) => invite.agentId === agentId && inviteState(invite, now) === "pending")) {
           throw new OAuthRequestError(
-            "An invitation is already open. Revoke it before creating another.",
+            "An invitation is already open for this agent. Revoke it before creating another.",
             409,
             "invite_already_pending",
           );
@@ -708,6 +710,7 @@ export function createHandler(options = {}) {
         const invite = {
           inviteId,
           workspaceId: identity.workspaceId,
+          agentId,
           // Denormalised so the public landing page can name the company
           // without exposing the workspace record to an anonymous caller.
           workspaceName: await lookupWorkspaceName(
@@ -730,10 +733,12 @@ export function createHandler(options = {}) {
 
       if (path === "/calendars/invites" && method === "GET") {
         const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const agentId = event?.queryStringParameters?.agentId;
         const invites = await (await getInviteStore())
           .listByWorkspace(identity.workspaceId);
         return json(200, {
           invites: invites
+            .filter((invite) => !agentId || invite.agentId === agentId)
             .map((invite) => ({
               ...toPublicInviteAdmin(invite),
               url: buildInviteUrl(appUrl, invite.inviteId),
@@ -813,6 +818,7 @@ export function createHandler(options = {}) {
         await (await getStateStore()).put({
           state: oauthState,
           workspaceId: invite.workspaceId,
+          agentId: invite.agentId,
           // consumeOAuthState requires a non-empty userId; an invited person may
           // have no account at all, so the invite itself is the identity.
           userId: `invite:${inviteId}`,
@@ -1070,6 +1076,7 @@ function buildInviteUrl(appUrl, inviteId) {
 function toPublicInviteAdmin(invite) {
   return {
     inviteId: invite.inviteId,
+    agentId: invite.agentId,
     inviteeLabel: invite.inviteeLabel ?? "",
     status: invite.status,
     createdAt: invite.createdAt,

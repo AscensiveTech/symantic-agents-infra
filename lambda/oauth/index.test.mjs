@@ -419,7 +419,7 @@ test("an unconfigured provider reports setup needed, not an internal error", asy
     });
 
     const response = await handler(
-      authenticatedEvent("GET", "/oauth/microsoft-365-calendar/start"),
+      authenticatedEvent("GET", "/oauth/microsoft-365-calendar/start", undefined, { agentId: "agent-123" }),
     );
     const body = JSON.parse(response.body);
 
@@ -727,7 +727,7 @@ test("an issued invitation returns a shareable link the admin can send by any me
   const { handler, invites } = inviteHandler();
 
   const created = await handler(
-    adminEvent("POST", "/calendars/invites", { inviteeLabel: "Front desk – Jane" }),
+    adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Front desk – Jane" }),
   );
   const body = JSON.parse(created.body);
 
@@ -818,6 +818,7 @@ test("completing an invitation connects the calendar and reports back to the adm
   await invites.put({
     inviteId,
     workspaceId,
+    agentId: "agent-123",
     status: "pending",
     createdByName: "Dana Admin",
     expiresAt: 1_900_000_000,
@@ -825,6 +826,7 @@ test("completing an invitation connects the calendar and reports back to the adm
   await stateStore.put({
     state: "invited-state",
     workspaceId,
+    agentId: "agent-123",
     userId: `invite:${inviteId}`,
     inviteId,
     provider: "google-calendar",
@@ -839,7 +841,7 @@ test("completing an invitation connects the calendar and reports back to the adm
     undefined,
     { code: "authorization-code", state: "invited-state" },
   ));
-  const connection = await connections.get(workspaceId);
+  const connection = await connections.get(workspaceId, "agent-123");
   const listed = JSON.parse(
     (await handler(adminEvent("GET", "/calendars/invites"))).body,
   ).invites[0];
@@ -863,8 +865,8 @@ test("completing an invitation connects the calendar and reports back to the adm
 test("only one invitation can be open at a time", async () => {
   const { handler, invites } = inviteHandler();
 
-  const first = await handler(adminEvent("POST", "/calendars/invites", { inviteeLabel: "Jane" }));
-  const second = await handler(adminEvent("POST", "/calendars/invites", { inviteeLabel: "Sam" }));
+  const first = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Jane" }));
+  const second = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Sam" }));
 
   assert.equal(first.statusCode, 201);
   assert.equal(second.statusCode, 409);
@@ -872,16 +874,49 @@ test("only one invitation can be open at a time", async () => {
   assert.equal((await invites.listByWorkspace(workspaceId)).length, 1);
 });
 
+test("a pending invitation for one agent does not block a different agent's invitation", async () => {
+  const { handler, invites } = inviteHandler();
+
+  const first = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Jane" }));
+  const second = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-456", inviteeLabel: "Sam" }));
+
+  assert.equal(first.statusCode, 201);
+  assert.equal(second.statusCode, 201);
+  assert.equal((await invites.listByWorkspace(workspaceId)).length, 2);
+});
+
+test("listing invitations can be filtered to a single agent", async () => {
+  const { handler } = inviteHandler();
+  await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Jane" }));
+  await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-456", inviteeLabel: "Sam" }));
+
+  const filtered = JSON.parse(
+    (await handler(adminEvent("GET", "/calendars/invites", undefined, { agentId: "agent-123" }))).body,
+  );
+  const all = JSON.parse((await handler(adminEvent("GET", "/calendars/invites"))).body);
+
+  assert.equal(filtered.invites.length, 1);
+  assert.equal(filtered.invites[0].inviteeLabel, "Jane");
+  assert.equal(all.invites.length, 2);
+});
+
+test("creating an invitation without an agentId is rejected", async () => {
+  const { handler } = inviteHandler();
+  const response = await handler(adminEvent("POST", "/calendars/invites", { inviteeLabel: "Jane" }));
+  assert.equal(response.statusCode, 400);
+  assert.equal(JSON.parse(response.body).code, "missing_agent_id");
+});
+
 test("revoking frees the slot so a fresh invitation can be issued", async () => {
   const { handler } = inviteHandler();
   const created = JSON.parse(
-    (await handler(adminEvent("POST", "/calendars/invites", {}))).body,
+    (await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123" }))).body,
   );
 
   const revoked = await handler(
     adminEvent("POST", `/calendars/invites/${created.inviteId}/revoke`),
   );
-  const replacement = await handler(adminEvent("POST", "/calendars/invites", {}));
+  const replacement = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123" }));
 
   assert.equal(revoked.statusCode, 200);
   assert.equal(JSON.parse(revoked.body).status, "revoked");
@@ -892,7 +927,7 @@ test("an expired invitation does not keep the slot occupied", async () => {
   const { handler, invites } = inviteHandler();
   await invites.put({ inviteId, workspaceId, status: "pending", expiresAt: 1_000 });
 
-  const response = await handler(adminEvent("POST", "/calendars/invites", {}));
+  const response = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123" }));
 
   assert.equal(response.statusCode, 201);
 });
