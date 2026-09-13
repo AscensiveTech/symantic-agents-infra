@@ -90,6 +90,93 @@ test("Telnyx provisioning returns an already-owned DID without ordering", async 
   });
 });
 
+test("Telnyx ensureNumber orders a customer-chosen desiredPhone directly, skipping the search", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (calls.length === 1) return response({ data: [] });
+    return response({
+      data: {
+        id: "order-456",
+        status: "pending",
+        phone_numbers: [{
+          id: "telnyx-number-456",
+          phone_number: "+17035550188",
+        }],
+      },
+    });
+  };
+  const client = createTelnyxClient({
+    apiKey: "telnyx-key",
+    connectionId: "connection-123",
+    fetchImpl,
+  });
+
+  const number = await client.ensureNumber({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    preferredPhone: "+17035550100",
+    desiredPhone: "(703) 555-0188",
+  });
+
+  assert.deepEqual(number, {
+    telnyxNumberId: "telnyx-number-456",
+    telnyxPhoneNumber: "+17035550188",
+    telnyxOrderId: "order-456",
+  });
+  // Only 2 calls (owned-number check, then order) - no available_phone_numbers search.
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1][0], "https://api.telnyx.com/v2/number_orders");
+  assert.deepEqual(JSON.parse(calls[1][1].body), {
+    phone_numbers: [{ phone_number: "+17035550188" }],
+    connection_id: "connection-123",
+    customer_reference: "workspace-123:agent-123",
+  });
+});
+
+test("Telnyx searchAvailableNumbers filters by area code and returns candidates", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    return response({
+      data: [
+        {
+          phone_number: "+17035550101",
+          region_information: [{ region_type: "state", region_name: "Virginia" }],
+        },
+        { phone_number: "+17035550102" },
+      ],
+    });
+  };
+  const client = createTelnyxClient({
+    apiKey: "telnyx-key",
+    connectionId: "connection-123",
+    fetchImpl,
+  });
+
+  const results = await client.searchAvailableNumbers({ areaCode: "703", limit: 5 });
+
+  assert.deepEqual(results, [
+    { phoneNumber: "+17035550101", region: "Virginia", locality: undefined },
+    { phoneNumber: "+17035550102", region: undefined, locality: undefined },
+  ]);
+  assert.match(calls[0], /filter%5Bnational_destination_code%5D=703/);
+  assert.match(calls[0], /filter%5Blimit%5D=5/);
+});
+
+test("Telnyx searchAvailableNumbers rejects a malformed area code", async () => {
+  const client = createTelnyxClient({
+    apiKey: "telnyx-key",
+    connectionId: "connection-123",
+    fetchImpl: async () => response({ data: [] }),
+  });
+
+  await assert.rejects(
+    client.searchAvailableNumbers({ areaCode: "abc" }),
+    /areaCode/,
+  );
+});
+
 test("Retell upsert creates an LLM and voice agent with compiled config", async () => {
   const calls = [];
   const fetchImpl = async (url, init = {}) => {

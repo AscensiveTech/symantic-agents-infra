@@ -54,10 +54,39 @@ export function createTelnyxClient({
   }
 
   return {
+    // Lets the customer pick from real available numbers (by area code)
+    // before an agent orders one, instead of only the best-effort
+    // auto-pick ensureNumber falls back to below.
+    async searchAvailableNumbers({ areaCode, limit = 10 } = {}) {
+      const availableUrl = new URL(
+        `${TELNYX_BASE_URL}/available_phone_numbers`,
+      );
+      availableUrl.searchParams.set("filter[country_code]", "US");
+      availableUrl.searchParams.set("filter[phone_number_type]", "local");
+      availableUrl.searchParams.append("filter[features][]", "voice");
+      availableUrl.searchParams.set("filter[limit]", String(Math.min(Math.max(1, Number(limit) || 10), 20)));
+      if (typeof areaCode === "string" && areaCode.length > 0) {
+        const normalizedAreaCode = areaCode.replace(/\D/g, "");
+        if (!/^\d{3}$/.test(normalizedAreaCode)) {
+          throw new ProviderRequestError("Telnyx", "areaCode must be exactly 3 digits");
+        }
+        availableUrl.searchParams.set("filter[national_destination_code]", normalizedAreaCode);
+      }
+      const result = await telnyxRequest(availableUrl);
+      return (result?.data ?? [])
+        .filter((candidate) => typeof candidate?.phone_number === "string" && candidate.phone_number)
+        .map((candidate) => ({
+          phoneNumber: candidate.phone_number,
+          region: stringOrUndefined(candidate?.region_information?.[0]?.region_name),
+          locality: stringOrUndefined(candidate?.region_information?.find((r) => r?.region_type === "rate_center")?.region_name),
+        }));
+    },
+
     async ensureNumber({
       workspaceId,
       agentId,
       preferredPhone,
+      desiredPhone,
     }) {
       const customerReference = `${required(workspaceId, "workspaceId")}:${
         required(agentId, "agentId")
@@ -67,23 +96,26 @@ export function createTelnyxClient({
       });
       if (owned) return telnyxNumber(owned);
 
-      const availableUrl = new URL(
-        `${TELNYX_BASE_URL}/available_phone_numbers`,
-      );
-      availableUrl.searchParams.set("filter[country_code]", "US");
-      availableUrl.searchParams.set("filter[phone_number_type]", "local");
-      availableUrl.searchParams.append("filter[features][]", "voice");
-      availableUrl.searchParams.set("filter[limit]", "1");
-      availableUrl.searchParams.set("filter[best_effort]", "true");
-      const areaCode = northAmericanAreaCode(preferredPhone);
-      if (areaCode) {
-        availableUrl.searchParams.set(
-          "filter[national_destination_code]",
-          areaCode,
+      let phoneNumber = normalizeE164ForTelnyx(desiredPhone);
+      if (!phoneNumber) {
+        const availableUrl = new URL(
+          `${TELNYX_BASE_URL}/available_phone_numbers`,
         );
+        availableUrl.searchParams.set("filter[country_code]", "US");
+        availableUrl.searchParams.set("filter[phone_number_type]", "local");
+        availableUrl.searchParams.append("filter[features][]", "voice");
+        availableUrl.searchParams.set("filter[limit]", "1");
+        availableUrl.searchParams.set("filter[best_effort]", "true");
+        const areaCode = northAmericanAreaCode(preferredPhone);
+        if (areaCode) {
+          availableUrl.searchParams.set(
+            "filter[national_destination_code]",
+            areaCode,
+          );
+        }
+        const availableResult = await telnyxRequest(availableUrl);
+        phoneNumber = availableResult?.data?.[0]?.phone_number;
       }
-      const availableResult = await telnyxRequest(availableUrl);
-      const phoneNumber = availableResult?.data?.[0]?.phone_number;
       if (typeof phoneNumber !== "string" || !phoneNumber) {
         throw new ProviderRequestError(
           "Telnyx",
@@ -468,6 +500,13 @@ async function requestJson(fetchImpl, url, init, provider) {
     );
   }
   return body;
+}
+
+function normalizeE164ForTelnyx(phoneNumber) {
+  const digits = String(phoneNumber ?? "").replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return null;
 }
 
 function northAmericanAreaCode(phoneNumber) {

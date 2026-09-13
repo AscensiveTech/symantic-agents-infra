@@ -471,6 +471,7 @@ function productForPath(path) {
     "/workspaces/me/retell/",
     "/workspaces/me/knowledge-assets/",
     "/workspaces/me/knowledge-bases",
+    "/workspaces/me/available-numbers",
     "/calendars/",
   ].some((prefix) => path.startsWith(prefix))) {
     return "receptionist";
@@ -657,6 +658,16 @@ export function createHandler({
       if (path === "/workspaces/me/retell/voices" && method === "GET") {
         const providers = await getProviders();
         return json(200, curateReceptionistVoices(await providers.retell.listVoices()));
+      }
+
+      if (path === "/workspaces/me/available-numbers" && method === "GET") {
+        const providers = await getProviders();
+        const areaCode = event?.queryStringParameters?.areaCode;
+        try {
+          return json(200, await providers.telnyx.searchAvailableNumbers({ areaCode }));
+        } catch (error) {
+          return json(error?.statusCode ?? 502, { message: error instanceof Error ? error.message : "Unable to search phone numbers" });
+        }
       }
 
       if (path === "/workspaces/me/knowledge-assets/upload-url" && method === "POST") {
@@ -3838,12 +3849,30 @@ async function handleInboundLookup(event, {
     return json(404, { message: "Receptionist configuration not found" });
   }
   if (agent.status !== "active" || !agent.retellAgentId) {
+    await logDeclinedCall(store, {
+      workspaceId: phoneNumber.workspaceId,
+      agentId: phoneNumber.agentId,
+      fromNumber: input.call_inbound.from_number,
+      reason: "agent_inactive",
+    });
     return json(200, { call_inbound: { reject: true } });
   }
   if (await inboundCallerBlocked(store, phoneNumber.workspaceId, profile, workspace, input.call_inbound.from_number)) {
+    await logDeclinedCall(store, {
+      workspaceId: phoneNumber.workspaceId,
+      agentId: phoneNumber.agentId,
+      fromNumber: input.call_inbound.from_number,
+      reason: "caller_blocked",
+    });
     return json(200, { call_inbound: { reject: true } });
   }
   if (await inboundCapReached(store, phoneNumber.workspaceId, profile, workspace)) {
+    await logDeclinedCall(store, {
+      workspaceId: phoneNumber.workspaceId,
+      agentId: phoneNumber.agentId,
+      fromNumber: input.call_inbound.from_number,
+      reason: "minute_cap_reached",
+    });
     return json(200, { call_inbound: { reject: true } });
   }
   return json(200, {
@@ -3901,6 +3930,35 @@ async function inboundCapReached(store, workspaceId, profile, workspace) {
   }
 }
 
+// A call rejected before Retell ever answered it never reaches the Postcall
+// Lambda (no call_id exists), so this is the only place that ever knows it
+// happened - write it here or it's invisible everywhere, including Call
+// History and any "missed calls" reporting.
+async function logDeclinedCall(store, { workspaceId, agentId, fromNumber, reason }) {
+  if (typeof store.createDeclinedCall !== "function") return;
+  const timestamp = new Date().toISOString();
+  const callerNumber = normalizeE164(fromNumber);
+  try {
+    await store.createDeclinedCall({
+      workspaceId,
+      callId: `declined-${randomUUID()}`,
+      agentId,
+      direction: "inbound",
+      callerNumber: callerNumber ?? undefined,
+      outcome: "declined",
+      disconnectionReason: reason,
+      startedAt: timestamp,
+      endedAt: timestamp,
+      durationMs: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+  } catch (error) {
+    // Never let logging a declined call fail the actual reject response.
+    console.error("Failed to log a declined call", { name: error?.name, message: error?.message, workspaceId, reason });
+  }
+}
+
 async function syncReceptionistRuntime({
   workspaceId,
   agentId,
@@ -3918,6 +3976,7 @@ async function syncReceptionistRuntime({
       workspaceId,
       agentId,
       preferredPhone: agent?.configuration?.phone ?? profile.phone,
+      desiredPhone: agent?.configuration?.desiredPhoneNumber,
     });
     phoneNumber = {
       workspaceId,
@@ -4680,6 +4739,19 @@ export function createDynamoStore(client, commands, tableNames) {
         ConsistentRead: true,
       }));
       return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    // For a call that was rejected before Retell ever answered it (blocked
+    // caller, over the minute cap, inactive agent) - there is no Retell
+    // call_id to key off, so this writes a standalone row instead of the
+    // Postcall Lambda's upsert-by-retellCallId path.
+    async createDeclinedCall(record) {
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.calls,
+        Item: marshall(record),
+        ConditionExpression: "attribute_not_exists(callId)",
+      }));
+      return record;
     },
 
     // Lean projection of the full call history for usage aggregation. Paginated;

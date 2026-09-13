@@ -153,6 +153,36 @@ test("voice catalog returns the curated six and knowledge uploads are workspace 
   assert.deepEqual(signed, [["user-123", key, "text/plain"]]);
 });
 
+test("available-numbers searches Telnyx by area code and surfaces provider errors as JSON", async () => {
+  const { createHandler } = await loadBff();
+  const searches = [];
+  const handler = createHandler({
+    getStore: async () => ({}),
+    getProviders: async () => ({
+      telnyx: {
+        async searchAvailableNumbers(input) {
+          searches.push(input);
+          if (input.areaCode === "bad") {
+            const error = new Error("areaCode must be exactly 3 digits");
+            error.statusCode = 400;
+            throw error;
+          }
+          return [{ phoneNumber: "+17035550101", region: "Virginia" }];
+        },
+      },
+    }),
+  });
+
+  const ok = await handler(authenticatedEvent("GET", "/workspaces/me/available-numbers", undefined, { areaCode: "703" }));
+  assert.equal(ok.statusCode, 200);
+  assert.deepEqual(JSON.parse(ok.body), [{ phoneNumber: "+17035550101", region: "Virginia" }]);
+  assert.deepEqual(searches, [{ areaCode: "703" }]);
+
+  const bad = await handler(authenticatedEvent("GET", "/workspaces/me/available-numbers", undefined, { areaCode: "bad" }));
+  assert.equal(bad.statusCode, 400);
+  assert.equal(JSON.parse(bad.body).message, "areaCode must be exactly 3 digits");
+});
+
 test("PUT profile rejects an invalid body before accessing DynamoDB", async () => {
   const getStore = () => {
     throw new Error("store should not be loaded");
@@ -3888,8 +3918,9 @@ test("PUT /workspaces/me/profile rejects an unknown plan key", async () => {
   assert.equal(response.statusCode, 400);
 });
 
-test("inbound lookup rejects the call once the overage cap is reached", async () => {
+test("inbound lookup rejects the call once the overage cap is reached, and logs it as a declined call", async () => {
   const { createHandler } = await loadBff();
+  const declined = [];
   const store = {
     async getPhoneNumberByDid() {
       return { workspaceId: "workspace-123", agentId: "agent-123" };
@@ -3906,6 +3937,10 @@ test("inbound lookup rejects the call once the overage cap is reached", async ()
     async getUsageCounter() {
       return { billedMinutes: 2200 };
     },
+    async createDeclinedCall(record) {
+      declined.push(record);
+      return record;
+    },
   };
   const handler = createHandler({
     getStore: async () => store,
@@ -3918,11 +3953,55 @@ test("inbound lookup rejects the call once the overage cap is reached", async ()
     headers: { "x-retell-signature": "v=1,d=deadbeef" },
     body: JSON.stringify({
       event: "call_inbound",
-      call_inbound: { to_number: "+17035550100" },
+      call_inbound: { to_number: "+17035550100", from_number: "+17035550188" },
     }),
   });
   assert.equal(response.statusCode, 200);
   assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
+  assert.equal(declined.length, 1);
+  assert.equal(declined[0].workspaceId, "workspace-123");
+  assert.equal(declined[0].agentId, "agent-123");
+  assert.equal(declined[0].outcome, "declined");
+  assert.equal(declined[0].disconnectionReason, "minute_cap_reached");
+  assert.equal(declined[0].callerNumber, "+17035550188");
+});
+
+test("inbound lookup rejects an inactive agent's call and logs it as declined", async () => {
+  const { createHandler } = await loadBff();
+  const declined = [];
+  const store = {
+    async getPhoneNumberByDid() {
+      return { workspaceId: "workspace-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "draft", retellAgentId: null };
+    },
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "starter" };
+    },
+    async createDeclinedCall(record) {
+      declined.push(record);
+      return record;
+    },
+  };
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550100", from_number: "+17035550188" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
+  assert.equal(declined.length, 1);
+  assert.equal(declined[0].disconnectionReason, "agent_inactive");
 });
 
 // ---------------------------------------------------------------------------
@@ -4012,8 +4091,9 @@ test("blocked-numbers CRUD works when the premium feature is enabled", async () 
   assert.equal(store.rows.size, 0);
 });
 
-test("inbound lookup rejects a blocked caller and records a hit", async () => {
+test("inbound lookup rejects a blocked caller, records a hit, and logs it as declined", async () => {
   const { createHandler } = await loadBff();
+  const declined = [];
   const store = blocklistStore({
     async getPhoneNumberByDid() {
       return { workspaceId: "user-123", agentId: "agent-123" };
@@ -4023,6 +4103,10 @@ test("inbound lookup rejects a blocked caller and records a hit", async () => {
     },
     async getUsageCounter() {
       return null;
+    },
+    async createDeclinedCall(record) {
+      declined.push(record);
+      return record;
     },
   });
   store.rows.set("+17035550100", { phoneNumber: "+17035550100", hitCount: 0 });
@@ -4043,6 +4127,9 @@ test("inbound lookup rejects a blocked caller and records a hit", async () => {
   assert.equal(response.statusCode, 200);
   assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
   assert.equal(store.rows.get("+17035550100").hitCount, 1);
+  assert.equal(declined.length, 1);
+  assert.equal(declined[0].disconnectionReason, "caller_blocked");
+  assert.equal(declined[0].callerNumber, "+17035550100");
 });
 
 test("inbound lookup ignores the blocklist for an unentitled workspace", async () => {
