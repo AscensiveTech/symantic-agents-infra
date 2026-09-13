@@ -3968,7 +3968,7 @@ async function logDeclinedCall(store, { workspaceId, agentId, fromNumber, reason
   }
 }
 
-async function syncReceptionistRuntime({
+export async function syncReceptionistRuntime({
   workspaceId,
   agentId,
   agent,
@@ -4214,6 +4214,13 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
     throw new Error("Files exceed the 100 MB total limit");
   }
   const enableAutoRefresh = url ? body?.enableAutoRefresh === true : false;
+  // Retell's own enable_auto_refresh is a fixed-daily on/off toggle - the
+  // 1/7/30-day cadence is our own scheduler (lambda/kb-refresh) layered on
+  // top, keyed off refreshIntervalDays + lastRefreshedAt. Off by default
+  // unless a URL source, which defaults to daily (1 day).
+  const refreshIntervalDays = url
+    ? [1, 7, 30].includes(body?.refreshIntervalDays) ? body.refreshIntervalDays : 1
+    : null;
 
   const created = await buildRetellKnowledgeBase({
     providers,
@@ -4233,6 +4240,7 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
     sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
     retellKnowledgeBaseId: created.knowledgeBaseId,
     enableAutoRefresh,
+    ...(url ? { refreshIntervalDays, lastRefreshedAt: new Date().toISOString() } : {}),
     createdAt: new Date().toISOString(),
   };
   await store.createKnowledgeBase(workspaceId, knowledgeBaseId, record);
@@ -5115,6 +5123,26 @@ export function createDynamoStore(client, commands, tableNames) {
       return { workspaceId, knowledgeBaseId, ...record };
     },
 
+    async updateKnowledgeBase(workspaceId, knowledgeBaseId, patch) {
+      const names = {};
+      const values = {};
+      const sets = [];
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === undefined) continue;
+        names[`#${key}`] = key;
+        values[`:${key}`] = value;
+        sets.push(`#${key} = :${key}`);
+      }
+      if (!sets.length) return;
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.knowledgeBases,
+        Key: marshall({ workspaceId, knowledgeBaseId }),
+        UpdateExpression: `SET ${sets.join(", ")}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: marshall(values),
+      }));
+    },
+
     async deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId) {
       await client.send(new commands.DeleteItemCommand({
         TableName: tableNames.knowledgeBases,
@@ -5620,7 +5648,7 @@ export function createDynamoStore(client, commands, tableNames) {
 
 let storePromise;
 
-async function getDefaultStore() {
+export async function getDefaultStore() {
   storePromise ??= import("@aws-sdk/client-dynamodb").then((commands) => {
     const tableNames = {
       workspaces: process.env.WORKSPACES_TABLE,
@@ -5792,7 +5820,7 @@ async function getDefaultRecordingSigner() {
 }
 
 let knowledgeSignerPromise;
-async function getDefaultKnowledgeSigner() {
+export async function getDefaultKnowledgeSigner() {
   const bucket = process.env.KNOWLEDGE_ASSETS_BUCKET;
   if (!bucket) throw new Error("KNOWLEDGE_ASSETS_BUCKET is required");
   knowledgeSignerPromise ??= Promise.resolve(createS3AssetSigner({
@@ -6031,7 +6059,7 @@ async function getDefaultSignWell() {
 }
 
 let providersPromise;
-async function getDefaultProviders() {
+export async function getDefaultProviders() {
   providersPromise ??= Promise.all([
     getProviderSecret(process.env.RETELL_SECRET_ARN, "Retell"),
     getProviderSecret(process.env.TELNYX_SECRET_ARN, "Telnyx"),
