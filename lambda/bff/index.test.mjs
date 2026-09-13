@@ -4778,3 +4778,111 @@ test("a completion webhook archives the signed PDF immediately, and a revise kee
     globalThis.fetch = originalFetch;
   }
 });
+
+// ---------------------------------------------------------------------------
+// Most asked questions (premium)
+// ---------------------------------------------------------------------------
+
+function mostAskedStore(overrides = {}) {
+  const digests = [];
+  return {
+    digests,
+    async ensureWorkspace() {},
+    async getWorkspace() {
+      return { workspaceId: "user-123", mostAskedQuestionsEnabled: true };
+    },
+    async listCalls() {
+      return [
+        { callId: "c1", agentId: "agent-1", startedAt: new Date().toISOString(), callSummary: "Asked about walk-ins." },
+        { callId: "c2", agentId: "agent-2", startedAt: new Date().toISOString(), callSummary: "Asked about pricing." },
+        {
+          callId: "c3",
+          agentId: "agent-1",
+          startedAt: new Date(Date.now() - 100 * 24 * 60 * 60 * 1000).toISOString(),
+          callSummary: "Too old to be in any window.",
+        },
+      ];
+    },
+    async createMostAskedDigest(record) {
+      digests.push(record);
+      return record;
+    },
+    async listMostAskedDigests() {
+      return digests;
+    },
+    ...overrides,
+  };
+}
+
+test("most-asked-questions is blocked for a workspace without the premium entitlement", async () => {
+  const { createHandler } = await loadBff();
+  const store = mostAskedStore({ async getWorkspace() { return { workspaceId: "user-123" }; } });
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30 }));
+  assert.equal(response.statusCode, 402);
+  assert.equal(store.digests.length, 0);
+});
+
+test("most-asked-questions generates a digest from eligible calls in the window and persists cost", async () => {
+  const { createHandler } = await loadBff();
+  const store = mostAskedStore();
+  const summarizeCalls = [];
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      anthropic: {
+        async summarizeMostAskedQuestions({ calls }) {
+          summarizeCalls.push(calls);
+          return {
+            questions: [{ question: "Do you take walk-ins?", count: 2, exampleQuote: "Can I walk in?", suggestedKnowledgeBaseAddition: "Add a walk-in FAQ." }],
+            model: "claude-haiku-4-5-20251001",
+            usage: { inputTokens: 500, outputTokens: 100 },
+            costCents: 0.08,
+          };
+        },
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30 }));
+  assert.equal(response.statusCode, 201);
+  const digest = JSON.parse(response.body);
+  assert.equal(digest.questions.length, 1);
+  assert.equal(digest.costCents, 0.08);
+  assert.equal(digest.callsAnalyzed, 2, "the 100-day-old call is outside the 30-day window");
+  assert.equal(summarizeCalls[0].length, 2);
+  assert.equal(store.digests.length, 1);
+});
+
+test("most-asked-questions scoped to one agent only analyzes that agent's calls", async () => {
+  const { createHandler } = await loadBff();
+  const store = mostAskedStore();
+  const summarizeCalls = [];
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      anthropic: {
+        async summarizeMostAskedQuestions({ calls }) {
+          summarizeCalls.push(calls);
+          return { questions: [], model: "claude-haiku-4-5-20251001", usage: { inputTokens: 0, outputTokens: 0 }, costCents: 0 };
+        },
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30, agentId: "agent-1" }));
+  assert.equal(response.statusCode, 201);
+  assert.equal(summarizeCalls[0].length, 1);
+  assert.equal(summarizeCalls[0][0].callId, "c1");
+});
+
+test("GET most-asked-questions returns entitled:false with no digests for a non-premium workspace", async () => {
+  const { createHandler } = await loadBff();
+  const store = mostAskedStore({ async getWorkspace() { return { workspaceId: "user-123" }; } });
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/most-asked-questions"));
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { entitled: false, digests: [] });
+});

@@ -89,9 +89,9 @@ resource "aws_iam_role_policy" "kb_refresh_runtime" {
         Resource = aws_dynamodb_table.control_plane["knowledge_bases"].arn
       },
       {
-        Sid      = "ReadProviderSecrets"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
+        Sid    = "ReadProviderSecrets"
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
         Resource = [
           aws_secretsmanager_secret.providers["retell"].arn,
           aws_secretsmanager_secret.providers["telnyx"].arn,
@@ -144,6 +144,7 @@ resource "aws_lambda_function" "kb_refresh" {
       LEGAL_DOCUMENTS_TABLE       = aws_dynamodb_table.legal_documents.name
       LEGAL_ACCEPTANCES_TABLE     = aws_dynamodb_table.legal_acceptances.name
       KNOWLEDGE_BASES_TABLE       = aws_dynamodb_table.control_plane["knowledge_bases"].name
+      MOST_ASKED_DIGESTS_TABLE    = aws_dynamodb_table.control_plane["most_asked_digests"].name
       RETELL_SECRET_ARN           = aws_secretsmanager_secret.providers["retell"].arn
       TELNYX_SECRET_ARN           = aws_secretsmanager_secret.providers["telnyx"].arn
       PUBLIC_API_BASE_URL         = aws_apigatewayv2_api.bff.api_endpoint

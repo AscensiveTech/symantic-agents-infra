@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createAnthropicClient,
   createRetellClient,
   createTelnyxClient,
   resolveRetellVoiceId,
@@ -592,4 +593,51 @@ test("voice resolver maps product labels without treating them as provider IDs",
       "Bright and energetic": "retell-Adrian",
     },
   }), "retell-Adrian");
+});
+
+test("Anthropic summarizeMostAskedQuestions parses the ranked digest and computes cost from usage", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    return response({
+      content: [{
+        type: "text",
+        text: JSON.stringify([
+          { question: "Do you accept walk-ins?", count: 5, exampleQuote: "Can I just walk in?", suggestedKnowledgeBaseAddition: "Add a walk-in policy FAQ." },
+        ]),
+      }],
+      usage: { input_tokens: 10_000, output_tokens: 500 },
+    });
+  };
+  const client = createAnthropicClient({ apiKey: "anthropic-key", fetchImpl });
+
+  const result = await client.summarizeMostAskedQuestions({
+    calls: [
+      { transcript: [{ speaker: "Caller", text: "Do you take walk-ins?" }] },
+      { callSummary: "Caller asked about walk-in availability." },
+    ],
+  });
+
+  assert.equal(calls[0][0], "https://api.anthropic.com/v1/messages");
+  assert.equal(calls[0][1].headers["x-api-key"], "anthropic-key");
+  assert.equal(result.questions.length, 1);
+  assert.equal(result.questions[0].question, "Do you accept walk-ins?");
+  assert.equal(result.questions[0].count, 5);
+  assert.equal(result.model, "claude-haiku-4-5-20251001");
+  assert.equal(result.usage.inputTokens, 10_000);
+  assert.equal(result.usage.outputTokens, 500);
+  // (10_000 / 1e6 * 80c) + (500 / 1e6 * 400c) = 0.8c + 0.2c = 1.0c
+  assert.equal(result.costCents, 1);
+});
+
+test("Anthropic summarizeMostAskedQuestions tolerates a non-JSON response by returning no questions", async () => {
+  const fetchImpl = async () => response({
+    content: [{ type: "text", text: "Sorry, I can't help with that." }],
+    usage: { input_tokens: 100, output_tokens: 20 },
+  });
+  const client = createAnthropicClient({ apiKey: "anthropic-key", fetchImpl });
+
+  const result = await client.summarizeMostAskedQuestions({ calls: [{ callSummary: "test" }] });
+
+  assert.deepEqual(result.questions, []);
 });

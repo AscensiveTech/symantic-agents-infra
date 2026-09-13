@@ -65,6 +65,13 @@ locals {
       name_suffix = "knowledge-bases"
       range_key   = "knowledgeBaseId"
     }
+    most_asked_digests = {
+      // One row per generated digest run - doubles as the LLM cost ledger
+      // (each row carries costCents + agentId), summed on read rather than
+      // maintained as a separate running counter.
+      name_suffix = "most-asked-digests"
+      range_key   = "digestId"
+    }
   }
 }
 

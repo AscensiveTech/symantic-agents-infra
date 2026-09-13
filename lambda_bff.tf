@@ -79,6 +79,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["knowledge_bases"].arn
       },
       {
+        Sid      = "ManageMostAskedDigests"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["most_asked_digests"].arn
+      },
+      {
         Sid      = "ManageWorkspaceUsage"
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
@@ -217,6 +223,7 @@ resource "aws_iam_role_policy" "bff_provider_secrets" {
         aws_secretsmanager_secret.providers["retell"].arn,
         aws_secretsmanager_secret.providers["telnyx"].arn,
         aws_secretsmanager_secret.providers["signwell"].arn,
+        aws_secretsmanager_secret.providers["anthropic"].arn,
       ]
     }]
   })
@@ -264,6 +271,7 @@ resource "aws_lambda_function" "bff" {
       LEGAL_DOCUMENTS_TABLE       = aws_dynamodb_table.legal_documents.name
       LEGAL_ACCEPTANCES_TABLE     = aws_dynamodb_table.legal_acceptances.name
       KNOWLEDGE_BASES_TABLE       = aws_dynamodb_table.control_plane["knowledge_bases"].name
+      MOST_ASKED_DIGESTS_TABLE    = aws_dynamodb_table.control_plane["most_asked_digests"].name
       COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
       CALL_ARTIFACTS_BUCKET       = aws_s3_bucket.call_artifacts.bucket
@@ -271,6 +279,7 @@ resource "aws_lambda_function" "bff" {
       RETELL_SECRET_ARN           = aws_secretsmanager_secret.providers["retell"].arn
       TELNYX_SECRET_ARN           = aws_secretsmanager_secret.providers["telnyx"].arn
       SIGNWELL_SECRET_ARN         = aws_secretsmanager_secret.providers["signwell"].arn
+      ANTHROPIC_SECRET_ARN        = aws_secretsmanager_secret.providers["anthropic"].arn
       PUBLIC_API_BASE_URL         = aws_apigatewayv2_api.bff.api_endpoint
     }
   }

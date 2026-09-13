@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 import {
+  createAnthropicClient,
   createRetellClient,
   createTelnyxClient,
   ProviderRequestError,
@@ -472,6 +473,7 @@ function productForPath(path) {
     "/workspaces/me/knowledge-assets/",
     "/workspaces/me/knowledge-bases",
     "/workspaces/me/available-numbers",
+    "/workspaces/me/most-asked-questions",
     "/calendars/",
   ].some((prefix) => path.startsWith(prefix))) {
     return "receptionist";
@@ -744,6 +746,38 @@ export function createHandler({
         }
         await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
         return json(200, { ok: true });
+      }
+
+      if (path === "/workspaces/me/most-asked-questions" && method === "POST") {
+        await store.ensureWorkspace(workspaceId);
+        if (!await isMostAskedQuestionsEnabled(store, workspaceId)) {
+          return json(402, { message: "Most asked questions is a premium feature - contact your account manager to turn it on." });
+        }
+        const body = readBody(event) ?? {};
+        const windowDays = [7, 30, 90].includes(body?.windowDays) ? body.windowDays : 30;
+        const agentId = typeof body?.agentId === "string" && body.agentId ? body.agentId : undefined;
+        const providers = await getProviders();
+        try {
+          const digest = await generateMostAskedQuestionsDigest({ store, providers, workspaceId, windowDays, agentId });
+          return json(201, digest);
+        } catch (error) {
+          return json(error?.statusCode ?? 502, { message: error instanceof Error ? error.message : "Unable to generate the digest" });
+        }
+      }
+
+      if (path === "/workspaces/me/most-asked-questions" && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        if (!await isMostAskedQuestionsEnabled(store, workspaceId)) {
+          return json(200, { entitled: false, digests: [] });
+        }
+        const digests = await store.listMostAskedDigests(workspaceId);
+        return json(200, {
+          entitled: true,
+          digests,
+          costCentsThisMonth: digests
+            .filter((digest) => digest.generatedAt?.slice(0, 7) === new Date().toISOString().slice(0, 7))
+            .reduce((total, digest) => total + (digest.costCents ?? 0), 0),
+        });
       }
 
       if (path === "/workspaces/me/calls" && method === "GET") {
@@ -1085,6 +1119,7 @@ async function handlePlatformCompanies(event, {
       const hasTier = body && Object.hasOwn(body, "tier");
       const hasPlan = isPlanPatch(body);
       const hasBlocklist = body && Object.hasOwn(body, "callBlocklistEnabled");
+      const hasMostAskedQuestions = body && Object.hasOwn(body, "mostAskedQuestionsEnabled");
       const hasProposalPrice = body && Object.hasOwn(body, "proposalPlanPriceOverride");
       const hasAnchor = body && Object.hasOwn(body, "billingAnchorDate");
       const hasCredit = body && Object.hasOwn(body, "billingCreditBalance");
@@ -1100,11 +1135,12 @@ async function handlePlatformCompanies(event, {
       const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
         || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
       if (
-        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
         (hasEntitlements && !isValidEntitlements(body.entitlements)) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
         (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
+        (hasMostAskedQuestions && typeof body.mostAskedQuestionsEnabled !== "boolean") ||
         (hasProposalPrice && !proposalPriceValid) ||
         (hasAnchor && !anchorValid) ||
         (hasCredit && !creditValid)
@@ -1120,6 +1156,7 @@ async function handlePlatformCompanies(event, {
         // intend them to keep.
         ...(hasEntitlements ? { entitlements: body.entitlements } : {}),
         ...(hasBlocklist ? { callBlocklistEnabled: body.callBlocklistEnabled } : {}),
+        ...(hasMostAskedQuestions ? { mostAskedQuestionsEnabled: body.mostAskedQuestionsEnabled } : {}),
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
       };
@@ -1460,7 +1497,10 @@ async function loadWorkspaceUsage(store, workspaceId) {
         agentName: entry.agentId === "unassigned" ? "Unassigned" : agentNames.get(entry.agentId) ?? entry.agentId,
       })),
     },
-    features: { callBlocklist: resolveCallBlocklist(workspace, plan) },
+    features: {
+      callBlocklist: resolveCallBlocklist(workspace, plan),
+      mostAskedQuestions: workspace?.mostAskedQuestionsEnabled === true,
+    },
   };
 }
 
@@ -1790,6 +1830,48 @@ async function countProposalGenerated(store, workspaceId, proposalId, { loaded =
 }
 
 // Whether the premium call blocklist is available to this workspace right now.
+async function isMostAskedQuestionsEnabled(store, workspaceId) {
+  const workspace = typeof store.getWorkspace === "function" ? await store.getWorkspace(workspaceId) : null;
+  return workspace?.mostAskedQuestionsEnabled === true;
+}
+
+// Caps the number of calls fed to the LLM per digest run - bounds both cost
+// and prompt size regardless of how busy the workspace's call history is.
+const MOST_ASKED_QUESTIONS_MAX_CALLS = 150;
+
+async function generateMostAskedQuestionsDigest({ store, providers, workspaceId, windowDays, agentId }) {
+  const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+  const allCalls = await store.listCalls(workspaceId);
+  const eligible = allCalls.filter((call) => {
+    const at = Date.parse(call.startedAt ?? call.createdAt ?? "");
+    if (Number.isNaN(at) || at < cutoff) return false;
+    if (agentId && call.agentId !== agentId) return false;
+    return Boolean(call.callSummary) || (Array.isArray(call.transcript) && call.transcript.length > 0);
+  }).slice(0, MOST_ASKED_QUESTIONS_MAX_CALLS);
+
+  if (!eligible.length) {
+    return { questions: [], callsAnalyzed: 0, costCents: 0 };
+  }
+
+  const result = await providers.anthropic.summarizeMostAskedQuestions({ calls: eligible });
+  const digestId = `digest-${randomUUID()}`;
+  const record = {
+    workspaceId,
+    digestId,
+    agentId: agentId ?? "all",
+    windowDays,
+    questions: result.questions,
+    model: result.model,
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    costCents: result.costCents,
+    callsAnalyzed: eligible.length,
+    generatedAt: new Date().toISOString(),
+  };
+  await store.createMostAskedDigest(record);
+  return record;
+}
+
 async function isCallBlocklistEnabled(store, workspaceId) {
   const [profile, workspace] = await Promise.all([
     typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
@@ -1847,6 +1929,7 @@ async function platformCompanySummary(store, workspace) {
     enterprisePriceMonthly: numberOrNullValue(workspace.enterprisePriceMonthly),
     enterpriseOveragePerMinute: numberOrNullValue(workspace.enterpriseOveragePerMinute),
     callBlocklistEnabled: workspace.callBlocklistEnabled === true,
+    mostAskedQuestionsEnabled: workspace.mostAskedQuestionsEnabled === true,
     proposalPlanPriceOverride: numberOrNullValue(workspace.proposalPlanPriceOverride),
     proposalMonthlyPrice: resolveProposalMonthlyPrice(normalizeCompanyTier(workspace.tier), workspace),
     billingAnchorDate: typeof workspace.billingAnchorDate === "string" ? workspace.billingAnchorDate : null,
@@ -5150,6 +5233,30 @@ export function createDynamoStore(client, commands, tableNames) {
       }));
     },
 
+    async createMostAskedDigest(record) {
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.mostAskedDigests,
+        Item: marshall(record),
+      }));
+      return record;
+    },
+
+    // digestId (the range key) is a random UUID, not time-ordered, so sort
+    // by generatedAt in memory rather than relying on ScanIndexForward -
+    // this table doubles as the cost ledger, capped so a long history
+    // doesn't force reading it all on every page load.
+    async listMostAskedDigests(workspaceId, limit = 50) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.mostAskedDigests,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+      }));
+      return (result.Items ?? [])
+        .map((item) => unmarshall(item))
+        .sort((left, right) => Date.parse(right.generatedAt ?? "") - Date.parse(left.generatedAt ?? ""))
+        .slice(0, limit);
+    },
+
     async getPhoneNumberForAgent(workspaceId, agentId) {
       const result = await client.send(new commands.GetItemCommand({
         TableName: tableNames.phoneNumbers,
@@ -5666,6 +5773,7 @@ export async function getDefaultStore() {
       legalDocuments: process.env.LEGAL_DOCUMENTS_TABLE,
       legalAcceptances: process.env.LEGAL_ACCEPTANCES_TABLE,
       knowledgeBases: process.env.KNOWLEDGE_BASES_TABLE,
+      mostAskedDigests: process.env.MOST_ASKED_DIGESTS_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");
@@ -6089,6 +6197,19 @@ export async function getDefaultProviders() {
           retellSecret.default_voice_id,
         voiceIds: retellSecret.voiceIds ?? retellSecret.voice_ids,
       }),
+    // Lazily resolved (unlike Retell/Telnyx above) so a deployment that has
+    // never turned this premium feature on for any workspace never needs
+    // ANTHROPIC_SECRET_ARN configured - only entitled workspaces ever reach
+    // this call.
+    anthropic: {
+      async summarizeMostAskedQuestions(args) {
+        const secret = await getProviderSecret(process.env.ANTHROPIC_SECRET_ARN, "Anthropic");
+        return createAnthropicClient({
+          apiKey: readApiKey(secret, "Anthropic"),
+          model: secret.model,
+        }).summarizeMostAskedQuestions(args);
+      },
+    },
   }));
   return providersPromise;
 }

@@ -15,6 +15,9 @@ locals {
     signwell = {
       description = "SignWell API key, webhook ID, and test-mode configuration"
     }
+    anthropic = {
+      description = "Anthropic API key used for the most-asked-questions digest (premium feature)"
+    }
   }
 }
 

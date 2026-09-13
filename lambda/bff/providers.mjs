@@ -455,6 +455,106 @@ export function createRetellClient({
   };
 }
 
+const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_VERSION = "2023-06-01";
+
+// Per-million-token pricing (USD cents) for the models this feature is
+// allowed to use - kept as an explicit table rather than trusting a single
+// constant, since a cost misattribution here is a billing correctness bug,
+// same class of risk as the minute-billing gate elsewhere in this file.
+// Update if Anthropic's published pricing changes.
+const ANTHROPIC_PRICING_CENTS_PER_MILLION_TOKENS = {
+  "claude-haiku-4-5-20251001": { input: 80, output: 400 },
+};
+
+function anthropicCostCents(model, usage) {
+  const pricing = ANTHROPIC_PRICING_CENTS_PER_MILLION_TOKENS[model];
+  if (!pricing || !usage) return 0;
+  const inputCost = (usage.input_tokens ?? 0) * pricing.input / 1_000_000;
+  const outputCost = (usage.output_tokens ?? 0) * pricing.output / 1_000_000;
+  return Math.round((inputCost + outputCost) * 100) / 100;
+}
+
+export function createAnthropicClient({
+  apiKey,
+  model = "claude-haiku-4-5-20251001",
+  fetchImpl = globalThis.fetch,
+}) {
+  requireCredential(apiKey, "Anthropic API key");
+
+  return {
+    // Clusters a batch of call summaries/transcript excerpts into the most
+    // frequently asked questions/topics - a premium, on-demand digest, not
+    // a per-call feature, so it's fine to spend a real LLM call on it.
+    async summarizeMostAskedQuestions({ calls }) {
+      const transcriptExcerpt = (call) => {
+        if (Array.isArray(call.transcript) && call.transcript.length) {
+          return call.transcript
+            .filter((entry) => entry?.speaker && entry?.text)
+            .slice(0, 20)
+            .map((entry) => `${entry.speaker}: ${entry.text}`)
+            .join("\n");
+        }
+        return call.callSummary ?? "";
+      };
+      const callBlocks = calls
+        .map((call, index) => ({ index, excerpt: transcriptExcerpt(call).trim() }))
+        .filter(({ excerpt }) => excerpt.length > 0)
+        .map(({ index, excerpt }) => `Call ${index + 1}:\n${excerpt}`)
+        .join("\n\n---\n\n");
+
+      const prompt = `Below are excerpts from ${calls.length} customer phone calls to a small business's AI receptionist. Identify the most frequently asked questions or topics across these calls.
+
+Respond with ONLY a JSON array (no prose, no markdown fences) of up to 8 objects, ranked by frequency, each shaped as:
+{"question": "a clear, generalized version of the question", "count": <number of calls that asked something like this>, "exampleQuote": "a short representative quote from one call", "suggestedKnowledgeBaseAddition": "one sentence suggesting what content to add to the knowledge base to answer this automatically"}
+
+Calls:
+${callBlocks}`;
+
+      const body = await requestJson(fetchImpl, ANTHROPIC_BASE_URL, {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": ANTHROPIC_API_VERSION,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 1500,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      }, "Anthropic");
+
+      const text = body?.content?.find((block) => block?.type === "text")?.text ?? "[]";
+      let questions;
+      try {
+        const parsed = JSON.parse(text.trim().replace(/^```json\s*|```$/g, ""));
+        questions = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        questions = [];
+      }
+
+      return {
+        questions: questions
+          .filter((entry) => entry && typeof entry.question === "string")
+          .map((entry) => ({
+            question: entry.question,
+            count: Number.isFinite(entry.count) ? entry.count : 0,
+            exampleQuote: typeof entry.exampleQuote === "string" ? entry.exampleQuote : "",
+            suggestedKnowledgeBaseAddition:
+              typeof entry.suggestedKnowledgeBaseAddition === "string" ? entry.suggestedKnowledgeBaseAddition : "",
+          })),
+        model,
+        usage: {
+          inputTokens: body?.usage?.input_tokens ?? 0,
+          outputTokens: body?.usage?.output_tokens ?? 0,
+        },
+        costCents: anthropicCostCents(model, body?.usage),
+      };
+    },
+  };
+}
+
 export function resolveRetellVoiceId(requestedVoice, settings) {
   const mapped = settings?.voiceIds?.[requestedVoice];
   if (typeof mapped === "string" && mapped) return mapped;
