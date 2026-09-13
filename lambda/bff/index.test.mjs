@@ -586,6 +586,15 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
       events.push(["updateAgentRuntime", workspaceId, agentId, updates]);
       return { ...agent, ...updates };
     },
+    async createKnowledgeBase(workspaceId, knowledgeBaseId, record) {
+      events.push(["storeCreateKnowledgeBase", workspaceId, knowledgeBaseId, record]);
+      return { workspaceId, knowledgeBaseId, ...record };
+    },
+    async putAgent(workspaceId, agentId, nextAgent) {
+      events.push(["putAgent", workspaceId, agentId, nextAgent]);
+      Object.assign(agent, nextAgent);
+      return nextAgent;
+    },
   };
   const providers = {
     telnyx: {
@@ -648,13 +657,14 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   assert.match(retellInput.config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
   assert.deepEqual(retellInput.config.knowledgeBaseIds, ["knowledge-base-123"]);
   assert.deepEqual(events.find(([name]) => name === "createKnowledgeBase")[1].texts, [{
-    title: "Customer-provided knowledge",
+    title: "Maya knowledge",
     text: "Appointments require 24 hours notice for cancellation.",
   }]);
-  assert.ok(events.some(([name, , , updates]) =>
-    name === "updateAgentRuntime" &&
-    updates?.retellKnowledgeBaseId === "knowledge-base-123" &&
-    typeof updates?.retellKnowledgeBaseFingerprint === "string"
+  assert.ok(events.some(([name, , , nextAgent]) =>
+    name === "putAgent" &&
+    nextAgent?.configuration?.legacyKnowledgeMigrated === true &&
+    Array.isArray(nextAgent?.configuration?.knowledgeBaseIds) &&
+    nextAgent.configuration.knowledgeBaseIds.length === 1
   ));
   assert.ok(retellInput.config.tools.filter(({ type }) => type === "custom").every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")

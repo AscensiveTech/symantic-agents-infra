@@ -214,11 +214,33 @@ test("Retell lists voices and creates a multipart knowledge base", async () => {
   assert.equal(calls[1][1].headers.Authorization, "Bearer retell-key");
   assert.equal(calls[1][1].headers["Content-Type"], undefined);
   assert.equal(calls[1][1].body.get("knowledge_base_name"), "Symantic agent-123");
-  assert.equal(
-    calls[1][1].body.get("knowledge_base_texts"),
-    JSON.stringify([{ title: "Customer-provided knowledge", text: "Open weekdays." }]),
-  );
-  assert.equal(calls[1][1].body.get("knowledge_base_files").name, "policies.txt");
+  assert.equal(calls[1][1].body.get("knowledge_base_texts"), null);
+  const uploadedFiles = calls[1][1].body.getAll("knowledge_base_files");
+  assert.equal(uploadedFiles.length, 2);
+  assert.equal(uploadedFiles[0].name, "Customer-provided-knowledge.txt");
+  assert.equal(await uploadedFiles[0].text(), "Open weekdays.");
+  assert.equal(uploadedFiles[1].name, "policies.txt");
+});
+
+test("Retell creates a knowledge base with a URL source and auto-refresh enabled", async () => {
+  const calls = [];
+  const client = createRetellClient({
+    apiKey: "retell-key",
+    fetchImpl: async (url, init = {}) => {
+      calls.push([String(url), init]);
+      return response({ knowledge_base_id: "knowledge_base-456", status: "in_progress" }, 201);
+    },
+  });
+
+  const created = await client.createKnowledgeBase({
+    name: "Hours policy",
+    urls: ["https://example.com/hours"],
+    enableAutoRefresh: true,
+  });
+
+  assert.deepEqual(created, { knowledgeBaseId: "knowledge_base-456", status: "in_progress" });
+  assert.equal(calls[0][1].body.get("knowledge_base_urls"), JSON.stringify(["https://example.com/hours"]));
+  assert.equal(calls[0][1].body.get("enable_auto_refresh"), "true");
 });
 
 test("Retell upsert reuses a Symantic-named agent instead of creating another", async () => {

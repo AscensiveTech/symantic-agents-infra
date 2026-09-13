@@ -8,6 +8,9 @@ import {
   resolveAllowedInboundCountries,
   resolveCallHandling,
   resolveConfiguredVoiceId,
+  resolveLanguage,
+  resolvePauseBeforeSpeakingMs,
+  resolveStartSpeaker,
 } from "./receptionist.mjs";
 
 const profile = {
@@ -232,7 +235,51 @@ test("booking-disabled agents omit calendar tools", () => {
   assert.ok(config.tools.some(({ type }) => type === "end_call"));
 });
 
-test("spamScreening:false drops the end_call tool", () => {
+test("resolveLanguage falls back to en-US for anything outside the supported set", () => {
+  assert.equal(resolveLanguage({ configuration: { language: "es-419" } }), "es-419");
+  assert.equal(resolveLanguage({ configuration: { language: "fr-FR" } }), "en-US");
+  assert.equal(resolveLanguage({ configuration: {} }), "en-US");
+});
+
+test("resolveStartSpeaker and resolvePauseBeforeSpeakingMs clamp to the supported Welcome Message options", () => {
+  assert.equal(resolveStartSpeaker({ configuration: { startSpeaker: "user" } }), "user");
+  assert.equal(resolveStartSpeaker({ configuration: {} }), "agent");
+  assert.equal(resolvePauseBeforeSpeakingMs({ configuration: { pauseBeforeSpeakingMs: 1000 } }), 1000);
+  assert.equal(resolvePauseBeforeSpeakingMs({ configuration: { pauseBeforeSpeakingMs: 3000 } }), 0);
+});
+
+test("buildReceptionistConfig sets language and begin_message_delay_ms when the agent speaks first with a pause", () => {
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: {
+      ...agent,
+      configuration: { ...agent.configuration, language: "es-419", startSpeaker: "agent", pauseBeforeSpeakingMs: 1000 },
+    },
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.equal(config.language, "es-419");
+  assert.equal(config.retellAgent.language, "es-419");
+  assert.equal(config.retellAgent.begin_message_delay_ms, 1000);
+});
+
+test("buildReceptionistConfig omits begin_message_delay_ms when the caller speaks first", () => {
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: {
+      ...agent,
+      configuration: { ...agent.configuration, startSpeaker: "user", pauseBeforeSpeakingMs: 1000 },
+    },
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.equal(config.startSpeaker, "user");
+  assert.equal(config.retellAgent.begin_message_delay_ms, undefined);
+});
+
+test("end_call is always available, independent of spamScreening - the agent also uses it to end calls gracefully", () => {
   const config = buildReceptionistConfig({
     workspaceId: "workspace-123",
     agent: { ...agent, configuration: { ...agent.configuration, spamScreening: false } },
@@ -240,5 +287,5 @@ test("spamScreening:false drops the end_call tool", () => {
     toolBaseUrl: "https://api.example.com",
     voiceId: "retell-voice-1",
   });
-  assert.ok(!config.tools.some(({ type }) => type === "end_call"));
+  assert.ok(config.tools.some(({ type }) => type === "end_call"));
 });

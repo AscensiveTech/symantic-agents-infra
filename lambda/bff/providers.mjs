@@ -177,7 +177,7 @@ export function createRetellClient({
     const result = await retellRequest("/create-retell-llm", {
       method: "POST",
       body: {
-        start_speaker: "agent",
+        start_speaker: config.startSpeaker === "user" ? "user" : "agent",
         begin_message: greeting,
         general_prompt: config.prompt,
         general_tools: config.tools,
@@ -191,7 +191,7 @@ export function createRetellClient({
     await retellRequest(`/update-retell-llm/${encodeURIComponent(llmId)}`, {
       method: "PATCH",
       body: {
-        start_speaker: "agent",
+        start_speaker: config.startSpeaker === "user" ? "user" : "agent",
         begin_message: greeting,
         general_prompt: config.prompt,
         general_tools: config.tools,
@@ -223,11 +223,23 @@ export function createRetellClient({
       return Array.isArray(voices) ? voices : [];
     },
 
-    async createKnowledgeBase({ name, texts = [], files = [] }) {
+    async createKnowledgeBase({ name, texts = [], files = [], urls = [], enableAutoRefresh = false }) {
       const form = new FormData();
       form.append("knowledge_base_name", required(name, "knowledgeBaseName").slice(0, 39));
-      if (texts.length) form.append("knowledge_base_texts", JSON.stringify(texts));
-      for (const file of files) {
+      if (urls.length) form.append("knowledge_base_urls", JSON.stringify(urls));
+      if (enableAutoRefresh) form.append("enable_auto_refresh", "true");
+      // Pasted text goes through Retell's file mechanism too (as a synthetic
+      // .txt file) rather than knowledge_base_texts, so every source in a
+      // knowledge base's list looks and behaves the same way.
+      const allFiles = [
+        ...texts.map((entry, index) => ({
+          name: `${(entry?.title || `pasted-text-${index + 1}`).replace(/[^A-Za-z0-9._-]+/g, "-")}.txt`,
+          contentType: "text/plain",
+          data: new TextEncoder().encode(entry?.text ?? ""),
+        })),
+        ...files,
+      ];
+      for (const file of allFiles) {
         const blob = new Blob([file.data], {
           type: file.contentType || "application/octet-stream",
         });

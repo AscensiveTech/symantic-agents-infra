@@ -56,6 +56,10 @@ locals {
       name_suffix = "proposal-templates"
       range_key   = "templateId"
     }
+    knowledge_bases = {
+      name_suffix = "knowledge-bases"
+      range_key   = "knowledgeBaseId"
+    }
   }
 }
 

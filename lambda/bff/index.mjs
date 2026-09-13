@@ -272,6 +272,11 @@ function isValidKnowledgeConfiguration(configuration) {
     configuration.knowledgeBaseText !== undefined &&
     (typeof configuration.knowledgeBaseText !== "string" || configuration.knowledgeBaseText.length > 100_000)
   ) return false;
+  if (
+    configuration.knowledgeBaseIds !== undefined &&
+    (!Array.isArray(configuration.knowledgeBaseIds) ||
+      configuration.knowledgeBaseIds.some((id) => typeof id !== "string" || !id))
+  ) return false;
   if (configuration.knowledgeBaseFiles === undefined) return true;
   if (!Array.isArray(configuration.knowledgeBaseFiles) || configuration.knowledgeBaseFiles.length > 25) {
     return false;
@@ -465,6 +470,7 @@ function productForPath(path) {
     "/workspaces/me/usage",
     "/workspaces/me/retell/",
     "/workspaces/me/knowledge-assets/",
+    "/workspaces/me/knowledge-bases",
     "/calendars/",
   ].some((prefix) => path.startsWith(prefix))) {
     return "receptionist";
@@ -688,6 +694,45 @@ export function createHandler({
         if (!agent) return json(400, { message: "Invalid agent" });
         await store.ensureWorkspace(workspaceId);
         return json(201, await store.createAgent(workspaceId, agent.id, agent));
+      }
+
+      if (path === "/workspaces/me/knowledge-bases" && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        return json(200, await listKnowledgeBasesWithAssignments(store, workspaceId));
+      }
+
+      if (path === "/workspaces/me/knowledge-bases" && method === "POST") {
+        await store.ensureWorkspace(workspaceId);
+        const body = readBody(event) ?? {};
+        try {
+          return json(201, await createKnowledgeBaseItem(store, await getProviders(), getKnowledgeSigner, workspaceId, body));
+        } catch (error) {
+          return json(400, { message: error instanceof Error ? error.message : "Unable to create knowledge base item" });
+        }
+      }
+
+      const knowledgeBaseTarget = path.match(/^\/workspaces\/me\/knowledge-bases\/(.+)$/)?.[1];
+      if (knowledgeBaseTarget && method === "DELETE") {
+        await store.ensureWorkspace(workspaceId);
+        const knowledgeBaseId = decodeURIComponent(knowledgeBaseTarget);
+        const agents = await store.listAgents(workspaceId);
+        const assignedTo = agents.filter((agent) =>
+          Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
+          agent.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
+        if (assignedTo.length > 0) {
+          return json(409, {
+            message: "Unassign this item from every agent before deleting it",
+            assignedAgents: assignedTo.map((agent) => ({ id: agent.id, name: agent.name })),
+          });
+        }
+        const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
+        if (!record) return json(404, { message: "Knowledge base item not found" });
+        const providers = await getProviders();
+        if (record.retellKnowledgeBaseId) {
+          await providers.retell.deleteKnowledgeBase(record.retellKnowledgeBaseId).catch(() => {});
+        }
+        await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
+        return json(200, { ok: true });
       }
 
       if (path === "/workspaces/me/calls" && method === "GET") {
@@ -3894,53 +3939,26 @@ async function syncReceptionistRuntime({
     toolBaseUrl,
     voiceId,
   });
-  const knowledge = await syncKnowledgeBase({
+  config.knowledgeBaseIds = await resolveAgentKnowledgeBaseIds({
+    store,
     workspaceId,
     agentId,
     agent,
     providers,
     getKnowledgeSigner,
   });
-  config.knowledgeBaseIds = knowledge.knowledgeBaseId
-    ? [knowledge.knowledgeBaseId]
-    : [];
-  let synced;
+  const synced = await providers.retell.upsertAgent({
+    retellAgentId: agent.retellAgentId,
+    symanticAgentId: agentId,
+    agentName: agent?.configuration?.name ?? agent.name,
+    greeting: agent?.configuration?.greeting ?? "",
+    config,
+  });
   try {
-    synced = await providers.retell.upsertAgent({
-      retellAgentId: agent.retellAgentId,
-      symanticAgentId: agentId,
-      agentName: agent?.configuration?.name ?? agent.name,
-      greeting: agent?.configuration?.greeting ?? "",
-      config,
-    });
-  } catch (error) {
-    if (knowledge.created && knowledge.knowledgeBaseId) {
-      await providers.retell.deleteKnowledgeBase(knowledge.knowledgeBaseId).catch(() => {});
-    }
-    throw error;
-  }
-  try {
-    const runtimeUpdates = { retellAgentId: synced.retellAgentId };
-    if (knowledge.fingerprint || knowledge.previousKnowledgeBaseId) {
-      runtimeUpdates.retellKnowledgeBaseId = knowledge.knowledgeBaseId;
-      runtimeUpdates.retellKnowledgeBaseFingerprint = knowledge.fingerprint;
-    }
-    await store.updateAgentRuntime(
-      workspaceId,
-      agentId,
-      runtimeUpdates,
-    );
+    await store.updateAgentRuntime(workspaceId, agentId, { retellAgentId: synced.retellAgentId });
   } catch (error) {
     if (isConditionalCheckFailed(error)) throw error;
     console.error("Failed to persist retellAgentId after Retell upsert", error);
-  }
-  if (
-    knowledge.previousKnowledgeBaseId &&
-    knowledge.previousKnowledgeBaseId !== knowledge.knowledgeBaseId
-  ) {
-    await providers.retell.deleteKnowledgeBase(knowledge.previousKnowledgeBaseId).catch((error) => {
-      console.error("Failed to delete superseded Retell knowledge base", error);
-    });
   }
   if (!phoneNumber.retellPhoneNumberId) {
     const imported = await providers.retell.importPhoneNumber({
@@ -3982,13 +4000,12 @@ async function syncReceptionistRuntime({
   };
 }
 
-async function syncKnowledgeBase({
-  workspaceId,
-  agentId,
-  agent,
-  providers,
-  getKnowledgeSigner,
-}) {
+// A one-time, lazy migration: an agent saved before the knowledge base hub
+// existed may still carry its own private knowledgeBaseText/knowledgeBaseFiles.
+// The first sync after the hub ships turns that private content into its own
+// new hub item (so nothing an agent already relied on disappears) and adds
+// it to the agent's own knowledgeBaseIds, instead of leaving it stranded.
+async function migrateLegacyAgentKnowledge({ store, workspaceId, agentId, agent, providers, getKnowledgeSigner }) {
   const knowledgeText = typeof agent?.configuration?.knowledgeBaseText === "string"
     ? agent.configuration.knowledgeBaseText.trim()
     : "";
@@ -4001,45 +4018,71 @@ async function syncKnowledgeBase({
       typeof file.contentType === "string" &&
       Number.isInteger(file.size) &&
       file.size > 0 &&
-      file.size <= MAX_KNOWLEDGE_FILE_BYTES
-    )
+      file.size <= MAX_KNOWLEDGE_FILE_BYTES)
     : [];
-  const previousKnowledgeBaseId = typeof agent?.retellKnowledgeBaseId === "string"
-    ? agent.retellKnowledgeBaseId
-    : null;
-  if (fileMetadata.reduce((total, file) => total + file.size, 0) > MAX_KNOWLEDGE_TOTAL_BYTES) {
-    throw new Error("Knowledge files exceed the 100 MB total limit");
-  }
-  const fingerprint = knowledgeText || fileMetadata.length
-    ? createHash("sha256").update(JSON.stringify({
-      text: knowledgeText,
-      files: fileMetadata.map(({ key, name, contentType, size }) => ({ key, name, contentType, size })),
-    })).digest("hex")
-    : null;
+  if (!knowledgeText && fileMetadata.length === 0) return null;
 
-  if (!fingerprint) {
-    return { knowledgeBaseId: null, fingerprint: null, previousKnowledgeBaseId, created: false };
-  }
-  if (
-    previousKnowledgeBaseId &&
-    fingerprint === agent?.retellKnowledgeBaseFingerprint
-  ) {
-    return {
-      knowledgeBaseId: previousKnowledgeBaseId,
-      fingerprint,
-      previousKnowledgeBaseId,
-      created: false,
+  const created = await buildRetellKnowledgeBase({
+    providers,
+    getKnowledgeSigner,
+    workspaceId,
+    name: `${agent.name || agentId} knowledge`,
+    text: knowledgeText,
+    fileMetadata,
+    url: "",
+    enableAutoRefresh: false,
+  });
+  const knowledgeBaseId = `kb-${randomUUID()}`;
+  await store.createKnowledgeBase(workspaceId, knowledgeBaseId, {
+    name: `${agent.name || agentId} knowledge`.slice(0, 120),
+    kind: fileMetadata.length ? "file" : "text",
+    sourceLabel: fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
+    retellKnowledgeBaseId: created.knowledgeBaseId,
+    enableAutoRefresh: false,
+    createdAt: new Date().toISOString(),
+    migratedFromAgentId: agentId,
+  });
+  return { knowledgeBaseId, retellKnowledgeBaseId: created.knowledgeBaseId };
+}
+
+async function resolveAgentKnowledgeBaseIds({ store, workspaceId, agentId, agent, providers, getKnowledgeSigner }) {
+  const selectedIds = Array.isArray(agent?.configuration?.knowledgeBaseIds)
+    ? agent.configuration.knowledgeBaseIds.filter((id) => typeof id === "string" && id)
+    : [];
+  const resolved = selectedIds.length
+    ? (await Promise.all(selectedIds.map((id) => store.getKnowledgeBase(workspaceId, id))))
+      .filter((record) => record?.retellKnowledgeBaseId)
+      .map((record) => record.retellKnowledgeBaseId)
+    : [];
+
+  const alreadyMigrated = Boolean(agent?.configuration?.legacyKnowledgeMigrated);
+  if (!alreadyMigrated) {
+    const migrated = await migrateLegacyAgentKnowledge({ store, workspaceId, agentId, agent, providers, getKnowledgeSigner });
+    const nextConfiguration = {
+      ...agent.configuration,
+      legacyKnowledgeMigrated: true,
+      ...(migrated ? { knowledgeBaseIds: [...selectedIds, migrated.knowledgeBaseId] } : {}),
     };
+    try {
+      await store.putAgent(workspaceId, agentId, { ...agent, configuration: nextConfiguration });
+    } catch (error) {
+      if (isConditionalCheckFailed(error)) throw error;
+      console.error("Failed to persist legacy knowledge base migration", error);
+    }
+    if (migrated) resolved.push(migrated.retellKnowledgeBaseId);
   }
+  return resolved;
+}
 
+async function buildRetellKnowledgeBase({ providers, getKnowledgeSigner, workspaceId, name, text, fileMetadata, url, enableAutoRefresh }) {
   const files = [];
   if (fileMetadata.length) {
     const signer = await getKnowledgeSigner();
     for (const file of fileMetadata) {
-      const url = await signer.createDownloadUrl(workspaceId, file.key);
-      const response = await fetch(url);
+      const downloadUrl = await signer.createDownloadUrl(workspaceId, file.key);
+      const response = await fetch(downloadUrl);
       if (!response.ok) {
-        throw new Error(`Unable to read knowledge file ${file.name} (${response.status})`);
+        throw new Error(`Unable to read ${file.name} (${response.status})`);
       }
       files.push({
         name: file.name,
@@ -4048,17 +4091,84 @@ async function syncKnowledgeBase({
       });
     }
   }
-  const created = await providers.retell.createKnowledgeBase({
-    name: `Symantic ${agentId}`.slice(0, 39),
-    texts: knowledgeText ? [{ title: "Customer-provided knowledge", text: knowledgeText }] : [],
+  return providers.retell.createKnowledgeBase({
+    name: `Symantic ${randomUUID().slice(0, 8)} · ${name}`.slice(0, 39),
+    texts: text ? [{ title: name, text }] : [],
     files,
+    urls: url ? [url] : [],
+    enableAutoRefresh,
   });
-  return {
-    knowledgeBaseId: created.knowledgeBaseId,
-    fingerprint,
-    previousKnowledgeBaseId,
-    created: true,
+}
+
+// The knowledge base hub: one workspace-level record per uploaded document,
+// pasted text, or website - each maps 1:1 to its own Retell knowledge base,
+// which agents then reference by id (Retell natively allows the same
+// knowledge_base_id on more than one agent, so no per-agent copy is needed).
+function toPublicKnowledgeBase(record) {
+  const { workspaceId: _workspaceId, ...rest } = record;
+  return rest;
+}
+
+async function listKnowledgeBasesWithAssignments(store, workspaceId) {
+  const [items, agents] = await Promise.all([
+    store.listKnowledgeBases(workspaceId),
+    store.listAgents(workspaceId),
+  ]);
+  return items.map((item) => ({
+    ...toPublicKnowledgeBase(item),
+    assignedAgents: agents
+      .filter((agent) => Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
+        agent.configuration.knowledgeBaseIds.includes(item.knowledgeBaseId))
+      .map((agent) => ({ id: agent.id, name: agent.name })),
+  }));
+}
+
+async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, workspaceId, body) {
+  const name = typeof body?.name === "string" ? body.name.trim().slice(0, 120) : "";
+  if (!name) throw new Error("A name is required");
+  const text = typeof body?.text === "string" ? body.text.trim() : "";
+  const url = typeof body?.url === "string" ? body.url.trim() : "";
+  const fileMetadata = Array.isArray(body?.files)
+    ? body.files.filter((file) =>
+      file &&
+      typeof file.name === "string" &&
+      typeof file.key === "string" &&
+      KNOWLEDGE_ASSET_KEY_PATTERN.test(file.key) &&
+      typeof file.contentType === "string" &&
+      Number.isInteger(file.size) &&
+      file.size > 0 &&
+      file.size <= MAX_KNOWLEDGE_FILE_BYTES)
+    : [];
+  if (!text && !url && fileMetadata.length === 0) {
+    throw new Error("Add pasted text, a file, or a website URL");
+  }
+  if (fileMetadata.reduce((total, file) => total + file.size, 0) > MAX_KNOWLEDGE_TOTAL_BYTES) {
+    throw new Error("Files exceed the 100 MB total limit");
+  }
+  const enableAutoRefresh = url ? body?.enableAutoRefresh === true : false;
+
+  const created = await buildRetellKnowledgeBase({
+    providers,
+    getKnowledgeSigner,
+    workspaceId,
+    name,
+    text,
+    fileMetadata,
+    url,
+    enableAutoRefresh,
+  });
+
+  const knowledgeBaseId = `kb-${randomUUID()}`;
+  const record = {
+    name,
+    kind: url ? "url" : fileMetadata.length ? "file" : "text",
+    sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
+    retellKnowledgeBaseId: created.knowledgeBaseId,
+    enableAutoRefresh,
+    createdAt: new Date().toISOString(),
   };
+  await store.createKnowledgeBase(workspaceId, knowledgeBaseId, record);
+  return { ...toPublicKnowledgeBase(record), knowledgeBaseId, assignedAgents: [] };
 }
 
 function launchReadinessIssue(agent, profile, calendar) {
@@ -4896,6 +5006,41 @@ export function createDynamoStore(client, commands, tableNames) {
       return toAgentRecord(unmarshall(result.Attributes));
     },
 
+    async listKnowledgeBases(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.knowledgeBases,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ConsistentRead: true,
+      }));
+      return (result.Items ?? []).map((item) => unmarshall(item));
+    },
+
+    async getKnowledgeBase(workspaceId, knowledgeBaseId) {
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.knowledgeBases,
+        Key: marshall({ workspaceId, knowledgeBaseId }),
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    async createKnowledgeBase(workspaceId, knowledgeBaseId, record) {
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.knowledgeBases,
+        Item: marshall({ workspaceId, knowledgeBaseId, ...record }),
+        ConditionExpression: "attribute_not_exists(knowledgeBaseId)",
+      }));
+      return { workspaceId, knowledgeBaseId, ...record };
+    },
+
+    async deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId) {
+      await client.send(new commands.DeleteItemCommand({
+        TableName: tableNames.knowledgeBases,
+        Key: marshall({ workspaceId, knowledgeBaseId }),
+      }));
+    },
+
     async getPhoneNumberForAgent(workspaceId, agentId) {
       const result = await client.send(new commands.GetItemCommand({
         TableName: tableNames.phoneNumbers,
@@ -5411,6 +5556,7 @@ async function getDefaultStore() {
       blockedNumbers: process.env.BLOCKED_NUMBERS_TABLE,
       legalDocuments: process.env.LEGAL_DOCUMENTS_TABLE,
       legalAcceptances: process.env.LEGAL_ACCEPTANCES_TABLE,
+      knowledgeBases: process.env.KNOWLEDGE_BASES_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");

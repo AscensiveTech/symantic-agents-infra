@@ -73,6 +73,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["calls"].arn
       },
       {
+        Sid      = "ManageKnowledgeBases"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["knowledge_bases"].arn
+      },
+      {
         Sid      = "ManageWorkspaceUsage"
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
@@ -257,6 +263,7 @@ resource "aws_lambda_function" "bff" {
       WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
       LEGAL_DOCUMENTS_TABLE       = aws_dynamodb_table.legal_documents.name
       LEGAL_ACCEPTANCES_TABLE     = aws_dynamodb_table.legal_acceptances.name
+      KNOWLEDGE_BASES_TABLE       = aws_dynamodb_table.control_plane["knowledge_bases"].name
       COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
       CALL_ARTIFACTS_BUCKET       = aws_s3_bucket.call_artifacts.bucket
