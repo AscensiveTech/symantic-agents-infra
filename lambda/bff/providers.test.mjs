@@ -231,6 +231,7 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
     },
     voice_id: "retell-Cimo",
     agent_name: "Symantic agent-123 · Maya",
+    webhook_events: ["call_started", "call_ended", "call_analyzed"],
   });
   assert.equal(calls[2][1].headers.Authorization, "Bearer retell-key");
 });

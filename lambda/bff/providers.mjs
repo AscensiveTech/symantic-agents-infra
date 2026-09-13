@@ -245,6 +245,11 @@ export function createRetellClient({
       },
       voice_id: config.voice,
       agent_name: `Symantic ${symanticAgentId} · ${agentName}`,
+      // Explicit rather than relying on Retell's account-level default -
+      // call_started is what makes an "ongoing" row show up in Call History
+      // before the call ends; this guarantees it stays subscribed per agent
+      // regardless of what the account-level webhook is configured to send.
+      webhook_events: ["call_started", "call_ended", "call_analyzed"],
       ...(config.retellAgent ?? {}),
     };
   }
