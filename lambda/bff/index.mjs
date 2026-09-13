@@ -852,7 +852,7 @@ export function createHandler({
         const profile = await store.getProfile(workspaceId);
         const calendar = agent?.configuration?.booking === true &&
             typeof store.getCalendarConnection === "function"
-          ? await store.getCalendarConnection(workspaceId)
+          ? await store.getCalendarConnection(workspaceId, agentAction.agentId)
           : null;
         const launchIssue = launchReadinessIssue(agent, profile, calendar);
         if (launchIssue) return json(409, { message: launchIssue });
@@ -5053,10 +5053,10 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
-    async getCalendarConnection(workspaceId) {
+    async getCalendarConnection(workspaceId, agentId) {
       const result = await client.send(new commands.GetItemCommand({
         TableName: tableNames.calendarConnections,
-        Key: marshall({ workspaceId }),
+        Key: marshall({ workspaceId, agentId }),
         ConsistentRead: true,
       }));
       return result.Item ? unmarshall(result.Item) : null;

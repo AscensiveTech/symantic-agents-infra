@@ -1,18 +1,18 @@
 export function createDynamoToolsStore(client, commands, tableNames) {
   return {
-    async getCalendarConnection(workspaceId) {
+    async getCalendarConnection(workspaceId, agentId) {
       return getItem(
         client,
         commands,
         tableNames.calendarConnections,
-        { workspaceId },
+        { workspaceId, agentId },
       );
     },
 
-    async markCalendarReauthRequired(workspaceId, reason) {
+    async markCalendarReauthRequired(workspaceId, agentId, reason) {
       const result = await client.send(new commands.UpdateItemCommand({
         TableName: tableNames.calendarConnections,
-        Key: marshall({ workspaceId }),
+        Key: marshall({ workspaceId, agentId }),
         UpdateExpression:
           "SET connectionState = :state, bookingToolsEnabled = :disabled, " +
           "reauthReason = :reason, updatedAt = :updatedAt",
@@ -29,13 +29,14 @@ export function createDynamoToolsStore(client, commands, tableNames) {
 
     async rotateCalendarToken({
       workspaceId,
+      agentId,
       provider,
       expectedVersion,
       encryptedRefreshToken,
     }) {
       const result = await client.send(new commands.UpdateItemCommand({
         TableName: tableNames.calendarConnections,
-        Key: marshall({ workspaceId }),
+        Key: marshall({ workspaceId, agentId }),
         UpdateExpression:
           "SET encryptedRefreshToken = :token, tokenVersion = :nextVersion",
         ConditionExpression:

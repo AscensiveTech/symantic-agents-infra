@@ -670,8 +670,8 @@ test("adapter requires two consecutive invalid_grant failures before reauth", as
           connectionState: "connected",
         };
       },
-      async markReauthRequired(id, reason) {
-        reauth = { id, reason };
+      async markReauthRequired(id, agentId, reason) {
+        reauth = { id, agentId, reason };
       },
     },
     decryptToken: async () => "refresh-token",
@@ -707,7 +707,7 @@ test("adapter requires two consecutive invalid_grant failures before reauth", as
     }),
     (error) => error.code === "calendar_reauth_required",
   );
-  assert.deepEqual(reauth, { id: workspaceId, reason: "invalid_grant" });
+  assert.deepEqual(reauth, { id: workspaceId, agentId: undefined, reason: "invalid_grant" });
 });
 
 test("Microsoft adapter reuses a still-valid access token per workspace", async () => {

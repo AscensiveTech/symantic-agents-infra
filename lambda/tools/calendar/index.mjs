@@ -48,7 +48,7 @@ export function createCalendarAdapter({
   const invalidGrantFailures = new Map();
 
   async function invoke(operation, input) {
-    const connection = await connectionStore.get(input.workspaceId);
+    const connection = await connectionStore.get(input.workspaceId, input.agentId);
     requireUsableConnection(connection);
     const client = clients[connection.provider];
     if (!client?.[operation]) {
@@ -74,13 +74,13 @@ export function createCalendarAdapter({
       if (error?.statusCode !== 401) throw error;
     }
 
-    accessTokenCache.delete(connection.workspaceId);
+    accessTokenCache.delete(connectionKey(connection));
     accessToken = await getAccessToken(connection, { forceRefresh: true });
     try {
       return await client[operation]({ ...providerInput, accessToken });
     } catch (error) {
       if (error?.statusCode !== 401) throw error;
-      await markReauthRequired(connection.workspaceId, "repeated_401");
+      await markReauthRequired(connection.workspaceId, connection.agentId, "repeated_401");
       throw new CalendarReauthRequiredError("repeated_401");
     }
   }
@@ -90,7 +90,7 @@ export function createCalendarAdapter({
       connection.provider === "microsoft-365-calendar" &&
       forceRefresh !== true
     ) {
-      const cached = accessTokenCache.get(connection.workspaceId);
+      const cached = accessTokenCache.get(connectionKey(connection));
       if (
         cached?.provider === connection.provider &&
         cached?.credentialFingerprints.has(
@@ -102,7 +102,7 @@ export function createCalendarAdapter({
       }
     }
 
-    const refreshKey = `${connection.provider}\0${connection.workspaceId}`;
+    const refreshKey = `${connection.provider}\0${connectionKey(connection)}`;
     const inFlight = refreshPromises.get(refreshKey);
     if (inFlight) return inFlight;
     const refresh = refreshAccessToken(connection)
@@ -135,6 +135,7 @@ export function createCalendarAdapter({
     const refreshToken = await decryptToken({
       encryptedToken: connection.encryptedRefreshToken,
       workspaceId: connection.workspaceId,
+      agentId: connection.agentId,
       provider: connection.provider,
     });
     const form = {
@@ -155,33 +156,33 @@ export function createCalendarAdapter({
     if (!response.ok) {
       if (value?.error === "invalid_grant" || response.status === 401) {
         const reason = value?.error || "invalid_grant";
-        accessTokenCache.delete(connection.workspaceId);
+        accessTokenCache.delete(connectionKey(connection));
         if (connection.provider !== "microsoft-365-calendar") {
-          await markReauthRequired(connection.workspaceId, reason);
+          await markReauthRequired(connection.workspaceId, connection.agentId, reason);
           throw new CalendarReauthRequiredError(reason);
         }
         if (allowRaceRecovery) {
-          const latest = await connectionStore.get(connection.workspaceId);
+          const latest = await connectionStore.get(connection.workspaceId, connection.agentId);
           if (
             latest &&
             credentialFingerprint(latest) !== credentialFingerprint(connection)
           ) {
             requireUsableConnection(latest);
-            invalidGrantFailures.delete(connection.workspaceId);
+            invalidGrantFailures.delete(connectionKey(connection));
             return refreshAccessToken(latest, { allowRaceRecovery: false });
           }
         }
-        const previous = invalidGrantFailures.get(connection.workspaceId);
+        const previous = invalidGrantFailures.get(connectionKey(connection));
         const fingerprint = credentialFingerprint(connection);
         const count = previous?.fingerprint === fingerprint
           ? previous.count + 1
           : 1;
-        invalidGrantFailures.set(connection.workspaceId, {
+        invalidGrantFailures.set(connectionKey(connection), {
           fingerprint,
           count,
         });
         if (count >= 2) {
-          await markReauthRequired(connection.workspaceId, reason);
+          await markReauthRequired(connection.workspaceId, connection.agentId, reason);
           throw new CalendarReauthRequiredError(reason);
         }
         throw calendarError(
@@ -203,7 +204,7 @@ export function createCalendarAdapter({
         502,
       );
     }
-    invalidGrantFailures.delete(connection.workspaceId);
+    invalidGrantFailures.delete(connectionKey(connection));
     const persistedConnection = await persistRotatedToken(
       connection,
       value.refresh_token,
@@ -214,7 +215,7 @@ export function createCalendarAdapter({
       Number.isFinite(expiresInSeconds) &&
       expiresInSeconds > 0
     ) {
-      accessTokenCache.set(connection.workspaceId, {
+      accessTokenCache.set(connectionKey(connection), {
         provider: connection.provider,
         credentialFingerprints: new Set([
           credentialFingerprint(connection),
@@ -239,11 +240,13 @@ export function createCalendarAdapter({
     const encryptedRefreshToken = await encryptToken({
       token: rotatedToken,
       workspaceId: connection.workspaceId,
+      agentId: connection.agentId,
       provider: connection.provider,
     });
     try {
       return await connectionStore.rotateToken({
         workspaceId: connection.workspaceId,
+        agentId: connection.agentId,
         provider: connection.provider,
         expectedVersion: connection.tokenVersion,
         encryptedRefreshToken,
@@ -254,9 +257,9 @@ export function createCalendarAdapter({
     }
   }
 
-  async function markReauthRequired(workspaceId, reason) {
+  async function markReauthRequired(workspaceId, agentId, reason) {
     if (typeof connectionStore.markReauthRequired === "function") {
-      await connectionStore.markReauthRequired(workspaceId, reason);
+      await connectionStore.markReauthRequired(workspaceId, agentId, reason);
     }
   }
 
@@ -266,6 +269,10 @@ export function createCalendarAdapter({
     rescheduleBooking: (input) => invoke("rescheduleBooking", input),
     cancelBooking: (input) => invoke("cancelBooking", input),
   };
+}
+
+function connectionKey(connection) {
+  return `${connection.workspaceId}\0${connection.agentId}`;
 }
 
 function credentialFingerprint(connection) {
@@ -369,21 +376,21 @@ async function createDefaultCalendarAdapter() {
     return secretCache.get(secretId);
   };
   const tokenCrypto = {
-    async decryptToken({ encryptedToken, workspaceId, provider }) {
+    async decryptToken({ encryptedToken, workspaceId, agentId, provider }) {
       const result = await kmsClient.send(new kms.DecryptCommand({
         CiphertextBlob: Buffer.from(encryptedToken, "base64"),
-        EncryptionContext: { workspaceId, provider },
+        EncryptionContext: { workspaceId, agentId, provider },
       }));
       if (!result.Plaintext) throw new Error("KMS did not return plaintext");
       return new TextDecoder().decode(result.Plaintext);
     },
-    async encryptToken({ token, workspaceId, provider }) {
+    async encryptToken({ token, workspaceId, agentId, provider }) {
       const keyId = process.env.CALENDAR_TOKENS_KMS_KEY_ID;
       if (!keyId) throw new Error("CALENDAR_TOKENS_KMS_KEY_ID is required");
       const result = await kmsClient.send(new kms.EncryptCommand({
         KeyId: keyId,
         Plaintext: new TextEncoder().encode(token),
-        EncryptionContext: { workspaceId, provider },
+        EncryptionContext: { workspaceId, agentId, provider },
       }));
       if (!result.CiphertextBlob) throw new Error("KMS did not return ciphertext");
       return Buffer.from(result.CiphertextBlob).toString("base64");
@@ -391,9 +398,9 @@ async function createDefaultCalendarAdapter() {
   };
   return createCalendarAdapter({
     connectionStore: {
-      get: (workspaceId) => store.getCalendarConnection(workspaceId),
-      markReauthRequired: (workspaceId, reason) =>
-        store.markCalendarReauthRequired(workspaceId, reason),
+      get: (workspaceId, agentId) => store.getCalendarConnection(workspaceId, agentId),
+      markReauthRequired: (workspaceId, agentId, reason) =>
+        store.markCalendarReauthRequired(workspaceId, agentId, reason),
       rotateToken: (input) => store.rotateCalendarToken(input),
     },
     decryptToken: tokenCrypto.decryptToken,

@@ -17,8 +17,13 @@ locals {
       range_key   = "phoneNumberId"
     }
     calendar_connections = {
+      // Was workspaceId-only (one calendar per account); now workspaceId +
+      // agentId so each agent can have its own calendar connection. This is
+      // a breaking key-schema change for any already-deployed table - it
+      // requires a real migration (new table + backfill, or accept
+      // reconnects) before this is ever applied to the live stack.
       name_suffix = "calendar-connections"
-      range_key   = null
+      range_key   = "agentId"
     }
     appointments = {
       name_suffix = "appointments"

@@ -112,6 +112,8 @@ export async function consumeOAuthState({
   if (
     typeof record.workspaceId !== "string" ||
     record.workspaceId.length === 0 ||
+    typeof record.agentId !== "string" ||
+    record.agentId.length === 0 ||
     typeof record.userId !== "string" ||
     record.userId.length === 0
   ) {
@@ -125,47 +127,52 @@ export async function consumeOAuthState({
 }
 
 export async function encryptRefreshToken(
-  { token, workspaceId, provider },
+  { token, workspaceId, agentId, provider },
   { client, EncryptCommand, keyId },
 ) {
   if (!token) throw new TypeError("Refresh token is required");
   const result = await client.send(new EncryptCommand({
     KeyId: keyId,
     Plaintext: new TextEncoder().encode(token),
-    EncryptionContext: { workspaceId, provider },
+    EncryptionContext: { workspaceId, agentId, provider },
   }));
   if (!result.CiphertextBlob) throw new Error("KMS did not return ciphertext");
   return Buffer.from(result.CiphertextBlob).toString("base64");
 }
 
 export async function decryptRefreshToken(
-  { encryptedToken, workspaceId, provider },
+  { encryptedToken, workspaceId, agentId, provider },
   { client, DecryptCommand },
 ) {
   if (!encryptedToken) throw new TypeError("Encrypted refresh token is required");
   const result = await client.send(new DecryptCommand({
     CiphertextBlob: Buffer.from(encryptedToken, "base64"),
-    EncryptionContext: { workspaceId, provider },
+    EncryptionContext: { workspaceId, agentId, provider },
   }));
   if (!result.Plaintext) throw new Error("KMS did not return plaintext");
   return new TextDecoder().decode(result.Plaintext);
 }
 
+function connectionRecordKey(workspaceId, agentId) {
+  return `${workspaceId}\0${agentId}`;
+}
+
 export function createInMemoryConnectionStore(initialRecords = []) {
   const records = new Map(
-    initialRecords.map((record) => [record.workspaceId, cloneRecord(record)]),
+    initialRecords.map((record) => [connectionRecordKey(record.workspaceId, record.agentId), cloneRecord(record)]),
   );
   return {
-    async get(workspaceId) {
-      const record = records.get(workspaceId);
+    async get(workspaceId, agentId) {
+      const record = records.get(connectionRecordKey(workspaceId, agentId));
       return record ? cloneRecord(record) : null;
     },
     async save(record) {
-      records.set(record.workspaceId, cloneRecord(record));
+      records.set(connectionRecordKey(record.workspaceId, record.agentId), cloneRecord(record));
       return cloneRecord(record);
     },
-    async select(workspaceId, provider, calendarId, calendarTimezone) {
-      const current = records.get(workspaceId);
+    async select(workspaceId, agentId, provider, calendarId, calendarTimezone) {
+      const key = connectionRecordKey(workspaceId, agentId);
+      const current = records.get(key);
       if (
         !current ||
         current.provider !== provider ||
@@ -184,11 +191,12 @@ export function createInMemoryConnectionStore(initialRecords = []) {
         connectionState: "connected",
         updatedAt: new Date().toISOString(),
       };
-      records.set(workspaceId, next);
+      records.set(key, next);
       return cloneRecord(next);
     },
-    async disconnect(workspaceId) {
-      const current = records.get(workspaceId);
+    async disconnect(workspaceId, agentId) {
+      const key = connectionRecordKey(workspaceId, agentId);
+      const current = records.get(key);
       if (!current) return null;
       const next = {
         ...current,
@@ -196,16 +204,18 @@ export function createInMemoryConnectionStore(initialRecords = []) {
         connectionState: "disconnected",
       };
       delete next.encryptedRefreshToken;
-      records.set(workspaceId, next);
+      records.set(key, next);
       return cloneRecord(next);
     },
     async compareAndSwapToken(
       workspaceId,
+      agentId,
       provider,
       expectedVersion,
       encryptedRefreshToken,
     ) {
-      const current = records.get(workspaceId);
+      const key = connectionRecordKey(workspaceId, agentId);
+      const current = records.get(key);
       if (
         !current ||
         current.provider !== provider ||
@@ -218,7 +228,7 @@ export function createInMemoryConnectionStore(initialRecords = []) {
         encryptedRefreshToken,
         tokenVersion: expectedVersion + 1,
       };
-      records.set(workspaceId, next);
+      records.set(key, next);
       return cloneRecord(next);
     },
   };
@@ -257,6 +267,7 @@ export function configureMicrosoftRotationForTests(dependencies) {
 
 export async function rotateMicrosoftToken({
   workspaceId,
+  agentId,
   expectedVersion,
   newToken,
 }, dependencies = microsoftRotationDependencies) {
@@ -266,11 +277,13 @@ export async function rotateMicrosoftToken({
   const encryptedRefreshToken = await dependencies.encryptToken({
     token: newToken,
     workspaceId,
+    agentId,
     provider: "microsoft-365-calendar",
   });
   try {
     return await dependencies.store.compareAndSwapToken(
       workspaceId,
+      agentId,
       "microsoft-365-calendar",
       expectedVersion,
       encryptedRefreshToken,
@@ -349,6 +362,7 @@ export function createHandler(options = {}) {
         const provider = requireProvider(startMatch[1]);
         const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
+        const agentId = requireAgentId(event?.queryStringParameters?.agentId);
         const baseUrl = requireAbsoluteUrl(redirectBaseUrl, "OAuth redirect base URL");
         const callbackUri = `${baseUrl}/oauth/${provider}/callback`;
         const secret = normalizeSecret(await getOAuthSecret(provider));
@@ -360,6 +374,7 @@ export function createHandler(options = {}) {
         await stateStore.put({
           state,
           workspaceId: identity.workspaceId,
+          agentId,
           userId: identity.userId,
           provider,
           redirectUri: callbackUri,
@@ -421,7 +436,7 @@ export function createHandler(options = {}) {
           // customer switch to a different calendar afterwards.
           const selected = selectDefaultCalendar(calendars);
           const connectionStore = await getConnectionStore();
-          const existing = await connectionStore.get(stateRecord.workspaceId);
+          const existing = await connectionStore.get(stateRecord.workspaceId, stateRecord.agentId);
           const tokenCrypto = await getTokenCrypto();
 
           let encryptedRefreshToken;
@@ -430,6 +445,7 @@ export function createHandler(options = {}) {
             encryptedRefreshToken = await tokenCrypto.encryptToken({
               token: tokens.refreshToken,
               workspaceId: stateRecord.workspaceId,
+              agentId: stateRecord.agentId,
               provider,
             });
             tokenVersion = existing?.provider === provider
@@ -452,6 +468,7 @@ export function createHandler(options = {}) {
 
           const connection = {
             workspaceId: stateRecord.workspaceId,
+            agentId: stateRecord.agentId,
             provider,
             selectedCalendarId: selected?.id ?? null,
             calendarTimezone: selected?.timezone || "UTC",
@@ -488,28 +505,31 @@ export function createHandler(options = {}) {
       if (path === "/calendars/connection" && method === "GET") {
         const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
+        const agentId = requireAgentId(event?.queryStringParameters?.agentId);
         const store = await getConnectionStore();
-        return json(200, toPublicConnection(await store.get(identity.workspaceId)));
+        return json(200, toPublicConnection(await store.get(identity.workspaceId, agentId)));
       }
 
       if (path === "/calendars/connection" && method === "DELETE") {
         const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
+        const agentId = requireAgentId(event?.queryStringParameters?.agentId);
         const store = await getConnectionStore();
-        return json(200, toPublicConnection(await store.disconnect(identity.workspaceId)));
+        return json(200, toPublicConnection(await store.disconnect(identity.workspaceId, agentId)));
       }
 
       if (path === "/calendars/select" && method === "POST") {
         const identity = await resolveIdentity(event, await getMembershipStore());
         if (!identity) return json(401, { message: "Unauthorized" });
         const body = readBody(event);
+        const agentId = requireAgentId(body?.agentId);
         const provider = requireProvider(body?.provider);
         if (typeof body?.calendarId !== "string" || body.calendarId.length === 0) {
           throw new OAuthRequestError("calendarId is required");
         }
 
         const store = await getConnectionStore();
-        const current = await store.get(identity.workspaceId);
+        const current = await store.get(identity.workspaceId, agentId);
         if (
           !current ||
           current.provider !== provider ||
@@ -527,6 +547,7 @@ export function createHandler(options = {}) {
         const refreshToken = await tokenCrypto.decryptToken({
           encryptedToken: current.encryptedRefreshToken,
           workspaceId: identity.workspaceId,
+          agentId,
           provider,
         });
         const providerClient = getProviderClient(provider);
@@ -539,6 +560,7 @@ export function createHandler(options = {}) {
           if (provider === "microsoft-365-calendar") {
             await rotateMicrosoftToken({
               workspaceId: identity.workspaceId,
+              agentId,
               expectedVersion: current.tokenVersion,
               newToken: tokens.refreshToken,
             }, {
@@ -549,10 +571,12 @@ export function createHandler(options = {}) {
             const encrypted = await tokenCrypto.encryptToken({
               token: tokens.refreshToken,
               workspaceId: identity.workspaceId,
+              agentId,
               provider,
             });
             await store.compareAndSwapToken(
               identity.workspaceId,
+              agentId,
               provider,
               current.tokenVersion,
               encrypted,
@@ -572,6 +596,7 @@ export function createHandler(options = {}) {
         }
         const connection = await store.select(
           identity.workspaceId,
+          agentId,
           provider,
           selected.id,
           selected.timezone || body.calendarTimezone || "UTC",
@@ -611,6 +636,15 @@ function getProviderConfig(provider) {
 function requireProvider(provider) {
   getProviderConfig(provider);
   return provider;
+}
+
+// Calendars are per-agent now, not per-workspace - every calendar route
+// needs to know which agent it's acting on.
+function requireAgentId(agentId) {
+  if (typeof agentId !== "string" || agentId.length === 0) {
+    throw new OAuthRequestError("agentId is required", 400, "missing_agent_id");
+  }
+  return agentId;
 }
 
 // The BFF resolves the caller's workspace through the workspace-memberships
@@ -945,10 +979,10 @@ export function createDynamoStateStore(client, commands, tableName) {
 
 export function createDynamoConnectionStore(client, commands, tableName) {
   return {
-    async get(workspaceId) {
+    async get(workspaceId, agentId) {
       const result = await client.send(new commands.GetItemCommand({
         TableName: tableName,
-        Key: marshall({ workspaceId }),
+        Key: marshall({ workspaceId, agentId }),
         ConsistentRead: true,
       }));
       return result.Item ? unmarshall(result.Item) : null;
@@ -960,10 +994,10 @@ export function createDynamoConnectionStore(client, commands, tableName) {
       }));
       return record;
     },
-    async select(workspaceId, provider, calendarId, calendarTimezone) {
+    async select(workspaceId, agentId, provider, calendarId, calendarTimezone) {
       const result = await client.send(new commands.UpdateItemCommand({
         TableName: tableName,
-        Key: marshall({ workspaceId }),
+        Key: marshall({ workspaceId, agentId }),
         UpdateExpression:
           "SET selectedCalendarId = :calendarId, " +
           "calendarTimezone = :timezone, connectionState = :connected, " +
@@ -980,11 +1014,11 @@ export function createDynamoConnectionStore(client, commands, tableName) {
       }));
       return unmarshall(result.Attributes);
     },
-    async disconnect(workspaceId) {
+    async disconnect(workspaceId, agentId) {
       try {
         const result = await client.send(new commands.UpdateItemCommand({
           TableName: tableName,
-          Key: marshall({ workspaceId }),
+          Key: marshall({ workspaceId, agentId }),
           UpdateExpression:
             "SET selectedCalendarId = :none, connectionState = :disconnected " +
             "REMOVE encryptedRefreshToken",
@@ -1003,13 +1037,14 @@ export function createDynamoConnectionStore(client, commands, tableName) {
     },
     async compareAndSwapToken(
       workspaceId,
+      agentId,
       provider,
       expectedVersion,
       encryptedRefreshToken,
     ) {
       const result = await client.send(new commands.UpdateItemCommand({
         TableName: tableName,
-        Key: marshall({ workspaceId }),
+        Key: marshall({ workspaceId, agentId }),
         UpdateExpression:
           "SET encryptedRefreshToken = :token, tokenVersion = :nextVersion",
         ConditionExpression:

@@ -22,6 +22,7 @@ import {
 } from "./calendar-adapter.mjs";
 
 const workspaceId = "workspace-123";
+const agentId = "agent-1";
 const redirectUri = "https://api.example.com/oauth/google-calendar/callback";
 
 test("google start URL requests offline calendar access and explicit consent", () => {
@@ -128,24 +129,27 @@ test("refresh tokens round-trip through KMS with workspace and provider context"
   const encrypted = await encryptRefreshToken({
     token: "refresh-token",
     workspaceId,
+    agentId,
     provider: "google-calendar",
   }, dependencies);
   const decrypted = await decryptRefreshToken({
     encryptedToken: encrypted,
     workspaceId,
+    agentId,
     provider: "google-calendar",
   }, dependencies);
 
   assert.equal(decrypted, "refresh-token");
   assert.deepEqual(contexts, [
-    { workspaceId, provider: "google-calendar" },
-    { workspaceId, provider: "google-calendar" },
+    { workspaceId, agentId, provider: "google-calendar" },
+    { workspaceId, agentId, provider: "google-calendar" },
   ]);
 });
 
 test("microsoft refresh replaces token only if version matches", async () => {
   const store = createInMemoryConnectionStore([{
     workspaceId,
+    agentId,
     provider: "microsoft-365-calendar",
     selectedCalendarId: "calendar-a",
     calendarTimezone: "UTC",
@@ -162,13 +166,14 @@ test("microsoft refresh replaces token only if version matches", async () => {
   await assert.doesNotReject(async () => {
     const result = await rotateMicrosoftToken({
       workspaceId,
+      agentId,
       expectedVersion: 1,
       newToken: "b",
     });
     assert.equal(result.tokenVersion, 2);
   });
   await assert.rejects(
-    rotateMicrosoftToken({ workspaceId, expectedVersion: 1, newToken: "c" }),
+    rotateMicrosoftToken({ workspaceId, agentId, expectedVersion: 1, newToken: "c" }),
     /version/i,
   );
 });
@@ -178,6 +183,7 @@ test("oauth state is one-time and rejects reuse", async () => {
   await stateStore.put({
     state: "one-time-state",
     workspaceId,
+    agentId,
     userId: "person@example.com",
     provider: "google-calendar",
     redirectUri,
@@ -269,7 +275,7 @@ test("start requires JWT claims and returns a provider authorization URL", async
     "GET",
     "/oauth/google-calendar/start",
     undefined,
-    { returnTo: "/agents/new/connections?agentId=agent-1" },
+    { returnTo: "/agents/new/connections?agentId=agent-1", agentId },
   ));
   assert.equal(response.statusCode, 200);
   const body = JSON.parse(response.body);
@@ -278,6 +284,7 @@ test("start requires JWT claims and returns a provider authorization URL", async
   assert.deepEqual(stored, {
     state: "random-state",
     workspaceId,
+    agentId,
     userId: "person@example.com",
     provider: "google-calendar",
     redirectUri,
@@ -301,7 +308,7 @@ test("start resolves the shared workspace from the memberships table, not the ra
     randomState: () => "membership-state",
   });
 
-  const response = await handler(authenticatedEvent("GET", "/oauth/google-calendar/start"));
+  const response = await handler(authenticatedEvent("GET", "/oauth/google-calendar/start", undefined, { agentId }));
   assert.equal(response.statusCode, 200);
   const stored = await stateStore.peek("membership-state");
   assert.equal(stored.workspaceId, "workspace-symantic-ai");
@@ -338,7 +345,7 @@ test("start preserves the safe integrations return route", async () => {
     "GET",
     "/oauth/microsoft-365-calendar/start",
     undefined,
-    { returnTo: "/integrations" },
+    { returnTo: "/integrations", agentId },
   ));
 
   assert.equal(response.statusCode, 200);
@@ -353,6 +360,7 @@ test("google callback preserves an existing refresh token when Google omits one"
   await stateStore.put({
     state: "callback-state",
     workspaceId,
+    agentId,
     userId: "person@example.com",
     provider: "google-calendar",
     redirectUri,
@@ -361,6 +369,7 @@ test("google callback preserves an existing refresh token when Google omits one"
   });
   const connections = createInMemoryConnectionStore([{
     workspaceId,
+    agentId,
     provider: "google-calendar",
     selectedCalendarId: "old-calendar",
     calendarTimezone: "UTC",
@@ -408,8 +417,9 @@ test("google callback preserves an existing refresh token when Google omits one"
     response.headers.location,
     "https://agents.example.com/agents/new/connections?calendar=connected&provider=google-calendar",
   );
-  assert.deepEqual(await connections.get(workspaceId), {
+  assert.deepEqual(await connections.get(workspaceId, agentId), {
     workspaceId,
+    agentId,
     provider: "google-calendar",
     selectedCalendarId: "primary-calendar",
     calendarTimezone: "America/New_York",
@@ -432,6 +442,7 @@ test("callback auto-selects the primary calendar and still exposes the rest for 
   await stateStore.put({
     state: "multi-calendar-state",
     workspaceId,
+    agentId,
     userId: "person@example.com",
     provider: "google-calendar",
     redirectUri,
@@ -486,10 +497,13 @@ test("callback auto-selects the primary calendar and still exposes the rest for 
   const connection = await handler(authenticatedEvent(
     "GET",
     "/calendars/connection",
+    undefined,
+    { agentId },
   ));
 
   assert.equal(callback.statusCode, 302);
   assert.deepEqual(JSON.parse(connection.body), {
+    agentId,
     provider: "google-calendar",
     // Primary calendar auto-selected; the customer can still switch via
     // /calendars/select (covered separately) or the wizard's Connections step.
@@ -508,6 +522,7 @@ test("callback redirects post-consume failures to the app instead of JSON", asyn
   await stateStore.put({
     state: "fail-state",
     workspaceId,
+    agentId,
     userId: "person@example.com",
     provider: "google-calendar",
     redirectUri,
