@@ -155,3 +155,18 @@ test("buildUsage counts spam calls separately without dropping them from totals"
   assert.equal(usage.billingCycle.spamCalls, 2);
   assert.equal(usage.billingCycle.minutes, 3);
 });
+
+test("buildUsage breaks the cycle's minutes down per agent, most minutes first", () => {
+  const now = new Date("2026-09-15T12:00:00Z");
+  const usage = buildUsage([
+    call("2026-09-02T10:00:00Z", 120_000, { agentId: "agent-a" }),
+    call("2026-09-03T10:00:00Z", 60_000, { agentId: "agent-b" }),
+    call("2026-09-04T10:00:00Z", 60_000, { agentId: "agent-b" }),
+    call("2026-09-05T10:00:00Z", 30_000),
+  ], { now, timezone: "UTC", plan: resolvePlan({ receptionistPlan: "starter" }, {}, now, "UTC") });
+  assert.deepEqual(usage.billingCycle.agentBreakdown, [
+    { agentId: "agent-a", minutes: 2, calls: 1 },
+    { agentId: "agent-b", minutes: 2, calls: 2 },
+    { agentId: "unassigned", minutes: 1, calls: 1 },
+  ]);
+});

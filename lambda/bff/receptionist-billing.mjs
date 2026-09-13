@@ -188,6 +188,9 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
 
   // Bucket every call by its tz-local start month.
   const byMonth = new Map();
+  // Same shared plan, same total bill - this is purely a read of "who's
+  // driving the number" for the current cycle, not a second billing model.
+  const byAgent = new Map();
   let cycleMinutes = 0;
   let cycleCalls = 0;
   let cycleSpamCalls = 0;
@@ -212,10 +215,16 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
       cycleCalls += 1;
       if (call.outcome === "spam") cycleSpamCalls += 1;
       cycleActualSeconds += Math.max(0, Math.round((call.durationMs ?? 0) / 1000));
+      const agentId = typeof call.agentId === "string" && call.agentId ? call.agentId : "unassigned";
+      const agentEntry = byAgent.get(agentId) ?? { agentId, minutes: 0, calls: 0 };
+      agentEntry.minutes += minutes;
+      agentEntry.calls += 1;
+      byAgent.set(agentId, agentEntry);
     }
     if (at >= detailCutoff) {
       detail.push({
         callId: call.callId,
+        agentId: call.agentId ?? null,
         callerName: call.callerName ?? null,
         callerNameSource: call.callerNameSource ?? null,
         callerNumber: call.callerNumber ?? null,
@@ -249,6 +258,7 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
   const { daysInCycle, daysElapsed } = cycleProgress(startsOn, endsOn, now);
 
   const months = [...byMonth.values()].sort((a, b) => b.period.localeCompare(a.period));
+  const agentBreakdown = [...byAgent.values()].sort((a, b) => b.minutes - a.minutes);
 
   return {
     plan: plan?.plan ?? "",
@@ -274,6 +284,7 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
       capMinute,
       usageState,
       blocked: usageState === "capped",
+      agentBreakdown,
     },
     months,
     calls: detail.sort((a, b) => b.startedAt.localeCompare(a.startedAt)),

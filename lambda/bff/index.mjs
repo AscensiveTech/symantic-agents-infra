@@ -1440,17 +1440,26 @@ async function listCallsForUsage(store, workspaceId) {
 
 // Build the customer-facing usage view for a workspace (no cost/margin).
 async function loadWorkspaceUsage(store, workspaceId) {
-  const [calls, profile, workspace] = await Promise.all([
+  const [calls, profile, workspace, agents] = await Promise.all([
     listCallsForUsage(store, workspaceId),
     typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
     typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
+    typeof store.listAgents === "function" ? store.listAgents(workspaceId).catch(() => []) : [],
   ]);
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
   const plan = resolvePlan(profile, workspace, now, timezone);
   const usage = buildUsage(calls ?? [], { now, timezone, plan });
+  const agentNames = new Map((agents ?? []).map((agent) => [agent.id, agent.name]));
   return {
     ...usage,
+    billingCycle: {
+      ...usage.billingCycle,
+      agentBreakdown: usage.billingCycle.agentBreakdown.map((entry) => ({
+        ...entry,
+        agentName: entry.agentId === "unassigned" ? "Unassigned" : agentNames.get(entry.agentId) ?? entry.agentId,
+      })),
+    },
     features: { callBlocklist: resolveCallBlocklist(workspace, plan) },
   };
 }
