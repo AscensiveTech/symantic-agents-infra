@@ -108,6 +108,41 @@ test("call_analyzed falls back to the transcript for the caller name and flags t
   assert.equal(persistedCall.callerNameSource, "transcript");
 });
 
+test("isOverage is persisted onto the call record when Retell echoes it back, and omitted otherwise", async () => {
+  let persistedOverage;
+  let persistedNormal;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async upsertCall(record) {
+        if (record.retellCallId.includes("overage")) persistedOverage = structuredClone(record);
+        else persistedNormal = structuredClone(record);
+        return { record, created: true };
+      },
+    }),
+    getRecordingStore: async () => null,
+  });
+  await handler(callAnalyzedEvent({
+    call_id: "retell-call-overage",
+    metadata: { workspaceId: "workspace-123", isOverage: true },
+    start_timestamp: 1_800_000_000_000,
+    end_timestamp: 1_800_000_030_000,
+    transcript_object: [],
+    transcript_with_tool_calls: [],
+  }));
+  await handler(callAnalyzedEvent({
+    call_id: "retell-call-normal",
+    metadata: { workspaceId: "workspace-123" },
+    start_timestamp: 1_800_000_000_000,
+    end_timestamp: 1_800_000_030_000,
+    transcript_object: [],
+    transcript_with_tool_calls: [],
+  }));
+  assert.equal(persistedOverage.isOverage, true);
+  assert.equal(persistedNormal.isOverage, undefined);
+});
+
 test("a newly-created call increments the workspace usage counter once", async () => {
   const increments = [];
   let billedDurationMs;

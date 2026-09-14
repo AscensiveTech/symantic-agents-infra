@@ -4178,15 +4178,12 @@ async function handleInboundLookup(event, {
     });
     return json(200, { call_inbound: { reject: true } });
   }
-  if (await inboundCapReached(store, phoneNumber.workspaceId, profile, workspace)) {
-    await logDeclinedCall(store, {
-      workspaceId: phoneNumber.workspaceId,
-      agentId: phoneNumber.agentId,
-      fromNumber: input.call_inbound.from_number,
-      reason: "minute_cap_reached",
-    });
-    return json(200, { call_inbound: { reject: true } });
-  }
+  // We never decline a call just because the account is past its plan
+  // minutes - it's always answered, and billed at the plan's overage rate
+  // instead (see receptionist-billing.mjs). `isOverage` just tags the call
+  // so the customer can see which calls landed after their plan minutes
+  // were used this cycle; it carries no reject behavior.
+  const isOverage = await inboundIsOverage(store, phoneNumber.workspaceId, profile, workspace);
   return json(200, {
     call_inbound: {
       override_agent_id: agent.retellAgentId,
@@ -4199,6 +4196,7 @@ async function handleInboundLookup(event, {
       metadata: {
         workspaceId: phoneNumber.workspaceId,
         agentId: phoneNumber.agentId,
+        ...(isOverage ? { isOverage: true } : {}),
       },
     },
   });
@@ -4231,18 +4229,20 @@ async function inboundCallerBlocked(store, workspaceId, profile, workspace, from
 // cap — the one hard stop, where the receptionist stops accepting inbound calls
 // until the cycle resets or the customer upgrades. Reads a single counter item;
 // a missing counter or an unmetered plan is never blocked.
-async function inboundCapReached(store, workspaceId, profile, workspace) {
+// True once this cycle's billed minutes already reached the plan's
+// allowance - the call is still always accepted; this only flags it as
+// billed at the overage rate (see RECEPTIONIST_PLANS.overagePerMinute).
+async function inboundIsOverage(store, workspaceId, profile, workspace) {
   if (typeof store.getUsageCounter !== "function") return false;
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
   const plan = resolvePlan(profile, workspace, now, timezone);
-  if (plan.priceMonthly == null || plan.minutes == null || !plan.overagePerMinute) return false;
-  const capMinute = plan.minutes + Math.ceil(plan.priceMonthly / plan.overagePerMinute);
+  if (plan.minutes == null) return false;
   try {
     const counter = await store.getUsageCounter(workspaceId, periodKey(now, timezone));
-    return Number(counter?.billedMinutes ?? 0) >= capMinute;
+    return Number(counter?.billedMinutes ?? 0) >= plan.minutes;
   } catch (error) {
-    console.error("Usage cap check failed", { name: error?.name, message: error?.message, workspaceId });
+    console.error("Usage overage check failed", { name: error?.name, message: error?.message, workspaceId });
     return false;
   }
 }
@@ -4281,7 +4281,11 @@ const DEMO_END_REASONS = {
   spam: "scam_detected",
   failed: "error",
   abandoned: "user_hangup",
-  declined: "minute_cap_reached",
+  // Minutes are never a decline reason - an account past its plan minutes
+  // is always answered and billed at the overage rate instead (see
+  // isOverage below). The only real declines left are an inactive agent
+  // or a blocked caller.
+  declined: "agent_inactive",
 };
 
 function demoCallRecords(agentId) {
@@ -4323,6 +4327,10 @@ function demoCallRecords(agentId) {
         : outcome === "escalated" ? ["Transferred the call"]
           : outcome === "message" ? ["Took a message for the office"] : [],
       disconnectionReason: DEMO_END_REASONS[outcome],
+      // Roughly one in eight non-declined calls lands after a realistic
+      // demo account would have used its plan minutes for the cycle -
+      // gives the "Overage" label something to actually show in the seed.
+      ...(outcome !== "declined" && i % 8 === 0 ? { isOverage: true } : {}),
       hasRecording: false,
       transcript: [],
       createdAt: startedAt.toISOString(),

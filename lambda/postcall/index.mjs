@@ -229,6 +229,11 @@ export function createHandler({
       durationMs: durationMs(call),
       recordingKey,
       disconnectionReason: stringValue(call.disconnection_reason),
+      // Set once at call_inbound (see inboundIsOverage in the BFF) and
+      // echoed back by Retell on every webhook for this call - true means
+      // the account had already used its plan minutes for the cycle when
+      // this call started, so it's billed at the overage rate.
+      ...(call?.metadata?.isOverage === true ? { isOverage: true } : {}),
       transcript,
       toolLog: storedToolLog,
       actions: describeActions(toolLog),

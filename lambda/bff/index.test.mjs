@@ -4195,7 +4195,7 @@ test("PUT /workspaces/me/profile rejects an unknown plan key", async () => {
   assert.equal(response.statusCode, 400);
 });
 
-test("inbound lookup rejects the call once the overage cap is reached, and logs it as a declined call", async () => {
+test("inbound lookup never rejects a call for being past the plan's minutes - it's accepted and tagged isOverage instead", async () => {
   const { createHandler } = await loadBff();
   const declined = [];
   const store = {
@@ -4212,6 +4212,7 @@ test("inbound lookup rejects the call once the overage cap is reached, and logs 
       return { workspaceId: "workspace-123" };
     },
     async getUsageCounter() {
+      // Starter's allowance is 1000 minutes - already well past it.
       return { billedMinutes: 2200 };
     },
     async createDeclinedCall(record) {
@@ -4234,13 +4235,50 @@ test("inbound lookup rejects the call once the overage cap is reached, and logs 
     }),
   });
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
-  assert.equal(declined.length, 1);
-  assert.equal(declined[0].workspaceId, "workspace-123");
-  assert.equal(declined[0].agentId, "agent-123");
-  assert.equal(declined[0].outcome, "declined");
-  assert.equal(declined[0].disconnectionReason, "minute_cap_reached");
-  assert.equal(declined[0].callerNumber, "+17035550188");
+  const body = JSON.parse(response.body);
+  assert.equal(body.call_inbound.reject, undefined);
+  assert.equal(body.call_inbound.override_agent_id, "retell-agent-1");
+  assert.equal(body.call_inbound.metadata.isOverage, true);
+  assert.equal(declined.length, 0);
+});
+
+test("inbound lookup does not tag isOverage once billed minutes are back under the plan's allowance", async () => {
+  const { createHandler } = await loadBff();
+  const store = {
+    async getPhoneNumberByDid() {
+      return { workspaceId: "workspace-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "active", retellAgentId: "retell-agent-1" };
+    },
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "starter" };
+    },
+    async getWorkspace() {
+      return { workspaceId: "workspace-123" };
+    },
+    async getUsageCounter() {
+      return { billedMinutes: 400 };
+    },
+  };
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550100", from_number: "+17035550188" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.call_inbound.reject, undefined);
+  assert.equal(body.call_inbound.metadata.isOverage, undefined);
 });
 
 test("inbound lookup rejects an inactive agent's call and logs it as declined", async () => {
