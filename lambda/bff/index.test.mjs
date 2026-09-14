@@ -4137,6 +4137,95 @@ test("blocked-numbers CRUD works when the premium feature is enabled", async () 
   assert.equal(store.rows.size, 0);
 });
 
+test("blocking with a duration sets a DynamoDB TTL expiresAt; forever leaves it unset", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const handler = createHandler({ getStore: async () => store });
+  const before = Math.floor(Date.now() / 1000);
+
+  const timed = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0100",
+    durationDays: 30,
+  }));
+  assert.equal(timed.statusCode, 201);
+  const timedBody = JSON.parse(timed.body);
+  assert.ok(timedBody.expiresAt >= before + 30 * 86_400);
+  assert.ok(timedBody.expiresAt < before + 31 * 86_400);
+
+  const forever = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0199",
+  }));
+  assert.equal(forever.statusCode, 201);
+  assert.equal(JSON.parse(forever.body).expiresAt, undefined);
+
+  const bogus = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0177",
+    durationDays: 45,
+  }));
+  assert.equal(JSON.parse(bogus.body).expiresAt, undefined, "an unsupported duration is treated as forever, not rejected");
+});
+
+test("GET blocked-numbers omits a row whose TTL has already passed, even if DynamoDB hasn't swept it yet", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  store.rows.set("+17035550100", {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550100",
+    hitCount: 0,
+    expiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  store.rows.set("+17035550199", {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550199",
+    hitCount: 0,
+    expiresAt: Math.floor(Date.now() / 1000) + 30 * 86_400,
+  });
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/blocked-numbers"));
+  const rows = JSON.parse(response.body);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].phoneNumber, "+17035550199");
+});
+
+test("inbound lookup does not reject a caller whose block has expired, even before DynamoDB sweeps the row", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore({
+    async getPhoneNumberByDid() {
+      return { workspaceId: "user-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "active", retellAgentId: "retell-agent-1" };
+    },
+    async getUsageCounter() {
+      return null;
+    },
+  });
+  store.rows.set("+17035550100", {
+    phoneNumber: "+17035550100",
+    hitCount: 0,
+    expiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550177", from_number: "+1 703-555-0100" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.notEqual(body.call_inbound?.reject, true);
+  assert.equal(store.rows.get("+17035550100").hitCount, 0, "an expired block never records a hit");
+});
+
 test("inbound lookup rejects a blocked caller, records a hit, and logs it as declined", async () => {
   const { createHandler } = await loadBff();
   const declined = [];

@@ -118,7 +118,7 @@ resource "aws_dynamodb_table" "control_plane" {
   }
 
   dynamic "ttl" {
-    for_each = each.key == "workspace_usage" ? [1] : []
+    for_each = contains(["workspace_usage", "blocked_numbers"], each.key) ? [1] : []
 
     content {
       attribute_name = "expiresAt"

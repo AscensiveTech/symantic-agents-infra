@@ -814,7 +814,10 @@ export function createHandler({
           return json(403, { message: "Call blocking is not enabled for this workspace" });
         }
         if (path === "/workspaces/me/blocked-numbers" && method === "GET") {
-          return json(200, await store.listBlockedNumbers(workspaceId));
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          const rows = (await store.listBlockedNumbers(workspaceId))
+            .filter((row) => typeof row.expiresAt !== "number" || row.expiresAt > nowSeconds);
+          return json(200, rows);
         }
         if (path === "/workspaces/me/blocked-numbers" && method === "POST") {
           const body = readBody(event) ?? {};
@@ -827,6 +830,7 @@ export function createHandler({
           const sourceCallId = typeof body.sourceCallId === "string" && body.sourceCallId
             ? body.sourceCallId
             : undefined;
+          const durationDays = [30, 60, 90, 180, 365].includes(body.durationDays) ? body.durationDays : null;
           const record = {
             workspaceId,
             phoneNumber,
@@ -837,6 +841,9 @@ export function createHandler({
             blockedBy: subject,
             blockedAt: new Date().toISOString(),
             hitCount: 0,
+            // DynamoDB TTL attribute (epoch seconds) - omitted entirely means
+            // "forever", since TTL only acts on items that actually carry it.
+            ...(durationDays ? { expiresAt: Math.floor(Date.now() / 1000) + durationDays * 86_400 } : {}),
           };
           try {
             await store.putBlockedNumber(record);
@@ -4030,6 +4037,11 @@ async function inboundCallerBlocked(store, workspaceId, profile, workspace, from
   if (!caller) return false;
   const blocked = await store.getBlockedNumber(workspaceId, caller);
   if (!blocked) return false;
+  // DynamoDB TTL deletion isn't instant (it can lag up to 48h past
+  // expiresAt), so an expired-but-not-yet-swept row must not still block.
+  if (typeof blocked.expiresAt === "number" && blocked.expiresAt <= Math.floor(Date.now() / 1000)) {
+    return false;
+  }
   if (typeof store.recordBlockedHit === "function") {
     await store.recordBlockedHit(workspaceId, caller).catch(() => {});
   }
