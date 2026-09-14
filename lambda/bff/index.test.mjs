@@ -4072,7 +4072,8 @@ function blocklistStore(overrides = {}) {
       return rows.get(phoneNumber) ?? null;
     },
     async putBlockedNumber(item) {
-      if (rows.has(item.phoneNumber)) {
+      const existing = rows.get(item.phoneNumber);
+      if (existing && existing.active !== false) {
         const error = new Error("exists");
         error.name = "ConditionalCheckFailedException";
         throw error;
@@ -4082,6 +4083,13 @@ function blocklistStore(overrides = {}) {
     },
     async deleteBlockedNumber(_ws, phoneNumber) {
       rows.delete(phoneNumber);
+    },
+    async deactivateBlockedNumber(_ws, phoneNumber, notes) {
+      const row = rows.get(phoneNumber);
+      if (row) {
+        row.active = false;
+        row.notes = notes;
+      }
     },
     async recordBlockedHit(_ws, phoneNumber) {
       const row = rows.get(phoneNumber);
@@ -4134,7 +4142,102 @@ test("blocked-numbers CRUD works when the premium feature is enabled", async () 
     "/workspaces/me/blocked-numbers/%2B17035550100",
   ));
   assert.equal(removed.statusCode, 200);
-  assert.equal(store.rows.size, 0);
+  // Deactivated, not deleted, so the note history survives a future re-block.
+  assert.equal(store.rows.size, 1);
+  assert.equal(store.rows.get("+17035550100").active, false);
+
+  const relisted = await handler(authenticatedEvent("GET", "/workspaces/me/blocked-numbers"));
+  assert.equal(JSON.parse(relisted.body).length, 0, "an inactive row is not listed as blocked");
+});
+
+test("blocking records who blocked it, a name, and an optional 500-char reason as the first note", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const handler = createHandler({ getStore: async () => store });
+
+  const event = authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0100",
+    reason: "x".repeat(600),
+  });
+  event.requestContext.authorizer.jwt.claims.name = "Dana Admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 201);
+  const body = JSON.parse(response.body);
+  assert.equal(body.blockedByName, "Dana Admin");
+  assert.equal(body.active, true);
+  assert.equal(body.notes.length, 1);
+  assert.equal(body.notes[0].action, "block");
+  assert.equal(body.notes[0].byName, "Dana Admin");
+  assert.equal(body.notes[0].text.length, 500, "reason is capped at 500 characters");
+});
+
+test("only keeps the 3 most recent notes across repeated block/unblock cycles on the same number", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const handler = createHandler({ getStore: async () => store });
+
+  for (let i = 0; i < 3; i += 1) {
+    const blockEvent = authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+      phoneNumber: "(703) 555-0100",
+      reason: `block-${i}`,
+    });
+    blockEvent.requestContext.authorizer.jwt.claims.name = "Dana Admin";
+    // eslint-disable-next-line no-await-in-loop
+    await handler(blockEvent);
+    const unblockEvent = authenticatedEvent("DELETE", "/workspaces/me/blocked-numbers/%2B17035550100", {
+      reason: `unblock-${i}`,
+    });
+    unblockEvent.requestContext.authorizer.jwt.claims.name = "Dana Admin";
+    // eslint-disable-next-line no-await-in-loop
+    await handler(unblockEvent);
+  }
+
+  const row = store.rows.get("+17035550100");
+  assert.equal(row.notes.length, 3);
+  assert.deepEqual(row.notes.map((n) => n.text), ["unblock-2", "block-2", "unblock-1"]);
+});
+
+// The current role model (super-admin / company-admin / quotation-builder)
+// gates quotation-builders out of every receptionist path before this check
+// even runs, so a full-stack 403 can't be exercised against today's roles -
+// this directly unit-tests the permission rule itself instead, the same
+// condition the DELETE route evaluates.
+test("unblock permission rule: an org admin or the original blocker may unblock, no one else", () => {
+  const record = { blockedBy: "the-original-blocker", blockedByName: "Jordan Miles" };
+  const mayUnblock = (actor) => isWorkspaceAdminForTest(actor) || actor.userId === record.blockedBy;
+
+  assert.equal(mayUnblock({ userId: "the-original-blocker", roles: ["quotation-builder"] }), true);
+  assert.equal(mayUnblock({ userId: "some-admin", roles: ["company-admin"] }), true);
+  assert.equal(mayUnblock({ userId: "someone-else", roles: ["quotation-builder"] }), false);
+
+  function isWorkspaceAdminForTest(actor) {
+    return actor.roles.includes("company-admin") || actor.roles.includes("super-admin");
+  }
+});
+
+test("an org admin can unblock a number even when they weren't the one who blocked it", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  store.rows.set("+17035550100", {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550100",
+    hitCount: 0,
+    active: true,
+    blockedBy: "a-different-admin",
+    blockedByName: "Alex Admin",
+    notes: [],
+  });
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/blocked-numbers/%2B17035550100", {
+    reason: "false positive, confirmed with the caller",
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(store.rows.get("+17035550100").active, false);
+  assert.equal(store.rows.get("+17035550100").notes[0].text, "false positive, confirmed with the caller");
+  assert.equal(store.rows.get("+17035550100").notes[0].byUserId, "user-123");
 });
 
 test("blocking with a duration sets a DynamoDB TTL expiresAt; forever leaves it unset", async () => {

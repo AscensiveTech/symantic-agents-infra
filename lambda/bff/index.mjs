@@ -425,6 +425,16 @@ async function resolveActor(event, store) {
   return { userId, workspaceId: membership.workspaceId, roles, membership };
 }
 
+// Best-effort human name for attributing a block/unblock action - falls
+// back through the JWT's name/email claims, then the actor's own id, so a
+// note is never left blank even if the token carries neither.
+function actorDisplayName(event, actor) {
+  const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+  if (typeof claims.name === "string" && claims.name.trim()) return claims.name.trim();
+  if (typeof claims.email === "string" && claims.email.trim()) return claims.email.trim();
+  return actor?.userId || "A teammate";
+}
+
 function isWorkspaceAdmin(actor) {
   return actor.roles.includes("company-admin") || actor.roles.includes("super-admin");
 }
@@ -816,6 +826,7 @@ export function createHandler({
         if (path === "/workspaces/me/blocked-numbers" && method === "GET") {
           const nowSeconds = Math.floor(Date.now() / 1000);
           const rows = (await store.listBlockedNumbers(workspaceId))
+            .filter((row) => row.active !== false)
             .filter((row) => typeof row.expiresAt !== "number" || row.expiresAt > nowSeconds);
           return json(200, rows);
         }
@@ -831,6 +842,22 @@ export function createHandler({
             ? body.sourceCallId
             : undefined;
           const durationDays = [30, 60, 90, 180, 365].includes(body.durationDays) ? body.durationDays : null;
+          const blockReason = typeof body.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+          const existing = await store.getBlockedNumber(workspaceId, phoneNumber);
+          if (existing && existing.active !== false) {
+            return json(409, { message: "That number is already blocked" });
+          }
+          const blockedByName = actorDisplayName(event, actor);
+          const notes = [
+            {
+              action: "block",
+              text: blockReason || undefined,
+              byUserId: actor.userId,
+              byName: blockedByName,
+              at: new Date().toISOString(),
+            },
+            ...(Array.isArray(existing?.notes) ? existing.notes : []),
+          ].slice(0, 3);
           const record = {
             workspaceId,
             phoneNumber,
@@ -838,9 +865,12 @@ export function createHandler({
             label: label || undefined,
             note: note || undefined,
             sourceCallId,
-            blockedBy: subject,
+            blockedBy: actor.userId,
+            blockedByName,
             blockedAt: new Date().toISOString(),
-            hitCount: 0,
+            hitCount: existing?.hitCount ?? 0,
+            active: true,
+            notes,
             // DynamoDB TTL attribute (epoch seconds) - omitted entirely means
             // "forever", since TTL only acts on items that actually carry it.
             ...(durationDays ? { expiresAt: Math.floor(Date.now() / 1000) + durationDays * 86_400 } : {}),
@@ -865,7 +895,30 @@ export function createHandler({
           }
           const phoneNumber = normalizeE164(decoded);
           if (!phoneNumber) return json(400, { message: "A valid phone number is required" });
-          await store.deleteBlockedNumber(workspaceId, phoneNumber);
+          const existing = await store.getBlockedNumber(workspaceId, phoneNumber);
+          if (!existing || existing.active === false) {
+            return json(200, { ok: true });
+          }
+          // Only an org admin or the specific person who blocked it can
+          // unblock it - anyone else is told exactly who to contact.
+          if (!isWorkspaceAdmin(actor) && actor.userId !== existing.blockedBy) {
+            return json(403, {
+              message: `Only ${existing.blockedByName || "the person who blocked this number"} or an org admin can unblock this number. Contact them, or your manager, to have it unblocked.`,
+            });
+          }
+          const body = readBody(event) ?? {};
+          const unblockReason = typeof body?.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+          const notes = [
+            {
+              action: "unblock",
+              text: unblockReason || undefined,
+              byUserId: actor.userId,
+              byName: actorDisplayName(event, actor),
+              at: new Date().toISOString(),
+            },
+            ...(Array.isArray(existing.notes) ? existing.notes : []),
+          ].slice(0, 3);
+          await store.deactivateBlockedNumber(workspaceId, phoneNumber, notes);
           return json(200, { ok: true });
         }
         return json(404, { message: "Not found" });
@@ -5115,11 +5168,15 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    // Allowed when the row is brand new, or when a prior block on this same
+    // number was later unblocked (active: false) - re-blocking reactivates
+    // the same row (and its note history) rather than starting a fresh one.
     async putBlockedNumber(item) {
       await client.send(new commands.PutItemCommand({
         TableName: tableNames.blockedNumbers,
         Item: marshall(item, { removeUndefinedValues: true }),
-        ConditionExpression: "attribute_not_exists(phoneNumber)",
+        ConditionExpression: "attribute_not_exists(phoneNumber) OR active = :inactive",
+        ExpressionAttributeValues: marshall({ ":inactive": false }),
       }));
       return item;
     },
@@ -5128,6 +5185,19 @@ export function createDynamoStore(client, commands, tableNames) {
       await client.send(new commands.DeleteItemCommand({
         TableName: tableNames.blockedNumbers,
         Key: marshall({ workspaceId, phoneNumber }),
+      }));
+    },
+
+    // Unblocking deactivates rather than deletes, so the note history (who
+    // blocked/unblocked it, when, and why) survives for the next time this
+    // number comes up - re-blocking later reactivates the same row.
+    async deactivateBlockedNumber(workspaceId, phoneNumber, notes) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.blockedNumbers,
+        Key: marshall({ workspaceId, phoneNumber }),
+        UpdateExpression: "SET active = :false, notes = :notes",
+        ConditionExpression: "attribute_exists(phoneNumber)",
+        ExpressionAttributeValues: marshall({ ":false": false, ":notes": notes }),
       }));
     },
 
