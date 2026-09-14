@@ -1042,7 +1042,7 @@ test("Dynamo agent updates preserve provider foreign keys", async () => {
   ));
 });
 
-test("POST activate provisions the DID before syncing Retell and keeps Symantic route ids", async () => {
+test("POST activate syncs Retell only - no phone number is touched", async () => {
   const events = [];
   const agent = receptionistAgent();
   agent.configuration.knowledgeBaseText = "Appointments require 24 hours notice for cancellation.";
@@ -1065,11 +1065,8 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
       };
     },
     async getPhoneNumberForAgent() {
+      events.push(["getPhoneNumberForAgent"]);
       return null;
-    },
-    async putPhoneNumber(record) {
-      events.push(["putPhoneNumber", record]);
-      return record;
     },
     async updateAgentRuntime(workspaceId, agentId, updates) {
       events.push(["updateAgentRuntime", workspaceId, agentId, updates]);
@@ -1089,11 +1086,7 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
     telnyx: {
       async ensureNumber(input) {
         events.push(["telnyx", input]);
-        return {
-          telnyxNumberId: "telnyx-number-123",
-          telnyxPhoneNumber: "+17035550177",
-          telnyxOrderId: "telnyx-order-123",
-        };
+        throw new Error("activate must never provision a phone number");
       },
     },
     retell: {
@@ -1107,7 +1100,7 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
       },
       async importPhoneNumber(input) {
         events.push(["importPhoneNumber", input]);
-        return { retellPhoneNumberId: input.phoneNumber };
+        throw new Error("activate must never import a phone number");
       },
     },
     resolveVoiceId(requestedVoice) {
@@ -1131,16 +1124,8 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   const body = JSON.parse(response.body);
   assert.equal(body.agent.id, "agent-123");
   assert.equal(body.agent.status, "active");
-  assert.equal(body.agent.retellAgentId, undefined);
-  assert.equal(body.phoneNumber.id, "phone-agent-123");
-  assert.equal(body.phoneNumber.phoneNumber, "+17035550177");
-  assert.equal(body.phoneNumber.telnyxNumberId, undefined);
-  assert.ok(
-    events.findIndex(([name]) => name === "retell") <
-      events.findIndex(([name]) => name === "importPhoneNumber") &&
-      events.findIndex(([name]) => name === "importPhoneNumber") <
-        events.findIndex(([name]) => name === "putPhoneNumber"),
-  );
+  assert.equal(body.phoneNumber, null);
+  assert.ok(!events.some(([name]) => name === "telnyx" || name === "importPhoneNumber"));
   const retellInput = events.find(([name]) => name === "retell")[1];
   assert.equal(retellInput.symanticAgentId, "agent-123");
   assert.match(retellInput.config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
@@ -1158,6 +1143,62 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   assert.ok(retellInput.config.tools.filter(({ type }) => type === "custom").every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")
   ));
+});
+
+test("POST attach-phone-number provisions the DID and imports it into an already-active agent", async () => {
+  const events = [];
+  const agent = receptionistAgent();
+  agent.status = "active";
+  agent.retellAgentId = "retell-agent-123";
+  const profile = receptionistProfile();
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+    async getAgent() { return agent; },
+    async getProfile() { return profile; },
+    async getPhoneNumberForAgent() { return null; },
+    async putPhoneNumber(record) {
+      events.push(["putPhoneNumber", record]);
+      return record;
+    },
+  };
+  const providers = {
+    telnyx: {
+      async ensureNumber(input) {
+        events.push(["telnyx", input]);
+        return {
+          telnyxNumberId: "telnyx-number-123",
+          telnyxPhoneNumber: "+17035550177",
+          telnyxOrderId: "telnyx-order-123",
+        };
+      },
+    },
+    retell: {
+      async importPhoneNumber(input) {
+        events.push(["importPhoneNumber", input]);
+        return { retellPhoneNumberId: input.phoneNumber };
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => providers,
+    toolBaseUrl: "https://api.example.com",
+  });
+  const event = authenticatedEvent("POST", "/workspaces/me/agents/agent-123/attach-phone-number");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.phoneNumber.id, "phone-agent-123");
+  assert.equal(body.phoneNumber.phoneNumber, "+17035550177");
+  assert.ok(
+    events.findIndex(([name]) => name === "importPhoneNumber") <
+      events.findIndex(([name]) => name === "putPhoneNumber"),
+  );
   const importInput = events.find(([name]) => name === "importPhoneNumber")[1];
   assert.equal(importInput.phoneNumber, "+17035550177");
   assert.equal(importInput.retellAgentId, "retell-agent-123");
@@ -1168,6 +1209,29 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   const persistedPhone = events.find(([name]) => name === "putPhoneNumber")[1];
   assert.equal(persistedPhone.phoneNumberId, "phone-agent-123");
   assert.equal(persistedPhone.retellPhoneNumberId, "+17035550177");
+});
+
+test("POST attach-phone-number is refused for a non-admin and refuses a second attach", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("POST", "/workspaces/me/agents/agent-123/attach-phone-number");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const forbidden = await handler(event);
+  assert.equal(forbidden.statusCode, 403);
+
+  const adminStore = {
+    async ensureWorkspace() {},
+    async getAgent() { return { ...receptionistAgent(), status: "active" }; },
+    async getPhoneNumberForAgent() { return { phoneNumberId: "phone-agent-123", telnyxPhoneNumber: "+17035550177" }; },
+  };
+  const adminHandler = createHandler({ getStore: async () => adminStore });
+  const already = await adminHandler(authenticatedEvent("POST", "/workspaces/me/agents/agent-123/attach-phone-number"));
+  assert.equal(already.statusCode, 409);
 });
 
 test("POST activate rejects an untested current configuration", async () => {

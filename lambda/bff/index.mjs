@@ -317,7 +317,7 @@ function getAgentId(event, path) {
 
 function getAgentAction(event, path) {
   const match = path.match(
-    /^\/workspaces\/me\/agents\/([^/]+)\/(activate|start-test-call|disable|enable)$/,
+    /^\/workspaces\/me\/agents\/([^/]+)\/(activate|start-test-call|disable|enable|attach-phone-number)$/,
   );
   if (!match) return null;
   try {
@@ -1115,7 +1115,10 @@ export function createHandler({
         const launchIssue = launchReadinessIssue(agent, profile, calendar);
         if (launchIssue) return json(409, { message: launchIssue });
         const providers = await getProviders();
-        const runtime = await syncReceptionistRuntime({
+        // Retell-only - no phone number touched here. Attaching one is a
+        // fully separate action, any time after this, from the Agents
+        // roster (see the attach-phone-number route below).
+        const synced = await syncRetellAgent({
           workspaceId,
           agentId: agentAction.agentId,
           agent,
@@ -1124,7 +1127,6 @@ export function createHandler({
           providers,
           getKnowledgeSigner,
           toolBaseUrl,
-          phoneStatus: "active",
         });
         const activatedAt = new Date().toISOString();
         let updatedAgent;
@@ -1134,7 +1136,7 @@ export function createHandler({
             agentAction.agentId,
             {
               status: "active",
-              retellAgentId: runtime.retellAgentId,
+              retellAgentId: synced.retellAgentId,
               activatedAt,
               updatedAt: activatedAt,
             },
@@ -1145,10 +1147,46 @@ export function createHandler({
           }
           throw error;
         }
+        const existingPhone = await store.getPhoneNumberForAgent(workspaceId, agentAction.agentId);
         return json(200, {
           agent: toPublicAgent(updatedAgent),
-          phoneNumber: toPublicPhoneNumber(runtime.phoneNumber),
+          phoneNumber: existingPhone ? toPublicPhoneNumber(existingPhone) : null,
         });
+      }
+
+      if (agentAction?.action === "attach-phone-number" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can attach a phone number" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentAction.agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+        if (agent.status === "deleted") {
+          return json(409, { message: "This agent has been deleted" });
+        }
+        const existing = await store.getPhoneNumberForAgent(workspaceId, agentAction.agentId);
+        if (existing) {
+          return json(409, { message: "This agent already has a phone number attached" });
+        }
+        const profile = await store.getProfile(workspaceId);
+        const providers = await getProviders();
+        const body = readBody(event) ?? {};
+        const agentForSync = typeof body?.desiredPhoneNumber === "string" && body.desiredPhoneNumber
+          ? { ...agent, configuration: { ...agent.configuration, desiredPhoneNumber: body.desiredPhoneNumber } }
+          : agent;
+        const synced = await syncPhoneNumber({
+          workspaceId,
+          agentId: agentAction.agentId,
+          agent: agentForSync,
+          profile,
+          store,
+          providers,
+          getKnowledgeSigner,
+          toolBaseUrl,
+          phoneStatus: agent.status === "active" ? "active" : "draft",
+        });
+        return json(200, { phoneNumber: toPublicPhoneNumber(synced.phoneNumber) });
       }
 
       if (agentAction?.action === "disable" && method === "POST") {
@@ -4541,7 +4579,12 @@ async function logDeclinedCall(store, { workspaceId, agentId, fromNumber, reason
   }
 }
 
-export async function syncReceptionistRuntime({
+// The Retell-only half of activation: builds the agent's config and
+// upserts it on Retell. No phone number involved - an agent can be fully
+// "active" on Retell with no number yet, it just can't receive calls
+// until one is attached (a fully separate, later, optional action - see
+// syncPhoneNumber below and the /attach-phone-number route).
+export async function syncRetellAgent({
   workspaceId,
   agentId,
   agent,
@@ -4550,25 +4593,7 @@ export async function syncReceptionistRuntime({
   providers,
   getKnowledgeSigner,
   toolBaseUrl,
-  phoneStatus,
 }) {
-  let phoneNumber = await store.getPhoneNumberForAgent(workspaceId, agentId);
-  if (!phoneNumber) {
-    const provisioned = await providers.telnyx.ensureNumber({
-      workspaceId,
-      agentId,
-      preferredPhone: agent?.configuration?.phone ?? profile.phone,
-      desiredPhone: agent?.configuration?.desiredPhoneNumber,
-    });
-    phoneNumber = {
-      workspaceId,
-      phoneNumberId: `phone-${agentId}`,
-      agentId,
-      ...provisioned,
-      status: phoneStatus,
-      createdAt: new Date().toISOString(),
-    };
-  }
   const voiceId = resolveConfiguredVoiceId(
     agent?.configuration,
     providers.resolveVoiceId,
@@ -4601,17 +4626,62 @@ export async function syncReceptionistRuntime({
     if (isConditionalCheckFailed(error)) throw error;
     console.error("Failed to persist retellAgentId after Retell upsert", error);
   }
+  return { retellAgentId: synced.retellAgentId, config };
+}
+
+// The phone-only half: provisions (or reuses) a Telnyx number and imports
+// it into Retell against this agent. Callable any time after the agent
+// exists - a minute later or five days later - not tied to activation.
+// If the agent hasn't been synced to Retell yet, does that first (its own
+// retellAgentId is required to import a number against it).
+export async function syncPhoneNumber({
+  workspaceId,
+  agentId,
+  agent,
+  profile,
+  store,
+  providers,
+  getKnowledgeSigner,
+  toolBaseUrl,
+  phoneStatus,
+}) {
+  let retellAgentId = agent.retellAgentId;
+  let config;
+  if (!retellAgentId) {
+    const synced = await syncRetellAgent({
+      workspaceId, agentId, agent, profile, store, providers, getKnowledgeSigner, toolBaseUrl,
+    });
+    retellAgentId = synced.retellAgentId;
+    config = synced.config;
+  }
+  let phoneNumber = await store.getPhoneNumberForAgent(workspaceId, agentId);
+  if (!phoneNumber) {
+    const provisioned = await providers.telnyx.ensureNumber({
+      workspaceId,
+      agentId,
+      preferredPhone: agent?.configuration?.phone ?? profile.phone,
+      desiredPhone: agent?.configuration?.desiredPhoneNumber,
+    });
+    phoneNumber = {
+      workspaceId,
+      phoneNumberId: `phone-${agentId}`,
+      agentId,
+      ...provisioned,
+      status: phoneStatus,
+      createdAt: new Date().toISOString(),
+    };
+  }
   if (!phoneNumber.retellPhoneNumberId) {
     const imported = await providers.retell.importPhoneNumber({
       phoneNumber: phoneNumber.telnyxPhoneNumber,
-      retellAgentId: synced.retellAgentId,
+      retellAgentId,
       nickname: `Symantic ${workspaceId} ${agentId}`,
       inboundWebhookUrl:
         `${String(toolBaseUrl).replace(/\/+$/, "")}/retell/inbound-lookup`,
     });
     phoneNumber = { ...phoneNumber, ...imported };
   }
-  const desiredCountries = config.allowedInboundCountries ?? [];
+  const desiredCountries = config?.allowedInboundCountries ?? agent?.configuration?.allowedInboundCountries ?? [];
   const appliedCountries = Array.isArray(phoneNumber.allowedInboundCountries)
     ? phoneNumber.allowedInboundCountries
     : [];
@@ -4635,10 +4705,15 @@ export async function syncReceptionistRuntime({
     updatedAt: new Date().toISOString(),
   };
   await store.putPhoneNumber(phoneNumber);
-  return {
-    phoneNumber,
-    retellAgentId: synced.retellAgentId,
-  };
+  return { phoneNumber, retellAgentId };
+}
+
+// Both halves together - kept for call sites (like start-test-call) that
+// need a fully wired agent+number in one shot regardless of what already
+// exists.
+export async function syncReceptionistRuntime(args) {
+  const phoneResult = await syncPhoneNumber(args);
+  return { phoneNumber: phoneResult.phoneNumber, retellAgentId: phoneResult.retellAgentId };
 }
 
 // A one-time, lazy migration: an agent saved before the knowledge base hub
@@ -4844,13 +4919,13 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
 }
 
 function launchReadinessIssue(agent, profile, calendar) {
+  // businessType, ownerPhone, and fallbackPhone are no longer collected up
+  // front - only the business phone matters at this stage. A forwarding
+  // number gets configured separately, at phone-number setup.
   const requiredProfileFields = [
     "businessName",
-    "businessType",
     "timezone",
     "hours",
-    "ownerPhone",
-    "fallbackPhone",
     "phone",
   ];
   if (
@@ -4864,30 +4939,26 @@ function launchReadinessIssue(agent, profile, calendar) {
   if (
     !agent?.configuration ||
     !agent.configuration.template ||
-    agent.configuration.businessConfirmed !== true ||
     !agent.configuration.name?.trim() ||
     !agent.configuration.guidance?.trim() ||
     !agent.configuration.escalation?.trim()
   ) {
     return "Complete the agent details and behavior before activation";
   }
+  // Only validate phone-shaped fields that are actually present - owner/
+  // fallback/escalation/transfer numbers are all optional now.
   const phoneValues = [
     profile.phone,
+    agent?.configuration?.phone,
     profile.ownerPhone,
     profile.fallbackPhone,
-    agent?.configuration?.phone,
-    ...(typeof profile.escalationContact === "string" &&
-        profile.escalationContact.trim()
-      ? [profile.escalationContact]
-      : []),
+    profile.escalationContact,
     ...(Array.isArray(agent?.configuration?.emergencyRules)
-      ? agent.configuration.emergencyRules.map(({ transferTarget }) =>
-        transferTarget
-      )
+      ? agent.configuration.emergencyRules.map(({ transferTarget }) => transferTarget)
       : []),
-  ];
+  ].filter((value) => typeof value === "string" && value.trim());
   if (phoneValues.some((value) => !isValidPhone(value))) {
-    return "Configure valid business, owner, fallback, and transfer phone numbers before activation";
+    return "Configure valid phone numbers before activation";
   }
   if (
     agent?.configuration?.booking === true &&
