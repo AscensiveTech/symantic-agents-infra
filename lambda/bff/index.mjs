@@ -852,12 +852,13 @@ export function createHandler({
           const startedAt = call.startedAt ?? "";
           const existing = byPhone.get(phoneNumber);
           if (!existing) {
-            byPhone.set(phoneNumber, { phoneNumber, name, callCount: 1, latestCallISO: startedAt });
+            byPhone.set(phoneNumber, { phoneNumber, name, callCount: 1, latestCallISO: startedAt, demoSeed: call.demoSeed === true });
             continue;
           }
           existing.callCount += 1;
           if (!existing.name && name) existing.name = name;
           if (startedAt > existing.latestCallISO) existing.latestCallISO = startedAt;
+          if (call.demoSeed === true) existing.demoSeed = true;
         }
         for (const override of contactRows) {
           if (override.hidden) {
