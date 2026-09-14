@@ -1105,6 +1105,20 @@ export function createHandler({
         }
       }
 
+      if (agentId && method === "DELETE") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        try {
+          await store.deleteAgent(workspaceId, agentId);
+          return json(200, { ok: true });
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
+      }
+
       return json(404, { message: "Not found" });
     } catch (error) {
       if (isConditionalCheckFailed(error)) {
@@ -5241,6 +5255,18 @@ export function createDynamoStore(client, commands, tableNames) {
         ConditionExpression: "attribute_not_exists(agentId)",
       }));
       return agent;
+    },
+
+    // Deletes the agent record regardless of its status (draft, preview, or
+    // active) - the customer decides when an agent is no longer wanted, not
+    // us. Does not deprovision the agent's phone number or Retell resources;
+    // those remain a separate, deliberate action.
+    async deleteAgent(workspaceId, agentId) {
+      await client.send(new commands.DeleteItemCommand({
+        TableName: tableNames.agents,
+        Key: marshall({ workspaceId, agentId }),
+        ConditionExpression: "attribute_exists(agentId)",
+      }));
     },
 
     async putAgent(

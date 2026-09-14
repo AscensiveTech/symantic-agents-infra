@@ -399,6 +399,42 @@ test("PUT agent uses the route id and returns the updated agent", async () => {
   assert.deepEqual(calls, [["user-123", "agent-123", savedAgent]]);
 });
 
+test("DELETE agent removes it regardless of status", async () => {
+  const calls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async deleteAgent(workspaceId, agentId) {
+      calls.push([workspaceId, agentId]);
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/agents/agent-123"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { ok: true });
+  assert.deepEqual(calls, [["user-123", "agent-123"]]);
+});
+
+test("DELETE agent returns 404 when the agent is missing", async () => {
+  const error = new Error("The conditional request failed");
+  error.name = "ConditionalCheckFailedException";
+  const store = {
+    async ensureWorkspace() {},
+    async deleteAgent() {
+      throw error;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/agents/agent-404"));
+
+  assert.equal(response.statusCode, 404);
+  assert.equal(JSON.parse(response.body).message, "Agent not found");
+});
+
 test("PUT agent invalidates a successful test when launch configuration changes", async () => {
   let saved;
   const existing = receptionistAgent();
