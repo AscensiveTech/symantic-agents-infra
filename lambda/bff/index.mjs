@@ -797,6 +797,28 @@ export function createHandler({
         return json(200, calls.map(toPublicCallSummary));
       }
 
+      if (path === "/workspaces/me/calls/seed-demo" && method === "POST") {
+        if (!actor.roles.includes("super-admin")) {
+          return json(403, { message: "Super admin access is required" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agents = typeof store.listAgents === "function" ? await store.listAgents(workspaceId) : [];
+        const agentId = agents[0]?.id;
+        const created = await store.seedDemoCalls(workspaceId, demoCallRecords(agentId));
+        return json(200, { count: created });
+      }
+
+      if (path === "/workspaces/me/calls/seed-demo" && method === "DELETE") {
+        if (!actor.roles.includes("super-admin")) {
+          return json(403, { message: "Super admin access is required" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const removed = await store.clearDemoCalls(workspaceId);
+        return json(200, { removed });
+      }
+
       if (path === "/workspaces/me/usage" && method === "GET") {
         await store.ensureWorkspace(workspaceId);
         return json(200, await loadWorkspaceUsage(store, workspaceId));
@@ -4142,6 +4164,101 @@ async function inboundCapReached(store, workspaceId, profile, workspace) {
   }
 }
 
+// Super-admin-only demo data for the AI Receptionist's own Call History -
+// the RapidProposal "Manage Company Accounts" page has an equivalent (see
+// lib/proposals/repository.ts seedDemoProposals). Calls have no customer-
+// facing create endpoint at all (they're normally written by the Postcall
+// Lambda from a real Retell webhook), so this generates full call records
+// directly rather than looping a public create route the way the proposal
+// version does. 12 months, weighted toward the current month, a realistic
+// mix of outcomes - every record tagged demoSeed:true so it can be found
+// and removed later without touching real call history.
+const DEMO_CALL_NAMES = [
+  "Jordan Miles", "Alicia Chen", "Marcus Reed", "Nina Patel", "Samuel Brooks",
+  "Priya Nair", "Diego Alvarez", "Grace Kim", "Tyler Brooks", "Olivia Chen",
+  "Ethan Walsh", "Maria Gonzalez", "Liam O'Brien", "Sophia Turner", "Noah Bennett",
+  "Ava Coleman", "Lucas Ferreira", "Chloe Bishop", "Mason Reilly", "Isabella Cruz",
+];
+const DEMO_OUTCOME_WEIGHTS = [
+  ["booked", 6], ["answered", 5], ["escalated", 2], ["message", 3], ["lead", 2],
+  ["spam", 1], ["failed", 1], ["abandoned", 1], ["declined", 1],
+];
+const DEMO_SUMMARIES = {
+  booked: (name) => `${name} called to schedule an appointment; the AI checked availability and booked a time.`,
+  answered: (name) => `${name} asked a general question about hours and services; the AI answered directly, no booking needed.`,
+  escalated: (name) => `${name}'s request needed a person; the AI transferred the call to the team.`,
+  message: (name) => `${name} asked to leave a message for the office instead of booking.`,
+  lead: (name) => `${name} was interested in services and left contact info for a follow-up.`,
+  spam: () => "Automated robocall; the AI recognised it and ended the call.",
+  failed: () => "The call failed to connect due to a technical issue.",
+  abandoned: (name) => `${name} hung up before anything was resolved.`,
+  declined: () => "Rejected before the AI ever answered.",
+};
+const DEMO_END_REASONS = {
+  spam: "scam_detected",
+  failed: "error",
+  abandoned: "user_hangup",
+  declined: "minute_cap_reached",
+};
+
+function demoCallRecords(agentId) {
+  const now = Date.now();
+  const dayMs = 86_400_000;
+  const records = [];
+  for (let i = 0; i < 120; i += 1) {
+    // Weighted toward recent: most days come from the last ~90 days, the
+    // rest spread across the full 12-month window.
+    const daysAgo = i % 3 === 0
+      ? Math.floor(Math.random() * 365)
+      : Math.floor(Math.random() * 90);
+    const startedAt = new Date(now - daysAgo * dayMs - Math.floor(Math.random() * dayMs));
+    const outcome = pickWeighted(DEMO_OUTCOME_WEIGHTS);
+    const name = DEMO_CALL_NAMES[i % DEMO_CALL_NAMES.length];
+    const hasIdentity = outcome !== "spam" && outcome !== "declined" && Math.random() > 0.15;
+    const durationMs = outcome === "declined" ? 0
+      : outcome === "spam" ? Math.round((5 + Math.random() * 15) * 1000)
+        : outcome === "failed" || outcome === "abandoned" ? Math.round(Math.random() * 30 * 1000)
+          : Math.round((30 + Math.random() * 330) * 1000);
+    const endedAt = new Date(startedAt.getTime() + durationMs);
+    records.push({
+      callId: `demo-call-${randomUUID()}`,
+      demoSeed: true,
+      agentId,
+      direction: "inbound",
+      callerName: hasIdentity ? name : undefined,
+      callerNameSource: hasIdentity ? "agent" : undefined,
+      callerNumber: `+1415555${String(1000 + (i % 900)).padStart(4, "0")}`,
+      outcome,
+      startedAt: startedAt.toISOString(),
+      endedAt: endedAt.toISOString(),
+      durationMs,
+      callSummary: DEMO_SUMMARIES[outcome](name),
+      userSentiment: outcome === "spam" || outcome === "failed" ? "Neutral"
+        : outcome === "abandoned" || outcome === "declined" ? "Unknown"
+          : outcome === "escalated" ? "Negative" : "Positive",
+      actions: outcome === "booked" ? ["Booked appointment"]
+        : outcome === "escalated" ? ["Transferred the call"]
+          : outcome === "message" ? ["Took a message for the office"] : [],
+      disconnectionReason: DEMO_END_REASONS[outcome],
+      hasRecording: false,
+      transcript: [],
+      createdAt: startedAt.toISOString(),
+      updatedAt: startedAt.toISOString(),
+    });
+  }
+  return records;
+}
+
+function pickWeighted(pairs) {
+  const total = pairs.reduce((sum, [, weight]) => sum + weight, 0);
+  let roll = Math.random() * total;
+  for (const [value, weight] of pairs) {
+    roll -= weight;
+    if (roll <= 0) return value;
+  }
+  return pairs[pairs.length - 1][0];
+}
+
 // A call rejected before Retell ever answered it never reaches the Postcall
 // Lambda (no call_id exists), so this is the only place that ever knows it
 // happened - write it here or it's invisible everywhere, including Call
@@ -5002,6 +5119,40 @@ export function createDynamoStore(client, commands, tableNames) {
         ConditionExpression: "attribute_not_exists(callId)",
       }));
       return record;
+    },
+
+    // Super-admin demo data (see demoCallRecords below) - additive, each
+    // record tagged demoSeed:true so clearDemoCalls can find and remove
+    // exactly these rows later without touching any real call history.
+    async seedDemoCalls(workspaceId, records) {
+      let created = 0;
+      for (const record of records) {
+        await client.send(new commands.PutItemCommand({
+          TableName: tableNames.calls,
+          Item: marshall({ ...record, workspaceId }),
+          ConditionExpression: "attribute_not_exists(callId)",
+        }));
+        created += 1;
+      }
+      return created;
+    },
+
+    async clearDemoCalls(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.calls,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        FilterExpression: "demoSeed = :true",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":true": true }),
+        ConsistentRead: true,
+      }));
+      const items = (result.Items ?? []).map((item) => unmarshall(item));
+      for (const item of items) {
+        await client.send(new commands.DeleteItemCommand({
+          TableName: tableNames.calls,
+          Key: marshall({ workspaceId, callId: item.callId }),
+        }));
+      }
+      return items.length;
     },
 
     // Lean projection of the full call history for usage aggregation. Paginated;

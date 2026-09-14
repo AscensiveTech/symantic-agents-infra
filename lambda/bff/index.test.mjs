@@ -629,6 +629,68 @@ test("PATCH call with a blank/whitespace-only name clears it instead of rejectin
   assert.equal(body.callerNameSource, undefined);
 });
 
+test("POST calls/seed-demo is super-admin only and writes ~120 tagged demo calls", async () => {
+  const { createHandler } = await loadBff();
+
+  const nonAdminStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+  };
+  const nonAdminHandler = createHandler({ getStore: async () => nonAdminStore });
+  const forbiddenEvent = authenticatedEvent("POST", "/workspaces/me/calls/seed-demo");
+  forbiddenEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await nonAdminHandler(forbiddenEvent)).statusCode, 403);
+
+  const superStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "super-admin", status: "active" }; },
+    async listAgents() { return [{ id: "agent-1", name: "Maya" }]; },
+    async seedDemoCalls(workspaceId, records) {
+      assert.equal(records.length, 120);
+      assert.ok(records.every((record) => record.demoSeed === true));
+      assert.ok(records.every((record) => record.agentId === "agent-1"));
+      assert.equal(new Set(records.map((r) => r.callId)).size, records.length);
+      return records.length;
+    },
+  };
+  const superHandler = createHandler({ getStore: async () => superStore });
+  const event = authenticatedEvent("POST", "/workspaces/me/calls/seed-demo");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await superHandler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { count: 120 });
+});
+
+test("DELETE calls/seed-demo is super-admin only and removes tagged demo calls", async () => {
+  const { createHandler } = await loadBff();
+
+  const nonAdminStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+  };
+  const nonAdminHandler = createHandler({ getStore: async () => nonAdminStore });
+  const forbiddenEvent = authenticatedEvent("DELETE", "/workspaces/me/calls/seed-demo");
+  forbiddenEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await nonAdminHandler(forbiddenEvent)).statusCode, 403);
+
+  const superStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "super-admin", status: "active" }; },
+    async clearDemoCalls(workspaceId) {
+      assert.equal(workspaceId, "user-123");
+      return 120;
+    },
+  };
+  const superHandler = createHandler({ getStore: async () => superStore });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/calls/seed-demo");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await superHandler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { removed: 120 });
+});
+
 test("GET call recording returns a presigned URL, or 404 when there is none", async () => {
   const store = {
     async ensureWorkspace() {},
