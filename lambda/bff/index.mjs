@@ -4958,12 +4958,13 @@ function launchReadinessIssue(agent, profile, calendar) {
   ) {
     return "Complete the business profile before activation";
   }
+  // guidance and escalation are both optional now - emergency rules cover
+  // escalation routing, and a blank guidance field is a legitimate choice
+  // (Retell still gets a reasonable default prompt either way).
   if (
     !agent?.configuration ||
     !agent.configuration.template ||
-    !agent.configuration.name?.trim() ||
-    !agent.configuration.guidance?.trim() ||
-    !agent.configuration.escalation?.trim()
+    !agent.configuration.name?.trim()
   ) {
     return "Complete the agent details and behavior before activation";
   }
