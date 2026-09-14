@@ -4288,16 +4288,28 @@ const DEMO_END_REASONS = {
   declined: "agent_inactive",
 };
 
+// Starter's own allowance (see RECEPTIONIST_PLANS.starter.minutes) - the
+// seed intentionally stays well under it (~75%) so a freshly-seeded account
+// doesn't show an overage-billed call sitting next to a usage banner that
+// says it's nowhere near its plan limit.
+const DEMO_MINUTE_BUDGET = 750;
+
 function demoCallRecords(agentId) {
   const now = Date.now();
   const dayMs = 86_400_000;
   const records = [];
   for (let i = 0; i < 120; i += 1) {
-    // Weighted toward recent: most days come from the last ~90 days, the
-    // rest spread across the full 12-month window.
-    const daysAgo = i % 3 === 0
-      ? Math.floor(Math.random() * 365)
-      : Math.floor(Math.random() * 90);
+    // Spread across the last 30 days (matches the Overview charts' own
+    // "last 30 days" range), weighted toward weekdays with some weekend
+    // activity too - re-rolling the day a few times biases the distribution
+    // without ever fully excluding a Saturday/Sunday call.
+    let daysAgo = Math.floor(Math.random() * 30);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const dow = new Date(now - daysAgo * dayMs).getDay();
+      const isWeekend = dow === 0 || dow === 6;
+      if (!isWeekend || Math.random() < 0.3) break;
+      daysAgo = Math.floor(Math.random() * 30);
+    }
     const startedAt = new Date(now - daysAgo * dayMs - Math.floor(Math.random() * dayMs));
     const outcome = pickWeighted(DEMO_OUTCOME_WEIGHTS);
     const name = DEMO_CALL_NAMES[i % DEMO_CALL_NAMES.length];
@@ -4305,7 +4317,7 @@ function demoCallRecords(agentId) {
     const durationMs = outcome === "declined" ? 0
       : outcome === "spam" ? Math.round((5 + Math.random() * 15) * 1000)
         : outcome === "failed" || outcome === "abandoned" ? Math.round(Math.random() * 30 * 1000)
-          : Math.round((30 + Math.random() * 330) * 1000);
+          : Math.round((30 + Math.random() * 180) * 1000);
     const endedAt = new Date(startedAt.getTime() + durationMs);
     records.push({
       callId: `demo-call-${randomUUID()}`,
@@ -4327,15 +4339,23 @@ function demoCallRecords(agentId) {
         : outcome === "escalated" ? ["Transferred the call"]
           : outcome === "message" ? ["Took a message for the office"] : [],
       disconnectionReason: DEMO_END_REASONS[outcome],
-      // Roughly one in eight non-declined calls lands after a realistic
-      // demo account would have used its plan minutes for the cycle -
-      // gives the "Overage" label something to actually show in the seed.
-      ...(outcome !== "declined" && i % 8 === 0 ? { isOverage: true } : {}),
       hasRecording: false,
       transcript: [],
       createdAt: startedAt.toISOString(),
       updatedAt: startedAt.toISOString(),
     });
+  }
+  // Scale every call's duration down proportionally if the batch would add
+  // up to more than the minute budget - keeps the relative "some calls run
+  // long, most are short" shape instead of just truncating the tail.
+  const totalBilledMinutes = records.reduce((sum, r) => sum + Math.ceil(r.durationMs / 60_000), 0);
+  if (totalBilledMinutes > DEMO_MINUTE_BUDGET) {
+    const scale = DEMO_MINUTE_BUDGET / totalBilledMinutes;
+    for (const record of records) {
+      if (record.durationMs <= 0) continue;
+      record.durationMs = Math.max(1000, Math.round(record.durationMs * scale));
+      record.endedAt = new Date(new Date(record.startedAt).getTime() + record.durationMs).toISOString();
+    }
   }
   return records;
 }
