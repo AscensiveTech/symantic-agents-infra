@@ -763,12 +763,12 @@ test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid
   const missingName = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", {}));
   assert.equal(missingName.statusCode, 400);
 
-  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "  Jordan Miles  " }));
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "  Jordan Miles  ", companyName: "  Acme Co  " }));
   assert.equal(response.statusCode, 200);
   assert.deepEqual(saved, {
     workspaceId: "user-123",
     phoneNumber: "+17035550123",
-    patch: { name: "Jordan Miles", hidden: false },
+    patch: { name: "Jordan Miles", companyName: "Acme Co", updatedByName: "user-123", hidden: false },
   });
 });
 
@@ -790,8 +790,22 @@ test("DELETE contacts/{phoneNumber} soft-deletes (hidden: true) rather than remo
   assert.deepEqual(saved, {
     workspaceId: "user-123",
     phoneNumber: "+17035550123",
-    patch: { hidden: true },
+    patch: { hidden: true, updatedByName: "user-123" },
   });
+});
+
+test("DELETE contacts/{phoneNumber} is refused for a non-admin", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/contacts/(703)%20555-0123");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 403);
 });
 
 test("GET call recording returns a presigned URL, or 404 when there is none", async () => {

@@ -825,6 +825,8 @@ export function createHandler({
         return json(200, rows.map((row) => ({
           phoneNumber: row.phoneNumber,
           name: row.name,
+          companyName: row.companyName,
+          updatedByName: row.updatedByName,
           hidden: row.hidden === true,
           createdAt: row.createdAt,
           updatedAt: row.updatedAt,
@@ -865,8 +867,17 @@ export function createHandler({
           const existing = byPhone.get(override.phoneNumber);
           if (existing) {
             if (override.name) existing.name = override.name;
-          } else if (override.name) {
-            byPhone.set(override.phoneNumber, { phoneNumber: override.phoneNumber, name: override.name, callCount: 0, latestCallISO: "" });
+            if (override.companyName) existing.companyName = override.companyName;
+            if (override.updatedByName) existing.updatedByName = override.updatedByName;
+          } else if (override.name || override.companyName) {
+            byPhone.set(override.phoneNumber, {
+              phoneNumber: override.phoneNumber,
+              name: override.name,
+              companyName: override.companyName,
+              updatedByName: override.updatedByName,
+              callCount: 0,
+              latestCallISO: "",
+            });
           }
         }
         const rows = Array.from(byPhone.values()).sort((a, b) => b.latestCallISO.localeCompare(a.latestCallISO));
@@ -891,14 +902,26 @@ export function createHandler({
         if (!phoneNumber) return json(400, { message: "A valid phone number is required" });
 
         if (method === "DELETE") {
-          const saved = await store.putContact(workspaceId, phoneNumber, { hidden: true });
+          if (!isWorkspaceAdmin(actor)) {
+            return json(403, { message: "Only an org admin can delete a contact" });
+          }
+          const saved = await store.putContact(workspaceId, phoneNumber, {
+            hidden: true,
+            updatedByName: actorDisplayName(event, actor),
+          });
           return json(200, saved);
         }
 
         const body = readBody(event) ?? {};
         if (typeof body.name !== "string") return json(400, { message: "name is required" });
         const name = body.name.trim().slice(0, 120);
-        const saved = await store.putContact(workspaceId, phoneNumber, { name: name || undefined, hidden: false });
+        const companyName = typeof body.companyName === "string" ? body.companyName.trim().slice(0, 120) : undefined;
+        const saved = await store.putContact(workspaceId, phoneNumber, {
+          name: name || undefined,
+          companyName: companyName || undefined,
+          updatedByName: actorDisplayName(event, actor),
+          hidden: false,
+        });
         return json(200, saved);
       }
 
