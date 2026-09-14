@@ -819,6 +819,47 @@ export function createHandler({
         return json(200, { removed });
       }
 
+      if (path === "/workspaces/me/contacts" && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        const rows = await store.listContacts(workspaceId);
+        return json(200, rows.map((row) => ({
+          phoneNumber: row.phoneNumber,
+          name: row.name,
+          hidden: row.hidden === true,
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+        })));
+      }
+
+      // Contacts is still primarily a client-side aggregation over call
+      // history - this table only ever holds what a customer explicitly
+      // set for a phone number (a rename, a manually-added contact with no
+      // calls yet, or a delete), so a single PATCH (upsert) is enough; no
+      // separate POST create route.
+      const contactTarget = path.match(/^\/workspaces\/me\/contacts\/(.+)$/)?.[1];
+      if (contactTarget && (method === "PATCH" || method === "DELETE")) {
+        await store.ensureWorkspace(workspaceId);
+        let decodedTarget;
+        try {
+          decodedTarget = decodeURIComponent(contactTarget);
+        } catch {
+          decodedTarget = contactTarget;
+        }
+        const phoneNumber = normalizeE164(decodedTarget);
+        if (!phoneNumber) return json(400, { message: "A valid phone number is required" });
+
+        if (method === "DELETE") {
+          const saved = await store.putContact(workspaceId, phoneNumber, { hidden: true });
+          return json(200, saved);
+        }
+
+        const body = readBody(event) ?? {};
+        if (typeof body.name !== "string") return json(400, { message: "name is required" });
+        const name = body.name.trim().slice(0, 120);
+        const saved = await store.putContact(workspaceId, phoneNumber, { name: name || undefined, hidden: false });
+        return json(200, saved);
+      }
+
       if (path === "/workspaces/me/usage" && method === "GET") {
         await store.ensureWorkspace(workspaceId);
         return json(200, await loadWorkspaceUsage(store, workspaceId));
@@ -5399,6 +5440,37 @@ export function createDynamoStore(client, commands, tableNames) {
       }));
     },
 
+    // Contacts (see the "contacts" table comment in dynamodb.tf) - only
+    // holds what a customer explicitly set for a phone number: a manual
+    // name override, a contact added with no call history yet (Excel
+    // import), or a delete (hidden: true, a tombstone rather than an
+    // actual row removal so a rename doesn't resurrect it).
+    async listContacts(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.contacts,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ConsistentRead: false,
+      }));
+      return (result.Items ?? []).map((item) => unmarshall(item));
+    },
+
+    async putContact(workspaceId, phoneNumber, patch) {
+      const now = new Date().toISOString();
+      const existing = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.contacts,
+        Key: marshall({ workspaceId, phoneNumber }),
+        ConsistentRead: true,
+      }));
+      const createdAt = existing.Item ? unmarshall(existing.Item).createdAt : now;
+      const item = { workspaceId, phoneNumber, createdAt, updatedAt: now, ...patch };
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.contacts,
+        Item: marshall(item, { removeUndefinedValues: true }),
+      }));
+      return item;
+    },
+
     async listAgents(workspaceId) {
       const result = await client.send(new commands.QueryCommand({
         TableName: tableNames.agents,
@@ -6104,6 +6176,7 @@ export async function getDefaultStore() {
       legalAcceptances: process.env.LEGAL_ACCEPTANCES_TABLE,
       knowledgeBases: process.env.KNOWLEDGE_BASES_TABLE,
       mostAskedDigests: process.env.MOST_ASKED_DIGESTS_TABLE,
+      contacts: process.env.CONTACTS_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");

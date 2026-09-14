@@ -691,6 +691,78 @@ test("DELETE calls/seed-demo is super-admin only and removes tagged demo calls",
   assert.deepEqual(JSON.parse(response.body), { removed: 120 });
 });
 
+test("GET contacts returns the workspace's stored contact overrides", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listContacts(workspaceId) {
+      assert.equal(workspaceId, "user-123");
+      return [
+        { workspaceId, phoneNumber: "+17035550123", name: "Jordan Miles", createdAt: "t1", updatedAt: "t1" },
+        { workspaceId, phoneNumber: "+17035550199", hidden: true, createdAt: "t2", updatedAt: "t2" },
+      ];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), [
+    { phoneNumber: "+17035550123", name: "Jordan Miles", hidden: false, createdAt: "t1", updatedAt: "t1" },
+    { phoneNumber: "+17035550199", hidden: true, createdAt: "t2", updatedAt: "t2" },
+  ]);
+});
+
+test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid number or missing name", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async putContact(workspaceId, phoneNumber, patch) {
+      saved = { workspaceId, phoneNumber, patch };
+      return { workspaceId, phoneNumber, ...patch, createdAt: "t1", updatedAt: "t2" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const badNumber = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/not-a-number", { name: "Jordan" }));
+  assert.equal(badNumber.statusCode, 400);
+
+  const missingName = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", {}));
+  assert.equal(missingName.statusCode, 400);
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "  Jordan Miles  " }));
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(saved, {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550123",
+    patch: { name: "Jordan Miles", hidden: false },
+  });
+});
+
+test("DELETE contacts/{phoneNumber} soft-deletes (hidden: true) rather than removing the row", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async putContact(workspaceId, phoneNumber, patch) {
+      saved = { workspaceId, phoneNumber, patch };
+      return { workspaceId, phoneNumber, ...patch };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/contacts/(703)%20555-0123"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(saved, {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550123",
+    patch: { hidden: true },
+  });
+});
+
 test("GET call recording returns a presigned URL, or 404 when there is none", async () => {
   const store = {
     async ensureWorkspace() {},

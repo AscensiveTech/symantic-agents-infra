@@ -41,6 +41,15 @@ locals {
       name_suffix = "blocked-numbers"
       range_key   = "phoneNumber"
     }
+    contacts = {
+      // A manual name override (and/or a "hidden" tombstone for delete) per
+      // phone number - the Contacts page itself is still primarily a
+      // client-side aggregation over call history, this table only holds
+      // what a customer explicitly set: a rename, a manually-added contact
+      // with no calls yet (via the Excel import), or a delete.
+      name_suffix = "contacts"
+      range_key   = "phoneNumber"
+    }
     leads = {
       name_suffix = "leads"
       range_key   = "leadId"
