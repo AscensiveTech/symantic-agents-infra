@@ -60,7 +60,10 @@ const PROFILE_FIELDS = {
   communicationStyle: "string",
 };
 
-const AGENT_STATUSES = new Set(["active", "draft", "preview", "planned"]);
+const AGENT_STATUSES = new Set(["active", "draft", "preview", "planned", "disabled", "deleted"]);
+// "deleted" is only ever set by the DELETE-agent teardown itself, never by
+// a client PUT - a deleted agent is done, not editable back into existence.
+const CLIENT_SETTABLE_AGENT_STATUSES = new Set(["active", "draft", "preview", "planned", "disabled"]);
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -245,7 +248,7 @@ function pickAgent(value, routeAgentId) {
     typeof value.name !== "string" ||
     typeof value.role !== "string" ||
     typeof value.description !== "string" ||
-    !AGENT_STATUSES.has(value.status) ||
+    !CLIENT_SETTABLE_AGENT_STATUSES.has(value.status) ||
     !Array.isArray(value.capabilities) ||
     !value.capabilities.every((item) => typeof item === "string") ||
     (value.configuration !== undefined && (
@@ -314,7 +317,7 @@ function getAgentId(event, path) {
 
 function getAgentAction(event, path) {
   const match = path.match(
-    /^\/workspaces\/me\/agents\/([^/]+)\/(activate|start-test-call)$/,
+    /^\/workspaces\/me\/agents\/([^/]+)\/(activate|start-test-call|disable|enable)$/,
   );
   if (!match) return null;
   try {
@@ -712,6 +715,7 @@ export function createHandler({
           ? {
             ...candidate,
             status: candidate.status === "active" ? "draft" : candidate.status,
+            createdAt: new Date().toISOString(),
           }
           : null;
         if (!agent) return json(400, { message: "Invalid agent" });
@@ -1147,6 +1151,67 @@ export function createHandler({
         });
       }
 
+      if (agentAction?.action === "disable" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can disable an agent" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentAction.agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+        if (agent.status === "deleted") {
+          return json(409, { message: "This agent has been deleted" });
+        }
+        // No Retell/Telnyx calls here on purpose - the inbound-lookup
+        // webhook already rejects every call the instant status isn't
+        // "active" (see the call_inbound handler below), so flipping
+        // this one field is the entire mechanism. Everything else
+        // (the agent, its knowledge base, its phone number) stays
+        // exactly as it is, and billing keeps running.
+        const updatedAt = new Date().toISOString();
+        try {
+          const updated = await store.updateAgentRuntime(workspaceId, agentAction.agentId, {
+            status: "disabled",
+            updatedAt,
+          });
+          return json(200, toPublicAgent(updated));
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
+      }
+
+      if (agentAction?.action === "enable" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can reactivate an agent" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentAction.agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+        if (agent.status === "deleted") {
+          return json(409, { message: "This agent has been deleted and can't be reactivated" });
+        }
+        if (agent.status !== "disabled") {
+          return json(409, { message: "This agent isn't disabled" });
+        }
+        const updatedAt = new Date().toISOString();
+        try {
+          const updated = await store.updateAgentRuntime(workspaceId, agentAction.agentId, {
+            status: "active",
+            updatedAt,
+          });
+          return json(200, toPublicAgent(updated));
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
+      }
+
       if (agentAction?.action === "start-test-call" && method === "POST") {
         const body = readBody(event);
         const toNumber = body?.toNumber;
@@ -1243,11 +1308,62 @@ export function createHandler({
       }
 
       if (agentId && method === "DELETE") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can delete an agent" });
+        }
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+
+        const [phoneNumber, calls, otherAgents] = await Promise.all([
+          store.getPhoneNumberForAgent(workspaceId, agentId),
+          store.listCalls(workspaceId),
+          store.listAgents(workspaceId),
+        ]);
+        const callsHandledAtDeletion = calls.filter((call) => call.agentId === agentId).length;
+
+        const knowledgeBaseIds = Array.isArray(agent?.configuration?.knowledgeBaseIds)
+          ? agent.configuration.knowledgeBaseIds
+          : [];
+        const providers = await getProviders();
+        for (const knowledgeBaseId of knowledgeBaseIds) {
+          const stillUsed = otherAgents.some((other) =>
+            other.id !== agentId &&
+            Array.isArray(other?.configuration?.knowledgeBaseIds) &&
+            other.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
+          if (stillUsed) continue;
+          const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
+          if (!record) continue;
+          if (record.retellKnowledgeBaseId) {
+            await providers.retell.deleteKnowledgeBase(record.retellKnowledgeBaseId).catch(() => {});
+          }
+          await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
+        }
+
+        if (agent.retellAgentId) {
+          await providers.retell.deleteAgentAndLlm(agent.retellAgentId).catch(() => {});
+        }
+        if (phoneNumber?.retellPhoneNumberId) {
+          await providers.retell.deletePhoneNumber(phoneNumber.retellPhoneNumberId).catch(() => {});
+        }
+        if (phoneNumber?.telnyxNumberId) {
+          await providers.telnyx.releaseNumber(phoneNumber.telnyxNumberId).catch(() => {});
+        }
+        if (phoneNumber?.phoneNumberId) {
+          await store.deletePhoneNumberRecord(workspaceId, phoneNumber.phoneNumberId);
+        }
+
         try {
-          await store.deleteAgent(workspaceId, agentId);
-          return json(200, { ok: true });
+          const deletedAt = new Date().toISOString();
+          const updated = await store.updateAgentRuntime(workspaceId, agentId, {
+            status: "deleted",
+            deletedAt,
+            deletedByName: actorDisplayName(event, actor),
+            callsHandledAtDeletion,
+            updatedAt: deletedAt,
+          });
+          return json(200, toPublicAgent(updated));
         } catch (error) {
           if (isConditionalCheckFailed(error)) {
             return json(404, { message: "Agent not found" });
@@ -6056,6 +6172,10 @@ export function createDynamoStore(client, commands, tableNames) {
         Item: marshall(record),
       }));
       return record;
+    },
+
+    deletePhoneNumberRecord(workspaceId, phoneNumberId) {
+      return deleteRecord(tableNames.phoneNumbers, "phoneNumberId", workspaceId, phoneNumberId);
     },
 
     async getPhoneNumberByDid(telnyxPhoneNumber) {

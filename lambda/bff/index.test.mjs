@@ -285,8 +285,11 @@ test("POST and GET agents preserve product agent ids", async () => {
   const listed = await handler(authenticatedEvent("GET", "/workspaces/me/agents"));
 
   assert.equal(created.statusCode, 201);
-  const savedAgent = { ...agent, status: "draft" };
-  assert.deepEqual(JSON.parse(created.body), savedAgent);
+  const createdBody = JSON.parse(created.body);
+  assert.equal(createdBody.status, "draft");
+  assert.ok(createdBody.createdAt);
+  const savedAgent = { ...agent, status: "draft", createdAt: createdBody.createdAt };
+  assert.deepEqual(createdBody, savedAgent);
   assert.equal(listed.statusCode, 200);
   assert.deepEqual(JSON.parse(listed.body), [savedAgent]);
 });
@@ -399,32 +402,178 @@ test("PUT agent uses the route id and returns the updated agent", async () => {
   assert.deepEqual(calls, [["user-123", "agent-123", savedAgent]]);
 });
 
-test("DELETE agent removes it regardless of status", async () => {
-  const calls = [];
+function companyAdminEvent(method, path, body, queryStringParameters) {
+  const event = authenticatedEvent(method, path, body, queryStringParameters);
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  return event;
+}
+
+test("DELETE agent is refused for a non-admin", async () => {
   const store = {
     async ensureWorkspace() {},
-    async deleteAgent(workspaceId, agentId) {
-      calls.push([workspaceId, agentId]);
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/agents/agent-123");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared knowledge base items, and records a history summary", async () => {
+  const providerCalls = [];
+  const storeCalls = [];
+  const agent = {
+    workspaceId: "user-123",
+    agentId: "agent-123",
+    id: "agent-123",
+    name: "Maya",
+    status: "active",
+    retellAgentId: "retell-agent-1",
+    configuration: { knowledgeBaseIds: ["kb-shared", "kb-solo"] },
+  };
+  const otherAgent = {
+    id: "agent-456",
+    configuration: { knowledgeBaseIds: ["kb-shared"] },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getPhoneNumberForAgent() {
+      return {
+        phoneNumberId: "phone-agent-123",
+        retellPhoneNumberId: "+17035550133",
+        telnyxNumberId: "telnyx-num-1",
+      };
+    },
+    async listCalls() {
+      return [
+        { agentId: "agent-123" },
+        { agentId: "agent-123" },
+        { agentId: "agent-456" },
+      ];
+    },
+    async listAgents() { return [agent, otherAgent]; },
+    async getKnowledgeBase(workspaceId, knowledgeBaseId) {
+      return { knowledgeBaseId, retellKnowledgeBaseId: `retell-${knowledgeBaseId}` };
+    },
+    async deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId) {
+      storeCalls.push(["deleteKnowledgeBaseRecord", knowledgeBaseId]);
+    },
+    async deletePhoneNumberRecord(workspaceId, phoneNumberId) {
+      storeCalls.push(["deletePhoneNumberRecord", phoneNumberId]);
+    },
+    async updateAgentRuntime(workspaceId, agentId, updates) {
+      storeCalls.push(["updateAgentRuntime", agentId, updates]);
+      return { ...agent, ...updates };
+    },
+  };
+  const providers = {
+    retell: {
+      async deleteAgentAndLlm(retellAgentId) { providerCalls.push(["deleteAgentAndLlm", retellAgentId]); },
+      async deletePhoneNumber(phoneNumber) { providerCalls.push(["deletePhoneNumber", phoneNumber]); },
+      async deleteKnowledgeBase(retellKnowledgeBaseId) { providerCalls.push(["deleteKnowledgeBase", retellKnowledgeBaseId]); },
+    },
+    telnyx: {
+      async releaseNumber(telnyxNumberId) { providerCalls.push(["releaseNumber", telnyxNumberId]); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const response = await handler(companyAdminEvent("DELETE", "/workspaces/me/agents/agent-123"));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.status, "deleted");
+  assert.equal(body.callsHandledAtDeletion, 2);
+  assert.ok(body.deletedAt);
+  assert.equal(body.deletedByName, "user-123");
+
+  // Only the KB not referenced by another agent gets torn down.
+  assert.deepEqual(
+    providerCalls.filter(([name]) => name === "deleteKnowledgeBase"),
+    [["deleteKnowledgeBase", "retell-kb-solo"]],
+  );
+  assert.deepEqual(
+    storeCalls.filter(([name]) => name === "deleteKnowledgeBaseRecord"),
+    [["deleteKnowledgeBaseRecord", "kb-solo"]],
+  );
+
+  assert.deepEqual(providerCalls.filter(([name]) => name === "deleteAgentAndLlm"), [["deleteAgentAndLlm", "retell-agent-1"]]);
+  assert.deepEqual(providerCalls.filter(([name]) => name === "deletePhoneNumber"), [["deletePhoneNumber", "+17035550133"]]);
+  assert.deepEqual(providerCalls.filter(([name]) => name === "releaseNumber"), [["releaseNumber", "telnyx-num-1"]]);
+  assert.deepEqual(storeCalls.filter(([name]) => name === "deletePhoneNumberRecord"), [["deletePhoneNumberRecord", "phone-agent-123"]]);
+});
+
+test("POST disable is refused for a non-admin", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => { throw new Error("must not call a provider to disable"); } });
+  const event = authenticatedEvent("POST", "/workspaces/me/agents/agent-123/disable");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("POST disable flips status without touching Retell/Telnyx", async () => {
+  const agent = { id: "agent-123", status: "active" };
+  const updates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async updateAgentRuntime(workspaceId, agentId, patch) {
+      updates.push(patch);
+      return { ...agent, ...patch };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => { throw new Error("must not call a provider to disable"); } });
+
+  const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/disable"));
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).status, "disabled");
+  assert.deepEqual(updates, [{ status: "disabled", updatedAt: updates[0].updatedAt }]);
+});
+
+test("POST enable reactivates a disabled agent but refuses a deleted one", async () => {
+  const updates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent(workspaceId, agentId) {
+      return agentId === "agent-deleted"
+        ? { id: "agent-deleted", status: "deleted" }
+        : { id: "agent-123", status: "disabled" };
+    },
+    async updateAgentRuntime(workspaceId, agentId, patch) {
+      updates.push(patch);
+      return { id: agentId, ...patch };
     },
   };
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
 
-  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/agents/agent-123"));
+  const deleted = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-deleted/enable"));
+  assert.equal(deleted.statusCode, 409);
 
+  const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/enable"));
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(JSON.parse(response.body), { ok: true });
-  assert.deepEqual(calls, [["user-123", "agent-123"]]);
+  assert.equal(JSON.parse(response.body).status, "active");
+  assert.deepEqual(updates, [{ status: "active", updatedAt: updates[0].updatedAt }]);
 });
 
 test("DELETE agent returns 404 when the agent is missing", async () => {
-  const error = new Error("The conditional request failed");
-  error.name = "ConditionalCheckFailedException";
   const store = {
     async ensureWorkspace() {},
-    async deleteAgent() {
-      throw error;
-    },
+    async getAgent() { return null; },
   };
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });

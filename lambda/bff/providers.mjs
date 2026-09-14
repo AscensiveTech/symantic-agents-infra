@@ -173,6 +173,16 @@ export function createTelnyxClient({
         { details: { orderId: order?.id, phoneNumber } },
       );
     },
+
+    // Releases a number back to Telnyx (stops recurring per-number
+    // billing) - used when an agent is permanently deleted, never on
+    // disable.
+    async releaseNumber(telnyxNumberId) {
+      await telnyxRequest(
+        `${TELNYX_BASE_URL}/phone_numbers/${encodeURIComponent(required(telnyxNumberId, "telnyxNumberId"))}`,
+        { method: "DELETE" },
+      );
+    },
   };
 }
 
@@ -416,6 +426,34 @@ export function createRetellClient({
           },
         },
       );
+    },
+
+    // Only ever called from the permanent agent-delete teardown, never
+    // from disable. The agent's llm_id isn't persisted on our own side
+    // (upsertAgent only ever returns retellAgentId - the llm is looked
+    // up live via get-agent when needed), so this looks it up from
+    // Retell right before tearing both down. Best-effort throughout -
+    // the caller wraps this in .catch(() => {}), matching how
+    // deleteKnowledgeBase is already used from the standalone KB-delete
+    // route.
+    async deleteAgentAndLlm(retellAgentId) {
+      let llmId = null;
+      try {
+        const existing = await retellRequest(`/get-agent/${encodeURIComponent(required(retellAgentId, "retellAgentId"))}`);
+        llmId = existing?.response_engine?.type === "retell-llm" ? existing.response_engine.llm_id : null;
+      } catch {
+        // Agent may already be gone or unreachable - still try the delete below.
+      }
+      await retellRequest(`/delete-agent/${encodeURIComponent(retellAgentId)}`, { method: "DELETE" });
+      if (llmId) {
+        await retellRequest(`/delete-retell-llm/${encodeURIComponent(llmId)}`, { method: "DELETE" });
+      }
+    },
+
+    async deletePhoneNumber(phoneNumber) {
+      await retellRequest(`/delete-phone-number/${encodeURIComponent(required(phoneNumber, "phoneNumber"))}`, {
+        method: "DELETE",
+      });
     },
 
     async startPhoneCall({
