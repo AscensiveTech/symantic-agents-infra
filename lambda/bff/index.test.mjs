@@ -714,6 +714,37 @@ test("GET contacts returns the workspace's stored contact overrides", async () =
   ]);
 });
 
+test("GET contacts/summary joins calls and contact overrides server-side", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [
+        { callerNumber: "+17035550123", callerName: "", startedAt: "2026-01-01T00:00:00.000Z" },
+        { callerNumber: "+17035550123", callerName: "Jordan Miles", startedAt: "2026-02-01T00:00:00.000Z" },
+        { callerNumber: "+17035550199", callerName: "Alicia Chen", startedAt: "2026-01-15T00:00:00.000Z" },
+        { callerNumber: undefined, callerName: "", startedAt: "2026-01-20T00:00:00.000Z" },
+      ];
+    },
+    async listContacts() {
+      return [
+        { phoneNumber: "+17035550199", hidden: true },
+        { phoneNumber: "+17035550111", name: "No Calls Yet", hidden: false },
+        { phoneNumber: "+17035550123", name: "J. Miles", hidden: false },
+      ];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), [
+    { phoneNumber: "+17035550123", name: "J. Miles", callCount: 2, latestCallISO: "2026-02-01T00:00:00.000Z" },
+    { phoneNumber: "+17035550111", name: "No Calls Yet", callCount: 0, latestCallISO: "" },
+  ]);
+});
+
 test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid number or missing name", async () => {
   let saved;
   const store = {

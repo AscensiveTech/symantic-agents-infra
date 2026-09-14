@@ -831,6 +831,48 @@ export function createHandler({
         })));
       }
 
+      // Same aggregation the Contacts page used to do client-side (fetch
+      // every call, group by phone, layer contact overrides on top) - moved
+      // server-side so the page doesn't have to pull the full call history
+      // just to render a contacts list. Keyed on E164 throughout, since both
+      // calls and contact overrides already store phone numbers that way.
+      if (path === "/workspaces/me/contacts/summary" && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        const [calls, contactRows] = await Promise.all([
+          store.listCalls(workspaceId),
+          store.listContacts(workspaceId),
+        ]);
+        const byPhone = new Map();
+        for (const call of calls) {
+          const phoneNumber = call.callerNumber;
+          if (!phoneNumber) continue;
+          const name = call.callerName?.trim() || undefined;
+          const startedAt = call.startedAt ?? "";
+          const existing = byPhone.get(phoneNumber);
+          if (!existing) {
+            byPhone.set(phoneNumber, { phoneNumber, name, callCount: 1, latestCallISO: startedAt });
+            continue;
+          }
+          existing.callCount += 1;
+          if (!existing.name && name) existing.name = name;
+          if (startedAt > existing.latestCallISO) existing.latestCallISO = startedAt;
+        }
+        for (const override of contactRows) {
+          if (override.hidden) {
+            byPhone.delete(override.phoneNumber);
+            continue;
+          }
+          const existing = byPhone.get(override.phoneNumber);
+          if (existing) {
+            if (override.name) existing.name = override.name;
+          } else if (override.name) {
+            byPhone.set(override.phoneNumber, { phoneNumber: override.phoneNumber, name: override.name, callCount: 0, latestCallISO: "" });
+          }
+        }
+        const rows = Array.from(byPhone.values()).sort((a, b) => b.latestCallISO.localeCompare(a.latestCallISO));
+        return json(200, rows);
+      }
+
       // Contacts is still primarily a client-side aggregation over call
       // history - this table only ever holds what a customer explicitly
       // set for a phone number (a rename, a manually-added contact with no

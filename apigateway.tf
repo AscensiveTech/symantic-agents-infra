@@ -49,6 +49,7 @@ locals {
     "POST /workspaces/me/blocked-numbers",
     "DELETE /workspaces/me/blocked-numbers/{phoneNumber}",
     "GET /workspaces/me/contacts",
+    "GET /workspaces/me/contacts/summary",
     "PATCH /workspaces/me/contacts/{phoneNumber}",
     "DELETE /workspaces/me/contacts/{phoneNumber}",
     "GET /workspaces/me/calls",
