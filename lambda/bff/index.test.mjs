@@ -619,6 +619,58 @@ test("PUT agent invalidates a successful test when launch configuration changes"
   assert.equal(saved.agent.status, "draft");
 });
 
+test("PUT agent keeps an already-active agent active and pushes the edit to Retell", async () => {
+  const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
+  const changed = {
+    ...existing,
+    configuration: {
+      ...existing.configuration,
+      guidance: "Updated answering restrictions.",
+      tested: false,
+    },
+  };
+  let savedAgent;
+  const retellCalls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async getProfile() { return receptionistProfile(); },
+    async putAgent(_workspaceId, _agentId, agent) {
+      savedAgent = agent;
+      return agent;
+    },
+    async updateAgentRuntime(_workspaceId, _agentId, updates) {
+      return { ...savedAgent, ...updates };
+    },
+  };
+  const providers = {
+    retell: {
+      async upsertAgent(input) {
+        retellCalls.push(input);
+        return { retellAgentId: "retell-agent-123" };
+      },
+    },
+    resolveVoiceId(requestedVoice) { return requestedVoice; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => providers,
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    changed,
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(savedAgent.status, "active");
+  assert.equal(retellCalls.length, 1);
+  assert.match(retellCalls[0].config.prompt, /Updated answering restrictions/);
+});
+
 test("GET calls lists workspace calls without exposing Retell identifiers", async () => {
   const calls = [{
     workspaceId: "user-123",

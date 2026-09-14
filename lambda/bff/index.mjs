@@ -1314,29 +1314,51 @@ export function createHandler({
           const existing = typeof store.getAgent === "function"
             ? await store.getAgent(workspaceId, agentId)
             : null;
+          const wasActive = existing?.status === "active";
           const invalidateTest = Boolean(
             existing &&
             !sameLaunchConfiguration(existing.configuration, agent.configuration),
           );
           const saved = {
             ...agent,
-            status: invalidateTest
-              ? "draft"
-              : existing?.status === "active"
-                ? "active"
-                : agent.status === "active"
-                  ? "draft"
-                  : agent.status,
+            // Editing an already-active agent keeps it active and pushes the
+            // change straight to Retell (below) instead of silently taking
+            // it offline - a customer who edits a live receptionist expects
+            // it to answer with the new config, not stop answering at all.
+            status: wasActive
+              ? "active"
+              : agent.status === "active"
+                ? "draft"
+                : agent.status,
           };
-          return json(
-            200,
-            await store.putAgent(
-              workspaceId,
-              agentId,
-              saved,
-              { invalidateTest },
-            ),
+          const updatedAgent = await store.putAgent(
+            workspaceId,
+            agentId,
+            saved,
+            { invalidateTest },
           );
+          if (wasActive) {
+            try {
+              const profile = await store.getProfile(workspaceId);
+              const providers = await getProviders();
+              await syncRetellAgent({
+                workspaceId,
+                agentId,
+                agent: updatedAgent,
+                profile,
+                store,
+                providers,
+                getKnowledgeSigner,
+                toolBaseUrl,
+              });
+            } catch (syncError) {
+              // The edit is already saved either way - a Retell hiccup here
+              // shouldn't block the save, just leaves the live agent one
+              // sync behind until the next successful save or activation.
+              console.error("Failed to resync an active agent to Retell after edit", syncError);
+            }
+          }
+          return json(200, updatedAgent);
         } catch (error) {
           if (isConditionalCheckFailed(error)) {
             return json(404, { message: "Agent not found" });
