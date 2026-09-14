@@ -764,7 +764,8 @@ export function createHandler({
           return json(402, { message: "Most asked questions is a premium feature - contact your account manager to turn it on." });
         }
         const body = readBody(event) ?? {};
-        const windowDays = [7, 30, 90].includes(body?.windowDays) ? body.windowDays : 30;
+        // Only a 30-day window now - the 7/30/90 picker was removed from the UI.
+        const windowDays = 30;
         const agentId = typeof body?.agentId === "string" && body.agentId ? body.agentId : undefined;
         const providers = await getProviders();
         try {
@@ -2101,7 +2102,8 @@ async function generateMostAskedQuestionsDigest({ store, providers, workspaceId,
     digestId,
     agentId: agentId ?? "all",
     windowDays,
-    questions: result.questions,
+    // Top 25 - whatever the model returned beyond that isn't shown.
+    questions: result.questions.slice(0, 25),
     model: result.model,
     inputTokens: result.usage.inputTokens,
     outputTokens: result.usage.outputTokens,
