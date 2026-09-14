@@ -4622,11 +4622,32 @@ async function listKnowledgeBasesWithAssignments(store, workspaceId) {
   }));
 }
 
+// Retell's own knowledge-base limits (docs.retellai.com/build/knowledge-base):
+// max 25 files, 50 text snippets, 500 URLs. The Hub is a workspace-wide
+// shared library rather than one entry per agent's own Retell KB, so these
+// are enforced per workspace here rather than truly per-agent - a
+// documented simplification, not a Retell requirement itself.
+const MAX_KNOWLEDGE_TEXT_ITEMS = 50;
+const MAX_KNOWLEDGE_URL_ITEMS = 500;
+// Retell has no stated length cap on a single text source - this just
+// stops one pathological paste, at plain-text density nowhere near
+// Retell's 50MB per-file cap either way.
+const MAX_KNOWLEDGE_TEXT_CHARS = 200_000;
+
 async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, workspaceId, body) {
   const name = typeof body?.name === "string" ? body.name.trim().slice(0, 120) : "";
   if (!name) throw new Error("A name is required");
-  const text = typeof body?.text === "string" ? body.text.trim() : "";
+  const text = typeof body?.text === "string" ? body.text.trim().slice(0, MAX_KNOWLEDGE_TEXT_CHARS) : "";
   const url = typeof body?.url === "string" ? body.url.trim() : "";
+  if (text || url) {
+    const existing = await store.listKnowledgeBases(workspaceId);
+    if (text && existing.filter((item) => item.kind === "text").length >= MAX_KNOWLEDGE_TEXT_ITEMS) {
+      throw new Error(`This workspace already has the maximum of ${MAX_KNOWLEDGE_TEXT_ITEMS} pasted-text items`);
+    }
+    if (url && existing.filter((item) => item.kind === "url").length >= MAX_KNOWLEDGE_URL_ITEMS) {
+      throw new Error(`This workspace already has the maximum of ${MAX_KNOWLEDGE_URL_ITEMS} website items`);
+    }
+  }
   const fileMetadata = Array.isArray(body?.files)
     ? body.files.filter((file) =>
       file &&
