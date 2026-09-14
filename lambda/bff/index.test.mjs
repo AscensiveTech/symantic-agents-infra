@@ -517,6 +517,52 @@ test("GET call detail uses the product call id and hides provider keys", async (
   assert.doesNotMatch(response.body, /calls\/call-123\.wav/);
 });
 
+test("PATCH call sets a manual caller name and reports it back", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall(workspaceId, callId) {
+      return { workspaceId, callId, outcome: "answered" };
+    },
+    async updateCallerName(workspaceId, callId, callerName) {
+      saved = { workspaceId, callId, callerName };
+      return { workspaceId, callId, callerName, callerNameSource: "manual", outcome: "answered" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/calls/call-123",
+    { callerName: "  Jordan Miles  " },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(saved, { workspaceId: "user-123", callId: "call-123", callerName: "Jordan Miles" });
+  const body = JSON.parse(response.body);
+  assert.equal(body.callerName, "Jordan Miles");
+  assert.equal(body.callerNameSource, "manual");
+});
+
+test("PATCH call rejects a blank name and a call that doesn't exist", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getCall() { return null; },
+    async updateCallerName() {
+      throw new Error("should not be called");
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const blank = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-123", { callerName: "   " }));
+  assert.equal(blank.statusCode, 400);
+
+  const missing = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-404", { callerName: "Jordan Miles" }));
+  assert.equal(missing.statusCode, 404);
+});
+
 test("GET call recording returns a presigned URL, or 404 when there is none", async () => {
   const store = {
     async ensureWorkspace() {},

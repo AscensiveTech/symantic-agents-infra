@@ -888,6 +888,18 @@ export function createHandler({
           : json(404, { message: "Call not found" });
       }
 
+      if (callId && method === "PATCH") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const body = readBody(event) ?? {};
+        const callerName = typeof body?.callerName === "string" ? body.callerName.trim().slice(0, 120) : "";
+        if (!callerName) return json(400, { message: "callerName is required" });
+        const existing = await store.getCall(workspaceId, callId);
+        if (!existing) return json(404, { message: "Call not found" });
+        const updated = await store.updateCallerName(workspaceId, callId, callerName);
+        return json(200, toPublicCall(updated));
+      }
+
       const agentAction = getAgentAction(event, path);
       if (agentAction?.action === "activate" && method === "POST") {
         const store = await getStore();
@@ -4339,14 +4351,16 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
   });
 
   const knowledgeBaseId = `kb-${randomUUID()}`;
+  const nowIso = new Date().toISOString();
   const record = {
     name,
     kind: url ? "url" : fileMetadata.length ? "file" : "text",
     sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
     retellKnowledgeBaseId: created.knowledgeBaseId,
     enableAutoRefresh,
-    ...(url ? { refreshIntervalDays, lastRefreshedAt: new Date().toISOString() } : {}),
-    createdAt: new Date().toISOString(),
+    ...(url ? { refreshIntervalDays, lastRefreshedAt: nowIso } : {}),
+    createdAt: nowIso,
+    updatedAt: nowIso,
   };
   await store.createKnowledgeBase(workspaceId, knowledgeBaseId, record);
   return { ...toPublicKnowledgeBase(record), knowledgeBaseId, assignedAgents: [] };
@@ -4861,6 +4875,21 @@ export function createDynamoStore(client, commands, tableNames) {
         ConsistentRead: true,
       }));
       return result.Item ? unmarshall(result.Item) : null;
+    },
+
+    // Lets a workspace admin manually label a caller who was never
+    // identified automatically (no name volunteered on the call, none
+    // extracted from the transcript) - source is "manual" so it never gets
+    // silently overwritten by a later automatic call to the same number.
+    async updateCallerName(workspaceId, callId, callerName) {
+      const result = await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "SET callerName = :callerName, callerNameSource = :source",
+        ExpressionAttributeValues: marshall({ ":callerName": callerName, ":source": "manual" }),
+        ReturnValues: "ALL_NEW",
+      }));
+      return unmarshall(result.Attributes);
     },
 
     // For a call that was rejected before Retell ever answered it (blocked
