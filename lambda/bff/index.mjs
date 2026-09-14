@@ -952,11 +952,18 @@ export function createHandler({
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         const body = readBody(event) ?? {};
-        const callerName = typeof body?.callerName === "string" ? body.callerName.trim().slice(0, 120) : "";
-        if (!callerName) return json(400, { message: "callerName is required" });
+        if (typeof body?.callerName !== "string") {
+          return json(400, { message: "callerName is required" });
+        }
+        const callerName = body.callerName.trim().slice(0, 120);
         const existing = await store.getCall(workspaceId, callId);
         if (!existing) return json(404, { message: "Call not found" });
-        const updated = await store.updateCallerName(workspaceId, callId, callerName);
+        // An empty string clears the manually-set name (e.g. the customer
+        // backspaced it out entirely) rather than being rejected - it goes
+        // back to "not available" until something names this caller again.
+        const updated = callerName
+          ? await store.updateCallerName(workspaceId, callId, callerName)
+          : await store.clearCallerName(workspaceId, callId);
         return json(200, toPublicCall(updated));
       }
 
@@ -4966,6 +4973,19 @@ export function createDynamoStore(client, commands, tableNames) {
         Key: marshall({ workspaceId, callId }),
         UpdateExpression: "SET callerName = :callerName, callerNameSource = :source",
         ExpressionAttributeValues: marshall({ ":callerName": callerName, ":source": "manual" }),
+        ReturnValues: "ALL_NEW",
+      }));
+      return unmarshall(result.Attributes);
+    },
+
+    // Backspacing a manually-set name out entirely clears it, rather than
+    // being rejected - back to "not available" until named again (by hand
+    // or automatically on a later call).
+    async clearCallerName(workspaceId, callId) {
+      const result = await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "REMOVE callerName, callerNameSource",
         ReturnValues: "ALL_NEW",
       }));
       return unmarshall(result.Attributes);

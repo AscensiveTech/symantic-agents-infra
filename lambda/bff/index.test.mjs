@@ -581,22 +581,52 @@ test("PATCH call sets a manual caller name and reports it back", async () => {
   assert.equal(body.callerNameSource, "manual");
 });
 
-test("PATCH call rejects a blank name and a call that doesn't exist", async () => {
+test("PATCH call rejects a missing callerName field and a call that doesn't exist", async () => {
   const store = {
     async ensureWorkspace() {},
     async getCall() { return null; },
     async updateCallerName() {
       throw new Error("should not be called");
     },
+    async clearCallerName() {
+      throw new Error("should not be called");
+    },
   };
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
 
-  const blank = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-123", { callerName: "   " }));
-  assert.equal(blank.statusCode, 400);
+  const missingField = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-123", {}));
+  assert.equal(missingField.statusCode, 400);
 
-  const missing = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-404", { callerName: "Jordan Miles" }));
-  assert.equal(missing.statusCode, 404);
+  const missingCall = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-404", { callerName: "Jordan Miles" }));
+  assert.equal(missingCall.statusCode, 404);
+});
+
+test("PATCH call with a blank/whitespace-only name clears it instead of rejecting", async () => {
+  let cleared = null;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall(workspaceId, callId) {
+      return { workspaceId, callId, callerName: "Jordan Miles", callerNameSource: "manual", outcome: "answered" };
+    },
+    async updateCallerName() {
+      throw new Error("should not be called for a blank name");
+    },
+    async clearCallerName(workspaceId, callId) {
+      cleared = { workspaceId, callId };
+      return { workspaceId, callId, outcome: "answered" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-123", { callerName: "   " }));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(cleared, { workspaceId: "user-123", callId: "call-123" });
+  const body = JSON.parse(response.body);
+  assert.equal(body.callerName, undefined);
+  assert.equal(body.callerNameSource, undefined);
 });
 
 test("GET call recording returns a presigned URL, or 404 when there is none", async () => {
