@@ -7,9 +7,9 @@
 // lib/domain/receptionist-plans.ts.
 
 export const RECEPTIONIST_PLANS = {
-  starter: { label: "Starter", priceMonthly: 349, minutes: 1000, overagePerMinute: 0.3 },
-  growth: { label: "Growth", priceMonthly: 649, minutes: 2000, overagePerMinute: 0.3 },
-  pro: { label: "Pro", priceMonthly: 1199, minutes: 4000, overagePerMinute: 0.3 },
+  starter: { label: "Starter", priceMonthly: 349, minutes: 1000, overagePerMinute: 0.5 },
+  growth: { label: "Growth", priceMonthly: 649, minutes: 2000, overagePerMinute: 0.5 },
+  pro: { label: "Pro", priceMonthly: 1199, minutes: 4000, overagePerMinute: 0.5 },
   enterprise: { label: "Enterprise", priceMonthly: null, minutes: null, overagePerMinute: null },
 };
 
