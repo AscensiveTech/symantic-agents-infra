@@ -846,6 +846,18 @@ export function createHandler({
       }
 
       const knowledgeBaseTarget = path.match(/^\/workspaces\/me\/knowledge-bases\/(.+)$/)?.[1];
+      if (knowledgeBaseTarget && method === "PATCH") {
+        await store.ensureWorkspace(workspaceId);
+        const knowledgeBaseId = decodeURIComponent(knowledgeBaseTarget);
+        const body = readBody(event) ?? {};
+        try {
+          return json(200, await updateKnowledgeBaseItem(store, await getProviders(), workspaceId, knowledgeBaseId, body));
+        } catch (error) {
+          if (error?.statusCode) return json(error.statusCode, { message: error.message });
+          return json(400, { message: error instanceof Error ? error.message : "Unable to update knowledge base item" });
+        }
+      }
+
       if (knowledgeBaseTarget && method === "DELETE") {
         await store.ensureWorkspace(workspaceId);
         const knowledgeBaseId = decodeURIComponent(knowledgeBaseTarget);
@@ -5214,12 +5226,91 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
     sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
     retellKnowledgeBaseId: created.knowledgeBaseId,
     enableAutoRefresh,
+    // Only pasted-text items keep their raw content server-side - it's what
+    // lets the Hub's edit flow pre-fill the text box. File/url items have no
+    // edit flow (delete and re-add covers them).
+    ...(text && !url && fileMetadata.length === 0 ? { sourceText: text } : {}),
     ...(url ? { refreshIntervalDays, lastRefreshedAt: nowIso } : {}),
     createdAt: nowIso,
     updatedAt: nowIso,
   };
   await store.createKnowledgeBase(workspaceId, knowledgeBaseId, record);
   return { ...toPublicKnowledgeBase(record), knowledgeBaseId, assignedAgents: [] };
+}
+
+// Editing a pasted-text item: Retell has no "replace this knowledge base's
+// content in place" call (confirmed against providers.mjs and Retell's own
+// API - create/delete are the only content-level operations), so this
+// deletes the old Retell knowledge base and creates a new one, then pushes
+// the new id to every agent currently assigned this item - live, without
+// requiring a trip through each agent's own Edit Configuration/wizard save.
+// Best-effort per agent: one agent failing to pick up the change never
+// blocks the item's own update or any other agent's push.
+async function updateKnowledgeBaseItem(store, providers, workspaceId, knowledgeBaseId, body) {
+  const existing = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
+  if (!existing) {
+    const error = new Error("Knowledge base item not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (existing.kind !== "text") {
+    const error = new Error("Only pasted-text items can be edited - delete and re-add a file or website instead");
+    error.statusCode = 400;
+    throw error;
+  }
+  const name = typeof body?.name === "string" ? body.name.trim().slice(0, 120) : "";
+  const text = typeof body?.text === "string" ? body.text.trim().slice(0, MAX_KNOWLEDGE_TEXT_CHARS) : "";
+  if (!name) throw new Error("A name is required");
+  if (!text) throw new Error("Paste some text first");
+
+  const created = await providers.retell.createKnowledgeBase({
+    name: `Symantic ${randomUUID().slice(0, 8)} · ${name}`.slice(0, 39),
+    texts: [{ title: name, text }],
+    files: [],
+    urls: [],
+    enableAutoRefresh: false,
+  });
+  if (existing.retellKnowledgeBaseId) {
+    await providers.retell.deleteKnowledgeBase(existing.retellKnowledgeBaseId).catch(() => {});
+  }
+
+  const updatedAt = new Date().toISOString();
+  await store.updateKnowledgeBase(workspaceId, knowledgeBaseId, {
+    name,
+    sourceText: text,
+    sourceLabel: "Pasted text",
+    retellKnowledgeBaseId: created.knowledgeBaseId,
+    updatedAt,
+  });
+  const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
+
+  const agents = await store.listAgents(workspaceId);
+  const assignedTo = agents.filter((agent) =>
+    Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
+    agent.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
+
+  const pushedTo = [];
+  const failedFor = [];
+  await Promise.all(assignedTo.map(async (agent) => {
+    try {
+      const llmId = await providers.retell.getAgentLlmId(agent.retellAgentId);
+      if (!llmId) throw new Error("Agent has no live Retell agent yet");
+      const knowledgeBaseIds = (await Promise.all(
+        (agent.configuration.knowledgeBaseIds ?? []).map((id) => store.getKnowledgeBase(workspaceId, id)),
+      )).filter((item) => item?.retellKnowledgeBaseId).map((item) => item.retellKnowledgeBaseId);
+      await providers.retell.updateLlmKnowledgeBaseIds(llmId, knowledgeBaseIds);
+      pushedTo.push({ id: agent.id, name: agent.name });
+    } catch (error) {
+      console.error("Unable to push knowledge base edit to agent", { agentId: agent.id, error });
+      failedFor.push({ id: agent.id, name: agent.name });
+    }
+  }));
+
+  return {
+    item: { ...toPublicKnowledgeBase(record), assignedAgents: assignedTo.map((agent) => ({ id: agent.id, name: agent.name })) },
+    pushedTo,
+    failedFor,
+  };
 }
 
 function launchReadinessIssue(agent, profile, calendar) {

@@ -242,6 +242,18 @@ export function createRetellClient({
     });
   }
 
+  // A narrow companion to updateLlm - only touches knowledge_base_ids,
+  // instead of resending the full prompt/greeting/tools every time. Used
+  // when a Knowledge Base Hub edit needs to push a new content id to every
+  // agent that references it, without paying for (or risking clobbering)
+  // that agent's full config in the same request.
+  async function updateLlmKnowledgeBaseIds(llmId, knowledgeBaseIds) {
+    await retellRequest(`/update-retell-llm/${encodeURIComponent(llmId)}`, {
+      method: "PATCH",
+      body: { knowledge_base_ids: knowledgeBaseIds ?? [] },
+    });
+  }
+
   function agentBody({
     llmId,
     symanticAgentId,
@@ -303,6 +315,26 @@ export function createRetellClient({
       await retellRequest(`/delete-knowledge-base/${encodeURIComponent(required(knowledgeBaseId, "knowledgeBaseId"))}`, {
         method: "DELETE",
       });
+    },
+
+    updateLlmKnowledgeBaseIds,
+
+    // Just the llm_id off an existing Retell agent - the one piece
+    // updateLlmKnowledgeBaseIds needs, without the heavier lookups
+    // upsertAgent does (symantic-id fallback search, agent body rebuild).
+    // Null if the agent doesn't exist in Retell yet (never activated, or
+    // was deleted there) - callers treat that as "nothing to push to".
+    async getAgentLlmId(retellAgentId) {
+      if (!retellAgentId) return null;
+      try {
+        const existing = await retellRequest(`/get-agent/${encodeURIComponent(retellAgentId)}`);
+        return existing?.response_engine?.type === "retell-llm"
+          ? existing.response_engine.llm_id ?? null
+          : null;
+      } catch (error) {
+        if (error?.providerStatus === 404) return null;
+        throw error;
+      }
     },
 
     async upsertAgent({

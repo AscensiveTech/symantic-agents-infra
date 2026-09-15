@@ -3655,6 +3655,132 @@ test("company profile APIs read and update the signed-in workspace name", async 
   assert.equal(workspace.tier, "basic");
 });
 
+function knowledgeBaseTestStore(overrides = {}) {
+  const knowledgeBases = new Map(overrides.knowledgeBases ?? []);
+  const agents = overrides.agents ?? [];
+  return {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-technovate", role: "company-admin", status: "active" };
+    },
+    async ensureWorkspace() {},
+    async getKnowledgeBase(workspaceId, knowledgeBaseId) {
+      return knowledgeBases.get(knowledgeBaseId) ?? null;
+    },
+    async updateKnowledgeBase(workspaceId, knowledgeBaseId, patch) {
+      const current = knowledgeBases.get(knowledgeBaseId);
+      knowledgeBases.set(knowledgeBaseId, { ...current, ...patch });
+    },
+    async listAgents() { return agents; },
+    knowledgeBases,
+  };
+}
+
+test("PATCH knowledge-bases/{id} rejects an unknown item", async () => {
+  const store = knowledgeBaseTestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({ retell: {} }),
+  });
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-missing", { name: "New name", text: "New text" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  assert.equal(response.statusCode, 404);
+});
+
+test("PATCH knowledge-bases/{id} refuses to edit a file or url item - only pasted text is editable", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "url", name: "Site", retellKnowledgeBaseId: "retell-kb-1" }]],
+  });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({ retell: {} }),
+  });
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "New name", text: "New text" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  assert.equal(response.statusCode, 400);
+});
+
+test("PATCH knowledge-bases/{id} re-uploads the text to Retell under a new id and pushes it live to every assigned agent", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [
+      ["kb-1", { knowledgeBaseId: "kb-1", kind: "text", name: "Old Name", sourceText: "old text", retellKnowledgeBaseId: "retell-kb-old" }],
+      ["kb-2", { knowledgeBaseId: "kb-2", kind: "text", name: "Other", sourceText: "other", retellKnowledgeBaseId: "retell-kb-2" }],
+    ],
+    agents: [
+      { id: "agent-1", name: "Maya", retellAgentId: "retell-agent-1", configuration: { knowledgeBaseIds: ["kb-1", "kb-2"] } },
+      { id: "agent-2", name: "Not Assigned", retellAgentId: "retell-agent-2", configuration: { knowledgeBaseIds: ["kb-2"] } },
+    ],
+  });
+  const deleted = [];
+  const pushedIds = [];
+  const providers = {
+    retell: {
+      async createKnowledgeBase({ texts }) {
+        assert.equal(texts[0].text, "new text");
+        return { knowledgeBaseId: "retell-kb-new" };
+      },
+      async deleteKnowledgeBase(id) { deleted.push(id); },
+      async getAgentLlmId(retellAgentId) {
+        return retellAgentId === "retell-agent-1" ? "llm-1" : null;
+      },
+      async updateLlmKnowledgeBaseIds(llmId, ids) {
+        pushedIds.push([llmId, ids]);
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "New Name", text: "new text" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.item.name, "New Name");
+  assert.equal(body.item.sourceText, "new text");
+  assert.equal(body.item.retellKnowledgeBaseId, "retell-kb-new");
+  assert.deepEqual(deleted, ["retell-kb-old"]);
+  // Only agent-1 (assigned to kb-1) gets pushed - agent-2 only has kb-2.
+  assert.deepEqual(body.pushedTo, [{ id: "agent-1", name: "Maya" }]);
+  assert.deepEqual(body.failedFor, []);
+  assert.equal(pushedIds.length, 1);
+  assert.equal(pushedIds[0][0], "llm-1");
+  assert.deepEqual(new Set(pushedIds[0][1]), new Set(["retell-kb-new", "retell-kb-2"]));
+});
+
+test("PATCH knowledge-bases/{id} reports per-agent push failures without blocking the item update", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "text", name: "Old", sourceText: "old", retellKnowledgeBaseId: "retell-kb-old" }]],
+    agents: [
+      { id: "agent-1", name: "Maya", retellAgentId: null, configuration: { knowledgeBaseIds: ["kb-1"] } },
+    ],
+  });
+  const providers = {
+    retell: {
+      async createKnowledgeBase() { return { knowledgeBaseId: "retell-kb-new" }; },
+      async deleteKnowledgeBase() {},
+      async getAgentLlmId() { return null; },
+      async updateLlmKnowledgeBaseIds() { throw new Error("should not be called without an llmId"); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "Old", text: "new text" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.item.sourceText, "new text");
+  assert.deepEqual(body.pushedTo, []);
+  assert.deepEqual(body.failedFor, [{ id: "agent-1", name: "Maya" }]);
+});
+
 test("company email is required once set, and a PATCH can never clear it", async () => {
   let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design", tier: "basic" };
   const store = {

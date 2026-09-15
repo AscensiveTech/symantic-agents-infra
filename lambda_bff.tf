@@ -75,7 +75,7 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid      = "ManageKnowledgeBases"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.control_plane["knowledge_bases"].arn
       },
       {
