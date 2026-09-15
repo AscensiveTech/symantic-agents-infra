@@ -939,8 +939,8 @@ export function createHandler({
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         const agents = typeof store.listAgents === "function" ? await store.listAgents(workspaceId) : [];
-        const agentId = agents[0]?.id;
-        const records = demoCallRecords(agentId);
+        const agentIds = agents.map((agent) => agent.id).filter(Boolean);
+        const records = demoCallRecords(agentIds);
         const created = await store.seedDemoCalls(workspaceId, records);
         await store.seedDemoContacts(workspaceId, demoContactOverrides(records));
         return json(200, { count: created });
@@ -4832,11 +4832,17 @@ const DEMO_END_REASONS = {
 // says it's nowhere near its plan limit.
 const DEMO_MINUTE_BUDGET = 750;
 
-function demoCallRecords(agentId) {
+function demoCallRecords(agentIds) {
+  const ids = Array.isArray(agentIds) ? agentIds.filter(Boolean) : [agentIds].filter(Boolean);
   const now = Date.now();
   const dayMs = 86_400_000;
   const records = [];
   for (let i = 0; i < 120; i += 1) {
+    // Round-robin across every live agent on the account instead of always
+    // agentIds[0] - otherwise a second (or third) receptionist's own
+    // Analytics/Call History pages stay empty after seeding even though the
+    // account genuinely has demo data, just none tagged to that agent.
+    const agentId = ids[i % ids.length];
     // Every 7th call goes to one of a handful of repeat callers instead of
     // a fresh one-off number, spread over ~2 months so Contacts has a real
     // multi-call history to show, not just a wall of single calls.

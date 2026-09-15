@@ -962,6 +962,30 @@ test("POST calls/seed-demo is super-admin only and writes ~120 tagged demo calls
   assert.deepEqual(JSON.parse(response.body), { count: 120 });
 });
 
+test("POST calls/seed-demo spreads demo calls across every agent on the account, not just the first", async () => {
+  const { createHandler } = await loadBff();
+
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "super-admin", status: "active" }; },
+    async listAgents() { return [{ id: "agent-1", name: "Maya" }, { id: "agent-2", name: "Summer Sunrise" }]; },
+    async seedDemoCalls(workspaceId, records) {
+      const agentIds = new Set(records.map((record) => record.agentId));
+      assert.deepEqual(agentIds, new Set(["agent-1", "agent-2"]));
+      assert.ok(records.filter((record) => record.agentId === "agent-1").length > 0);
+      assert.ok(records.filter((record) => record.agentId === "agent-2").length > 0);
+      return records.length;
+    },
+    async seedDemoContacts() { return 0; },
+  };
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("POST", "/workspaces/me/calls/seed-demo");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+});
+
 test("DELETE calls/seed-demo is super-admin only and removes tagged demo calls", async () => {
   const { createHandler } = await loadBff();
 
