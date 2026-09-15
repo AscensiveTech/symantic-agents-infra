@@ -110,17 +110,3 @@ resource "aws_route53_record" "ses_mail_from_spf" {
   ttl     = 1800
   records = ["v=spf1 include:amazonses.com ~all"]
 }
-
-# Pre-existing DMARC policy for the sending domain - not something SES
-# itself needs, but it protects deliverability/reputation for mail sent
-# from this domain (including the notification emails above) by telling
-# receiving mail servers what to do with messages that fail SPF/DKIM.
-# Imported into state (not newly created) so a future `terraform apply`
-# never proposes deleting it just because it was missing from this file.
-resource "aws_route53_record" "dmarc" {
-  zone_id = data.aws_route53_zone.email_sender.zone_id
-  name    = "_dmarc.${local.email_sender_domain}"
-  type    = "TXT"
-  ttl     = 3600
-  records = ["v=DMARC1; p=none"]
-}
