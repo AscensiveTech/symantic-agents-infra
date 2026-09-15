@@ -117,12 +117,12 @@ resource "aws_lambda_function" "digest" {
 }
 
 resource "aws_cloudwatch_event_rule" "call_digest" {
-  name                = "${local.name_prefix}-call-digest-hourly"
-  description         = "Evaluates every workspace's call-summary schedule at the top of each hour."
-  schedule_expression = "cron(0 * * * ? *)"
+  name        = "${local.name_prefix}-call-digest-5min"
+  description = "Evaluates every workspace's notification schedule every 5 minutes - isDigestDue() in schedule.mjs decides whether a given workspace is actually due on any given tick, so this just needs to be at least as frequent as the shortest selectable interval."
+  schedule_expression = "rate(5 minutes)"
 
   tags = {
-    Name = "${local.name_prefix}-call-digest-hourly"
+    Name = "${local.name_prefix}-call-digest-5min"
   }
 }
 

@@ -4640,7 +4640,7 @@ test("invalid call summary settings are rejected with a specific reason", async 
     [{ weekday: 7 }, /day of the week/],
     [{ timezone: "Mars/Olympus" }, /timezone/],
     [{ extraRecipients: ["not-an-email"] }, /not a valid email/],
-    [{ extraRecipients: Array.from({ length: 11 }, (_, index) => `p${index}@example.com`) }, /at most 10/],
+    [{ extraRecipients: Array.from({ length: 5 }, (_, index) => `p${index}@example.com`) }, /at most 4/],
     [{ enabled: "yes" }, /enabled/],
   ];
   for (const [override, message] of cases) {
@@ -4703,6 +4703,83 @@ test("a failed test summary surfaces the reason instead of a blank error", async
 
   assert.equal(response.statusCode, 502);
   assert.match(JSON.parse(response.body).message, /verified addresses/);
+});
+
+// --- Notification history ------------------------------------------------------
+
+function notificationsStore({ notifications = [] } = {}) {
+  let saved = null;
+  return {
+    get saved() { return saved; },
+    async ensureWorkspace() {},
+    async getWorkspace() {
+      return { workspaceId: "user-123", name: "Arc Dental", notifications };
+    },
+    async saveNotifications(workspaceId, next) {
+      saved = { workspaceId, notifications: next };
+    },
+  };
+}
+
+test("GET notifications returns the stored history, newest first", async () => {
+  const notifications = [
+    { id: "n2", sentAt: "2026-09-15T08:00:00.000Z", recipients: ["dana@arcdental.com"], content: "Arc Dental: 2 new calls", read: false },
+    { id: "n1", sentAt: "2026-09-15T07:00:00.000Z", recipients: ["dana@arcdental.com"], content: "Arc Dental: 1 new call", read: true },
+  ];
+  const store = notificationsStore({ notifications });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/notifications"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), notifications);
+});
+
+test("PATCH notifications/{id} marks just that entry read", async () => {
+  const notifications = [
+    { id: "n2", sentAt: "2026-09-15T08:00:00.000Z", recipients: [], content: "Arc Dental: 2 new calls", read: false },
+    { id: "n1", sentAt: "2026-09-15T07:00:00.000Z", recipients: [], content: "Arc Dental: 1 new call", read: false },
+  ];
+  const store = notificationsStore({ notifications });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("PATCH", "/workspaces/me/notifications/n1"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(
+    store.saved.notifications.map((entry) => [entry.id, entry.read]),
+    [["n2", false], ["n1", true]],
+  );
+});
+
+test("DELETE notifications clears the whole history", async () => {
+  const store = notificationsStore({ notifications: [{ id: "n1", sentAt: "x", recipients: [], content: "x", read: false }] });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("DELETE", "/workspaces/me/notifications"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(store.saved.notifications, []);
+});
+
+test("notifications are an admin-only resource", async () => {
+  const store = {
+    ...notificationsStore(),
+    async getMembership() {
+      return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/notifications");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
 });
 
 function authenticatedEvent(method, path, body, queryStringParameters) {

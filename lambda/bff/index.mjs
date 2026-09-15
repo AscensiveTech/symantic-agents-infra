@@ -445,8 +445,18 @@ function isWorkspaceAdmin(actor) {
 // Call-summary emails. The schedule itself runs in the call-digest Lambda;
 // the BFF only stores the settings and brokers a "send me a test" request.
 // Keep the defaults and bounds in step with lambda/digest/schedule.mjs.
-const CALL_DIGEST_FREQUENCIES = new Set(["hourly", "every_6_hours", "daily", "weekly"]);
-const CALL_DIGEST_MAX_EXTRA_RECIPIENTS = 10;
+const CALL_DIGEST_FREQUENCIES = new Set([
+  "every_5_minutes",
+  "every_10_minutes",
+  "every_30_minutes",
+  "hourly",
+  "every_6_hours",
+  "daily",
+  "weekly",
+]);
+// Up to 5 people total receive notifications - the configuring admin's own
+// account email counts as one of the 5, so at most 4 more can be added.
+const CALL_DIGEST_MAX_EXTRA_RECIPIENTS = 4;
 const CALL_DIGEST_DEFAULTS = Object.freeze({
   enabled: false,
   frequency: "daily",
@@ -1099,6 +1109,36 @@ export function createHandler({
             });
           }
           return json(200, result);
+        }
+
+        return json(405, { message: "Method not allowed" });
+      }
+
+      if (path === "/workspaces/me/notifications" || path.startsWith("/workspaces/me/notifications/")) {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can manage notifications" });
+        }
+        await store.ensureWorkspace(workspaceId);
+
+        if (path === "/workspaces/me/notifications" && method === "GET") {
+          const workspace = await store.getWorkspace(workspaceId);
+          return json(200, (workspace?.notifications ?? []).slice(0, 100));
+        }
+
+        if (path === "/workspaces/me/notifications" && method === "DELETE") {
+          await store.saveNotifications(workspaceId, []);
+          return json(200, { cleared: true });
+        }
+
+        const notificationMatch = path.match(/^\/workspaces\/me\/notifications\/([^/]+)$/);
+        if (notificationMatch && method === "PATCH") {
+          const notificationId = decodeURIComponent(notificationMatch[1]);
+          const workspace = await store.getWorkspace(workspaceId);
+          const notifications = (workspace?.notifications ?? []).map((entry) => (
+            entry.id === notificationId ? { ...entry, read: true } : entry
+          ));
+          await store.saveNotifications(workspaceId, notifications);
+          return json(200, { id: notificationId, read: true });
         }
 
         return json(405, { message: "Method not allowed" });
@@ -5715,6 +5755,15 @@ export function createDynamoStore(client, commands, tableNames) {
         Key: marshall({ workspaceId }),
         UpdateExpression: update,
         ExpressionAttributeValues: marshall(values),
+      }));
+    },
+
+    async saveNotifications(workspaceId, notifications) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: "SET notifications = :list",
+        ExpressionAttributeValues: marshall({ ":list": notifications }),
       }));
     },
 

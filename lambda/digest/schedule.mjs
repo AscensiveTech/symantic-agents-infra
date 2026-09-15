@@ -1,4 +1,12 @@
-export const DIGEST_FREQUENCIES = ["hourly", "every_6_hours", "daily", "weekly"];
+export const DIGEST_FREQUENCIES = [
+  "every_5_minutes",
+  "every_10_minutes",
+  "every_30_minutes",
+  "hourly",
+  "every_6_hours",
+  "daily",
+  "weekly",
+];
 
 export const DEFAULT_DIGEST_SETTINGS = Object.freeze({
   enabled: false,
@@ -11,10 +19,14 @@ export const DEFAULT_DIGEST_SETTINGS = Object.freeze({
 });
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
-// The schedule ticks hourly. A few minutes of slack absorbs EventBridge jitter,
-// so an hourly summary never skips a tick because it fired seconds early.
+// The schedule ticks every 5 minutes. A few minutes of slack absorbs
+// EventBridge jitter, so an hourly summary never skips a tick because it
+// fired seconds early. The short intervals get a much smaller slack so they
+// stay meaningfully faster than the next interval up.
 const SLACK_MS = 5 * 60_000;
+const SHORT_SLACK_MS = 15_000;
 
 export function isValidTimezone(value) {
   if (typeof value !== "string" || !value) return false;
@@ -70,6 +82,12 @@ export function isDigestDue(settings, cursorIso, now) {
   if (!Number.isFinite(cursor)) return false;
   const elapsed = now.getTime() - cursor;
   switch (settings.frequency) {
+    case "every_5_minutes":
+      return elapsed >= 5 * MINUTE_MS - SHORT_SLACK_MS;
+    case "every_10_minutes":
+      return elapsed >= 10 * MINUTE_MS - SHORT_SLACK_MS;
+    case "every_30_minutes":
+      return elapsed >= 30 * MINUTE_MS - SHORT_SLACK_MS;
     case "hourly":
       return elapsed >= HOUR_MS - SLACK_MS;
     case "every_6_hours":

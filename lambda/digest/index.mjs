@@ -30,16 +30,13 @@ export function createDigestHandler({
 } = {}) {
   const links = appLinks(appUrl);
 
-  async function composeFor(store, workspace, settings, calls, windowStart, windowEnd, isTest) {
-    const agents = await store.listAgents(workspace.workspaceId);
+  function composeFor(workspace, settings, calls, windowStart, windowEnd, isTest) {
     return renderDigest({
       workspaceName: workspace.name,
       calls,
-      agentNames: new Map(agents.map((agent) => [agent.agentId, agent.name])),
       timezone: settings.timezone,
       windowStart,
       windowEnd,
-      includeTranscripts: settings.includeTranscripts,
       isTest,
       ...links,
     });
@@ -77,7 +74,7 @@ export function createDigestHandler({
       return "no_recipients";
     }
 
-    const message = await composeFor(store, workspace, settings, calls, cursor, windowEnd, false);
+    const message = composeFor(workspace, settings, calls, cursor, windowEnd, false);
     const send = await getSender();
     const failures = [];
     for (const to of recipients) {
@@ -116,6 +113,14 @@ export function createDigestHandler({
         }
         : {}),
     });
+    const sentTo = recipients.filter((to) => !failures.some((failure) => failure.to === to));
+    await store.appendNotification(workspace.workspaceId, {
+      id: `${workspace.workspaceId}-${windowEnd}`,
+      sentAt: windowEnd,
+      recipients: sentTo,
+      content: message.subject,
+      read: false,
+    }, workspace.notifications ?? []);
     return "sent";
   }
 
@@ -134,8 +139,7 @@ export function createDigestHandler({
       windowStart.toISOString(),
       windowEnd.toISOString(),
     );
-    const message = await composeFor(
-      store,
+    const message = composeFor(
       workspace,
       settings,
       calls,
@@ -258,7 +262,7 @@ export function createDynamoDigestStore(client, commands, tableNames) {
       return queryAll(client, (startKey) => new commands.ScanCommand({
         TableName: tableNames.workspaces,
         FilterExpression: "#digest.#enabled = :true",
-        ProjectionExpression: "workspaceId, #name, #digest, callDigestCursor",
+        ProjectionExpression: "workspaceId, #name, #digest, callDigestCursor, notifications",
         ExpressionAttributeNames: { "#digest": "callDigest", "#enabled": "enabled", "#name": "name" },
         ExpressionAttributeValues: marshall({ ":true": true }),
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
@@ -355,6 +359,20 @@ export function createDynamoDigestStore(client, commands, tableNames) {
         UpdateExpression: "SET callDigestLastRun = :run",
         ExpressionAttributeValues: marshall({ ":run": run }),
       });
+    },
+
+    // The last 100 sent notifications, newest first - kept as a single list
+    // on the workspace item so the settings page can show a history without
+    // a dedicated table. `current` is passed in by the caller (already held
+    // from the same scan that drove this run) to avoid an extra read.
+    appendNotification(workspaceId, entry, current) {
+      const notifications = [entry, ...(Array.isArray(current) ? current : [])].slice(0, 100);
+      return client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: "SET notifications = :list",
+        ExpressionAttributeValues: marshall({ ":list": notifications }),
+      }));
     },
   };
 }

@@ -89,6 +89,11 @@ function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], cl
       state.get(workspaceId).callDigestLastRun = run;
       return true;
     },
+    async appendNotification(workspaceId, entry, current) {
+      log.push(["appendNotification", workspaceId, entry]);
+      state.get(workspaceId).notifications = [entry, ...(current ?? [])].slice(0, 100);
+      return true;
+    },
   };
 }
 
@@ -181,12 +186,11 @@ test("a due summary goes to every admin plus extra addresses, once each", async 
   );
   const [message] = sender.sent;
   assert.equal(message.subject, "Arc Dental: 1 new call");
-  assert.match(message.html, /Booked a cleaning for Thursday at 2 PM\./);
-  assert.match(message.html, /Maya/);
-  // Transcript text is caller-controlled: it must be escaped, never rendered.
-  assert.match(message.html, /&lt;b&gt;Thursday&lt;\/b&gt;/);
-  assert.doesNotMatch(message.html, /<b>Thursday<\/b>/);
-  assert.match(message.text, /Caller: I'd like a cleaning <b>Thursday<\/b>\./);
+  // The nudge is intentionally content-free: no caller name, summary, or
+  // transcript text ever appears in the email body.
+  assert.match(message.html, /1 new call since your last check/);
+  assert.doesNotMatch(message.html, /Booked a cleaning/);
+  assert.doesNotMatch(message.html, /Jordan Miles/);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
   assert.deepEqual(store.state.get("ws-1").callDigestLastRun, {
     at: NOW.toISOString(),
@@ -194,21 +198,11 @@ test("a due summary goes to every admin plus extra addresses, once each", async 
     callCount: 1,
     recipientCount: 3,
   });
-});
-
-test("transcripts are left out when the admin turns them off", async () => {
-  const store = memoryStore({
-    workspaces: [workspace({ callDigest: settings({ includeTranscripts: false }) })],
-    calls: [call()],
-    admins: ["dana@arcdental.com"],
-  });
-  const sender = recordingSender();
-
-  await handlerFor(store, sender)({});
-
-  assert.match(sender.sent[0].html, /Booked a cleaning/);
-  assert.doesNotMatch(sender.sent[0].html, /Thanks for calling Arc Dental/);
-  assert.doesNotMatch(sender.sent[0].text, /Transcript:/);
+  // A history entry is recorded alongside the send.
+  const [notification] = store.state.get("ws-1").notifications;
+  assert.equal(notification.content, "Arc Dental: 1 new call");
+  assert.deepEqual(notification.recipients.sort(), ["dana@arcdental.com", "frontdesk@arcdental.com", "sam@arcdental.com"]);
+  assert.equal(notification.read, false);
 });
 
 test("an interval with no calls sends nothing but still moves the window on", async () => {
@@ -218,6 +212,7 @@ test("an interval with no calls sends nothing but still moves the window on", as
   const results = await handlerFor(store, sender)({});
 
   assert.deepEqual(results, { no_calls: 1 });
+  assert.equal(store.state.get("ws-1").notifications, undefined);
   assert.equal(sender.sent.length, 0);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
 });
@@ -235,8 +230,10 @@ test("only calls analyzed inside the window are included", async () => {
 
   await handlerFor(store, sender)({});
 
-  assert.match(sender.sent[0].html, /Inside the window\./);
-  assert.doesNotMatch(sender.sent[0].html, /Before the window\./);
+  // Only the count is content-derived; both calls' summary text is absent
+  // from the email either way, but the count must reflect just the one call
+  // inside the window.
+  assert.match(sender.sent[0].html, /1 new call since your last check/);
 });
 
 test("a summary that is not yet due does nothing", async () => {
@@ -347,7 +344,7 @@ test("a test send goes only to the requester and leaves the schedule alone", asy
 
   assert.deepEqual(result, { sent: true, to: "dana@arcdental.com", callCount: 1 });
   assert.equal(sender.sent.length, 1);
-  assert.equal(sender.sent[0].subject, "Test: Arc Dental call summary");
+  assert.equal(sender.sent[0].subject, "Test: Arc Dental notification");
   assert.equal(store.state.get("ws-1").callDigestCursor, cursor);
 });
 
