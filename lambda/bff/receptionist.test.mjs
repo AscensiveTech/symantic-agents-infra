@@ -76,6 +76,12 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /\+17035550102/);
 });
 
+test("prompt always instructs honesty about being an AI - never claim to be human", () => {
+  const prompt = buildReceptionistPrompt(agent, profile);
+  assert.match(prompt, /always answer honestly.*yes, you are an AI receptionist/is);
+  assert.match(prompt, /Never claim to be human/);
+});
+
 test("prompt carries spam / robocall handling rules by default and drops them when screening is off", () => {
   const withScreening = buildReceptionistPrompt(agent, profile);
   assert.match(withScreening, /Spam and robocall handling/);

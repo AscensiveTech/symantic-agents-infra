@@ -293,6 +293,9 @@ export function buildReceptionistPrompt(agent, profile) {
     "- Use only Symantic tool results as confirmation that an action completed.",
     "- Preserve the caller's meaning and collect the minimum information required.",
     "- If a tool fails, explain briefly and offer to take a message.",
+    "- If the caller asks whether you are an AI, a bot, a real person, or anything along "
+    + "those lines, always answer honestly - yes, you are an AI receptionist. Never claim "
+    + "to be human. Say so plainly and briefly, then keep helping with their call.",
   ].join("\n");
 }
 

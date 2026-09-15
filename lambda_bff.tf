@@ -97,6 +97,12 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["blocked_numbers"].arn
       },
       {
+        Sid      = "ManageContacts"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
+        Resource = aws_dynamodb_table.control_plane["contacts"].arn
+      },
+      {
         Sid    = "ManagePhoneNumbers"
         Effect = "Allow"
         Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
@@ -272,6 +278,7 @@ resource "aws_lambda_function" "bff" {
       LEGAL_ACCEPTANCES_TABLE     = aws_dynamodb_table.legal_acceptances.name
       KNOWLEDGE_BASES_TABLE       = aws_dynamodb_table.control_plane["knowledge_bases"].name
       MOST_ASKED_DIGESTS_TABLE    = aws_dynamodb_table.control_plane["most_asked_digests"].name
+      CONTACTS_TABLE              = aws_dynamodb_table.control_plane["contacts"].name
       COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
       CALL_ARTIFACTS_BUCKET       = aws_s3_bucket.call_artifacts.bucket

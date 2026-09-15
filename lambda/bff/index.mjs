@@ -60,7 +60,10 @@ const PROFILE_FIELDS = {
   communicationStyle: "string",
 };
 
-const AGENT_STATUSES = new Set(["active", "draft", "preview", "planned"]);
+const AGENT_STATUSES = new Set(["active", "draft", "preview", "planned", "disabled", "deleted"]);
+// "deleted" is only ever set by the DELETE-agent teardown itself, never by
+// a client PUT - a deleted agent is done, not editable back into existence.
+const CLIENT_SETTABLE_AGENT_STATUSES = new Set(["active", "draft", "preview", "planned", "disabled"]);
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -245,7 +248,7 @@ function pickAgent(value, routeAgentId) {
     typeof value.name !== "string" ||
     typeof value.role !== "string" ||
     typeof value.description !== "string" ||
-    !AGENT_STATUSES.has(value.status) ||
+    !CLIENT_SETTABLE_AGENT_STATUSES.has(value.status) ||
     !Array.isArray(value.capabilities) ||
     !value.capabilities.every((item) => typeof item === "string") ||
     (value.configuration !== undefined && (
@@ -314,7 +317,7 @@ function getAgentId(event, path) {
 
 function getAgentAction(event, path) {
   const match = path.match(
-    /^\/workspaces\/me\/agents\/([^/]+)\/(activate|start-test-call)$/,
+    /^\/workspaces\/me\/agents\/([^/]+)\/(activate|start-test-call|disable|enable|attach-phone-number)$/,
   );
   if (!match) return null;
   try {
@@ -423,6 +426,16 @@ async function resolveActor(event, store) {
     .filter((group) => WORKSPACE_ROLES.has(group));
   if (!roles.includes(membership.role) && !roles.includes("super-admin")) return null;
   return { userId, workspaceId: membership.workspaceId, roles, membership };
+}
+
+// Best-effort human name for attributing a block/unblock action - falls
+// back through the JWT's name/email claims, then the actor's own id, so a
+// note is never left blank even if the token carries neither.
+function actorDisplayName(event, actor) {
+  const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+  if (typeof claims.name === "string" && claims.name.trim()) return claims.name.trim();
+  if (typeof claims.email === "string" && claims.email.trim()) return claims.email.trim();
+  return actor?.userId || "A teammate";
 }
 
 function isWorkspaceAdmin(actor) {
@@ -702,6 +715,7 @@ export function createHandler({
           ? {
             ...candidate,
             status: candidate.status === "active" ? "draft" : candidate.status,
+            createdAt: new Date().toISOString(),
           }
           : null;
         if (!agent) return json(400, { message: "Invalid agent" });
@@ -754,7 +768,8 @@ export function createHandler({
           return json(402, { message: "Most asked questions is a premium feature - contact your account manager to turn it on." });
         }
         const body = readBody(event) ?? {};
-        const windowDays = [7, 30, 90].includes(body?.windowDays) ? body.windowDays : 30;
+        // Only a 30-day window now - the 7/30/90 picker was removed from the UI.
+        const windowDays = 30;
         const agentId = typeof body?.agentId === "string" && body.agentId ? body.agentId : undefined;
         const providers = await getProviders();
         try {
@@ -787,6 +802,135 @@ export function createHandler({
         return json(200, calls.map(toPublicCallSummary));
       }
 
+      if (path === "/workspaces/me/calls/seed-demo" && method === "POST") {
+        if (!actor.roles.includes("super-admin")) {
+          return json(403, { message: "Super admin access is required" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agents = typeof store.listAgents === "function" ? await store.listAgents(workspaceId) : [];
+        const agentId = agents[0]?.id;
+        const created = await store.seedDemoCalls(workspaceId, demoCallRecords(agentId));
+        return json(200, { count: created });
+      }
+
+      if (path === "/workspaces/me/calls/seed-demo" && method === "DELETE") {
+        if (!actor.roles.includes("super-admin")) {
+          return json(403, { message: "Super admin access is required" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const removed = await store.clearDemoCalls(workspaceId);
+        return json(200, { removed });
+      }
+
+      if (path === "/workspaces/me/contacts" && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        const rows = await store.listContacts(workspaceId);
+        return json(200, rows.map((row) => ({
+          phoneNumber: row.phoneNumber,
+          name: row.name,
+          companyName: row.companyName,
+          updatedByName: row.updatedByName,
+          hidden: row.hidden === true,
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+        })));
+      }
+
+      // Same aggregation the Contacts page used to do client-side (fetch
+      // every call, group by phone, layer contact overrides on top) - moved
+      // server-side so the page doesn't have to pull the full call history
+      // just to render a contacts list. Keyed on E164 throughout, since both
+      // calls and contact overrides already store phone numbers that way.
+      if (path === "/workspaces/me/contacts/summary" && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        const [calls, contactRows] = await Promise.all([
+          store.listCalls(workspaceId),
+          store.listContacts(workspaceId),
+        ]);
+        const byPhone = new Map();
+        for (const call of calls) {
+          const phoneNumber = call.callerNumber;
+          if (!phoneNumber) continue;
+          const name = call.callerName?.trim() || undefined;
+          const startedAt = call.startedAt ?? "";
+          const existing = byPhone.get(phoneNumber);
+          if (!existing) {
+            byPhone.set(phoneNumber, { phoneNumber, name, callCount: 1, latestCallISO: startedAt, demoSeed: call.demoSeed === true });
+            continue;
+          }
+          existing.callCount += 1;
+          if (!existing.name && name) existing.name = name;
+          if (startedAt > existing.latestCallISO) existing.latestCallISO = startedAt;
+          if (call.demoSeed === true) existing.demoSeed = true;
+        }
+        for (const override of contactRows) {
+          if (override.hidden) {
+            byPhone.delete(override.phoneNumber);
+            continue;
+          }
+          const existing = byPhone.get(override.phoneNumber);
+          if (existing) {
+            if (override.name) existing.name = override.name;
+            if (override.companyName) existing.companyName = override.companyName;
+            if (override.updatedByName) existing.updatedByName = override.updatedByName;
+          } else if (override.name || override.companyName) {
+            byPhone.set(override.phoneNumber, {
+              phoneNumber: override.phoneNumber,
+              name: override.name,
+              companyName: override.companyName,
+              updatedByName: override.updatedByName,
+              callCount: 0,
+              latestCallISO: "",
+            });
+          }
+        }
+        const rows = Array.from(byPhone.values()).sort((a, b) => b.latestCallISO.localeCompare(a.latestCallISO));
+        return json(200, rows);
+      }
+
+      // Contacts is still primarily a client-side aggregation over call
+      // history - this table only ever holds what a customer explicitly
+      // set for a phone number (a rename, a manually-added contact with no
+      // calls yet, or a delete), so a single PATCH (upsert) is enough; no
+      // separate POST create route.
+      const contactTarget = path.match(/^\/workspaces\/me\/contacts\/(.+)$/)?.[1];
+      if (contactTarget && (method === "PATCH" || method === "DELETE")) {
+        await store.ensureWorkspace(workspaceId);
+        let decodedTarget;
+        try {
+          decodedTarget = decodeURIComponent(contactTarget);
+        } catch {
+          decodedTarget = contactTarget;
+        }
+        const phoneNumber = normalizeE164(decodedTarget);
+        if (!phoneNumber) return json(400, { message: "A valid phone number is required" });
+
+        if (method === "DELETE") {
+          if (!isWorkspaceAdmin(actor)) {
+            return json(403, { message: "Only an org admin can delete a contact" });
+          }
+          const saved = await store.putContact(workspaceId, phoneNumber, {
+            hidden: true,
+            updatedByName: actorDisplayName(event, actor),
+          });
+          return json(200, saved);
+        }
+
+        const body = readBody(event) ?? {};
+        if (typeof body.name !== "string") return json(400, { message: "name is required" });
+        const name = body.name.trim().slice(0, 120);
+        const companyName = typeof body.companyName === "string" ? body.companyName.trim().slice(0, 120) : undefined;
+        const saved = await store.putContact(workspaceId, phoneNumber, {
+          name: name || undefined,
+          companyName: companyName || undefined,
+          updatedByName: actorDisplayName(event, actor),
+          hidden: false,
+        });
+        return json(200, saved);
+      }
+
       if (path === "/workspaces/me/usage" && method === "GET") {
         await store.ensureWorkspace(workspaceId);
         return json(200, await loadWorkspaceUsage(store, workspaceId));
@@ -814,7 +958,11 @@ export function createHandler({
           return json(403, { message: "Call blocking is not enabled for this workspace" });
         }
         if (path === "/workspaces/me/blocked-numbers" && method === "GET") {
-          return json(200, await store.listBlockedNumbers(workspaceId));
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          const rows = (await store.listBlockedNumbers(workspaceId))
+            .filter((row) => row.active !== false)
+            .filter((row) => typeof row.expiresAt !== "number" || row.expiresAt > nowSeconds);
+          return json(200, rows);
         }
         if (path === "/workspaces/me/blocked-numbers" && method === "POST") {
           const body = readBody(event) ?? {};
@@ -827,6 +975,23 @@ export function createHandler({
           const sourceCallId = typeof body.sourceCallId === "string" && body.sourceCallId
             ? body.sourceCallId
             : undefined;
+          const durationDays = [30, 60, 90, 180, 365].includes(body.durationDays) ? body.durationDays : null;
+          const blockReason = typeof body.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+          const existing = await store.getBlockedNumber(workspaceId, phoneNumber);
+          if (existing && existing.active !== false) {
+            return json(409, { message: "That number is already blocked" });
+          }
+          const blockedByName = actorDisplayName(event, actor);
+          const notes = [
+            {
+              action: "block",
+              text: blockReason || undefined,
+              byUserId: actor.userId,
+              byName: blockedByName,
+              at: new Date().toISOString(),
+            },
+            ...(Array.isArray(existing?.notes) ? existing.notes : []),
+          ].slice(0, 3);
           const record = {
             workspaceId,
             phoneNumber,
@@ -834,9 +999,15 @@ export function createHandler({
             label: label || undefined,
             note: note || undefined,
             sourceCallId,
-            blockedBy: subject,
+            blockedBy: actor.userId,
+            blockedByName,
             blockedAt: new Date().toISOString(),
-            hitCount: 0,
+            hitCount: existing?.hitCount ?? 0,
+            active: true,
+            notes,
+            // DynamoDB TTL attribute (epoch seconds) - omitted entirely means
+            // "forever", since TTL only acts on items that actually carry it.
+            ...(durationDays ? { expiresAt: Math.floor(Date.now() / 1000) + durationDays * 86_400 } : {}),
           };
           try {
             await store.putBlockedNumber(record);
@@ -858,7 +1029,30 @@ export function createHandler({
           }
           const phoneNumber = normalizeE164(decoded);
           if (!phoneNumber) return json(400, { message: "A valid phone number is required" });
-          await store.deleteBlockedNumber(workspaceId, phoneNumber);
+          const existing = await store.getBlockedNumber(workspaceId, phoneNumber);
+          if (!existing || existing.active === false) {
+            return json(200, { ok: true });
+          }
+          // Only an org admin or the specific person who blocked it can
+          // unblock it - anyone else is told exactly who to contact.
+          if (!isWorkspaceAdmin(actor) && actor.userId !== existing.blockedBy) {
+            return json(403, {
+              message: `Only ${existing.blockedByName || "the person who blocked this number"} or an org admin can unblock this number. Contact them, or your manager, to have it unblocked.`,
+            });
+          }
+          const body = readBody(event) ?? {};
+          const unblockReason = typeof body?.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+          const notes = [
+            {
+              action: "unblock",
+              text: unblockReason || undefined,
+              byUserId: actor.userId,
+              byName: actorDisplayName(event, actor),
+              at: new Date().toISOString(),
+            },
+            ...(Array.isArray(existing.notes) ? existing.notes : []),
+          ].slice(0, 3);
+          await store.deactivateBlockedNumber(workspaceId, phoneNumber, notes);
           return json(200, { ok: true });
         }
         return json(404, { message: "Not found" });
@@ -888,6 +1082,25 @@ export function createHandler({
           : json(404, { message: "Call not found" });
       }
 
+      if (callId && method === "PATCH") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const body = readBody(event) ?? {};
+        if (typeof body?.callerName !== "string") {
+          return json(400, { message: "callerName is required" });
+        }
+        const callerName = body.callerName.trim().slice(0, 120);
+        const existing = await store.getCall(workspaceId, callId);
+        if (!existing) return json(404, { message: "Call not found" });
+        // An empty string clears the manually-set name (e.g. the customer
+        // backspaced it out entirely) rather than being rejected - it goes
+        // back to "not available" until something names this caller again.
+        const updated = callerName
+          ? await store.updateCallerName(workspaceId, callId, callerName)
+          : await store.clearCallerName(workspaceId, callId);
+        return json(200, toPublicCall(updated));
+      }
+
       const agentAction = getAgentAction(event, path);
       if (agentAction?.action === "activate" && method === "POST") {
         const store = await getStore();
@@ -902,7 +1115,10 @@ export function createHandler({
         const launchIssue = launchReadinessIssue(agent, profile, calendar);
         if (launchIssue) return json(409, { message: launchIssue });
         const providers = await getProviders();
-        const runtime = await syncReceptionistRuntime({
+        // Retell-only - no phone number touched here. Attaching one is a
+        // fully separate action, any time after this, from the Agents
+        // roster (see the attach-phone-number route below).
+        const synced = await syncRetellAgent({
           workspaceId,
           agentId: agentAction.agentId,
           agent,
@@ -911,7 +1127,6 @@ export function createHandler({
           providers,
           getKnowledgeSigner,
           toolBaseUrl,
-          phoneStatus: "active",
         });
         const activatedAt = new Date().toISOString();
         let updatedAgent;
@@ -921,7 +1136,7 @@ export function createHandler({
             agentAction.agentId,
             {
               status: "active",
-              retellAgentId: runtime.retellAgentId,
+              retellAgentId: synced.retellAgentId,
               activatedAt,
               updatedAt: activatedAt,
             },
@@ -932,10 +1147,107 @@ export function createHandler({
           }
           throw error;
         }
+        const existingPhone = await store.getPhoneNumberForAgent(workspaceId, agentAction.agentId);
         return json(200, {
           agent: toPublicAgent(updatedAgent),
-          phoneNumber: toPublicPhoneNumber(runtime.phoneNumber),
+          phoneNumber: existingPhone ? toPublicPhoneNumber(existingPhone) : null,
         });
+      }
+
+      if (agentAction?.action === "attach-phone-number" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can attach a phone number" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentAction.agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+        if (agent.status === "deleted") {
+          return json(409, { message: "This agent has been deleted" });
+        }
+        const existing = await store.getPhoneNumberForAgent(workspaceId, agentAction.agentId);
+        if (existing) {
+          return json(409, { message: "This agent already has a phone number attached" });
+        }
+        const profile = await store.getProfile(workspaceId);
+        const providers = await getProviders();
+        const body = readBody(event) ?? {};
+        const agentForSync = typeof body?.desiredPhoneNumber === "string" && body.desiredPhoneNumber
+          ? { ...agent, configuration: { ...agent.configuration, desiredPhoneNumber: body.desiredPhoneNumber } }
+          : agent;
+        const synced = await syncPhoneNumber({
+          workspaceId,
+          agentId: agentAction.agentId,
+          agent: agentForSync,
+          profile,
+          store,
+          providers,
+          getKnowledgeSigner,
+          toolBaseUrl,
+          phoneStatus: agent.status === "active" ? "active" : "draft",
+        });
+        return json(200, { phoneNumber: toPublicPhoneNumber(synced.phoneNumber) });
+      }
+
+      if (agentAction?.action === "disable" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can disable an agent" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentAction.agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+        if (agent.status === "deleted") {
+          return json(409, { message: "This agent has been deleted" });
+        }
+        // No Retell/Telnyx calls here on purpose - the inbound-lookup
+        // webhook already rejects every call the instant status isn't
+        // "active" (see the call_inbound handler below), so flipping
+        // this one field is the entire mechanism. Everything else
+        // (the agent, its knowledge base, its phone number) stays
+        // exactly as it is, and billing keeps running.
+        const updatedAt = new Date().toISOString();
+        try {
+          const updated = await store.updateAgentRuntime(workspaceId, agentAction.agentId, {
+            status: "disabled",
+            updatedAt,
+          });
+          return json(200, toPublicAgent(updated));
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
+      }
+
+      if (agentAction?.action === "enable" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can reactivate an agent" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentAction.agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+        if (agent.status === "deleted") {
+          return json(409, { message: "This agent has been deleted and can't be reactivated" });
+        }
+        if (agent.status !== "disabled") {
+          return json(409, { message: "This agent isn't disabled" });
+        }
+        const updatedAt = new Date().toISOString();
+        try {
+          const updated = await store.updateAgentRuntime(workspaceId, agentAction.agentId, {
+            status: "active",
+            updatedAt,
+          });
+          return json(200, toPublicAgent(updated));
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
       }
 
       if (agentAction?.action === "start-test-call" && method === "POST") {
@@ -1002,29 +1314,116 @@ export function createHandler({
           const existing = typeof store.getAgent === "function"
             ? await store.getAgent(workspaceId, agentId)
             : null;
+          const wasActive = existing?.status === "active";
           const invalidateTest = Boolean(
             existing &&
             !sameLaunchConfiguration(existing.configuration, agent.configuration),
           );
           const saved = {
             ...agent,
-            status: invalidateTest
-              ? "draft"
-              : existing?.status === "active"
-                ? "active"
-                : agent.status === "active"
-                  ? "draft"
-                  : agent.status,
+            // Editing an already-active agent keeps it active and pushes the
+            // change straight to Retell (below) instead of silently taking
+            // it offline - a customer who edits a live receptionist expects
+            // it to answer with the new config, not stop answering at all.
+            status: wasActive
+              ? "active"
+              : agent.status === "active"
+                ? "draft"
+                : agent.status,
           };
-          return json(
-            200,
-            await store.putAgent(
-              workspaceId,
-              agentId,
-              saved,
-              { invalidateTest },
-            ),
+          const updatedAgent = await store.putAgent(
+            workspaceId,
+            agentId,
+            saved,
+            { invalidateTest },
           );
+          if (wasActive) {
+            try {
+              const profile = await store.getProfile(workspaceId);
+              const providers = await getProviders();
+              await syncRetellAgent({
+                workspaceId,
+                agentId,
+                agent: updatedAgent,
+                profile,
+                store,
+                providers,
+                getKnowledgeSigner,
+                toolBaseUrl,
+              });
+            } catch (syncError) {
+              // The edit is already saved either way - a Retell hiccup here
+              // shouldn't block the save, just leaves the live agent one
+              // sync behind until the next successful save or activation.
+              console.error("Failed to resync an active agent to Retell after edit", syncError);
+            }
+          }
+          return json(200, updatedAgent);
+        } catch (error) {
+          if (isConditionalCheckFailed(error)) {
+            return json(404, { message: "Agent not found" });
+          }
+          throw error;
+        }
+      }
+
+      if (agentId && method === "DELETE") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can delete an agent" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const agent = await store.getAgent(workspaceId, agentId);
+        if (!agent) return json(404, { message: "Agent not found" });
+
+        const [phoneNumber, calls, otherAgents] = await Promise.all([
+          store.getPhoneNumberForAgent(workspaceId, agentId),
+          store.listCalls(workspaceId),
+          store.listAgents(workspaceId),
+        ]);
+        const callsHandledAtDeletion = calls.filter((call) => call.agentId === agentId).length;
+
+        const knowledgeBaseIds = Array.isArray(agent?.configuration?.knowledgeBaseIds)
+          ? agent.configuration.knowledgeBaseIds
+          : [];
+        const providers = await getProviders();
+        for (const knowledgeBaseId of knowledgeBaseIds) {
+          const stillUsed = otherAgents.some((other) =>
+            other.id !== agentId &&
+            Array.isArray(other?.configuration?.knowledgeBaseIds) &&
+            other.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
+          if (stillUsed) continue;
+          const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
+          if (!record) continue;
+          if (record.retellKnowledgeBaseId) {
+            await providers.retell.deleteKnowledgeBase(record.retellKnowledgeBaseId).catch(() => {});
+          }
+          await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
+        }
+
+        if (agent.retellAgentId) {
+          await providers.retell.deleteAgentAndLlm(agent.retellAgentId).catch(() => {});
+        }
+        if (phoneNumber?.retellPhoneNumberId) {
+          await providers.retell.deletePhoneNumber(phoneNumber.retellPhoneNumberId).catch(() => {});
+        }
+        if (phoneNumber?.telnyxNumberId) {
+          await providers.telnyx.releaseNumber(phoneNumber.telnyxNumberId).catch(() => {});
+        }
+        if (phoneNumber?.phoneNumberId) {
+          await store.deletePhoneNumberRecord(workspaceId, phoneNumber.phoneNumberId);
+        }
+
+        try {
+          const deletedAt = new Date().toISOString();
+          const updated = await store.updateAgentRuntime(workspaceId, agentId, {
+            status: "deleted",
+            deletedAt,
+            deletedByName: actorDisplayName(event, actor),
+            callsHandledAtDeletion,
+            updatedAt: deletedAt,
+          });
+          return json(200, toPublicAgent(updated));
         } catch (error) {
           if (isConditionalCheckFailed(error)) {
             return json(404, { message: "Agent not found" });
@@ -1879,7 +2278,8 @@ async function generateMostAskedQuestionsDigest({ store, providers, workspaceId,
     digestId,
     agentId: agentId ?? "all",
     windowDays,
-    questions: result.questions,
+    // Top 25 - whatever the model returned beyond that isn't shown.
+    questions: result.questions.slice(0, 25),
     model: result.model,
     inputTokens: result.usage.inputTokens,
     outputTokens: result.usage.outputTokens,
@@ -3980,15 +4380,12 @@ async function handleInboundLookup(event, {
     });
     return json(200, { call_inbound: { reject: true } });
   }
-  if (await inboundCapReached(store, phoneNumber.workspaceId, profile, workspace)) {
-    await logDeclinedCall(store, {
-      workspaceId: phoneNumber.workspaceId,
-      agentId: phoneNumber.agentId,
-      fromNumber: input.call_inbound.from_number,
-      reason: "minute_cap_reached",
-    });
-    return json(200, { call_inbound: { reject: true } });
-  }
+  // We never decline a call just because the account is past its plan
+  // minutes - it's always answered, and billed at the plan's overage rate
+  // instead (see receptionist-billing.mjs). `isOverage` just tags the call
+  // so the customer can see which calls landed after their plan minutes
+  // were used this cycle; it carries no reject behavior.
+  const isOverage = await inboundIsOverage(store, phoneNumber.workspaceId, profile, workspace);
   return json(200, {
     call_inbound: {
       override_agent_id: agent.retellAgentId,
@@ -4001,6 +4398,7 @@ async function handleInboundLookup(event, {
       metadata: {
         workspaceId: phoneNumber.workspaceId,
         agentId: phoneNumber.agentId,
+        ...(isOverage ? { isOverage: true } : {}),
       },
     },
   });
@@ -4018,6 +4416,11 @@ async function inboundCallerBlocked(store, workspaceId, profile, workspace, from
   if (!caller) return false;
   const blocked = await store.getBlockedNumber(workspaceId, caller);
   if (!blocked) return false;
+  // DynamoDB TTL deletion isn't instant (it can lag up to 48h past
+  // expiresAt), so an expired-but-not-yet-swept row must not still block.
+  if (typeof blocked.expiresAt === "number" && blocked.expiresAt <= Math.floor(Date.now() / 1000)) {
+    return false;
+  }
   if (typeof store.recordBlockedHit === "function") {
     await store.recordBlockedHit(workspaceId, caller).catch(() => {});
   }
@@ -4028,20 +4431,145 @@ async function inboundCallerBlocked(store, workspaceId, profile, workspace, from
 // cap — the one hard stop, where the receptionist stops accepting inbound calls
 // until the cycle resets or the customer upgrades. Reads a single counter item;
 // a missing counter or an unmetered plan is never blocked.
-async function inboundCapReached(store, workspaceId, profile, workspace) {
+// True once this cycle's billed minutes already reached the plan's
+// allowance - the call is still always accepted; this only flags it as
+// billed at the overage rate (see RECEPTIONIST_PLANS.overagePerMinute).
+async function inboundIsOverage(store, workspaceId, profile, workspace) {
   if (typeof store.getUsageCounter !== "function") return false;
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
   const plan = resolvePlan(profile, workspace, now, timezone);
-  if (plan.priceMonthly == null || plan.minutes == null || !plan.overagePerMinute) return false;
-  const capMinute = plan.minutes + Math.ceil(plan.priceMonthly / plan.overagePerMinute);
+  if (plan.minutes == null) return false;
   try {
     const counter = await store.getUsageCounter(workspaceId, periodKey(now, timezone));
-    return Number(counter?.billedMinutes ?? 0) >= capMinute;
+    return Number(counter?.billedMinutes ?? 0) >= plan.minutes;
   } catch (error) {
-    console.error("Usage cap check failed", { name: error?.name, message: error?.message, workspaceId });
+    console.error("Usage overage check failed", { name: error?.name, message: error?.message, workspaceId });
     return false;
   }
+}
+
+// Super-admin-only demo data for the AI Receptionist's own Call History -
+// the RapidProposal "Manage Company Accounts" page has an equivalent (see
+// lib/proposals/repository.ts seedDemoProposals). Calls have no customer-
+// facing create endpoint at all (they're normally written by the Postcall
+// Lambda from a real Retell webhook), so this generates full call records
+// directly rather than looping a public create route the way the proposal
+// version does. 12 months, weighted toward the current month, a realistic
+// mix of outcomes - every record tagged demoSeed:true so it can be found
+// and removed later without touching real call history.
+const DEMO_CALL_NAMES = [
+  "Jordan Miles", "Alicia Chen", "Marcus Reed", "Nina Patel", "Samuel Brooks",
+  "Priya Nair", "Diego Alvarez", "Grace Kim", "Tyler Brooks", "Olivia Chen",
+  "Ethan Walsh", "Maria Gonzalez", "Liam O'Brien", "Sophia Turner", "Noah Bennett",
+  "Ava Coleman", "Lucas Ferreira", "Chloe Bishop", "Mason Reilly", "Isabella Cruz",
+];
+const DEMO_OUTCOME_WEIGHTS = [
+  ["booked", 6], ["answered", 5], ["escalated", 2], ["message", 3], ["lead", 2],
+  ["spam", 1], ["failed", 1], ["abandoned", 1], ["declined", 1],
+];
+const DEMO_SUMMARIES = {
+  booked: (name) => `${name} called to schedule an appointment; the AI checked availability and booked a time.`,
+  answered: (name) => `${name} asked a general question about hours and services; the AI answered directly, no booking needed.`,
+  escalated: (name) => `${name}'s request needed a person; the AI transferred the call to the team.`,
+  message: (name) => `${name} asked to leave a message for the office instead of booking.`,
+  lead: (name) => `${name} was interested in services and left contact info for a follow-up.`,
+  spam: () => "Automated robocall; the AI recognised it and ended the call.",
+  failed: () => "The call failed to connect due to a technical issue.",
+  abandoned: (name) => `${name} hung up before anything was resolved.`,
+  declined: () => "Rejected before the AI ever answered.",
+};
+const DEMO_END_REASONS = {
+  spam: "scam_detected",
+  failed: "error",
+  abandoned: "user_hangup",
+  // Minutes are never a decline reason - an account past its plan minutes
+  // is always answered and billed at the overage rate instead (see
+  // isOverage below). The only real declines left are an inactive agent
+  // or a blocked caller.
+  declined: "agent_inactive",
+};
+
+// Starter's own allowance (see RECEPTIONIST_PLANS.starter.minutes) - the
+// seed intentionally stays well under it (~75%) so a freshly-seeded account
+// doesn't show an overage-billed call sitting next to a usage banner that
+// says it's nowhere near its plan limit.
+const DEMO_MINUTE_BUDGET = 750;
+
+function demoCallRecords(agentId) {
+  const now = Date.now();
+  const dayMs = 86_400_000;
+  const records = [];
+  for (let i = 0; i < 120; i += 1) {
+    // Spread across the last 30 days (matches the Overview charts' own
+    // "last 30 days" range), weighted toward weekdays with some weekend
+    // activity too - re-rolling the day a few times biases the distribution
+    // without ever fully excluding a Saturday/Sunday call.
+    let daysAgo = Math.floor(Math.random() * 30);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const dow = new Date(now - daysAgo * dayMs).getDay();
+      const isWeekend = dow === 0 || dow === 6;
+      if (!isWeekend || Math.random() < 0.3) break;
+      daysAgo = Math.floor(Math.random() * 30);
+    }
+    const startedAt = new Date(now - daysAgo * dayMs - Math.floor(Math.random() * dayMs));
+    const outcome = pickWeighted(DEMO_OUTCOME_WEIGHTS);
+    const name = DEMO_CALL_NAMES[i % DEMO_CALL_NAMES.length];
+    const hasIdentity = outcome !== "spam" && outcome !== "declined" && Math.random() > 0.15;
+    const durationMs = outcome === "declined" ? 0
+      : outcome === "spam" ? Math.round((5 + Math.random() * 15) * 1000)
+        : outcome === "failed" || outcome === "abandoned" ? Math.round(Math.random() * 30 * 1000)
+          : Math.round((30 + Math.random() * 180) * 1000);
+    const endedAt = new Date(startedAt.getTime() + durationMs);
+    records.push({
+      callId: `demo-call-${randomUUID()}`,
+      demoSeed: true,
+      agentId,
+      direction: "inbound",
+      callerName: hasIdentity ? name : undefined,
+      callerNameSource: hasIdentity ? "agent" : undefined,
+      callerNumber: `+1415555${String(1000 + (i % 900)).padStart(4, "0")}`,
+      outcome,
+      startedAt: startedAt.toISOString(),
+      endedAt: endedAt.toISOString(),
+      durationMs,
+      callSummary: DEMO_SUMMARIES[outcome](name),
+      userSentiment: outcome === "spam" || outcome === "failed" ? "Neutral"
+        : outcome === "abandoned" || outcome === "declined" ? "Unknown"
+          : outcome === "escalated" ? "Negative" : "Positive",
+      actions: outcome === "booked" ? ["Booked appointment"]
+        : outcome === "escalated" ? ["Transferred the call"]
+          : outcome === "message" ? ["Took a message for the office"] : [],
+      disconnectionReason: DEMO_END_REASONS[outcome],
+      hasRecording: false,
+      transcript: [],
+      createdAt: startedAt.toISOString(),
+      updatedAt: startedAt.toISOString(),
+    });
+  }
+  // Scale every call's duration down proportionally if the batch would add
+  // up to more than the minute budget - keeps the relative "some calls run
+  // long, most are short" shape instead of just truncating the tail.
+  const totalBilledMinutes = records.reduce((sum, r) => sum + Math.ceil(r.durationMs / 60_000), 0);
+  if (totalBilledMinutes > DEMO_MINUTE_BUDGET) {
+    const scale = DEMO_MINUTE_BUDGET / totalBilledMinutes;
+    for (const record of records) {
+      if (record.durationMs <= 0) continue;
+      record.durationMs = Math.max(1000, Math.round(record.durationMs * scale));
+      record.endedAt = new Date(new Date(record.startedAt).getTime() + record.durationMs).toISOString();
+    }
+  }
+  return records;
+}
+
+function pickWeighted(pairs) {
+  const total = pairs.reduce((sum, [, weight]) => sum + weight, 0);
+  let roll = Math.random() * total;
+  for (const [value, weight] of pairs) {
+    roll -= weight;
+    if (roll <= 0) return value;
+  }
+  return pairs[pairs.length - 1][0];
 }
 
 // A call rejected before Retell ever answered it never reaches the Postcall
@@ -4073,7 +4601,12 @@ async function logDeclinedCall(store, { workspaceId, agentId, fromNumber, reason
   }
 }
 
-export async function syncReceptionistRuntime({
+// The Retell-only half of activation: builds the agent's config and
+// upserts it on Retell. No phone number involved - an agent can be fully
+// "active" on Retell with no number yet, it just can't receive calls
+// until one is attached (a fully separate, later, optional action - see
+// syncPhoneNumber below and the /attach-phone-number route).
+export async function syncRetellAgent({
   workspaceId,
   agentId,
   agent,
@@ -4082,25 +4615,7 @@ export async function syncReceptionistRuntime({
   providers,
   getKnowledgeSigner,
   toolBaseUrl,
-  phoneStatus,
 }) {
-  let phoneNumber = await store.getPhoneNumberForAgent(workspaceId, agentId);
-  if (!phoneNumber) {
-    const provisioned = await providers.telnyx.ensureNumber({
-      workspaceId,
-      agentId,
-      preferredPhone: agent?.configuration?.phone ?? profile.phone,
-      desiredPhone: agent?.configuration?.desiredPhoneNumber,
-    });
-    phoneNumber = {
-      workspaceId,
-      phoneNumberId: `phone-${agentId}`,
-      agentId,
-      ...provisioned,
-      status: phoneStatus,
-      createdAt: new Date().toISOString(),
-    };
-  }
   const voiceId = resolveConfiguredVoiceId(
     agent?.configuration,
     providers.resolveVoiceId,
@@ -4133,17 +4648,62 @@ export async function syncReceptionistRuntime({
     if (isConditionalCheckFailed(error)) throw error;
     console.error("Failed to persist retellAgentId after Retell upsert", error);
   }
+  return { retellAgentId: synced.retellAgentId, config };
+}
+
+// The phone-only half: provisions (or reuses) a Telnyx number and imports
+// it into Retell against this agent. Callable any time after the agent
+// exists - a minute later or five days later - not tied to activation.
+// If the agent hasn't been synced to Retell yet, does that first (its own
+// retellAgentId is required to import a number against it).
+export async function syncPhoneNumber({
+  workspaceId,
+  agentId,
+  agent,
+  profile,
+  store,
+  providers,
+  getKnowledgeSigner,
+  toolBaseUrl,
+  phoneStatus,
+}) {
+  let retellAgentId = agent.retellAgentId;
+  let config;
+  if (!retellAgentId) {
+    const synced = await syncRetellAgent({
+      workspaceId, agentId, agent, profile, store, providers, getKnowledgeSigner, toolBaseUrl,
+    });
+    retellAgentId = synced.retellAgentId;
+    config = synced.config;
+  }
+  let phoneNumber = await store.getPhoneNumberForAgent(workspaceId, agentId);
+  if (!phoneNumber) {
+    const provisioned = await providers.telnyx.ensureNumber({
+      workspaceId,
+      agentId,
+      preferredPhone: agent?.configuration?.phone ?? profile.phone,
+      desiredPhone: agent?.configuration?.desiredPhoneNumber,
+    });
+    phoneNumber = {
+      workspaceId,
+      phoneNumberId: `phone-${agentId}`,
+      agentId,
+      ...provisioned,
+      status: phoneStatus,
+      createdAt: new Date().toISOString(),
+    };
+  }
   if (!phoneNumber.retellPhoneNumberId) {
     const imported = await providers.retell.importPhoneNumber({
       phoneNumber: phoneNumber.telnyxPhoneNumber,
-      retellAgentId: synced.retellAgentId,
+      retellAgentId,
       nickname: `Symantic ${workspaceId} ${agentId}`,
       inboundWebhookUrl:
         `${String(toolBaseUrl).replace(/\/+$/, "")}/retell/inbound-lookup`,
     });
     phoneNumber = { ...phoneNumber, ...imported };
   }
-  const desiredCountries = config.allowedInboundCountries ?? [];
+  const desiredCountries = config?.allowedInboundCountries ?? agent?.configuration?.allowedInboundCountries ?? [];
   const appliedCountries = Array.isArray(phoneNumber.allowedInboundCountries)
     ? phoneNumber.allowedInboundCountries
     : [];
@@ -4167,10 +4727,15 @@ export async function syncReceptionistRuntime({
     updatedAt: new Date().toISOString(),
   };
   await store.putPhoneNumber(phoneNumber);
-  return {
-    phoneNumber,
-    retellAgentId: synced.retellAgentId,
-  };
+  return { phoneNumber, retellAgentId };
+}
+
+// Both halves together - kept for call sites (like start-test-call) that
+// need a fully wired agent+number in one shot regardless of what already
+// exists.
+export async function syncReceptionistRuntime(args) {
+  const phoneResult = await syncPhoneNumber(args);
+  return { phoneNumber: phoneResult.phoneNumber, retellAgentId: phoneResult.retellAgentId };
 }
 
 // A one-time, lazy migration: an agent saved before the knowledge base hub
@@ -4296,11 +4861,32 @@ async function listKnowledgeBasesWithAssignments(store, workspaceId) {
   }));
 }
 
+// Retell's own knowledge-base limits (docs.retellai.com/build/knowledge-base):
+// max 25 files, 50 text snippets, 500 URLs. The Hub is a workspace-wide
+// shared library rather than one entry per agent's own Retell KB, so these
+// are enforced per workspace here rather than truly per-agent - a
+// documented simplification, not a Retell requirement itself.
+const MAX_KNOWLEDGE_TEXT_ITEMS = 50;
+const MAX_KNOWLEDGE_URL_ITEMS = 500;
+// Retell has no stated length cap on a single text source - this just
+// stops one pathological paste, at plain-text density nowhere near
+// Retell's 50MB per-file cap either way.
+const MAX_KNOWLEDGE_TEXT_CHARS = 200_000;
+
 async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, workspaceId, body) {
   const name = typeof body?.name === "string" ? body.name.trim().slice(0, 120) : "";
   if (!name) throw new Error("A name is required");
-  const text = typeof body?.text === "string" ? body.text.trim() : "";
+  const text = typeof body?.text === "string" ? body.text.trim().slice(0, MAX_KNOWLEDGE_TEXT_CHARS) : "";
   const url = typeof body?.url === "string" ? body.url.trim() : "";
+  if (text || url) {
+    const existing = await store.listKnowledgeBases(workspaceId);
+    if (text && existing.filter((item) => item.kind === "text").length >= MAX_KNOWLEDGE_TEXT_ITEMS) {
+      throw new Error(`This workspace already has the maximum of ${MAX_KNOWLEDGE_TEXT_ITEMS} pasted-text items`);
+    }
+    if (url && existing.filter((item) => item.kind === "url").length >= MAX_KNOWLEDGE_URL_ITEMS) {
+      throw new Error(`This workspace already has the maximum of ${MAX_KNOWLEDGE_URL_ITEMS} website items`);
+    }
+  }
   const fileMetadata = Array.isArray(body?.files)
     ? body.files.filter((file) =>
       file &&
@@ -4339,27 +4925,29 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
   });
 
   const knowledgeBaseId = `kb-${randomUUID()}`;
+  const nowIso = new Date().toISOString();
   const record = {
     name,
     kind: url ? "url" : fileMetadata.length ? "file" : "text",
     sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
     retellKnowledgeBaseId: created.knowledgeBaseId,
     enableAutoRefresh,
-    ...(url ? { refreshIntervalDays, lastRefreshedAt: new Date().toISOString() } : {}),
-    createdAt: new Date().toISOString(),
+    ...(url ? { refreshIntervalDays, lastRefreshedAt: nowIso } : {}),
+    createdAt: nowIso,
+    updatedAt: nowIso,
   };
   await store.createKnowledgeBase(workspaceId, knowledgeBaseId, record);
   return { ...toPublicKnowledgeBase(record), knowledgeBaseId, assignedAgents: [] };
 }
 
 function launchReadinessIssue(agent, profile, calendar) {
+  // businessType, ownerPhone, and fallbackPhone are no longer collected up
+  // front - only the business phone matters at this stage. A forwarding
+  // number gets configured separately, at phone-number setup.
   const requiredProfileFields = [
     "businessName",
-    "businessType",
     "timezone",
     "hours",
-    "ownerPhone",
-    "fallbackPhone",
     "phone",
   ];
   if (
@@ -4370,33 +4958,30 @@ function launchReadinessIssue(agent, profile, calendar) {
   ) {
     return "Complete the business profile before activation";
   }
+  // guidance and escalation are both optional now - emergency rules cover
+  // escalation routing, and a blank guidance field is a legitimate choice
+  // (Retell still gets a reasonable default prompt either way).
   if (
     !agent?.configuration ||
     !agent.configuration.template ||
-    agent.configuration.businessConfirmed !== true ||
-    !agent.configuration.name?.trim() ||
-    !agent.configuration.guidance?.trim() ||
-    !agent.configuration.escalation?.trim()
+    !agent.configuration.name?.trim()
   ) {
     return "Complete the agent details and behavior before activation";
   }
+  // Only validate phone-shaped fields that are actually present - owner/
+  // fallback/escalation/transfer numbers are all optional now.
   const phoneValues = [
     profile.phone,
+    agent?.configuration?.phone,
     profile.ownerPhone,
     profile.fallbackPhone,
-    agent?.configuration?.phone,
-    ...(typeof profile.escalationContact === "string" &&
-        profile.escalationContact.trim()
-      ? [profile.escalationContact]
-      : []),
+    profile.escalationContact,
     ...(Array.isArray(agent?.configuration?.emergencyRules)
-      ? agent.configuration.emergencyRules.map(({ transferTarget }) =>
-        transferTarget
-      )
+      ? agent.configuration.emergencyRules.map(({ transferTarget }) => transferTarget)
       : []),
-  ];
+  ].filter((value) => typeof value === "string" && value.trim());
   if (phoneValues.some((value) => !isValidPhone(value))) {
-    return "Configure valid business, owner, fallback, and transfer phone numbers before activation";
+    return "Configure valid phone numbers before activation";
   }
   if (
     agent?.configuration?.booking === true &&
@@ -4863,6 +5448,34 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    // Lets a workspace admin manually label a caller who was never
+    // identified automatically (no name volunteered on the call, none
+    // extracted from the transcript) - source is "manual" so it never gets
+    // silently overwritten by a later automatic call to the same number.
+    async updateCallerName(workspaceId, callId, callerName) {
+      const result = await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "SET callerName = :callerName, callerNameSource = :source",
+        ExpressionAttributeValues: marshall({ ":callerName": callerName, ":source": "manual" }),
+        ReturnValues: "ALL_NEW",
+      }));
+      return unmarshall(result.Attributes);
+    },
+
+    // Backspacing a manually-set name out entirely clears it, rather than
+    // being rejected - back to "not available" until named again (by hand
+    // or automatically on a later call).
+    async clearCallerName(workspaceId, callId) {
+      const result = await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "REMOVE callerName, callerNameSource",
+        ReturnValues: "ALL_NEW",
+      }));
+      return unmarshall(result.Attributes);
+    },
+
     // For a call that was rejected before Retell ever answered it (blocked
     // caller, over the minute cap, inactive agent) - there is no Retell
     // call_id to key off, so this writes a standalone row instead of the
@@ -4874,6 +5487,40 @@ export function createDynamoStore(client, commands, tableNames) {
         ConditionExpression: "attribute_not_exists(callId)",
       }));
       return record;
+    },
+
+    // Super-admin demo data (see demoCallRecords below) - additive, each
+    // record tagged demoSeed:true so clearDemoCalls can find and remove
+    // exactly these rows later without touching any real call history.
+    async seedDemoCalls(workspaceId, records) {
+      let created = 0;
+      for (const record of records) {
+        await client.send(new commands.PutItemCommand({
+          TableName: tableNames.calls,
+          Item: marshall({ ...record, workspaceId }),
+          ConditionExpression: "attribute_not_exists(callId)",
+        }));
+        created += 1;
+      }
+      return created;
+    },
+
+    async clearDemoCalls(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.calls,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        FilterExpression: "demoSeed = :true",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":true": true }),
+        ConsistentRead: true,
+      }));
+      const items = (result.Items ?? []).map((item) => unmarshall(item));
+      for (const item of items) {
+        await client.send(new commands.DeleteItemCommand({
+          TableName: tableNames.calls,
+          Key: marshall({ workspaceId, callId: item.callId }),
+        }));
+      }
+      return items.length;
     },
 
     // Lean projection of the full call history for usage aggregation. Paginated;
@@ -5074,11 +5721,15 @@ export function createDynamoStore(client, commands, tableNames) {
       return result.Item ? unmarshall(result.Item) : null;
     },
 
+    // Allowed when the row is brand new, or when a prior block on this same
+    // number was later unblocked (active: false) - re-blocking reactivates
+    // the same row (and its note history) rather than starting a fresh one.
     async putBlockedNumber(item) {
       await client.send(new commands.PutItemCommand({
         TableName: tableNames.blockedNumbers,
         Item: marshall(item, { removeUndefinedValues: true }),
-        ConditionExpression: "attribute_not_exists(phoneNumber)",
+        ConditionExpression: "attribute_not_exists(phoneNumber) OR active = :inactive",
+        ExpressionAttributeValues: marshall({ ":inactive": false }),
       }));
       return item;
     },
@@ -5087,6 +5738,19 @@ export function createDynamoStore(client, commands, tableNames) {
       await client.send(new commands.DeleteItemCommand({
         TableName: tableNames.blockedNumbers,
         Key: marshall({ workspaceId, phoneNumber }),
+      }));
+    },
+
+    // Unblocking deactivates rather than deletes, so the note history (who
+    // blocked/unblocked it, when, and why) survives for the next time this
+    // number comes up - re-blocking later reactivates the same row.
+    async deactivateBlockedNumber(workspaceId, phoneNumber, notes) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.blockedNumbers,
+        Key: marshall({ workspaceId, phoneNumber }),
+        UpdateExpression: "SET active = :false, notes = :notes",
+        ConditionExpression: "attribute_exists(phoneNumber)",
+        ExpressionAttributeValues: marshall({ ":false": false, ":notes": notes }),
       }));
     },
 
@@ -5101,6 +5765,37 @@ export function createDynamoStore(client, commands, tableNames) {
         }),
         ConditionExpression: "attribute_exists(phoneNumber)",
       }));
+    },
+
+    // Contacts (see the "contacts" table comment in dynamodb.tf) - only
+    // holds what a customer explicitly set for a phone number: a manual
+    // name override, a contact added with no call history yet (Excel
+    // import), or a delete (hidden: true, a tombstone rather than an
+    // actual row removal so a rename doesn't resurrect it).
+    async listContacts(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.contacts,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ConsistentRead: false,
+      }));
+      return (result.Items ?? []).map((item) => unmarshall(item));
+    },
+
+    async putContact(workspaceId, phoneNumber, patch) {
+      const now = new Date().toISOString();
+      const existing = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.contacts,
+        Key: marshall({ workspaceId, phoneNumber }),
+        ConsistentRead: true,
+      }));
+      const createdAt = existing.Item ? unmarshall(existing.Item).createdAt : now;
+      const item = { workspaceId, phoneNumber, createdAt, updatedAt: now, ...patch };
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.contacts,
+        Item: marshall(item, { removeUndefinedValues: true }),
+      }));
+      return item;
     },
 
     async listAgents(workspaceId) {
@@ -5130,6 +5825,18 @@ export function createDynamoStore(client, commands, tableNames) {
         ConditionExpression: "attribute_not_exists(agentId)",
       }));
       return agent;
+    },
+
+    // Deletes the agent record regardless of its status (draft, preview, or
+    // active) - the customer decides when an agent is no longer wanted, not
+    // us. Does not deprovision the agent's phone number or Retell resources;
+    // those remain a separate, deliberate action.
+    async deleteAgent(workspaceId, agentId) {
+      await client.send(new commands.DeleteItemCommand({
+        TableName: tableNames.agents,
+        Key: marshall({ workspaceId, agentId }),
+        ConditionExpression: "attribute_exists(agentId)",
+      }));
     },
 
     async putAgent(
@@ -5561,6 +6268,10 @@ export function createDynamoStore(client, commands, tableNames) {
       return record;
     },
 
+    deletePhoneNumberRecord(workspaceId, phoneNumberId) {
+      return deleteRecord(tableNames.phoneNumbers, "phoneNumberId", workspaceId, phoneNumberId);
+    },
+
     async getPhoneNumberByDid(telnyxPhoneNumber) {
       const result = await client.send(new commands.QueryCommand({
         TableName: tableNames.phoneNumbers,
@@ -5796,6 +6507,7 @@ export async function getDefaultStore() {
       legalAcceptances: process.env.LEGAL_ACCEPTANCES_TABLE,
       knowledgeBases: process.env.KNOWLEDGE_BASES_TABLE,
       mostAskedDigests: process.env.MOST_ASKED_DIGESTS_TABLE,
+      contacts: process.env.CONTACTS_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");

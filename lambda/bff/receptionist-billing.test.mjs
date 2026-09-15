@@ -45,7 +45,7 @@ test("buildUsage attributes a late-night call to the tz-local month", () => {
 
 test("buildUsage clamps the overage charge at the plan price and caps calls", () => {
   const now = new Date("2026-09-20T12:00:00Z");
-  const plan = { plan: "starter", ...RECEPTIONIST_PLANS.starter }; // 1000 min, $349, $0.30/min
+  const plan = { plan: "starter", ...RECEPTIONIST_PLANS.starter }; // 1000 min, $349, $0.50/min
   const mk = (n) => Array.from({ length: n }, (_, i) =>
     call(`2026-09-0${(i % 9) + 1}T10:0${i % 10}:00Z`, 60_000));
 
@@ -55,7 +55,7 @@ test("buildUsage clamps the overage charge at the plan price and caps calls", ()
   const over = buildUsage(mk(1500), { now, timezone: "UTC", plan });
   assert.equal(over.billingCycle.usageState, "overage");
   assert.equal(over.billingCycle.overageMinutes, 500);
-  assert.equal(over.billingCycle.overageCharge, 150);
+  assert.equal(over.billingCycle.overageCharge, 250);
   assert.equal(over.billingCycle.overageChargeCapped, false);
 
   const capped = buildUsage(mk(3000), { now, timezone: "UTC", plan });
@@ -63,7 +63,7 @@ test("buildUsage clamps the overage charge at the plan price and caps calls", ()
   assert.equal(capped.billingCycle.blocked, true);
   assert.equal(capped.billingCycle.overageCharge, 349);
   assert.equal(capped.billingCycle.overageChargeCapped, true);
-  assert.equal(capped.billingCycle.capMinute, 1000 + Math.ceil(349 / 0.3)); // 2164
+  assert.equal(capped.billingCycle.capMinute, 1000 + Math.ceil(349 / 0.5)); // 1698
 });
 
 test("buildUsage with no allowance never blocks and never charges overage", () => {

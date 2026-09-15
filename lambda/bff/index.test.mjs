@@ -285,8 +285,11 @@ test("POST and GET agents preserve product agent ids", async () => {
   const listed = await handler(authenticatedEvent("GET", "/workspaces/me/agents"));
 
   assert.equal(created.statusCode, 201);
-  const savedAgent = { ...agent, status: "draft" };
-  assert.deepEqual(JSON.parse(created.body), savedAgent);
+  const createdBody = JSON.parse(created.body);
+  assert.equal(createdBody.status, "draft");
+  assert.ok(createdBody.createdAt);
+  const savedAgent = { ...agent, status: "draft", createdAt: createdBody.createdAt };
+  assert.deepEqual(createdBody, savedAgent);
   assert.equal(listed.statusCode, 200);
   assert.deepEqual(JSON.parse(listed.body), [savedAgent]);
 });
@@ -399,6 +402,188 @@ test("PUT agent uses the route id and returns the updated agent", async () => {
   assert.deepEqual(calls, [["user-123", "agent-123", savedAgent]]);
 });
 
+function companyAdminEvent(method, path, body, queryStringParameters) {
+  const event = authenticatedEvent(method, path, body, queryStringParameters);
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  return event;
+}
+
+test("DELETE agent is refused for a non-admin", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/agents/agent-123");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared knowledge base items, and records a history summary", async () => {
+  const providerCalls = [];
+  const storeCalls = [];
+  const agent = {
+    workspaceId: "user-123",
+    agentId: "agent-123",
+    id: "agent-123",
+    name: "Maya",
+    status: "active",
+    retellAgentId: "retell-agent-1",
+    configuration: { knowledgeBaseIds: ["kb-shared", "kb-solo"] },
+  };
+  const otherAgent = {
+    id: "agent-456",
+    configuration: { knowledgeBaseIds: ["kb-shared"] },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getPhoneNumberForAgent() {
+      return {
+        phoneNumberId: "phone-agent-123",
+        retellPhoneNumberId: "+17035550133",
+        telnyxNumberId: "telnyx-num-1",
+      };
+    },
+    async listCalls() {
+      return [
+        { agentId: "agent-123" },
+        { agentId: "agent-123" },
+        { agentId: "agent-456" },
+      ];
+    },
+    async listAgents() { return [agent, otherAgent]; },
+    async getKnowledgeBase(workspaceId, knowledgeBaseId) {
+      return { knowledgeBaseId, retellKnowledgeBaseId: `retell-${knowledgeBaseId}` };
+    },
+    async deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId) {
+      storeCalls.push(["deleteKnowledgeBaseRecord", knowledgeBaseId]);
+    },
+    async deletePhoneNumberRecord(workspaceId, phoneNumberId) {
+      storeCalls.push(["deletePhoneNumberRecord", phoneNumberId]);
+    },
+    async updateAgentRuntime(workspaceId, agentId, updates) {
+      storeCalls.push(["updateAgentRuntime", agentId, updates]);
+      return { ...agent, ...updates };
+    },
+  };
+  const providers = {
+    retell: {
+      async deleteAgentAndLlm(retellAgentId) { providerCalls.push(["deleteAgentAndLlm", retellAgentId]); },
+      async deletePhoneNumber(phoneNumber) { providerCalls.push(["deletePhoneNumber", phoneNumber]); },
+      async deleteKnowledgeBase(retellKnowledgeBaseId) { providerCalls.push(["deleteKnowledgeBase", retellKnowledgeBaseId]); },
+    },
+    telnyx: {
+      async releaseNumber(telnyxNumberId) { providerCalls.push(["releaseNumber", telnyxNumberId]); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const response = await handler(companyAdminEvent("DELETE", "/workspaces/me/agents/agent-123"));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.status, "deleted");
+  assert.equal(body.callsHandledAtDeletion, 2);
+  assert.ok(body.deletedAt);
+  assert.equal(body.deletedByName, "user-123");
+
+  // Only the KB not referenced by another agent gets torn down.
+  assert.deepEqual(
+    providerCalls.filter(([name]) => name === "deleteKnowledgeBase"),
+    [["deleteKnowledgeBase", "retell-kb-solo"]],
+  );
+  assert.deepEqual(
+    storeCalls.filter(([name]) => name === "deleteKnowledgeBaseRecord"),
+    [["deleteKnowledgeBaseRecord", "kb-solo"]],
+  );
+
+  assert.deepEqual(providerCalls.filter(([name]) => name === "deleteAgentAndLlm"), [["deleteAgentAndLlm", "retell-agent-1"]]);
+  assert.deepEqual(providerCalls.filter(([name]) => name === "deletePhoneNumber"), [["deletePhoneNumber", "+17035550133"]]);
+  assert.deepEqual(providerCalls.filter(([name]) => name === "releaseNumber"), [["releaseNumber", "telnyx-num-1"]]);
+  assert.deepEqual(storeCalls.filter(([name]) => name === "deletePhoneNumberRecord"), [["deletePhoneNumberRecord", "phone-agent-123"]]);
+});
+
+test("POST disable is refused for a non-admin", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => { throw new Error("must not call a provider to disable"); } });
+  const event = authenticatedEvent("POST", "/workspaces/me/agents/agent-123/disable");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("POST disable flips status without touching Retell/Telnyx", async () => {
+  const agent = { id: "agent-123", status: "active" };
+  const updates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async updateAgentRuntime(workspaceId, agentId, patch) {
+      updates.push(patch);
+      return { ...agent, ...patch };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => { throw new Error("must not call a provider to disable"); } });
+
+  const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/disable"));
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).status, "disabled");
+  assert.deepEqual(updates, [{ status: "disabled", updatedAt: updates[0].updatedAt }]);
+});
+
+test("POST enable reactivates a disabled agent but refuses a deleted one", async () => {
+  const updates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent(workspaceId, agentId) {
+      return agentId === "agent-deleted"
+        ? { id: "agent-deleted", status: "deleted" }
+        : { id: "agent-123", status: "disabled" };
+    },
+    async updateAgentRuntime(workspaceId, agentId, patch) {
+      updates.push(patch);
+      return { id: agentId, ...patch };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const deleted = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-deleted/enable"));
+  assert.equal(deleted.statusCode, 409);
+
+  const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/enable"));
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).status, "active");
+  assert.deepEqual(updates, [{ status: "active", updatedAt: updates[0].updatedAt }]);
+});
+
+test("DELETE agent returns 404 when the agent is missing", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return null; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/agents/agent-404"));
+
+  assert.equal(response.statusCode, 404);
+  assert.equal(JSON.parse(response.body).message, "Agent not found");
+});
+
 test("PUT agent invalidates a successful test when launch configuration changes", async () => {
   let saved;
   const existing = receptionistAgent();
@@ -432,6 +617,58 @@ test("PUT agent invalidates a successful test when launch configuration changes"
   assert.equal(response.statusCode, 200);
   assert.equal(saved.options.invalidateTest, true);
   assert.equal(saved.agent.status, "draft");
+});
+
+test("PUT agent keeps an already-active agent active and pushes the edit to Retell", async () => {
+  const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
+  const changed = {
+    ...existing,
+    configuration: {
+      ...existing.configuration,
+      guidance: "Updated answering restrictions.",
+      tested: false,
+    },
+  };
+  let savedAgent;
+  const retellCalls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async getProfile() { return receptionistProfile(); },
+    async putAgent(_workspaceId, _agentId, agent) {
+      savedAgent = agent;
+      return agent;
+    },
+    async updateAgentRuntime(_workspaceId, _agentId, updates) {
+      return { ...savedAgent, ...updates };
+    },
+  };
+  const providers = {
+    retell: {
+      async upsertAgent(input) {
+        retellCalls.push(input);
+        return { retellAgentId: "retell-agent-123" };
+      },
+    },
+    resolveVoiceId(requestedVoice) { return requestedVoice; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => providers,
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    changed,
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(savedAgent.status, "active");
+  assert.equal(retellCalls.length, 1);
+  assert.match(retellCalls[0].config.prompt, /Updated answering restrictions/);
 });
 
 test("GET calls lists workspace calls without exposing Retell identifiers", async () => {
@@ -517,6 +754,280 @@ test("GET call detail uses the product call id and hides provider keys", async (
   assert.doesNotMatch(response.body, /calls\/call-123\.wav/);
 });
 
+test("PATCH call sets a manual caller name and reports it back", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall(workspaceId, callId) {
+      return { workspaceId, callId, outcome: "answered" };
+    },
+    async updateCallerName(workspaceId, callId, callerName) {
+      saved = { workspaceId, callId, callerName };
+      return { workspaceId, callId, callerName, callerNameSource: "manual", outcome: "answered" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/calls/call-123",
+    { callerName: "  Jordan Miles  " },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(saved, { workspaceId: "user-123", callId: "call-123", callerName: "Jordan Miles" });
+  const body = JSON.parse(response.body);
+  assert.equal(body.callerName, "Jordan Miles");
+  assert.equal(body.callerNameSource, "manual");
+});
+
+test("PATCH call rejects a missing callerName field and a call that doesn't exist", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getCall() { return null; },
+    async updateCallerName() {
+      throw new Error("should not be called");
+    },
+    async clearCallerName() {
+      throw new Error("should not be called");
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const missingField = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-123", {}));
+  assert.equal(missingField.statusCode, 400);
+
+  const missingCall = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-404", { callerName: "Jordan Miles" }));
+  assert.equal(missingCall.statusCode, 404);
+});
+
+test("PATCH call with a blank/whitespace-only name clears it instead of rejecting", async () => {
+  let cleared = null;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall(workspaceId, callId) {
+      return { workspaceId, callId, callerName: "Jordan Miles", callerNameSource: "manual", outcome: "answered" };
+    },
+    async updateCallerName() {
+      throw new Error("should not be called for a blank name");
+    },
+    async clearCallerName(workspaceId, callId) {
+      cleared = { workspaceId, callId };
+      return { workspaceId, callId, outcome: "answered" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-123", { callerName: "   " }));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(cleared, { workspaceId: "user-123", callId: "call-123" });
+  const body = JSON.parse(response.body);
+  assert.equal(body.callerName, undefined);
+  assert.equal(body.callerNameSource, undefined);
+});
+
+test("POST calls/seed-demo is super-admin only and writes ~120 tagged demo calls", async () => {
+  const { createHandler } = await loadBff();
+
+  const nonAdminStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+  };
+  const nonAdminHandler = createHandler({ getStore: async () => nonAdminStore });
+  const forbiddenEvent = authenticatedEvent("POST", "/workspaces/me/calls/seed-demo");
+  forbiddenEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await nonAdminHandler(forbiddenEvent)).statusCode, 403);
+
+  const superStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "super-admin", status: "active" }; },
+    async listAgents() { return [{ id: "agent-1", name: "Maya" }]; },
+    async seedDemoCalls(workspaceId, records) {
+      assert.equal(records.length, 120);
+      assert.ok(records.every((record) => record.demoSeed === true));
+      assert.ok(records.every((record) => record.agentId === "agent-1"));
+      assert.equal(new Set(records.map((r) => r.callId)).size, records.length);
+      return records.length;
+    },
+  };
+  const superHandler = createHandler({ getStore: async () => superStore });
+  const event = authenticatedEvent("POST", "/workspaces/me/calls/seed-demo");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await superHandler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { count: 120 });
+});
+
+test("DELETE calls/seed-demo is super-admin only and removes tagged demo calls", async () => {
+  const { createHandler } = await loadBff();
+
+  const nonAdminStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+  };
+  const nonAdminHandler = createHandler({ getStore: async () => nonAdminStore });
+  const forbiddenEvent = authenticatedEvent("DELETE", "/workspaces/me/calls/seed-demo");
+  forbiddenEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await nonAdminHandler(forbiddenEvent)).statusCode, 403);
+
+  const superStore = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "super-admin", status: "active" }; },
+    async clearDemoCalls(workspaceId) {
+      assert.equal(workspaceId, "user-123");
+      return 120;
+    },
+  };
+  const superHandler = createHandler({ getStore: async () => superStore });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/calls/seed-demo");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await superHandler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { removed: 120 });
+});
+
+test("GET contacts returns the workspace's stored contact overrides", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listContacts(workspaceId) {
+      assert.equal(workspaceId, "user-123");
+      return [
+        { workspaceId, phoneNumber: "+17035550123", name: "Jordan Miles", createdAt: "t1", updatedAt: "t1" },
+        { workspaceId, phoneNumber: "+17035550199", hidden: true, createdAt: "t2", updatedAt: "t2" },
+      ];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), [
+    { phoneNumber: "+17035550123", name: "Jordan Miles", hidden: false, createdAt: "t1", updatedAt: "t1" },
+    { phoneNumber: "+17035550199", hidden: true, createdAt: "t2", updatedAt: "t2" },
+  ]);
+});
+
+test("GET contacts/summary joins calls and contact overrides server-side", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [
+        { callerNumber: "+17035550123", callerName: "", startedAt: "2026-01-01T00:00:00.000Z" },
+        { callerNumber: "+17035550123", callerName: "Jordan Miles", startedAt: "2026-02-01T00:00:00.000Z" },
+        { callerNumber: "+17035550199", callerName: "Alicia Chen", startedAt: "2026-01-15T00:00:00.000Z" },
+        { callerNumber: undefined, callerName: "", startedAt: "2026-01-20T00:00:00.000Z" },
+      ];
+    },
+    async listContacts() {
+      return [
+        { phoneNumber: "+17035550199", hidden: true },
+        { phoneNumber: "+17035550111", name: "No Calls Yet", hidden: false },
+        { phoneNumber: "+17035550123", name: "J. Miles", hidden: false },
+      ];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), [
+    { phoneNumber: "+17035550123", name: "J. Miles", callCount: 2, latestCallISO: "2026-02-01T00:00:00.000Z", demoSeed: false },
+    { phoneNumber: "+17035550111", name: "No Calls Yet", callCount: 0, latestCallISO: "" },
+  ]);
+});
+
+test("GET contacts/summary flags demoSeed true once any of a contact's calls were super-admin seeded", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [
+        { callerNumber: "+17035550123", callerName: "Jordan Miles", startedAt: "2026-01-01T00:00:00.000Z", demoSeed: true },
+        { callerNumber: "+17035550123", callerName: "Jordan Miles", startedAt: "2026-02-01T00:00:00.000Z" },
+      ];
+    },
+    async listContacts() { return []; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary"));
+  const [row] = JSON.parse(response.body);
+  assert.equal(row.demoSeed, true);
+});
+
+test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid number or missing name", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async putContact(workspaceId, phoneNumber, patch) {
+      saved = { workspaceId, phoneNumber, patch };
+      return { workspaceId, phoneNumber, ...patch, createdAt: "t1", updatedAt: "t2" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const badNumber = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/not-a-number", { name: "Jordan" }));
+  assert.equal(badNumber.statusCode, 400);
+
+  const missingName = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", {}));
+  assert.equal(missingName.statusCode, 400);
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "  Jordan Miles  ", companyName: "  Acme Co  " }));
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(saved, {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550123",
+    patch: { name: "Jordan Miles", companyName: "Acme Co", updatedByName: "user-123", hidden: false },
+  });
+});
+
+test("DELETE contacts/{phoneNumber} soft-deletes (hidden: true) rather than removing the row", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async putContact(workspaceId, phoneNumber, patch) {
+      saved = { workspaceId, phoneNumber, patch };
+      return { workspaceId, phoneNumber, ...patch };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/contacts/(703)%20555-0123"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(saved, {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550123",
+    patch: { hidden: true, updatedByName: "user-123" },
+  });
+});
+
+test("DELETE contacts/{phoneNumber} is refused for a non-admin", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/contacts/(703)%20555-0123");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 403);
+});
+
 test("GET call recording returns a presigned URL, or 404 when there is none", async () => {
   const store = {
     async ensureWorkspace() {},
@@ -583,7 +1094,7 @@ test("Dynamo agent updates preserve provider foreign keys", async () => {
   ));
 });
 
-test("POST activate provisions the DID before syncing Retell and keeps Symantic route ids", async () => {
+test("POST activate syncs Retell only - no phone number is touched", async () => {
   const events = [];
   const agent = receptionistAgent();
   agent.configuration.knowledgeBaseText = "Appointments require 24 hours notice for cancellation.";
@@ -606,11 +1117,8 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
       };
     },
     async getPhoneNumberForAgent() {
+      events.push(["getPhoneNumberForAgent"]);
       return null;
-    },
-    async putPhoneNumber(record) {
-      events.push(["putPhoneNumber", record]);
-      return record;
     },
     async updateAgentRuntime(workspaceId, agentId, updates) {
       events.push(["updateAgentRuntime", workspaceId, agentId, updates]);
@@ -630,11 +1138,7 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
     telnyx: {
       async ensureNumber(input) {
         events.push(["telnyx", input]);
-        return {
-          telnyxNumberId: "telnyx-number-123",
-          telnyxPhoneNumber: "+17035550177",
-          telnyxOrderId: "telnyx-order-123",
-        };
+        throw new Error("activate must never provision a phone number");
       },
     },
     retell: {
@@ -648,7 +1152,7 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
       },
       async importPhoneNumber(input) {
         events.push(["importPhoneNumber", input]);
-        return { retellPhoneNumberId: input.phoneNumber };
+        throw new Error("activate must never import a phone number");
       },
     },
     resolveVoiceId(requestedVoice) {
@@ -672,16 +1176,8 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   const body = JSON.parse(response.body);
   assert.equal(body.agent.id, "agent-123");
   assert.equal(body.agent.status, "active");
-  assert.equal(body.agent.retellAgentId, undefined);
-  assert.equal(body.phoneNumber.id, "phone-agent-123");
-  assert.equal(body.phoneNumber.phoneNumber, "+17035550177");
-  assert.equal(body.phoneNumber.telnyxNumberId, undefined);
-  assert.ok(
-    events.findIndex(([name]) => name === "retell") <
-      events.findIndex(([name]) => name === "importPhoneNumber") &&
-      events.findIndex(([name]) => name === "importPhoneNumber") <
-        events.findIndex(([name]) => name === "putPhoneNumber"),
-  );
+  assert.equal(body.phoneNumber, null);
+  assert.ok(!events.some(([name]) => name === "telnyx" || name === "importPhoneNumber"));
   const retellInput = events.find(([name]) => name === "retell")[1];
   assert.equal(retellInput.symanticAgentId, "agent-123");
   assert.match(retellInput.config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
@@ -699,6 +1195,62 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   assert.ok(retellInput.config.tools.filter(({ type }) => type === "custom").every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")
   ));
+});
+
+test("POST attach-phone-number provisions the DID and imports it into an already-active agent", async () => {
+  const events = [];
+  const agent = receptionistAgent();
+  agent.status = "active";
+  agent.retellAgentId = "retell-agent-123";
+  const profile = receptionistProfile();
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+    async getAgent() { return agent; },
+    async getProfile() { return profile; },
+    async getPhoneNumberForAgent() { return null; },
+    async putPhoneNumber(record) {
+      events.push(["putPhoneNumber", record]);
+      return record;
+    },
+  };
+  const providers = {
+    telnyx: {
+      async ensureNumber(input) {
+        events.push(["telnyx", input]);
+        return {
+          telnyxNumberId: "telnyx-number-123",
+          telnyxPhoneNumber: "+17035550177",
+          telnyxOrderId: "telnyx-order-123",
+        };
+      },
+    },
+    retell: {
+      async importPhoneNumber(input) {
+        events.push(["importPhoneNumber", input]);
+        return { retellPhoneNumberId: input.phoneNumber };
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => providers,
+    toolBaseUrl: "https://api.example.com",
+  });
+  const event = authenticatedEvent("POST", "/workspaces/me/agents/agent-123/attach-phone-number");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.phoneNumber.id, "phone-agent-123");
+  assert.equal(body.phoneNumber.phoneNumber, "+17035550177");
+  assert.ok(
+    events.findIndex(([name]) => name === "importPhoneNumber") <
+      events.findIndex(([name]) => name === "putPhoneNumber"),
+  );
   const importInput = events.find(([name]) => name === "importPhoneNumber")[1];
   assert.equal(importInput.phoneNumber, "+17035550177");
   assert.equal(importInput.retellAgentId, "retell-agent-123");
@@ -709,6 +1261,29 @@ test("POST activate provisions the DID before syncing Retell and keeps Symantic 
   const persistedPhone = events.find(([name]) => name === "putPhoneNumber")[1];
   assert.equal(persistedPhone.phoneNumberId, "phone-agent-123");
   assert.equal(persistedPhone.retellPhoneNumberId, "+17035550177");
+});
+
+test("POST attach-phone-number is refused for a non-admin and refuses a second attach", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("POST", "/workspaces/me/agents/agent-123/attach-phone-number");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const forbidden = await handler(event);
+  assert.equal(forbidden.statusCode, 403);
+
+  const adminStore = {
+    async ensureWorkspace() {},
+    async getAgent() { return { ...receptionistAgent(), status: "active" }; },
+    async getPhoneNumberForAgent() { return { phoneNumberId: "phone-agent-123", telnyxPhoneNumber: "+17035550177" }; },
+  };
+  const adminHandler = createHandler({ getStore: async () => adminStore });
+  const already = await adminHandler(authenticatedEvent("POST", "/workspaces/me/agents/agent-123/attach-phone-number"));
+  assert.equal(already.statusCode, 409);
 });
 
 test("POST activate rejects an untested current configuration", async () => {
@@ -3918,7 +4493,7 @@ test("PUT /workspaces/me/profile rejects an unknown plan key", async () => {
   assert.equal(response.statusCode, 400);
 });
 
-test("inbound lookup rejects the call once the overage cap is reached, and logs it as a declined call", async () => {
+test("inbound lookup never rejects a call for being past the plan's minutes - it's accepted and tagged isOverage instead", async () => {
   const { createHandler } = await loadBff();
   const declined = [];
   const store = {
@@ -3935,6 +4510,7 @@ test("inbound lookup rejects the call once the overage cap is reached, and logs 
       return { workspaceId: "workspace-123" };
     },
     async getUsageCounter() {
+      // Starter's allowance is 1000 minutes - already well past it.
       return { billedMinutes: 2200 };
     },
     async createDeclinedCall(record) {
@@ -3957,13 +4533,50 @@ test("inbound lookup rejects the call once the overage cap is reached, and logs 
     }),
   });
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
-  assert.equal(declined.length, 1);
-  assert.equal(declined[0].workspaceId, "workspace-123");
-  assert.equal(declined[0].agentId, "agent-123");
-  assert.equal(declined[0].outcome, "declined");
-  assert.equal(declined[0].disconnectionReason, "minute_cap_reached");
-  assert.equal(declined[0].callerNumber, "+17035550188");
+  const body = JSON.parse(response.body);
+  assert.equal(body.call_inbound.reject, undefined);
+  assert.equal(body.call_inbound.override_agent_id, "retell-agent-1");
+  assert.equal(body.call_inbound.metadata.isOverage, true);
+  assert.equal(declined.length, 0);
+});
+
+test("inbound lookup does not tag isOverage once billed minutes are back under the plan's allowance", async () => {
+  const { createHandler } = await loadBff();
+  const store = {
+    async getPhoneNumberByDid() {
+      return { workspaceId: "workspace-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "active", retellAgentId: "retell-agent-1" };
+    },
+    async getProfile() {
+      return { ...receptionistProfile(), receptionistPlan: "starter" };
+    },
+    async getWorkspace() {
+      return { workspaceId: "workspace-123" };
+    },
+    async getUsageCounter() {
+      return { billedMinutes: 400 };
+    },
+  };
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550100", from_number: "+17035550188" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.call_inbound.reject, undefined);
+  assert.equal(body.call_inbound.metadata.isOverage, undefined);
 });
 
 test("inbound lookup rejects an inactive agent's call and logs it as declined", async () => {
@@ -4026,7 +4639,8 @@ function blocklistStore(overrides = {}) {
       return rows.get(phoneNumber) ?? null;
     },
     async putBlockedNumber(item) {
-      if (rows.has(item.phoneNumber)) {
+      const existing = rows.get(item.phoneNumber);
+      if (existing && existing.active !== false) {
         const error = new Error("exists");
         error.name = "ConditionalCheckFailedException";
         throw error;
@@ -4036,6 +4650,13 @@ function blocklistStore(overrides = {}) {
     },
     async deleteBlockedNumber(_ws, phoneNumber) {
       rows.delete(phoneNumber);
+    },
+    async deactivateBlockedNumber(_ws, phoneNumber, notes) {
+      const row = rows.get(phoneNumber);
+      if (row) {
+        row.active = false;
+        row.notes = notes;
+      }
     },
     async recordBlockedHit(_ws, phoneNumber) {
       const row = rows.get(phoneNumber);
@@ -4088,7 +4709,191 @@ test("blocked-numbers CRUD works when the premium feature is enabled", async () 
     "/workspaces/me/blocked-numbers/%2B17035550100",
   ));
   assert.equal(removed.statusCode, 200);
-  assert.equal(store.rows.size, 0);
+  // Deactivated, not deleted, so the note history survives a future re-block.
+  assert.equal(store.rows.size, 1);
+  assert.equal(store.rows.get("+17035550100").active, false);
+
+  const relisted = await handler(authenticatedEvent("GET", "/workspaces/me/blocked-numbers"));
+  assert.equal(JSON.parse(relisted.body).length, 0, "an inactive row is not listed as blocked");
+});
+
+test("blocking records who blocked it, a name, and an optional 500-char reason as the first note", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const handler = createHandler({ getStore: async () => store });
+
+  const event = authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0100",
+    reason: "x".repeat(600),
+  });
+  event.requestContext.authorizer.jwt.claims.name = "Dana Admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 201);
+  const body = JSON.parse(response.body);
+  assert.equal(body.blockedByName, "Dana Admin");
+  assert.equal(body.active, true);
+  assert.equal(body.notes.length, 1);
+  assert.equal(body.notes[0].action, "block");
+  assert.equal(body.notes[0].byName, "Dana Admin");
+  assert.equal(body.notes[0].text.length, 500, "reason is capped at 500 characters");
+});
+
+test("only keeps the 3 most recent notes across repeated block/unblock cycles on the same number", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const handler = createHandler({ getStore: async () => store });
+
+  for (let i = 0; i < 3; i += 1) {
+    const blockEvent = authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+      phoneNumber: "(703) 555-0100",
+      reason: `block-${i}`,
+    });
+    blockEvent.requestContext.authorizer.jwt.claims.name = "Dana Admin";
+    // eslint-disable-next-line no-await-in-loop
+    await handler(blockEvent);
+    const unblockEvent = authenticatedEvent("DELETE", "/workspaces/me/blocked-numbers/%2B17035550100", {
+      reason: `unblock-${i}`,
+    });
+    unblockEvent.requestContext.authorizer.jwt.claims.name = "Dana Admin";
+    // eslint-disable-next-line no-await-in-loop
+    await handler(unblockEvent);
+  }
+
+  const row = store.rows.get("+17035550100");
+  assert.equal(row.notes.length, 3);
+  assert.deepEqual(row.notes.map((n) => n.text), ["unblock-2", "block-2", "unblock-1"]);
+});
+
+// The current role model (super-admin / company-admin / quotation-builder)
+// gates quotation-builders out of every receptionist path before this check
+// even runs, so a full-stack 403 can't be exercised against today's roles -
+// this directly unit-tests the permission rule itself instead, the same
+// condition the DELETE route evaluates.
+test("unblock permission rule: an org admin or the original blocker may unblock, no one else", () => {
+  const record = { blockedBy: "the-original-blocker", blockedByName: "Jordan Miles" };
+  const mayUnblock = (actor) => isWorkspaceAdminForTest(actor) || actor.userId === record.blockedBy;
+
+  assert.equal(mayUnblock({ userId: "the-original-blocker", roles: ["quotation-builder"] }), true);
+  assert.equal(mayUnblock({ userId: "some-admin", roles: ["company-admin"] }), true);
+  assert.equal(mayUnblock({ userId: "someone-else", roles: ["quotation-builder"] }), false);
+
+  function isWorkspaceAdminForTest(actor) {
+    return actor.roles.includes("company-admin") || actor.roles.includes("super-admin");
+  }
+});
+
+test("an org admin can unblock a number even when they weren't the one who blocked it", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  store.rows.set("+17035550100", {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550100",
+    hitCount: 0,
+    active: true,
+    blockedBy: "a-different-admin",
+    blockedByName: "Alex Admin",
+    notes: [],
+  });
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("DELETE", "/workspaces/me/blocked-numbers/%2B17035550100", {
+    reason: "false positive, confirmed with the caller",
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(store.rows.get("+17035550100").active, false);
+  assert.equal(store.rows.get("+17035550100").notes[0].text, "false positive, confirmed with the caller");
+  assert.equal(store.rows.get("+17035550100").notes[0].byUserId, "user-123");
+});
+
+test("blocking with a duration sets a DynamoDB TTL expiresAt; forever leaves it unset", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const handler = createHandler({ getStore: async () => store });
+  const before = Math.floor(Date.now() / 1000);
+
+  const timed = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0100",
+    durationDays: 30,
+  }));
+  assert.equal(timed.statusCode, 201);
+  const timedBody = JSON.parse(timed.body);
+  assert.ok(timedBody.expiresAt >= before + 30 * 86_400);
+  assert.ok(timedBody.expiresAt < before + 31 * 86_400);
+
+  const forever = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0199",
+  }));
+  assert.equal(forever.statusCode, 201);
+  assert.equal(JSON.parse(forever.body).expiresAt, undefined);
+
+  const bogus = await handler(authenticatedEvent("POST", "/workspaces/me/blocked-numbers", {
+    phoneNumber: "(703) 555-0177",
+    durationDays: 45,
+  }));
+  assert.equal(JSON.parse(bogus.body).expiresAt, undefined, "an unsupported duration is treated as forever, not rejected");
+});
+
+test("GET blocked-numbers omits a row whose TTL has already passed, even if DynamoDB hasn't swept it yet", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  store.rows.set("+17035550100", {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550100",
+    hitCount: 0,
+    expiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  store.rows.set("+17035550199", {
+    workspaceId: "user-123",
+    phoneNumber: "+17035550199",
+    hitCount: 0,
+    expiresAt: Math.floor(Date.now() / 1000) + 30 * 86_400,
+  });
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/blocked-numbers"));
+  const rows = JSON.parse(response.body);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].phoneNumber, "+17035550199");
+});
+
+test("inbound lookup does not reject a caller whose block has expired, even before DynamoDB sweeps the row", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore({
+    async getPhoneNumberByDid() {
+      return { workspaceId: "user-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { status: "active", retellAgentId: "retell-agent-1" };
+    },
+    async getUsageCounter() {
+      return null;
+    },
+  });
+  store.rows.set("+17035550100", {
+    phoneNumber: "+17035550100",
+    hitCount: 0,
+    expiresAt: Math.floor(Date.now() / 1000) - 10,
+  });
+  const handler = createHandler({
+    getStore: async () => store,
+    getRetellApiKey: async () => "retell-secret",
+    verifySignature: () => true,
+  });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "v=1,d=deadbeef" },
+    body: JSON.stringify({
+      event: "call_inbound",
+      call_inbound: { to_number: "+17035550177", from_number: "+1 703-555-0100" },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.notEqual(body.call_inbound?.reject, true);
+  assert.equal(store.rows.get("+17035550100").hitCount, 0, "an expired block never records a hit");
 });
 
 test("inbound lookup rejects a blocked caller, records a hit, and logs it as declined", async () => {

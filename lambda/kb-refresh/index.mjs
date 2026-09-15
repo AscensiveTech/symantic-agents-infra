@@ -70,6 +70,7 @@ export function createHandler({
           await store.updateKnowledgeBase(workspaceId, item.knowledgeBaseId, {
             retellKnowledgeBaseId: created.knowledgeBaseId,
             lastRefreshedAt: new Date(nowMs).toISOString(),
+            updatedAt: new Date(nowMs).toISOString(),
           });
           refreshed += 1;
 
