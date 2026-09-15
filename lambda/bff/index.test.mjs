@@ -4305,6 +4305,188 @@ test("PATCH /platform/companies/{id} re-anchors billing and stores a credit bala
   assert.equal((await handler(bad)).statusCode, 400);
 });
 
+// --- Call-summary emails ------------------------------------------------------
+
+function callDigestStore({ workspace = { workspaceId: "user-123", name: "Arc Dental" }, members } = {}) {
+  const saved = [];
+  return {
+    saved,
+    async ensureWorkspace() {},
+    async getWorkspace() {
+      return workspace;
+    },
+    async listMemberships() {
+      return members ?? [
+        { userId: "u1", email: "Dana@ArcDental.com", role: "company-admin", status: "active" },
+        { userId: "u2", email: "sam@arcdental.com", role: "quotation-builder", status: "active" },
+        { userId: "u3", email: "gone@arcdental.com", role: "company-admin", status: "disabled" },
+      ];
+    },
+    async saveCallDigest(workspaceId, callDigest, cursor) {
+      saved.push({ workspaceId, callDigest, cursor });
+      workspace = { ...workspace, callDigest, ...(cursor ? { callDigestCursor: cursor } : {}) };
+    },
+  };
+}
+
+function validDigestBody(overrides = {}) {
+  return {
+    enabled: true,
+    frequency: "daily",
+    sendHour: 9,
+    weekday: 1,
+    timezone: "Asia/Kolkata",
+    includeTranscripts: true,
+    extraRecipients: ["FrontDesk@ArcDental.com", "frontdesk@arcdental.com"],
+    ...overrides,
+  };
+}
+
+test("GET call-digest returns safe defaults and only active admins as recipients", async () => {
+  const store = callDigestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    emailSenderAddress: "info@ascensivetech.com",
+  });
+
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/call-digest"));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(body.settings, {
+    enabled: false,
+    frequency: "daily",
+    sendHour: 8,
+    weekday: 1,
+    timezone: "UTC",
+    includeTranscripts: true,
+    extraRecipients: [],
+  });
+  assert.deepEqual(body.adminRecipients, ["dana@arcdental.com"]);
+  assert.equal(body.sender, "info@ascensivetech.com");
+  assert.equal(body.lastRun, null);
+});
+
+test("turning call summaries on saves the settings and starts the window now", async () => {
+  const store = callDigestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const before = Date.now();
+
+  const response = await handler(companyAdminEvent("PUT", "/workspaces/me/call-digest", validDigestBody()));
+
+  assert.equal(response.statusCode, 200);
+  const [save] = store.saved;
+  assert.deepEqual(
+    { ...save.callDigest, updatedAt: undefined, updatedBy: undefined },
+    {
+      enabled: true,
+      frequency: "daily",
+      sendHour: 9,
+      weekday: 1,
+      timezone: "Asia/Kolkata",
+      includeTranscripts: true,
+      extraRecipients: ["frontdesk@arcdental.com"],
+      updatedAt: undefined,
+      updatedBy: undefined,
+    },
+  );
+  // Without a fresh cursor the first email would mail the entire call history.
+  assert.ok(Date.parse(save.cursor) >= before);
+  assert.deepEqual(JSON.parse(response.body).settings.extraRecipients, ["frontdesk@arcdental.com"]);
+});
+
+test("editing summaries that are already on keeps the current window", async () => {
+  const store = callDigestStore({
+    workspace: {
+      workspaceId: "user-123",
+      callDigest: { ...validDigestBody(), enabled: true },
+      callDigestCursor: "2026-09-15T00:00:00.000Z",
+    },
+  });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  await handler(companyAdminEvent("PUT", "/workspaces/me/call-digest", validDigestBody({ frequency: "hourly" })));
+
+  assert.equal(store.saved[0].cursor, undefined);
+});
+
+test("invalid call summary settings are rejected with a specific reason", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => callDigestStore() });
+  const cases = [
+    [{ frequency: "every_minute" }, /how often/],
+    [{ sendHour: 24 }, /hour/],
+    [{ weekday: 7 }, /day of the week/],
+    [{ timezone: "Mars/Olympus" }, /timezone/],
+    [{ extraRecipients: ["not-an-email"] }, /not a valid email/],
+    [{ extraRecipients: Array.from({ length: 11 }, (_, index) => `p${index}@example.com`) }, /at most 10/],
+    [{ enabled: "yes" }, /enabled/],
+  ];
+  for (const [override, message] of cases) {
+    const response = await handler(companyAdminEvent("PUT", "/workspaces/me/call-digest", validDigestBody(override)));
+    assert.equal(response.statusCode, 400, JSON.stringify(override));
+    assert.match(JSON.parse(response.body).message, message);
+  }
+});
+
+test("call summaries are an admin-only setting", async () => {
+  const store = {
+    ...callDigestStore(),
+    async getMembership() {
+      return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("PUT", "/workspaces/me/call-digest", validDigestBody());
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+  assert.equal(store.saved.length, 0);
+});
+
+test("a test summary is sent only to the admin who asked for it", async () => {
+  const invocations = [];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => callDigestStore(),
+    invokeCallDigest: async (payload) => {
+      invocations.push(payload);
+      return { sent: true, to: payload.recipient, callCount: 2 };
+    },
+  });
+  const event = companyAdminEvent("POST", "/workspaces/me/call-digest/test");
+  event.requestContext.authorizer.jwt.claims.email = "Dana@ArcDental.com";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(invocations, [{ action: "send-test", workspaceId: "user-123", recipient: "dana@arcdental.com" }]);
+});
+
+test("a failed test summary surfaces the reason instead of a blank error", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => callDigestStore(),
+    invokeCallDigest: async () => ({
+      sent: false,
+      error: "This address can't receive email yet: sending is limited to verified addresses until email access is approved.",
+    }),
+  });
+  const event = companyAdminEvent("POST", "/workspaces/me/call-digest/test");
+  event.requestContext.authorizer.jwt.claims.email = "dana@arcdental.com";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 502);
+  assert.match(JSON.parse(response.body).message, /verified addresses/);
+});
+
 function authenticatedEvent(method, path, body, queryStringParameters) {
   return {
     requestContext: {

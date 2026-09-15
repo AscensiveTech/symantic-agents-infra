@@ -151,6 +151,7 @@ resource "aws_iam_role_policy" "oauth_runtime" {
         Action   = ["kms:Encrypt", "kms:Decrypt"]
         Resource = aws_kms_key.calendar_tokens.arn
       },
+      local.ses_send_statement,
     ]
   })
 }
@@ -191,6 +192,8 @@ resource "aws_lambda_function" "oauth" {
       CALENDAR_TOKENS_KMS_KEY_ID  = aws_kms_key.calendar_tokens.arn
       GOOGLE_OAUTH_SECRET_ARN     = aws_secretsmanager_secret.providers["google-oauth"].arn
       MICROSOFT_OAUTH_SECRET_ARN  = aws_secretsmanager_secret.providers["microsoft-oauth"].arn
+      EMAIL_FROM                  = local.email_from
+      EMAIL_CONFIGURATION_SET     = aws_sesv2_configuration_set.notifications.configuration_set_name
     }
   }
 

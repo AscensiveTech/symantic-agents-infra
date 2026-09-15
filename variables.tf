@@ -103,6 +103,18 @@ variable "github_repo_id" {
   default     = "1315122090"
 }
 
+variable "email_sender_address" {
+  description = "From address for invitations and call-summary emails. Its domain must be a public Route53 zone in this account, so SES can be verified by DKIM."
+  type        = string
+  default     = "info@ascensivetech.com"
+}
+
+variable "email_sender_name" {
+  description = "Display name shown next to the sender address."
+  type        = string
+  default     = "Symantic"
+}
+
 variable "create_github_oidc_provider" {
   description = "true to create the GitHub Actions OIDC provider; false to reuse one already in the account."
   type        = bool

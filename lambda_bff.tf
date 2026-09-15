@@ -288,6 +288,8 @@ resource "aws_lambda_function" "bff" {
       SIGNWELL_SECRET_ARN         = aws_secretsmanager_secret.providers["signwell"].arn
       ANTHROPIC_SECRET_ARN        = aws_secretsmanager_secret.providers["anthropic"].arn
       PUBLIC_API_BASE_URL         = aws_apigatewayv2_api.bff.api_endpoint
+      CALL_DIGEST_FUNCTION_NAME   = aws_lambda_function.digest.function_name
+      EMAIL_SENDER_ADDRESS        = var.email_sender_address
     }
   }
 
