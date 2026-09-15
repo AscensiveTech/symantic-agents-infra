@@ -1942,6 +1942,12 @@ async function handlePlatformCompanies(event, {
 
   const body = readBody(event);
   const name = typeof body?.name === "string" ? body.name.trim() : "";
+  // The workspace's own company email - required from here on (see
+  // handleCompanyProfile's PATCH, which never allows clearing it once set).
+  // Distinct from adminEmail below, which only creates/identifies the Org
+  // Admin login - a company can rename or replace its admin without ever
+  // touching this.
+  const email = typeof body?.email === "string" ? body.email.trim() : "";
   const adminEmail = typeof body?.adminEmail === "string"
     ? body.adminEmail.trim().toLowerCase()
     : "";
@@ -1950,8 +1956,12 @@ async function handlePlatformCompanies(event, {
   const tier = body?.tier ?? "basic";
   const hasEntitlements = body && Object.hasOwn(body, "entitlements");
   const entitlements = body?.entitlements;
-  const allowedSections = normalizeProposalSections(body?.allowedProposalSections);
-  const defaultSections = normalizeProposalSections(body?.defaultTemplateSections);
+  // A receptionist-only company (entitlements.rapidProposal explicitly
+  // false) has no use for RapidProposal's section pickers - default to the
+  // full set instead of requiring the caller to send them, since nothing
+  // ever reads them for a company that doesn't use RapidProposal.
+  const allowedSections = normalizeProposalSections(body?.allowedProposalSections, PROPOSAL_SECTION_KINDS);
+  const defaultSections = normalizeProposalSections(body?.defaultTemplateSections, allowedSections ?? PROPOSAL_SECTION_KINDS);
   // The super admin must set when billing starts for the new company; it can
   // be today or any future date (a changeable picker in the edit drawer moves
   // it later). Format YYYY-MM-DD.
@@ -1961,6 +1971,8 @@ async function handlePlatformCompanies(event, {
   if (
     name.length < 2 ||
     name.length > 120 ||
+    !email ||
+    email.length > 320 ||
     !EMAIL_PATTERN.test(adminEmail) ||
     adminEmail.length > 320 ||
     adminName.length > 120 ||
@@ -1981,6 +1993,7 @@ async function handlePlatformCompanies(event, {
   const workspace = {
     workspaceId,
     name,
+    email,
     tier,
     ...(hasEntitlements ? { entitlements } : {}),
     allowedProposalSections: allowedSections,
@@ -2013,6 +2026,7 @@ async function handlePlatformCompanies(event, {
     return json(201, {
       workspaceId,
       name,
+      email,
       createdAt: now,
       allowedProposalSections: allowedSections,
       entitlements: workspaceEntitlements(workspace),
@@ -2491,6 +2505,7 @@ async function platformCompanySummary(store, workspace) {
   return {
     workspaceId: workspace.workspaceId,
     name: workspace.name || workspace.workspaceId,
+    email: workspace.email || "",
     createdAt: workspace.createdAt ?? null,
     allowedProposalSections: normalizeProposalSections(
       workspace.allowedProposalSections,
@@ -3394,6 +3409,7 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
     }
     return json(200, {
       name: workspace.name || "",
+      email: workspace.email || "",
       ...companyLogoResponse(workspace, logoUrl),
     });
   }
@@ -3403,13 +3419,26 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
     if (name.length < 2 || name.length > 120) {
       return json(400, { message: "Invalid company name" });
     }
+    // Company email is required from here on and, once set, can never be
+    // cleared - a workspace admin PATCHing just the name (email omitted)
+    // keeps whatever's already stored; explicitly sending a blank email is
+    // the only way to trigger this rejection.
+    let email = workspace.email || "";
+    if (Object.hasOwn(body ?? {}, "email")) {
+      const nextEmail = typeof body.email === "string" ? body.email.trim() : "";
+      if (!nextEmail || nextEmail.length > 320) {
+        return json(400, { message: "Company email is required" });
+      }
+      email = nextEmail;
+    }
     await store.putWorkspace({
       ...workspace,
       name,
+      email,
       updatedAt: new Date().toISOString(),
       updatedBy: actor.userId,
     });
-    return json(200, { name });
+    return json(200, { name, email });
   }
   return json(404, { message: "Not found" });
 }

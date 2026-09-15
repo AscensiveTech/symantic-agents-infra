@@ -3223,6 +3223,7 @@ test("super administrators onboard a company with an isolated default template",
   });
   const event = authenticatedEvent("POST", "/platform/companies", {
     name: "Technovate Design",
+    email: "billing@technovate.design",
     adminEmail: "AJM@technovate.design",
     adminName: "AJM",
     temporaryPassword: "Temporary123!",
@@ -3239,6 +3240,8 @@ test("super administrators onboard a company with an isolated default template",
 
   assert.equal(response.statusCode, 201);
   assert.match(body.workspaceId, /^workspace-/);
+  assert.equal(body.email, "billing@technovate.design");
+  assert.equal(bundle.workspace.email, "billing@technovate.design");
   assert.equal(body.templateCount, 1);
   assert.equal(bundle.workspace.name, "Technovate Design");
   assert.equal(bundle.workspace.tier, "repository");
@@ -3251,6 +3254,51 @@ test("super administrators onboard a company with an isolated default template",
   assert.equal(bundle.template.isDefault, true);
   assert.deepEqual(bundle.template.items.map((item) => item.kind), ["cover", "agenda", "closing"]);
   assert.deepEqual(directoryCalls.map((call) => call[0]), ["create", "role"]);
+});
+
+test("company onboarding requires an email, and a receptionist-only company can omit RapidProposal's section pickers", async () => {
+  let bundle;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async createWorkspaceBundle(value) {
+      bundle = value;
+      return value;
+    },
+  };
+  const directory = {
+    async createUser() { return { userId: "id-1", username: "cognito-id-1" }; },
+    async setRole() {},
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+
+  const missingEmail = authenticatedEvent("POST", "/platform/companies", {
+    name: "Maple Dental",
+    adminEmail: "owner@mapledental.test",
+    temporaryPassword: "Temporary123!",
+    entitlements: { receptionist: true, rapidProposal: false },
+    billingAnchorDate: "2099-01-01",
+  });
+  missingEmail.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"super-admin\"]";
+  assert.equal((await handler(missingEmail)).statusCode, 400);
+
+  const receptionistOnly = authenticatedEvent("POST", "/platform/companies", {
+    name: "Maple Dental",
+    email: "owner@mapledental.test",
+    adminEmail: "owner@mapledental.test",
+    temporaryPassword: "Temporary123!",
+    entitlements: { receptionist: true, rapidProposal: false },
+    billingAnchorDate: "2099-01-01",
+  });
+  receptionistOnly.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"super-admin\"]";
+  const response = await handler(receptionistOnly);
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(JSON.parse(response.body).email, "owner@mapledental.test");
+  assert.ok(bundle.workspace.allowedProposalSections.length > 0);
 });
 
 test("only super administrators can access company onboarding", async () => {
@@ -3600,11 +3648,44 @@ test("company profile APIs read and update the signed-in workspace name", async 
   const patchResponse = await handler(patchEvent);
 
   assert.equal(getResponse.statusCode, 200);
-  assert.deepEqual(JSON.parse(getResponse.body), { name: "Technovate Design", logo: null });
+  assert.deepEqual(JSON.parse(getResponse.body), { name: "Technovate Design", email: "", logo: null });
   assert.equal(patchResponse.statusCode, 200);
-  assert.deepEqual(JSON.parse(patchResponse.body), { name: "Technovate Group" });
+  assert.deepEqual(JSON.parse(patchResponse.body), { name: "Technovate Group", email: "" });
   assert.equal(workspace.name, "Technovate Group");
   assert.equal(workspace.tier, "basic");
+});
+
+test("company email is required once set, and a PATCH can never clear it", async () => {
+  let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design", tier: "basic" };
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: workspace.workspaceId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return workspace; },
+    async putWorkspace(value) { workspace = value; return value; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const setEmail = authenticatedEvent("PATCH", "/workspaces/me/company", { name: "Technovate Design", email: "billing@technovate.test" });
+  setEmail.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const setResponse = await handler(setEmail);
+  assert.equal(setResponse.statusCode, 200);
+  assert.equal(JSON.parse(setResponse.body).email, "billing@technovate.test");
+  assert.equal(workspace.email, "billing@technovate.test");
+
+  // A name-only PATCH (email omitted) leaves the stored email untouched.
+  const nameOnly = authenticatedEvent("PATCH", "/workspaces/me/company", { name: "Technovate Group" });
+  nameOnly.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  await handler(nameOnly);
+  assert.equal(workspace.email, "billing@technovate.test");
+
+  // Explicitly submitting a blank email is rejected, not silently accepted.
+  const clearAttempt = authenticatedEvent("PATCH", "/workspaces/me/company", { name: "Technovate Group", email: "" });
+  clearAttempt.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const clearResponse = await handler(clearAttempt);
+  assert.equal(clearResponse.statusCode, 400);
+  assert.equal(workspace.email, "billing@technovate.test");
 });
 
 test("company administrators can upload, read, and remove their company logo", async () => {
