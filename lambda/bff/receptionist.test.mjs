@@ -76,6 +76,24 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /\+17035550102/);
 });
 
+test("a 'decline' emergency rule tells the agent to say a message instead of transferring", () => {
+  const declineAgent = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      emergencyRules: [
+        { phrases: ["fire", "smoke"], action: "decline", message: "We're sorry, we can't help with that. Please call 911." },
+        { phrases: ["chest pain"], transferTarget: "+17035550102" },
+      ],
+    },
+  };
+  const prompt = buildReceptionistPrompt(declineAgent, profile);
+
+  assert.match(prompt, /fire.*smoke.*say "We're sorry, we can't help with that\. Please call 911\."/s);
+  assert.match(prompt, /do not transfer/);
+  assert.match(prompt, /chest pain.*transfer to \+17035550102/s);
+});
+
 test("prompt always instructs honesty about being an AI - never claim to be human", () => {
   const prompt = buildReceptionistPrompt(agent, profile);
   assert.match(prompt, /always answer honestly.*yes, you are an AI receptionist/is);

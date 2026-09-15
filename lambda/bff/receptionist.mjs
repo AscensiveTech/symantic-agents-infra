@@ -486,10 +486,19 @@ function formatEmergencyRules(rules) {
     const phrases = Array.isArray(rule?.phrases)
       ? rule.phrases.map(text).filter(Boolean)
       : [];
+    if (!phrases.length) return [];
+    const phraseList = phrases.map((phrase) => `"${phrase}"`).join(", ");
+    if (rule?.action === "decline") {
+      const message = text(rule?.message);
+      if (!message) return [];
+      return [
+        `- If the caller mentions ${phraseList}: say "${message}" and do not transfer or take any other action.`,
+      ];
+    }
     const target = text(rule?.transferTarget);
-    if (!phrases.length || !target) return [];
+    if (!target) return [];
     return [
-      `- If the caller mentions ${phrases.map((phrase) => `"${phrase}"`).join(", ")}: transfer to ${target}.`,
+      `- If the caller mentions ${phraseList}: transfer to ${target}.`,
     ];
   }).join("\n");
 }
