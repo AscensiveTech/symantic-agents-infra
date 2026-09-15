@@ -105,7 +105,10 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid    = "ManagePhoneNumbers"
         Effect = "Allow"
-        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
+        # DeleteItem is needed to release a number when its agent is deleted -
+        # missing until now, which surfaced as a prod "Internal server error"
+        # on delete-agent for any agent that actually had a number attached.
+        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
         Resource = [
           aws_dynamodb_table.control_plane["phone_numbers"].arn,
           "${aws_dynamodb_table.control_plane["phone_numbers"].arn}/index/*",
