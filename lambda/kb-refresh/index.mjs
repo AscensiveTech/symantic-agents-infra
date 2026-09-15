@@ -70,6 +70,9 @@ export function createHandler({
           await store.updateKnowledgeBase(workspaceId, item.knowledgeBaseId, {
             retellKnowledgeBaseId: created.knowledgeBaseId,
             lastRefreshedAt: new Date(nowMs).toISOString(),
+            lastRefreshAttemptAt: new Date(nowMs).toISOString(),
+            refreshStatus: "ok",
+            lastRefreshError: null,
             updatedAt: new Date(nowMs).toISOString(),
           });
           refreshed += 1;
@@ -100,6 +103,11 @@ export function createHandler({
         } catch (error) {
           failed += 1;
           console.error(`Failed to refresh knowledge base ${item.knowledgeBaseId} for ${workspaceId}`, error);
+          await store.updateKnowledgeBase(workspaceId, item.knowledgeBaseId, {
+            refreshStatus: "failed",
+            lastRefreshError: error instanceof Error ? error.message : "Unable to refresh this website",
+            lastRefreshAttemptAt: new Date(nowMs).toISOString(),
+          }).catch(() => {});
         }
       }
     }

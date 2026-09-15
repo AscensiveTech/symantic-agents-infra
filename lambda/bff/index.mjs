@@ -882,24 +882,12 @@ export function createHandler({
       if (knowledgeBaseTarget && method === "DELETE") {
         await store.ensureWorkspace(workspaceId);
         const knowledgeBaseId = decodeURIComponent(knowledgeBaseTarget);
-        const agents = await store.listAgents(workspaceId);
-        const assignedTo = agents.filter((agent) =>
-          Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
-          agent.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
-        if (assignedTo.length > 0) {
-          return json(409, {
-            message: "Unassign this item from every agent before deleting it",
-            assignedAgents: assignedTo.map((agent) => ({ id: agent.id, name: agent.name })),
-          });
+        try {
+          return json(200, await deleteKnowledgeBaseItem(store, await getProviders(), workspaceId, knowledgeBaseId));
+        } catch (error) {
+          if (error?.statusCode) return json(error.statusCode, { message: error.message });
+          return json(400, { message: error instanceof Error ? error.message : "Unable to delete knowledge base item" });
         }
-        const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
-        if (!record) return json(404, { message: "Knowledge base item not found" });
-        const providers = await getProviders();
-        if (record.retellKnowledgeBaseId) {
-          await providers.retell.deleteKnowledgeBase(record.retellKnowledgeBaseId).catch(() => {});
-        }
-        await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
-        return json(200, { ok: true });
       }
 
       if (path === "/workspaces/me/most-asked-questions" && method === "POST") {
@@ -5259,16 +5247,28 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
     ? [1, 7, 30].includes(body?.refreshIntervalDays) ? body.refreshIntervalDays : 1
     : null;
 
-  const created = await buildRetellKnowledgeBase({
-    providers,
-    getKnowledgeSigner,
-    workspaceId,
-    name,
-    text,
-    fileMetadata,
-    url,
-    enableAutoRefresh,
-  });
+  // A website can be unreachable at the moment it's added (down, DNS
+  // failure, URL typo) without that being a reason to refuse to save the
+  // item at all - only a `url` source can fail this way (text/file content
+  // is provided directly, nothing to fetch), so only that branch tolerates
+  // the failure: the item still gets created, marked as failed-to-refresh
+  // with a reason, and the nightly refresher (lambda/kb-refresh) keeps
+  // retrying it on its normal schedule.
+  let created = null;
+  let refreshFailure = null;
+  if (url) {
+    try {
+      created = await buildRetellKnowledgeBase({
+        providers, getKnowledgeSigner, workspaceId, name, text, fileMetadata, url, enableAutoRefresh,
+      });
+    } catch (error) {
+      refreshFailure = error instanceof Error ? error.message : "Unable to reach this website";
+    }
+  } else {
+    created = await buildRetellKnowledgeBase({
+      providers, getKnowledgeSigner, workspaceId, name, text, fileMetadata, url, enableAutoRefresh,
+    });
+  }
 
   const knowledgeBaseId = `kb-${randomUUID()}`;
   const nowIso = new Date().toISOString();
@@ -5276,13 +5276,20 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
     name,
     kind: url ? "url" : fileMetadata.length ? "file" : "text",
     sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
-    retellKnowledgeBaseId: created.knowledgeBaseId,
+    ...(created ? { retellKnowledgeBaseId: created.knowledgeBaseId } : {}),
     enableAutoRefresh,
     // Only pasted-text items keep their raw content server-side - it's what
     // lets the Hub's edit flow pre-fill the text box. File/url items have no
     // edit flow (delete and re-add covers them).
     ...(text && !url && fileMetadata.length === 0 ? { sourceText: text } : {}),
-    ...(url ? { refreshIntervalDays, lastRefreshedAt: nowIso } : {}),
+    ...(url
+      ? {
+        refreshIntervalDays,
+        lastRefreshAttemptAt: nowIso,
+        refreshStatus: refreshFailure ? "failed" : "ok",
+        ...(refreshFailure ? { lastRefreshError: refreshFailure } : { lastRefreshedAt: nowIso }),
+      }
+      : {}),
     createdAt: nowIso,
     updatedAt: nowIso,
   };
@@ -5305,35 +5312,70 @@ async function updateKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
     error.statusCode = 404;
     throw error;
   }
-  if (existing.kind !== "text") {
-    const error = new Error("Only pasted-text items can be edited - delete and re-add a file or website instead");
+  if (existing.kind !== "text" && existing.kind !== "url") {
+    const error = new Error("Only pasted-text and website items can be edited - delete and re-add a file instead");
     error.statusCode = 400;
     throw error;
   }
   const name = typeof body?.name === "string" ? body.name.trim().slice(0, 120) : "";
-  const text = typeof body?.text === "string" ? body.text.trim().slice(0, MAX_KNOWLEDGE_TEXT_CHARS) : "";
   if (!name) throw new Error("A name is required");
-  if (!text) throw new Error("Paste some text first");
-
-  const created = await providers.retell.createKnowledgeBase({
-    name: `Symantic ${randomUUID().slice(0, 8)} · ${name}`.slice(0, 39),
-    texts: [{ title: name, text }],
-    files: [],
-    urls: [],
-    enableAutoRefresh: false,
-  });
-  if (existing.retellKnowledgeBaseId) {
-    await providers.retell.deleteKnowledgeBase(existing.retellKnowledgeBaseId).catch(() => {});
-  }
 
   const updatedAt = new Date().toISOString();
-  await store.updateKnowledgeBase(workspaceId, knowledgeBaseId, {
-    name,
-    sourceText: text,
-    sourceLabel: "Pasted text",
-    retellKnowledgeBaseId: created.knowledgeBaseId,
-    updatedAt,
-  });
+  let patch;
+  if (existing.kind === "url") {
+    const url = typeof body?.url === "string" ? body.url.trim() : "";
+    if (!url) throw new Error("Enter a website URL first");
+    const refreshIntervalDays = [1, 7, 30].includes(body?.refreshIntervalDays) ? body.refreshIntervalDays : existing.refreshIntervalDays ?? 1;
+    const enableAutoRefresh = body?.enableAutoRefresh === true;
+    let created = null;
+    let refreshFailure = null;
+    try {
+      created = await providers.retell.createKnowledgeBase({
+        name: `Symantic ${randomUUID().slice(0, 8)} · ${name}`.slice(0, 39),
+        urls: [url],
+        texts: [],
+        files: [],
+        enableAutoRefresh,
+      });
+    } catch (error) {
+      refreshFailure = error instanceof Error ? error.message : "Unable to reach this website";
+    }
+    if (created && existing.retellKnowledgeBaseId) {
+      await providers.retell.deleteKnowledgeBase(existing.retellKnowledgeBaseId).catch(() => {});
+    }
+    patch = {
+      name,
+      sourceLabel: url,
+      enableAutoRefresh,
+      refreshIntervalDays,
+      lastRefreshAttemptAt: updatedAt,
+      refreshStatus: refreshFailure ? "failed" : "ok",
+      lastRefreshError: refreshFailure ?? null,
+      ...(refreshFailure ? {} : { lastRefreshedAt: updatedAt, retellKnowledgeBaseId: created.knowledgeBaseId }),
+      updatedAt,
+    };
+  } else {
+    const text = typeof body?.text === "string" ? body.text.trim().slice(0, MAX_KNOWLEDGE_TEXT_CHARS) : "";
+    if (!text) throw new Error("Paste some text first");
+    const created = await providers.retell.createKnowledgeBase({
+      name: `Symantic ${randomUUID().slice(0, 8)} · ${name}`.slice(0, 39),
+      texts: [{ title: name, text }],
+      files: [],
+      urls: [],
+      enableAutoRefresh: false,
+    });
+    if (existing.retellKnowledgeBaseId) {
+      await providers.retell.deleteKnowledgeBase(existing.retellKnowledgeBaseId).catch(() => {});
+    }
+    patch = {
+      name,
+      sourceText: text,
+      sourceLabel: "Pasted text",
+      retellKnowledgeBaseId: created.knowledgeBaseId,
+      updatedAt,
+    };
+  }
+  await store.updateKnowledgeBase(workspaceId, knowledgeBaseId, patch);
   const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
 
   const agents = await store.listAgents(workspaceId);
@@ -5363,6 +5405,62 @@ async function updateKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
     pushedTo,
     failedFor,
   };
+}
+
+// Deleting an item no longer requires manually unassigning it from every
+// agent first - this does that automatically (best-effort per agent, same
+// as the edit-in-place push above), then removes it from Retell, and only
+// then deletes the local record. If the Retell deletion actually fails, the
+// record is left intact (rather than silently drifting out of sync with
+// Retell) so the caller can retry; an item that was never pushed to Retell
+// (no retellKnowledgeBaseId) skips straight to the local delete.
+async function deleteKnowledgeBaseItem(store, providers, workspaceId, knowledgeBaseId) {
+  const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
+  if (!record) {
+    const error = new Error("Knowledge base item not found");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const agents = await store.listAgents(workspaceId);
+  const assignedTo = agents.filter((agent) =>
+    Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
+    agent.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
+
+  const unassignedFrom = [];
+  const failedToUnassign = [];
+  await Promise.all(assignedTo.map(async (agent) => {
+    try {
+      const nextIds = (agent.configuration.knowledgeBaseIds ?? []).filter((id) => id !== knowledgeBaseId);
+      await store.putAgent(workspaceId, agent.id, { ...agent, configuration: { ...agent.configuration, knowledgeBaseIds: nextIds } });
+      if (agent.retellAgentId) {
+        const llmId = await providers.retell.getAgentLlmId(agent.retellAgentId);
+        if (llmId) {
+          const remainingRetellIds = (await Promise.all(
+            nextIds.map((id) => store.getKnowledgeBase(workspaceId, id)),
+          )).filter((item) => item?.retellKnowledgeBaseId).map((item) => item.retellKnowledgeBaseId);
+          await providers.retell.updateLlmKnowledgeBaseIds(llmId, remainingRetellIds);
+        }
+      }
+      unassignedFrom.push({ id: agent.id, name: agent.name });
+    } catch (error) {
+      console.error("Unable to unassign knowledge base item from agent before deleting it", { agentId: agent.id, error });
+      failedToUnassign.push({ id: agent.id, name: agent.name });
+    }
+  }));
+
+  if (record.retellKnowledgeBaseId) {
+    try {
+      await providers.retell.deleteKnowledgeBase(record.retellKnowledgeBaseId);
+    } catch (error) {
+      const wrapped = new Error("Removed from its assigned agents, but Retell would not confirm deletion - try again.");
+      wrapped.statusCode = 502;
+      throw wrapped;
+    }
+  }
+
+  await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
+  return { ok: true, unassignedFrom, failedToUnassign };
 }
 
 function launchReadinessIssue(agent, profile, calendar) {

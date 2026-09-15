@@ -3763,8 +3763,16 @@ function knowledgeBaseTestStore(overrides = {}) {
       const current = knowledgeBases.get(knowledgeBaseId);
       knowledgeBases.set(knowledgeBaseId, { ...current, ...patch });
     },
+    async deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId) {
+      knowledgeBases.delete(knowledgeBaseId);
+    },
     async listAgents() { return agents; },
+    async putAgent(workspaceId, agentId, agent) {
+      const index = agents.findIndex((item) => item.id === agentId);
+      if (index >= 0) agents[index] = agent;
+    },
     knowledgeBases,
+    agents,
   };
 }
 
@@ -3781,19 +3789,78 @@ test("PATCH knowledge-bases/{id} rejects an unknown item", async () => {
   assert.equal(response.statusCode, 404);
 });
 
-test("PATCH knowledge-bases/{id} refuses to edit a file or url item - only pasted text is editable", async () => {
+test("PATCH knowledge-bases/{id} refuses to edit a file item - only pasted text and websites are editable", async () => {
   const store = knowledgeBaseTestStore({
-    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "url", name: "Site", retellKnowledgeBaseId: "retell-kb-1" }]],
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "file", name: "Doc.pdf", retellKnowledgeBaseId: "retell-kb-1" }]],
   });
   const { createHandler } = await loadBff();
   const handler = createHandler({
     getStore: async () => store,
     getProviders: async () => ({ retell: {} }),
   });
-  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "New name", text: "New text" });
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "New name" });
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
   const response = await handler(event);
   assert.equal(response.statusCode, 400);
+});
+
+test("PATCH knowledge-bases/{id} re-scrapes a website under a new Retell id and pushes it live to every assigned agent", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "url", name: "Old Site", sourceLabel: "https://old.example.com", retellKnowledgeBaseId: "retell-kb-old", refreshIntervalDays: 7 }]],
+    agents: [{ id: "agent-1", name: "Maya", retellAgentId: "retell-agent-1", configuration: { knowledgeBaseIds: ["kb-1"] } }],
+  });
+  const deleted = [];
+  const providers = {
+    retell: {
+      async createKnowledgeBase({ urls }) {
+        assert.deepEqual(urls, ["https://new.example.com"]);
+        return { knowledgeBaseId: "retell-kb-new" };
+      },
+      async deleteKnowledgeBase(id) { deleted.push(id); },
+      async getAgentLlmId() { return "llm-1"; },
+      async updateLlmKnowledgeBaseIds() {},
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "New Site", url: "https://new.example.com" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.item.name, "New Site");
+  assert.equal(body.item.retellKnowledgeBaseId, "retell-kb-new");
+  assert.equal(body.item.refreshStatus, "ok");
+  assert.deepEqual(deleted, ["retell-kb-old"]);
+});
+
+test("PATCH knowledge-bases/{id} preserves the edit even when the new website URL is unreachable", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "url", name: "Old Site", sourceLabel: "https://old.example.com", retellKnowledgeBaseId: "retell-kb-old" }]],
+  });
+  const providers = {
+    retell: {
+      async createKnowledgeBase() { throw new Error("DNS lookup failed"); },
+      async deleteKnowledgeBase() { throw new Error("should not be called"); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "New Site", url: "https://gone.example.com" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.item.name, "New Site");
+  assert.equal(body.item.refreshStatus, "failed");
+  assert.match(body.item.lastRefreshError, /DNS lookup failed/);
+  // The old, still-working Retell knowledge base is left in place since the
+  // new one never got created.
+  assert.equal(body.item.retellKnowledgeBaseId, "retell-kb-old");
 });
 
 test("PATCH knowledge-bases/{id} re-uploads the text to Retell under a new id and pushes it live to every assigned agent", async () => {
@@ -3872,6 +3939,111 @@ test("PATCH knowledge-bases/{id} reports per-agent push failures without blockin
   assert.equal(body.item.sourceText, "new text");
   assert.deepEqual(body.pushedTo, []);
   assert.deepEqual(body.failedFor, [{ id: "agent-1", name: "Maya" }]);
+});
+
+test("POST knowledge-bases still creates a website item, marked as failed-to-refresh, when the site is unreachable", async () => {
+  const created = [];
+  const store = {
+    ...knowledgeBaseTestStore(),
+    async listKnowledgeBases() { return []; },
+    async createKnowledgeBase(workspaceId, knowledgeBaseId, record) { created.push(record); },
+  };
+  const providers = {
+    retell: { async createKnowledgeBase() { throw new Error("Could not resolve host"); } },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("POST", "/workspaces/me/knowledge-bases", { name: "Dead Site", url: "https://gone.example.com" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(body.refreshStatus, "failed");
+  assert.match(body.lastRefreshError, /Could not resolve host/);
+  assert.equal(body.retellKnowledgeBaseId, undefined);
+  assert.equal(created[0].kind, "url");
+});
+
+test("DELETE knowledge-bases/{id} rejects an unknown item", async () => {
+  const store = knowledgeBaseTestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => ({ retell: {} }) });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/knowledge-bases/kb-missing");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  assert.equal(response.statusCode, 404);
+});
+
+test("DELETE knowledge-bases/{id} auto-unassigns from every agent, pushes the change to Retell, then deletes it", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "text", name: "Policy", retellKnowledgeBaseId: "retell-kb-1" }]],
+    agents: [
+      { id: "agent-1", name: "Maya", retellAgentId: "retell-agent-1", configuration: { knowledgeBaseIds: ["kb-1", "kb-2"] } },
+    ],
+  });
+  const deleted = [];
+  const pushedIds = [];
+  const providers = {
+    retell: {
+      async deleteKnowledgeBase(id) { deleted.push(id); },
+      async getAgentLlmId() { return "llm-1"; },
+      async updateLlmKnowledgeBaseIds(llmId, ids) { pushedIds.push([llmId, ids]); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("DELETE", "/workspaces/me/knowledge-bases/kb-1");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(body.unassignedFrom, [{ id: "agent-1", name: "Maya" }]);
+  assert.deepEqual(body.failedToUnassign, []);
+  assert.deepEqual(deleted, ["retell-kb-1"]);
+  assert.equal(store.agents[0].configuration.knowledgeBaseIds.includes("kb-1"), false);
+  assert.equal(store.knowledgeBases.has("kb-1"), false);
+  assert.equal(pushedIds.length, 1);
+  assert.equal(pushedIds[0][0], "llm-1");
+});
+
+test("DELETE knowledge-bases/{id} leaves the record intact when Retell won't confirm the deletion", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "text", name: "Policy", retellKnowledgeBaseId: "retell-kb-1" }]],
+  });
+  const providers = {
+    retell: {
+      async deleteKnowledgeBase() { throw new Error("Retell timeout"); },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("DELETE", "/workspaces/me/knowledge-bases/kb-1");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 502);
+  assert.equal(store.knowledgeBases.has("kb-1"), true);
+});
+
+test("DELETE knowledge-bases/{id} with no retellKnowledgeBaseId skips straight to deleting the record", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "url", name: "Unreachable site" }]],
+  });
+  const providers = { retell: { async deleteKnowledgeBase() { throw new Error("should not be called"); } } };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("DELETE", "/workspaces/me/knowledge-bases/kb-1");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(store.knowledgeBases.has("kb-1"), false);
 });
 
 test("company email is required once set, and a PATCH can never clear it", async () => {
