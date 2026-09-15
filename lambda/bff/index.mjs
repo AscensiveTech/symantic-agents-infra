@@ -428,10 +428,16 @@ async function resolveActor(event, store) {
   return { userId, workspaceId: membership.workspaceId, roles, membership };
 }
 
-// Best-effort human name for attributing a block/unblock action - falls
-// back through the JWT's name/email claims, then the actor's own id, so a
-// note is never left blank even if the token carries neither.
+// Best-effort human name for attributing an action (block/unblock, delete
+// agent, etc.) - the membership record's own name/email is the source of
+// truth for who a user is (what Team & Access shows), checked before the
+// JWT's own claims, then the actor's raw id as a last resort so a note is
+// never left blank even if none of those are set.
 function actorDisplayName(event, actor) {
+  const membershipName = actor?.membership?.name;
+  if (typeof membershipName === "string" && membershipName.trim()) return membershipName.trim();
+  const membershipEmail = actor?.membership?.email;
+  if (typeof membershipEmail === "string" && membershipEmail.trim()) return membershipEmail.trim();
   const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
   if (typeof claims.name === "string" && claims.name.trim()) return claims.name.trim();
   if (typeof claims.email === "string" && claims.email.trim()) return claims.email.trim();
