@@ -4624,6 +4624,17 @@ const DEMO_CALL_NAMES = [
   "Ethan Walsh", "Maria Gonzalez", "Liam O'Brien", "Sophia Turner", "Noah Bennett",
   "Ava Coleman", "Lucas Ferreira", "Chloe Bishop", "Mason Reilly", "Isabella Cruz",
 ];
+// A handful of callers who come back multiple times over ~2 months - real
+// accounts always have a few repeat customers, and Contacts' call-count
+// popup has nothing to demonstrate without at least one contact showing
+// more than one call. Own number range so these never collide with the
+// unique one-off numbers demoCallRecords mints below.
+const DEMO_REPEAT_CALLERS = [
+  { name: "Jordan Miles", callerNumber: "+14155560001" },
+  { name: "Alicia Chen", callerNumber: "+14155560002" },
+  { name: "Marcus Reed", callerNumber: "+14155560003" },
+  { name: "Nina Patel", callerNumber: "+14155560004" },
+];
 const DEMO_OUTCOME_WEIGHTS = [
   ["booked", 6], ["answered", 5], ["escalated", 2], ["message", 3], ["lead", 2],
   ["spam", 1], ["failed", 1], ["abandoned", 1], ["declined", 1],
@@ -4661,21 +4672,28 @@ function demoCallRecords(agentId) {
   const dayMs = 86_400_000;
   const records = [];
   for (let i = 0; i < 120; i += 1) {
-    // Spread across the last 30 days (matches the Overview charts' own
-    // "last 30 days" range), weighted toward weekdays with some weekend
-    // activity too - re-rolling the day a few times biases the distribution
-    // without ever fully excluding a Saturday/Sunday call.
-    let daysAgo = Math.floor(Math.random() * 30);
+    // Every 7th call goes to one of a handful of repeat callers instead of
+    // a fresh one-off number, spread over ~2 months so Contacts has a real
+    // multi-call history to show, not just a wall of single calls.
+    const repeatCaller = i > 0 && i % 7 === 0 ? DEMO_REPEAT_CALLERS[Math.floor(i / 7) % DEMO_REPEAT_CALLERS.length] : null;
+    const dayRange = repeatCaller ? 60 : 30;
+    // Spread across the selected range (matches the Overview charts' own
+    // "last 30 days" range for one-off callers), weighted toward weekdays
+    // with some weekend activity too - re-rolling the day a few times
+    // biases the distribution without ever fully excluding a weekend call.
+    let daysAgo = Math.floor(Math.random() * dayRange);
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const dow = new Date(now - daysAgo * dayMs).getDay();
       const isWeekend = dow === 0 || dow === 6;
       if (!isWeekend || Math.random() < 0.3) break;
-      daysAgo = Math.floor(Math.random() * 30);
+      daysAgo = Math.floor(Math.random() * dayRange);
     }
     const startedAt = new Date(now - daysAgo * dayMs - Math.floor(Math.random() * dayMs));
-    const outcome = pickWeighted(DEMO_OUTCOME_WEIGHTS);
-    const name = DEMO_CALL_NAMES[i % DEMO_CALL_NAMES.length];
-    const hasIdentity = outcome !== "spam" && outcome !== "declined" && Math.random() > 0.15;
+    const outcome = repeatCaller
+      ? pickWeighted(DEMO_OUTCOME_WEIGHTS.filter(([value]) => value !== "spam" && value !== "declined"))
+      : pickWeighted(DEMO_OUTCOME_WEIGHTS);
+    const name = repeatCaller?.name ?? DEMO_CALL_NAMES[i % DEMO_CALL_NAMES.length];
+    const hasIdentity = repeatCaller ? true : outcome !== "spam" && outcome !== "declined" && Math.random() > 0.15;
     const durationMs = outcome === "declined" ? 0
       : outcome === "spam" ? Math.round((5 + Math.random() * 15) * 1000)
         : outcome === "failed" || outcome === "abandoned" ? Math.round(Math.random() * 30 * 1000)
@@ -4688,7 +4706,7 @@ function demoCallRecords(agentId) {
       direction: "inbound",
       callerName: hasIdentity ? name : undefined,
       callerNameSource: hasIdentity ? "agent" : undefined,
-      callerNumber: `+1415555${String(1000 + (i % 900)).padStart(4, "0")}`,
+      callerNumber: repeatCaller?.callerNumber ?? `+1415555${String(1000 + (i % 900)).padStart(4, "0")}`,
       outcome,
       startedAt: startedAt.toISOString(),
       endedAt: endedAt.toISOString(),
