@@ -67,9 +67,9 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["agents"].arn
       },
       {
-        Sid      = "ReadCalls"
+        Sid      = "ManageCalls"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"]
         Resource = aws_dynamodb_table.control_plane["calls"].arn
       },
       {
