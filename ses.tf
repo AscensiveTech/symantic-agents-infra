@@ -90,6 +90,19 @@ resource "aws_route53_record" "ses_mail_from_mx" {
   records = ["10 feedback-smtp.${var.aws_region}.amazonses.com"]
 }
 
+# Monitor-only DMARC (p=none). Receivers such as Gmail and Yahoo expect a
+# sending domain to publish a policy, but p=none changes how nothing is
+# delivered - including Zoho's own mail for this domain. Only tighten to
+# quarantine/reject after confirming every legitimate sender (SES, Zoho, Clerk)
+# passes aligned DKIM or SPF.
+resource "aws_route53_record" "dmarc" {
+  zone_id = data.aws_route53_zone.email_sender.zone_id
+  name    = "_dmarc.${local.email_sender_domain}"
+  type    = "TXT"
+  ttl     = 3600
+  records = ["v=DMARC1; p=none"]
+}
+
 resource "aws_route53_record" "ses_mail_from_spf" {
   zone_id = data.aws_route53_zone.email_sender.zone_id
   name    = local.email_mail_from_domain
