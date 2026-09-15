@@ -12,7 +12,9 @@ import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
   RECEPTIONIST_PLANS,
+  billedMinutes,
   buildUsage,
+  callStart,
   costBreakdown,
   periodKey,
   resolveCallBlocklist,
@@ -1145,7 +1147,10 @@ export function createHandler({
 
       if (path === "/workspaces/me/usage" && method === "GET") {
         await store.ensureWorkspace(workspaceId);
-        return json(200, await loadWorkspaceUsage(store, workspaceId));
+        const usageAgentId = typeof event?.queryStringParameters?.agentId === "string" && event.queryStringParameters.agentId
+          ? event.queryStringParameters.agentId
+          : undefined;
+        return json(200, await loadWorkspaceUsage(store, workspaceId, { agentId: usageAgentId }));
       }
 
       if (path === "/workspaces/me/proposal-usage" && method === "GET") {
@@ -2111,9 +2116,42 @@ async function listCallsForUsage(store, workspaceId) {
   return [];
 }
 
+// Every agent's own month-by-month minutes/calls, from the full unfiltered
+// call list - unlike the rest of loadWorkspaceUsage, this is never scoped
+// to a single agentId, since Monthly History always shows every AI
+// Receptionist the company has, regardless of which one the page is
+// currently focused on.
+function buildMonthlyByAgent(calls, { timezone, agentNames }) {
+  const byKey = new Map();
+  for (const call of calls) {
+    const started = callStart(call);
+    if (!started) continue;
+    const at = new Date(started);
+    if (Number.isNaN(at.getTime())) continue;
+    const period = periodKey(at, timezone);
+    const agentId = typeof call.agentId === "string" && call.agentId ? call.agentId : "unassigned";
+    const key = `${period}::${agentId}`;
+    const entry = byKey.get(key) ?? {
+      period,
+      agentId,
+      agentName: agentId === "unassigned" ? "Unassigned" : agentNames.get(agentId) ?? agentId,
+      minutes: 0,
+      calls: 0,
+    };
+    entry.minutes += billedMinutes(call.durationMs);
+    entry.calls += 1;
+    byKey.set(key, entry);
+  }
+  return [...byKey.values()].sort((a, b) =>
+    b.period.localeCompare(a.period) || a.agentName.localeCompare(b.agentName));
+}
+
 // Build the customer-facing usage view for a workspace (no cost/margin).
-async function loadWorkspaceUsage(store, workspaceId) {
-  const [calls, profile, workspace, agents] = await Promise.all([
+// Pass `agentId` to scope billingCycle/months/calls to one AI Receptionist -
+// `monthlyByAgent` is always every agent, regardless of that filter, and
+// the plan/price fields always stay workspace-level (one shared bill).
+async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
+  const [allCalls, profile, workspace, agents] = await Promise.all([
     listCallsForUsage(store, workspaceId),
     typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
     typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
@@ -2122,8 +2160,10 @@ async function loadWorkspaceUsage(store, workspaceId) {
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
   const plan = resolvePlan(profile, workspace, now, timezone);
-  const usage = buildUsage(calls ?? [], { now, timezone, plan });
   const agentNames = new Map((agents ?? []).map((agent) => [agent.id, agent.name]));
+  const calls = agentId ? (allCalls ?? []).filter((call) => call.agentId === agentId) : (allCalls ?? []);
+  const usage = buildUsage(calls, { now, timezone, plan });
+  const monthlyByAgent = buildMonthlyByAgent(allCalls ?? [], { timezone, agentNames });
   return {
     ...usage,
     billingCycle: {
@@ -2133,6 +2173,7 @@ async function loadWorkspaceUsage(store, workspaceId) {
         agentName: entry.agentId === "unassigned" ? "Unassigned" : agentNames.get(entry.agentId) ?? entry.agentId,
       })),
     },
+    monthlyByAgent,
     features: {
       callBlocklist: resolveCallBlocklist(workspace, plan),
       mostAskedQuestions: workspace?.mostAskedQuestionsEnabled === true,

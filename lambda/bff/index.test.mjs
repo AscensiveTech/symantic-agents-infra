@@ -5169,6 +5169,55 @@ test("GET /workspaces/me/usage returns a tz-correct billing cycle with no cost d
   assert.ok(Array.isArray(body.calls));
 });
 
+test("GET /workspaces/me/usage?agentId= scopes the cycle and months to just that agent", async () => {
+  const { createHandler } = await loadBff();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const store = meteringStore({
+    async listCalls() {
+      return [
+        { ...minuteCall(`${period}-05T10:00:00-04:00`, 90_000), agentId: "agent-1" },
+        { ...minuteCall(`${period}-06T11:00:00-04:00`, 30_000), agentId: "agent-2" },
+      ];
+    },
+    async listAgents() {
+      return [{ id: "agent-1", name: "Maya" }, { id: "agent-2", name: "Samantha" }];
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/usage", undefined, { agentId: "agent-1" }));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  // Only agent-1's 90-second call (1.5 -> 2 billed minutes) counts.
+  assert.equal(body.billingCycle.calls, 1);
+  assert.ok(body.calls.every((call) => call.agentId === "agent-1"));
+});
+
+test("GET /workspaces/me/usage always returns monthlyByAgent for every agent, regardless of the agentId filter", async () => {
+  const { createHandler } = await loadBff();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const store = meteringStore({
+    async listCalls() {
+      return [
+        { ...minuteCall(`${period}-05T10:00:00-04:00`, 90_000), agentId: "agent-1" },
+        { ...minuteCall(`${period}-06T11:00:00-04:00`, 30_000), agentId: "agent-2" },
+      ];
+    },
+    async listAgents() {
+      return [{ id: "agent-1", name: "Maya" }, { id: "agent-2", name: "Samantha" }];
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/usage", undefined, { agentId: "agent-1" }));
+  const body = JSON.parse(response.body);
+
+  const agentNamesInMonthly = new Set(body.monthlyByAgent.map((row) => row.agentName));
+  assert.ok(agentNamesInMonthly.has("Maya"));
+  assert.ok(agentNamesInMonthly.has("Samantha"));
+});
+
 test("PUT /workspaces/me/profile queues a downgrade for next cycle", async () => {
   const { createHandler } = await loadBff();
   let savedWorkspace;

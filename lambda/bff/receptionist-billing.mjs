@@ -108,7 +108,7 @@ function monthBounds(now, timeZone) {
   };
 }
 
-function callStart(call) {
+export function callStart(call) {
   return call?.startedAt ?? call?.createdAt ?? null;
 }
 
