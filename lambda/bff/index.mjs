@@ -916,7 +916,9 @@ export function createHandler({
         await store.ensureWorkspace(workspaceId);
         const agents = typeof store.listAgents === "function" ? await store.listAgents(workspaceId) : [];
         const agentId = agents[0]?.id;
-        const created = await store.seedDemoCalls(workspaceId, demoCallRecords(agentId));
+        const records = demoCallRecords(agentId);
+        const created = await store.seedDemoCalls(workspaceId, records);
+        await store.seedDemoContacts(workspaceId, demoContactOverrides(records));
         return json(200, { count: created });
       }
 
@@ -927,7 +929,8 @@ export function createHandler({
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         const removed = await store.clearDemoCalls(workspaceId);
-        return json(200, { removed });
+        const removedContacts = await store.clearDemoContacts(workspaceId);
+        return json(200, { removed, removedContacts });
       }
 
       if (path === "/workspaces/me/contacts" && method === "GET") {
@@ -4719,6 +4722,38 @@ function demoCallRecords(agentId) {
   return records;
 }
 
+const DEMO_COMPANY_NAMES = [
+  "Brightline Dental", "Harbor View Realty", "Summit Auto Repair", "Cedar Grove Landscaping",
+  "Maple & Co. Law", "Riverside Family Medicine", "Northgate HVAC", "Bluebird Salon & Spa",
+  "Union Street Plumbing", "Coastal Roofing", "Ironwood Fitness", "The Pantry Catering",
+  "Clearwater Pest Control", "Sterling Insurance Group", "Willow Creek Veterinary",
+  "Pinnacle Home Inspections", "Golden Gate Movers", "Lakeside Orthodontics",
+  "Ridgeline Electric", "Anchor Point Accounting",
+];
+
+// Attaches a company name to roughly 90% of the distinct callers a demo
+// batch just created, so Contacts reads like a real account instead of
+// every row showing "-" under Company - the other ~10% stays blank, same
+// as a real account always has a few calls with no company on file.
+function demoContactOverrides(records) {
+  const seen = new Set();
+  const rows = [];
+  let company = 0;
+  for (const record of records) {
+    const phoneNumber = record.callerNumber;
+    if (!phoneNumber || seen.has(phoneNumber)) continue;
+    seen.add(phoneNumber);
+    if (Math.random() < 0.1) continue;
+    rows.push({
+      phoneNumber,
+      companyName: DEMO_COMPANY_NAMES[company % DEMO_COMPANY_NAMES.length],
+      demoSeed: true,
+    });
+    company += 1;
+  }
+  return rows;
+}
+
 function pickWeighted(pairs) {
   const total = pairs.reduce((sum, [, weight]) => sum + weight, 0);
   let roll = Math.random() * total;
@@ -5954,6 +5989,44 @@ export function createDynamoStore(client, commands, tableNames) {
         ConsistentRead: false,
       }));
       return (result.Items ?? []).map((item) => unmarshall(item));
+    },
+
+    // Companion to seedDemoCalls - attaches company names to a batch of demo
+    // callers, tagged the same way so clearDemoCalls can remove exactly
+    // these rows without touching any real contact a user has edited.
+    async seedDemoContacts(workspaceId, rows) {
+      for (const row of rows) {
+        await client.send(new commands.PutItemCommand({
+          TableName: tableNames.contacts,
+          Item: marshall({
+            workspaceId,
+            phoneNumber: row.phoneNumber,
+            companyName: row.companyName,
+            demoSeed: true,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }, { removeUndefinedValues: true }),
+        }));
+      }
+      return rows.length;
+    },
+
+    async clearDemoContacts(workspaceId) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.contacts,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        FilterExpression: "demoSeed = :true",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":true": true }),
+        ConsistentRead: true,
+      }));
+      const items = (result.Items ?? []).map((item) => unmarshall(item));
+      for (const item of items) {
+        await client.send(new commands.DeleteItemCommand({
+          TableName: tableNames.contacts,
+          Key: marshall({ workspaceId, phoneNumber: item.phoneNumber }),
+        }));
+      }
+      return items.length;
     },
 
     async putContact(workspaceId, phoneNumber, patch) {

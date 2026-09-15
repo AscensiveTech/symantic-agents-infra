@@ -853,6 +853,13 @@ test("POST calls/seed-demo is super-admin only and writes ~120 tagged demo calls
       assert.equal(new Set(records.map((r) => r.callId)).size, records.length);
       return records.length;
     },
+    async seedDemoContacts(workspaceId, rows) {
+      assert.ok(rows.length > 0);
+      assert.ok(rows.every((row) => row.demoSeed === true && typeof row.companyName === "string"));
+      // ~90% of the 120 distinct demo callers get a company name.
+      assert.ok(rows.length >= 90 && rows.length <= 120);
+      return rows.length;
+    },
   };
   const superHandler = createHandler({ getStore: async () => superStore });
   const event = authenticatedEvent("POST", "/workspaces/me/calls/seed-demo");
@@ -882,6 +889,10 @@ test("DELETE calls/seed-demo is super-admin only and removes tagged demo calls",
       assert.equal(workspaceId, "user-123");
       return 120;
     },
+    async clearDemoContacts(workspaceId) {
+      assert.equal(workspaceId, "user-123");
+      return 108;
+    },
   };
   const superHandler = createHandler({ getStore: async () => superStore });
   const event = authenticatedEvent("DELETE", "/workspaces/me/calls/seed-demo");
@@ -889,7 +900,7 @@ test("DELETE calls/seed-demo is super-admin only and removes tagged demo calls",
   const response = await superHandler(event);
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(JSON.parse(response.body), { removed: 120 });
+  assert.deepEqual(JSON.parse(response.body), { removed: 120, removedContacts: 108 });
 });
 
 test("GET contacts returns the workspace's stored contact overrides", async () => {
