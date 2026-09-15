@@ -4,9 +4,9 @@ import { isDigestDue, normalizeDigestSettings } from "./schedule.mjs";
 
 const TEST_WINDOW_MS = 24 * 3_600_000;
 
-function recipientsFor(adminEmails, settings) {
+function recipientsFor(settings) {
   const seen = new Set();
-  for (const candidate of [...adminEmails, ...settings.extraRecipients]) {
+  for (const candidate of settings.recipients) {
     const email = normalizeEmail(candidate);
     if (email) seen.add(email);
   }
@@ -64,7 +64,7 @@ export function createDigestHandler({
       await store.recordRun(workspace.workspaceId, { at: windowEnd, status: "no_calls", callCount: 0 });
       return "no_calls";
     }
-    const recipients = recipientsFor(await store.listAdminEmails(workspace.workspaceId), settings);
+    const recipients = recipientsFor(settings);
     if (!recipients.length) {
       await store.recordRun(workspace.workspaceId, {
         at: windowEnd,

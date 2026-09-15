@@ -16,8 +16,7 @@ function settings(overrides = {}) {
     sendHour: 8,
     weekday: 2,
     timezone: "Asia/Kolkata",
-    includeTranscripts: true,
-    extraRecipients: [],
+    recipients: ["dana@arcdental.com"],
     ...overrides,
   });
 }
@@ -166,13 +165,12 @@ test("a disabled summary, or one without a cursor, is never due", () => {
 
 // --- runs -------------------------------------------------------------------
 
-test("a due summary goes to every admin plus extra addresses, once each", async () => {
+test("a due summary goes to every configured recipient, once each", async () => {
   const store = memoryStore({
     workspaces: [workspace({
-      callDigest: settings({ extraRecipients: ["Frontdesk@ArcDental.com", "dana@arcdental.com"] }),
+      callDigest: settings({ recipients: ["Frontdesk@ArcDental.com", "dana@arcdental.com", "sam@arcdental.com", "dana@arcdental.com"] }),
     })],
     calls: [call()],
-    admins: ["dana@arcdental.com", "sam@arcdental.com"],
     agents: [{ agentId: "agent-1", name: "Maya" }],
   });
   const sender = recordingSender();
@@ -281,9 +279,8 @@ test("when nobody could be emailed, the window is handed back for the next run",
 
 test("a partial failure still counts as sent and reports what failed", async () => {
   const store = memoryStore({
-    workspaces: [workspace()],
+    workspaces: [workspace({ callDigest: settings({ recipients: ["dana@arcdental.com", "sam@arcdental.com"] }) })],
     calls: [call()],
-    admins: ["dana@arcdental.com", "sam@arcdental.com"],
   });
   const sender = recordingSender({ failFor: ["sam@arcdental.com"] });
 

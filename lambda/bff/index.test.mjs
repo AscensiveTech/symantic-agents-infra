@@ -3289,6 +3289,7 @@ test("company onboarding requires an email, and a receptionist-only company can 
     name: "Maple Dental",
     email: "owner@mapledental.test",
     adminEmail: "owner@mapledental.test",
+    adminName: "Owner Name",
     temporaryPassword: "Temporary123!",
     entitlements: { receptionist: true, rapidProposal: false },
     billingAnchorDate: "2099-01-01",
@@ -4554,13 +4555,12 @@ function validDigestBody(overrides = {}) {
     sendHour: 9,
     weekday: 1,
     timezone: "Asia/Kolkata",
-    includeTranscripts: true,
-    extraRecipients: ["FrontDesk@ArcDental.com", "frontdesk@arcdental.com"],
+    recipients: ["Dana@ArcDental.com", "dana@arcdental.com", "frontdesk@arcdental.com"],
     ...overrides,
   };
 }
 
-test("GET call-digest returns safe defaults and only active admins as recipients", async () => {
+test("GET call-digest returns safe defaults", async () => {
   const store = callDigestStore();
   const { createHandler } = await loadBff();
   const handler = createHandler({
@@ -4578,10 +4578,8 @@ test("GET call-digest returns safe defaults and only active admins as recipients
     sendHour: 8,
     weekday: 1,
     timezone: "UTC",
-    includeTranscripts: true,
-    extraRecipients: [],
+    recipients: [],
   });
-  assert.deepEqual(body.adminRecipients, ["dana@arcdental.com"]);
   assert.equal(body.sender, "info@ascensivetech.com");
   assert.equal(body.lastRun, null);
 });
@@ -4604,15 +4602,14 @@ test("turning call summaries on saves the settings and starts the window now", a
       sendHour: 9,
       weekday: 1,
       timezone: "Asia/Kolkata",
-      includeTranscripts: true,
-      extraRecipients: ["frontdesk@arcdental.com"],
+      recipients: ["dana@arcdental.com", "frontdesk@arcdental.com"],
       updatedAt: undefined,
       updatedBy: undefined,
     },
   );
   // Without a fresh cursor the first email would mail the entire call history.
   assert.ok(Date.parse(save.cursor) >= before);
-  assert.deepEqual(JSON.parse(response.body).settings.extraRecipients, ["frontdesk@arcdental.com"]);
+  assert.deepEqual(JSON.parse(response.body).settings.recipients, ["dana@arcdental.com", "frontdesk@arcdental.com"]);
 });
 
 test("editing summaries that are already on keeps the current window", async () => {
@@ -4639,8 +4636,8 @@ test("invalid call summary settings are rejected with a specific reason", async 
     [{ sendHour: 24 }, /hour/],
     [{ weekday: 7 }, /day of the week/],
     [{ timezone: "Mars/Olympus" }, /timezone/],
-    [{ extraRecipients: ["not-an-email"] }, /not a valid email/],
-    [{ extraRecipients: Array.from({ length: 5 }, (_, index) => `p${index}@example.com`) }, /at most 4/],
+    [{ recipients: ["not-an-email"] }, /not a valid email/],
+    [{ recipients: Array.from({ length: 7 }, (_, index) => `p${index}@example.com`) }, /at most 6/],
     [{ enabled: "yes" }, /enabled/],
   ];
   for (const [override, message] of cases) {
@@ -6159,30 +6156,6 @@ test("most-asked-questions scoped to one agent only analyzes that agent's calls"
   assert.equal(summarizeCalls[0][0].callId, "c1");
 });
 
-test("most-asked-questions uses the company's own Anthropic key when the super admin has set one", async () => {
-  const { createHandler } = await loadBff();
-  const store = mostAskedStore({
-    async getWorkspace() {
-      return { workspaceId: "user-123", mostAskedQuestionsEnabled: true, anthropicApiKey: "sk-ant-company-specific-key" };
-    },
-  });
-  const overridesSeen = [];
-  const handler = createHandler({
-    getStore: async () => store,
-    getProviders: async () => ({
-      anthropic: {
-        async summarizeMostAskedQuestions({ apiKeyOverride }) {
-          overridesSeen.push(apiKeyOverride);
-          return { questions: [], model: "claude-haiku-4-5-20251001", usage: { inputTokens: 0, outputTokens: 0 }, costCents: 0 };
-        },
-      },
-    }),
-  });
-
-  await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30 }));
-  assert.deepEqual(overridesSeen, ["sk-ant-company-specific-key"]);
-});
-
 test("legal acceptance is scoped per product - the X-Product header picks which product's document/gate applies", async () => {
   const { invalidateActiveLegalCache } = await loadBff();
   invalidateActiveLegalCache();
@@ -6256,42 +6229,38 @@ test("publishing a legal document for one product never touches the other's acti
   invalidateActiveLegalCache();
 });
 
-test("PATCH company anthropicApiKey is accepted, stored, and never echoed back raw", async () => {
+test("most-asked-questions 'deleted' bucket only analyzes calls from agents that no longer exist", async () => {
   const { createHandler } = await loadBff();
-  let saved;
-  const store = {
-    async getMembership(userId) {
-      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+  const store = mostAskedStore({
+    async listCalls() {
+      return [
+        { callId: "c1", agentId: "agent-1", startedAt: new Date().toISOString(), callSummary: "Live agent's call." },
+        { callId: "c2", agentId: "agent-gone", startedAt: new Date().toISOString(), callSummary: "Deleted agent's call." },
+      ];
     },
-    async getWorkspace() {
-      return {
-        workspaceId: "workspace-technovate",
-        name: "Technovate",
-        tier: "growth",
-        createdAt: "2026-08-19T00:00:00.000Z",
-      };
+    async listAgents() {
+      return [
+        { id: "agent-1", status: "active" },
+        { id: "agent-gone", status: "deleted" },
+      ];
     },
-    async putWorkspace(workspace) {
-      saved = workspace;
-      return workspace;
-    },
-    async listMemberships() { return []; },
-    async listProposals() { return []; },
-    async listProposalTemplates() { return []; },
-  };
-  const handler = createHandler({ getStore: async () => store });
-  const event = authenticatedEvent("PATCH", "/platform/companies/workspace-technovate", {
-    anthropicApiKey: "sk-ant-a-real-looking-key-1234",
   });
-  event.pathParameters = { workspaceId: "workspace-technovate" };
-  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const summarizeCalls = [];
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      anthropic: {
+        async summarizeMostAskedQuestions({ calls }) {
+          summarizeCalls.push(calls);
+          return { questions: [], model: "m", usage: { inputTokens: 0, outputTokens: 0 }, costCents: 0 };
+        },
+      },
+    }),
+  });
 
-  const response = await handler(event);
-  assert.equal(response.statusCode, 200);
-  const body = JSON.parse(response.body);
-  assert.equal(body.anthropicApiKeyConfigured, true);
-  assert.equal(body.anthropicApiKey, undefined, "the raw key must never round-trip back to the client");
-  assert.equal(saved.anthropicApiKey, "sk-ant-a-real-looking-key-1234");
+  await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30, agentId: "deleted" }));
+  assert.equal(summarizeCalls[0].length, 1);
+  assert.equal(summarizeCalls[0][0].callId, "c2");
 });
 
 test("most-asked-questions always reads the authenticated actor's own workspace, ignoring any workspaceId in the request body", async () => {

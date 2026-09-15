@@ -460,17 +460,17 @@ const CALL_DIGEST_FREQUENCIES = new Set([
   "daily",
   "weekly",
 ]);
-// Up to 5 people total receive notifications - the configuring admin's own
-// account email counts as one of the 5, so at most 4 more can be added.
-const CALL_DIGEST_MAX_EXTRA_RECIPIENTS = 4;
+// Up to 6 people total receive notifications - a self-service list the
+// admin fully controls, including removing their own account email if they
+// don't want it. No more automatic "every company admin" fan-out.
+const CALL_DIGEST_MAX_RECIPIENTS = 6;
 const CALL_DIGEST_DEFAULTS = Object.freeze({
   enabled: false,
   frequency: "daily",
   sendHour: 8,
   weekday: 1,
   timezone: "UTC",
-  includeTranscripts: true,
-  extraRecipients: [],
+  recipients: [],
 });
 const DIGEST_EMAIL_PATTERN = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]{2,}$/;
 
@@ -504,9 +504,8 @@ function publicCallDigest(stored) {
       ? value.weekday
       : CALL_DIGEST_DEFAULTS.weekday,
     timezone: isIanaTimezone(value.timezone) ? value.timezone : CALL_DIGEST_DEFAULTS.timezone,
-    includeTranscripts: value.includeTranscripts !== false,
-    extraRecipients: Array.isArray(value.extraRecipients)
-      ? value.extraRecipients.map(normalizeDigestEmail).filter(Boolean)
+    recipients: Array.isArray(value.recipients)
+      ? value.recipients.map(normalizeDigestEmail).filter(Boolean)
       : [],
   };
 }
@@ -522,16 +521,15 @@ function readCallDigestSettings(body) {
     return { error: "Choose a day of the week" };
   }
   if (!isIanaTimezone(body.timezone)) return { error: "Choose a valid timezone" };
-  if (typeof body.includeTranscripts !== "boolean") return { error: "includeTranscripts must be true or false" };
-  if (!Array.isArray(body.extraRecipients)) return { error: "extraRecipients must be a list" };
-  if (body.extraRecipients.length > CALL_DIGEST_MAX_EXTRA_RECIPIENTS) {
-    return { error: `Add at most ${CALL_DIGEST_MAX_EXTRA_RECIPIENTS} extra recipients` };
+  if (!Array.isArray(body.recipients)) return { error: "recipients must be a list" };
+  if (body.recipients.length > CALL_DIGEST_MAX_RECIPIENTS) {
+    return { error: `Add at most ${CALL_DIGEST_MAX_RECIPIENTS} recipients` };
   }
-  const extraRecipients = [];
-  for (const candidate of body.extraRecipients) {
+  const recipients = [];
+  for (const candidate of body.recipients) {
     const email = normalizeDigestEmail(candidate);
     if (!email) return { error: `"${String(candidate).slice(0, 80)}" is not a valid email address` };
-    if (!extraRecipients.includes(email)) extraRecipients.push(email);
+    if (!recipients.includes(email)) recipients.push(email);
   }
   return {
     settings: {
@@ -540,23 +538,15 @@ function readCallDigestSettings(body) {
       sendHour: body.sendHour,
       weekday: body.weekday,
       timezone: body.timezone,
-      includeTranscripts: body.includeTranscripts,
-      extraRecipients,
+      recipients,
     },
   };
 }
 
 async function loadCallDigest(store, workspaceId, senderAddress) {
-  const [workspace, members] = await Promise.all([
-    store.getWorkspace(workspaceId),
-    store.listMemberships(workspaceId),
-  ]);
+  const workspace = await store.getWorkspace(workspaceId);
   return {
     settings: publicCallDigest(workspace?.callDigest),
-    adminRecipients: [...new Set((members ?? [])
-      .filter((member) => member.role === "company-admin" && member.status !== "disabled")
-      .map((member) => normalizeDigestEmail(member.email))
-      .filter(Boolean))],
     sender: senderAddress ?? null,
     lastRun: workspace?.callDigestLastRun ?? null,
   };
@@ -1738,7 +1728,6 @@ async function handlePlatformCompanies(event, {
       const hasPlan = isPlanPatch(body);
       const hasBlocklist = body && Object.hasOwn(body, "callBlocklistEnabled");
       const hasMostAskedQuestions = body && Object.hasOwn(body, "mostAskedQuestionsEnabled");
-      const hasAnthropicApiKey = body && Object.hasOwn(body, "anthropicApiKey");
       const hasProposalPrice = body && Object.hasOwn(body, "proposalPlanPriceOverride");
       const hasAnchor = body && Object.hasOwn(body, "billingAnchorDate");
       const hasCredit = body && Object.hasOwn(body, "billingCreditBalance");
@@ -1753,16 +1742,13 @@ async function handlePlatformCompanies(event, {
           && body.billingAnchorDate >= anchorTodayKey);
       const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
         || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
-      const anthropicApiKeyValid = body?.anthropicApiKey === null || body?.anthropicApiKey === ""
-        || (typeof body?.anthropicApiKey === "string" && body.anthropicApiKey.trim().length >= 20);
       if (
-        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasAnthropicApiKey && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
         (hasEntitlements && !isValidEntitlements(body.entitlements)) ||
         (hasName && (name.length < 2 || name.length > 120)) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
         (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
         (hasMostAskedQuestions && typeof body.mostAskedQuestionsEnabled !== "boolean") ||
-        (hasAnthropicApiKey && !anthropicApiKeyValid) ||
         (hasProposalPrice && !proposalPriceValid) ||
         (hasAnchor && !anchorValid) ||
         (hasCredit && !creditValid)
@@ -1782,11 +1768,6 @@ async function handlePlatformCompanies(event, {
         updatedAt: new Date().toISOString(),
         updatedBy: actor.userId,
       };
-      if (hasAnthropicApiKey) {
-        const trimmed = typeof body.anthropicApiKey === "string" ? body.anthropicApiKey.trim() : "";
-        if (!trimmed) delete updated.anthropicApiKey;
-        else updated.anthropicApiKey = trimmed;
-      }
       if (hasProposalPrice) {
         if (proposalPrice === null || proposalPrice === "") delete updated.proposalPlanPriceOverride;
         else updated.proposalPlanPriceOverride = Math.round(proposalPrice * 100) / 100;
@@ -2012,6 +1993,8 @@ async function handlePlatformCompanies(event, {
     ? body.adminEmail.trim().toLowerCase()
     : "";
   const adminName = typeof body?.adminName === "string" ? body.adminName.trim() : "";
+  const website = typeof body?.website === "string" ? body.website.trim().slice(0, 200) : "";
+  const officeAddress = typeof body?.officeAddress === "string" ? body.officeAddress.trim().slice(0, 240) : "";
   const temporaryPassword = body?.temporaryPassword;
   const tier = body?.tier ?? "basic";
   const hasEntitlements = body && Object.hasOwn(body, "entitlements");
@@ -2035,6 +2018,7 @@ async function handlePlatformCompanies(event, {
     email.length > 320 ||
     !EMAIL_PATTERN.test(adminEmail) ||
     adminEmail.length > 320 ||
+    !adminName ||
     adminName.length > 120 ||
     typeof temporaryPassword !== "string" ||
     temporaryPassword.length < 12 ||
@@ -2056,6 +2040,8 @@ async function handlePlatformCompanies(event, {
     email,
     tier,
     ...(hasEntitlements ? { entitlements } : {}),
+    ...(website ? { website } : {}),
+    ...(officeAddress ? { officeAddress } : {}),
     allowedProposalSections: allowedSections,
     billingAnchorDate,
     createdAt: now,
@@ -2087,6 +2073,8 @@ async function handlePlatformCompanies(event, {
       workspaceId,
       name,
       email,
+      website: website || undefined,
+      officeAddress: officeAddress || undefined,
       createdAt: now,
       allowedProposalSections: allowedSections,
       entitlements: workspaceEntitlements(workspace),
@@ -2484,10 +2472,21 @@ const MOST_ASKED_QUESTIONS_MAX_CALLS = 150;
 async function generateMostAskedQuestionsDigest({ store, providers, workspaceId, windowDays, agentId }) {
   const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
   const allCalls = await store.listCalls(workspaceId);
+  // "deleted" is a sentinel, not a real agent id - it buckets calls from
+  // any agent that no longer exists as a live (non-deleted) agent, so that
+  // history stays visible without suggesting a knowledge-base fix on an
+  // agent that's gone.
+  const liveAgentIds = agentId === "deleted"
+    ? new Set((await store.listAgents(workspaceId)).filter((agent) => agent.status !== "deleted").map((agent) => agent.id))
+    : null;
   const eligible = allCalls.filter((call) => {
     const at = Date.parse(call.startedAt ?? call.createdAt ?? "");
     if (Number.isNaN(at) || at < cutoff) return false;
-    if (agentId && call.agentId !== agentId) return false;
+    if (liveAgentIds) {
+      if (liveAgentIds.has(call.agentId)) return false;
+    } else if (agentId && call.agentId !== agentId) {
+      return false;
+    }
     return Boolean(call.callSummary) || (Array.isArray(call.transcript) && call.transcript.length > 0);
   }).slice(0, MOST_ASKED_QUESTIONS_MAX_CALLS);
 
@@ -2495,17 +2494,7 @@ async function generateMostAskedQuestionsDigest({ store, providers, workspaceId,
     return { questions: [], callsAnalyzed: 0, costCents: 0 };
   }
 
-  // Each company can be given its own Anthropic account/key (pasted in by a
-  // super admin on the Client Companies page, per-workspace on the
-  // workspace record) so usage and cost sit on that company's own account
-  // instead of a single shared platform key - fall back to the shared
-  // ANTHROPIC_SECRET_ARN key only when a workspace hasn't been given one.
-  const workspace = typeof store.getWorkspace === "function" ? await store.getWorkspace(workspaceId) : null;
-  const apiKeyOverride = typeof workspace?.anthropicApiKey === "string" && workspace.anthropicApiKey
-    ? workspace.anthropicApiKey
-    : undefined;
-
-  const result = await providers.anthropic.summarizeMostAskedQuestions({ calls: eligible, apiKeyOverride });
+  const result = await providers.anthropic.summarizeMostAskedQuestions({ calls: eligible });
   const digestId = `digest-${randomUUID()}`;
   const record = {
     workspaceId,
@@ -2566,6 +2555,8 @@ async function platformCompanySummary(store, workspace) {
     workspaceId: workspace.workspaceId,
     name: workspace.name || workspace.workspaceId,
     email: workspace.email || "",
+    website: workspace.website || "",
+    officeAddress: workspace.officeAddress || "",
     createdAt: workspace.createdAt ?? null,
     allowedProposalSections: normalizeProposalSections(
       workspace.allowedProposalSections,
@@ -2584,9 +2575,6 @@ async function platformCompanySummary(store, workspace) {
     enterpriseOveragePerMinute: numberOrNullValue(workspace.enterpriseOveragePerMinute),
     callBlocklistEnabled: workspace.callBlocklistEnabled === true,
     mostAskedQuestionsEnabled: workspace.mostAskedQuestionsEnabled === true,
-    // Never return the raw key once stored - only whether one is set, so it
-    // never round-trips back into a browser response after being pasted in.
-    anthropicApiKeyConfigured: typeof workspace.anthropicApiKey === "string" && workspace.anthropicApiKey.length > 0,
     proposalPlanPriceOverride: numberOrNullValue(workspace.proposalPlanPriceOverride),
     proposalMonthlyPrice: resolveProposalMonthlyPrice(normalizeCompanyTier(workspace.tier), workspace),
     billingAnchorDate: typeof workspace.billingAnchorDate === "string" ? workspace.billingAnchorDate : null,

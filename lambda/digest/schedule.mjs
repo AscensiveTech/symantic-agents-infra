@@ -14,8 +14,7 @@ export const DEFAULT_DIGEST_SETTINGS = Object.freeze({
   sendHour: 8,
   weekday: 1,
   timezone: "UTC",
-  includeTranscripts: true,
-  extraRecipients: [],
+  recipients: [],
 });
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -54,9 +53,8 @@ export function normalizeDigestSettings(value) {
       ? weekday
       : DEFAULT_DIGEST_SETTINGS.weekday,
     timezone: isValidTimezone(source.timezone) ? source.timezone : DEFAULT_DIGEST_SETTINGS.timezone,
-    includeTranscripts: source.includeTranscripts !== false,
-    extraRecipients: Array.isArray(source.extraRecipients)
-      ? source.extraRecipients.filter((item) => typeof item === "string")
+    recipients: Array.isArray(source.recipients)
+      ? source.recipients.filter((item) => typeof item === "string")
       : [],
   };
 }
