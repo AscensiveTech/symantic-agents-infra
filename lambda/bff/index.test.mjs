@@ -299,6 +299,7 @@ test("POST agent returns 409 when the agent already exists", async () => {
   error.name = "ConditionalCheckFailedException";
   const store = {
     async ensureWorkspace() {},
+    async listAgents() { return []; },
     async createAgent() {
       throw error;
     },
@@ -321,6 +322,53 @@ test("POST agent returns 409 when the agent already exists", async () => {
 
   assert.equal(response.statusCode, 409);
   assert.equal(JSON.parse(response.body).message, "Agent already exists");
+});
+
+test("POST agent is rejected when another live agent already has that name, case-insensitively", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listAgents() { return [{ id: "agent-existing", name: "Maya", status: "active" }]; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/agents", {
+    id: "agent-new",
+    name: "MAYA",
+    role: "Phone operations",
+    description: "Answers calls",
+    status: "draft",
+    capabilities: [],
+  }));
+
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /already exists/);
+});
+
+test("POST agent succeeds when the only agent with that name was deleted", async () => {
+  const created = [];
+  const store = {
+    async ensureWorkspace() {},
+    async listAgents() { return [{ id: "agent-old", name: "Maya", status: "deleted" }]; },
+    async createAgent(workspaceId, agentId, agent) {
+      created.push(agent);
+      return agent;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/agents", {
+    id: "agent-new",
+    name: "Maya",
+    role: "Phone operations",
+    description: "Answers calls",
+    status: "draft",
+    capabilities: [],
+  }));
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(created.length, 1);
 });
 
 test("GET agent returns 404 when the workspace agent is missing", async () => {
@@ -400,6 +448,50 @@ test("PUT agent uses the route id and returns the updated agent", async () => {
   const savedAgent = { ...agent, status: "draft" };
   assert.deepEqual(JSON.parse(response.body), savedAgent);
   assert.deepEqual(calls, [["user-123", "agent-123", savedAgent]]);
+});
+
+test("PUT agent rejects renaming to a name another live agent already has", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return { id: "agent-123", name: "Maya", status: "draft" }; },
+    async listAgents() { return [{ id: "agent-123", name: "Maya", status: "draft" }, { id: "agent-456", name: "Samantha", status: "active" }]; },
+    async putAgent() { throw new Error("should not be called"); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", {
+    id: "agent-123",
+    name: "Samantha",
+    role: "Phone operations",
+    description: "Answers calls",
+    status: "draft",
+    capabilities: [],
+  }));
+
+  assert.equal(response.statusCode, 409);
+});
+
+test("PUT agent saving under its own unchanged name is not a self-conflict", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return { id: "agent-123", name: "Maya", status: "draft" }; },
+    async listAgents() { return [{ id: "agent-123", name: "Maya", status: "draft" }]; },
+    async putAgent(workspaceId, agentId, agent) { return agent; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", {
+    id: "agent-123",
+    name: "Maya",
+    role: "Phone operations",
+    description: "Answers calls",
+    status: "draft",
+    capabilities: [],
+  }));
+
+  assert.equal(response.statusCode, 200);
 });
 
 function companyAdminEvent(method, path, body, queryStringParameters) {

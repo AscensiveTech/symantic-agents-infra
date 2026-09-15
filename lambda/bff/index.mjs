@@ -237,6 +237,18 @@ function nextPeriodKey(now, timezone) {
     : `${year}-${String(month + 1).padStart(2, "0")}`;
 }
 
+// Agent names are unique per workspace (case-insensitive, trimmed) - a
+// deleted agent's name frees up again, since it's no longer active.
+async function agentNameTaken(store, workspaceId, name, excludeAgentId) {
+  const target = String(name ?? "").trim().toLowerCase();
+  if (!target) return false;
+  const agents = await store.listAgents(workspaceId);
+  return agents.some((existing) =>
+    existing.id !== excludeAgentId &&
+    existing.status !== "deleted" &&
+    String(existing.name ?? "").trim().toLowerCase() === target);
+}
+
 function pickAgent(value, routeAgentId) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const agentId = routeAgentId ?? value.id ?? value.agentId;
@@ -833,6 +845,9 @@ export function createHandler({
           : null;
         if (!agent) return json(400, { message: "Invalid agent" });
         await store.ensureWorkspace(workspaceId);
+        if (await agentNameTaken(store, workspaceId, agent.name)) {
+          return json(409, { message: `An agent named "${agent.name}" already exists in this workspace - choose a different name.` });
+        }
         return json(201, await store.createAgent(workspaceId, agent.id, agent));
       }
 
@@ -1523,6 +1538,9 @@ export function createHandler({
           const existing = typeof store.getAgent === "function"
             ? await store.getAgent(workspaceId, agentId)
             : null;
+          if (existing && existing.name !== agent.name && await agentNameTaken(store, workspaceId, agent.name, agentId)) {
+            return json(409, { message: `An agent named "${agent.name}" already exists in this workspace - choose a different name.` });
+          }
           const wasActive = existing?.status === "active";
           const invalidateTest = Boolean(
             existing &&
