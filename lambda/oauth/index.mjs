@@ -1,4 +1,10 @@
 import { randomBytes } from "node:crypto";
+import {
+  describeSendFailure,
+  getDefaultSender,
+  normalizeEmail,
+  renderInviteEmail,
+} from "./email.mjs";
 
 export const PROVIDER_LABELS = Object.freeze({
   "google-calendar": "Google Calendar",
@@ -480,6 +486,7 @@ export function createHandler(options = {}) {
     getMembershipStore = getDefaultMembershipStore,
     getInviteStore = getDefaultInviteStore,
     getWorkspaceStore = getDefaultWorkspaceStore,
+    getEmailSender = getDefaultSender,
     getOAuthSecret = getDefaultOAuthSecret,
     getTokenCrypto = getDefaultTokenCrypto,
     getProviderClient = (provider) => createProviderClient(provider),
@@ -504,6 +511,30 @@ export function createHandler(options = {}) {
       );
     }
     return identity;
+  }
+
+  // The link is the invitation; email only delivers it. A failed send is
+  // reported back but never loses an invite the admin can still copy.
+  async function emailInvite(to, invite, url) {
+    try {
+      const send = await getEmailSender();
+      await send({
+        to,
+        ...renderInviteEmail({
+          workspaceName: invite.workspaceName,
+          inviterName: invite.createdByName,
+          url,
+          ttlDays: inviteTtlDays,
+        }),
+      });
+      return { status: "sent", to };
+    } catch (error) {
+      console.error("Calendar invite email failed", {
+        name: error?.name,
+        message: error?.message,
+      });
+      return { status: "failed", to, message: describeSendFailure(error) };
+    }
   }
 
   return async function handle(event) {
@@ -692,7 +723,9 @@ export function createHandler(options = {}) {
 
       if (path === "/calendars/invites" && method === "POST") {
         const identity = await requireAdminIdentity(event, await getMembershipStore());
-        const agentId = requireAgentId(readBody(event)?.agentId);
+        const body = readBody(event);
+        const agentId = requireAgentId(body?.agentId);
+        const inviteeEmail = readInviteeEmail(body);
         // Each agent books into exactly one calendar, so two people racing to
         // connect the SAME agent is meaningless - whoever finishes last would
         // silently win. A different agent's invite can still be pending.
@@ -717,7 +750,8 @@ export function createHandler(options = {}) {
             await getWorkspaceStore(),
             identity.workspaceId,
           ),
-          inviteeLabel: readInviteeLabel(readBody(event)),
+          inviteeLabel: readInviteeLabel(body),
+          ...(inviteeEmail ? { inviteeEmail } : {}),
           status: "pending",
           createdAt,
           createdByUserId: identity.userId,
@@ -725,9 +759,12 @@ export function createHandler(options = {}) {
           expiresAt: Math.floor(now() / 1000) + inviteTtlDays * 86_400,
         };
         await (await getInviteStore()).put(invite);
+        const url = buildInviteUrl(appUrl, inviteId);
+        const emailDelivery = inviteeEmail ? await emailInvite(inviteeEmail, invite, url) : null;
         return json(201, {
           ...toPublicInviteAdmin(invite),
-          url: buildInviteUrl(appUrl, inviteId),
+          url,
+          ...(emailDelivery ? { emailDelivery } : {}),
         });
       }
 
@@ -1058,6 +1095,15 @@ function readInviteeLabel(body) {
   return raw.trim().slice(0, 200);
 }
 
+// Optional: absent or blank means "I'll share the link myself".
+function readInviteeEmail(body) {
+  const raw = body?.inviteeEmail;
+  if (raw === undefined || raw === null || (typeof raw === "string" && !raw.trim())) return null;
+  const email = normalizeEmail(raw);
+  if (!email) throw new OAuthRequestError("Enter a valid email address", 400, "invalid_email");
+  return email;
+}
+
 /** "pending" is the only state that may start an authorization. */
 function inviteState(invite, now) {
   if (!invite) return "not_found";
@@ -1078,6 +1124,7 @@ function toPublicInviteAdmin(invite) {
     inviteId: invite.inviteId,
     agentId: invite.agentId,
     inviteeLabel: invite.inviteeLabel ?? "",
+    inviteeEmail: invite.inviteeEmail ?? null,
     status: invite.status,
     createdAt: invite.createdAt,
     createdByName: invite.createdByName ?? null,

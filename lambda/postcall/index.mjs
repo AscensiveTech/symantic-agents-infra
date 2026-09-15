@@ -228,6 +228,10 @@ export function createHandler({
       endedAt: timestampValue(call.end_timestamp),
       durationMs: durationMs(call),
       recordingKey,
+      // When the summary and transcript landed - what call-summary emails
+      // window on. Written once (see upsertCall), so a retried webhook can't
+      // make a call reappear in a later summary.
+      ...(eventType === "call_analyzed" ? { analyzedAt: timestamp } : {}),
       disconnectionReason: stringValue(call.disconnection_reason),
       // Set once at call_inbound (see inboundIsOverage in the BFF) and
       // echoed back by Retell on every webhook for this call - true means
@@ -780,12 +784,17 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
     },
 
     async upsertCall(record) {
-      const reserved = new Set(["workspaceId", "callId", "createdAt"]);
+      const reserved = new Set(["workspaceId", "callId", "createdAt", "analyzedAt"]);
       const entries = Object.entries(record)
         .filter(([key, value]) => value !== undefined && !reserved.has(key));
       const names = { "#createdAt": "createdAt" };
       const values = { ":createdAt": record.createdAt ?? new Date().toISOString() };
       const sets = ["#createdAt = if_not_exists(#createdAt, :createdAt)"];
+      if (record.analyzedAt) {
+        names["#analyzedAt"] = "analyzedAt";
+        values[":analyzedAt"] = record.analyzedAt;
+        sets.push("#analyzedAt = if_not_exists(#analyzedAt, :analyzedAt)");
+      }
       entries.forEach(([key, value], index) => {
         names[`#k${index}`] = key;
         values[`:v${index}`] = value;

@@ -21,6 +21,7 @@ import {
   getAvailability,
   rescheduleBooking,
 } from "./calendar-adapter.mjs";
+import { renderInviteEmail } from "./email.mjs";
 
 const workspaceId = "workspace-123";
 const agentId = "agent-1";
@@ -677,6 +678,9 @@ function inviteHandler({
   stateStore = createInMemoryStateStore(),
   connections = createInMemoryConnectionStore(),
   now = () => 1_800_000_000_000,
+  emailSender = async () => {
+    throw new Error("No email is expected in this test");
+  },
 } = {}) {
   return {
     invites,
@@ -689,6 +693,7 @@ function inviteHandler({
       getWorkspaceStore: async () => ({
         getWorkspace: async () => ({ workspaceId, name: "Arc Dental" }),
       }),
+      getEmailSender: async () => emailSender,
       getOAuthSecret: async () => ({ clientId: "client-id", clientSecret: "client-secret" }),
       getTokenCrypto: async () => ({
         encryptToken: async () => "encrypted-token",
@@ -1004,6 +1009,98 @@ function event(method, path, body, queryStringParameters) {
     queryStringParameters,
   };
 }
+
+// --- Emailed invitations -----------------------------------------------------
+
+test("an invitation can be emailed straight to the person who should connect", async () => {
+  const sent = [];
+  const { handler, invites } = inviteHandler({
+    emailSender: async (message) => {
+      sent.push(message);
+      return { messageId: "m-1" };
+    },
+  });
+
+  const response = await handler(adminEvent("POST", "/calendars/invites", {
+    agentId: "agent-123",
+    inviteeLabel: "Front desk",
+    inviteeEmail: " Jane@ArcDental.com ",
+  }));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 201);
+  assert.deepEqual(body.emailDelivery, { status: "sent", to: "jane@arcdental.com" });
+  assert.equal(body.inviteeEmail, "jane@arcdental.com");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].to, "jane@arcdental.com");
+  assert.equal(sent[0].subject, "Arc Dental invited you to connect your calendar");
+  assert.ok(sent[0].html.includes(body.url));
+  assert.ok(sent[0].text.includes(body.url));
+  assert.match(sent[0].text, /never be asked for your password/);
+  assert.equal((await invites.listByWorkspace(workspaceId))[0].inviteeEmail, "jane@arcdental.com");
+});
+
+test("a failed email still issues the invitation and says why", async () => {
+  const { handler, invites } = inviteHandler({
+    emailSender: async () => {
+      const error = new Error("Email address is not verified. The following identities failed the check");
+      error.name = "MessageRejected";
+      throw error;
+    },
+  });
+
+  const response = await handler(adminEvent("POST", "/calendars/invites", {
+    agentId: "agent-123",
+    inviteeEmail: "new@example.com",
+  }));
+  const body = JSON.parse(response.body);
+
+  // The link is still the invitation - the admin can copy it instead.
+  assert.equal(response.statusCode, 201);
+  assert.ok(body.url.startsWith("https://agents.example.com/connect-calendar/"));
+  assert.equal(body.emailDelivery.status, "failed");
+  assert.match(body.emailDelivery.message, /verified addresses until email access is approved/);
+  assert.equal((await invites.listByWorkspace(workspaceId)).length, 1);
+});
+
+test("a malformed invitee email is rejected before anything is created", async () => {
+  const { handler, invites } = inviteHandler();
+
+  const response = await handler(adminEvent("POST", "/calendars/invites", {
+    agentId: "agent-123",
+    inviteeEmail: "jane@arcdental\r\nBcc: someone@example.com",
+  }));
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(JSON.parse(response.body).code, "invalid_email");
+  assert.equal((await invites.listByWorkspace(workspaceId)).length, 0);
+});
+
+test("an invitation without an email address sends nothing", async () => {
+  const { handler } = inviteHandler();
+
+  const response = await handler(adminEvent("POST", "/calendars/invites", {
+    agentId: "agent-123",
+    inviteeEmail: "   ",
+  }));
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(JSON.parse(response.body).emailDelivery, undefined);
+});
+
+test("invitation email content escapes company and inviter names", () => {
+  const { html, subject } = renderInviteEmail({
+    workspaceName: "Arc <script>alert(1)</script> Dental",
+    inviterName: "Dana \"Admin\"",
+    url: "https://agents.example.com/connect-calendar/abc",
+    ttlDays: 7,
+  });
+
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /Arc &lt;script&gt;alert\(1\)&lt;\/script&gt; Dental/);
+  assert.match(html, /Dana &quot;Admin&quot;/);
+  assert.match(subject, /invited you to connect your calendar$/);
+});
 
 function adminEvent(method, path, body, queryStringParameters) {
   const value = authenticatedEvent(method, path, body, queryStringParameters);

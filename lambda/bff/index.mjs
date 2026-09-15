@@ -442,6 +442,110 @@ function isWorkspaceAdmin(actor) {
   return actor.roles.includes("company-admin") || actor.roles.includes("super-admin");
 }
 
+// Call-summary emails. The schedule itself runs in the call-digest Lambda;
+// the BFF only stores the settings and brokers a "send me a test" request.
+// Keep the defaults and bounds in step with lambda/digest/schedule.mjs.
+const CALL_DIGEST_FREQUENCIES = new Set(["hourly", "every_6_hours", "daily", "weekly"]);
+const CALL_DIGEST_MAX_EXTRA_RECIPIENTS = 10;
+const CALL_DIGEST_DEFAULTS = Object.freeze({
+  enabled: false,
+  frequency: "daily",
+  sendHour: 8,
+  weekday: 1,
+  timezone: "UTC",
+  includeTranscripts: true,
+  extraRecipients: [],
+});
+const DIGEST_EMAIL_PATTERN = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]{2,}$/;
+
+function isIanaTimezone(value) {
+  if (typeof value !== "string" || !value) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeDigestEmail(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.length <= 254 && DIGEST_EMAIL_PATTERN.test(trimmed) ? trimmed : null;
+}
+
+function publicCallDigest(stored) {
+  const value = stored && typeof stored === "object" ? stored : {};
+  return {
+    enabled: value.enabled === true,
+    frequency: CALL_DIGEST_FREQUENCIES.has(value.frequency)
+      ? value.frequency
+      : CALL_DIGEST_DEFAULTS.frequency,
+    sendHour: Number.isInteger(value.sendHour) && value.sendHour >= 0 && value.sendHour <= 23
+      ? value.sendHour
+      : CALL_DIGEST_DEFAULTS.sendHour,
+    weekday: Number.isInteger(value.weekday) && value.weekday >= 0 && value.weekday <= 6
+      ? value.weekday
+      : CALL_DIGEST_DEFAULTS.weekday,
+    timezone: isIanaTimezone(value.timezone) ? value.timezone : CALL_DIGEST_DEFAULTS.timezone,
+    includeTranscripts: value.includeTranscripts !== false,
+    extraRecipients: Array.isArray(value.extraRecipients)
+      ? value.extraRecipients.map(normalizeDigestEmail).filter(Boolean)
+      : [],
+  };
+}
+
+function readCallDigestSettings(body) {
+  if (!body || typeof body !== "object") return { error: "Invalid call summary settings" };
+  if (typeof body.enabled !== "boolean") return { error: "enabled must be true or false" };
+  if (!CALL_DIGEST_FREQUENCIES.has(body.frequency)) return { error: "Choose how often summaries are sent" };
+  if (!Number.isInteger(body.sendHour) || body.sendHour < 0 || body.sendHour > 23) {
+    return { error: "Choose an hour between 0 and 23" };
+  }
+  if (!Number.isInteger(body.weekday) || body.weekday < 0 || body.weekday > 6) {
+    return { error: "Choose a day of the week" };
+  }
+  if (!isIanaTimezone(body.timezone)) return { error: "Choose a valid timezone" };
+  if (typeof body.includeTranscripts !== "boolean") return { error: "includeTranscripts must be true or false" };
+  if (!Array.isArray(body.extraRecipients)) return { error: "extraRecipients must be a list" };
+  if (body.extraRecipients.length > CALL_DIGEST_MAX_EXTRA_RECIPIENTS) {
+    return { error: `Add at most ${CALL_DIGEST_MAX_EXTRA_RECIPIENTS} extra recipients` };
+  }
+  const extraRecipients = [];
+  for (const candidate of body.extraRecipients) {
+    const email = normalizeDigestEmail(candidate);
+    if (!email) return { error: `"${String(candidate).slice(0, 80)}" is not a valid email address` };
+    if (!extraRecipients.includes(email)) extraRecipients.push(email);
+  }
+  return {
+    settings: {
+      enabled: body.enabled,
+      frequency: body.frequency,
+      sendHour: body.sendHour,
+      weekday: body.weekday,
+      timezone: body.timezone,
+      includeTranscripts: body.includeTranscripts,
+      extraRecipients,
+    },
+  };
+}
+
+async function loadCallDigest(store, workspaceId, senderAddress) {
+  const [workspace, members] = await Promise.all([
+    store.getWorkspace(workspaceId),
+    store.listMemberships(workspaceId),
+  ]);
+  return {
+    settings: publicCallDigest(workspace?.callDigest),
+    adminRecipients: [...new Set((members ?? [])
+      .filter((member) => member.role === "company-admin" && member.status !== "disabled")
+      .map((member) => normalizeDigestEmail(member.email))
+      .filter(Boolean))],
+    sender: senderAddress ?? null,
+    lastRun: workspace?.callDigestLastRun ?? null,
+  };
+}
+
 // Explicit product entitlements.
 //
 // Access used to be inferred entirely from Cognito group membership: admin
@@ -517,6 +621,8 @@ export function createHandler({
   getSignWell = getDefaultSignWell,
   verifySignature = verifyRetellSignature,
   toolBaseUrl = process.env.PUBLIC_API_BASE_URL,
+  invokeCallDigest = defaultInvokeCallDigest,
+  emailSenderAddress = process.env.EMAIL_SENDER_ADDRESS,
 } = {}) {
   // A new handler may be backed by a different store (tests, or a config
   // reload) - don't let the per-container active-legal cache leak across.
@@ -929,6 +1035,57 @@ export function createHandler({
           hidden: false,
         });
         return json(200, saved);
+      }
+
+      if (path === "/workspaces/me/call-digest" || path === "/workspaces/me/call-digest/test") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can manage call summaries" });
+        }
+        await store.ensureWorkspace(workspaceId);
+
+        if (path === "/workspaces/me/call-digest" && method === "GET") {
+          return json(200, await loadCallDigest(store, workspaceId, emailSenderAddress));
+        }
+
+        if (path === "/workspaces/me/call-digest" && method === "PUT") {
+          const parsed = readCallDigestSettings(readBody(event));
+          if (parsed.error) return json(400, { message: parsed.error });
+          const workspace = await store.getWorkspace(workspaceId);
+          const nowIso = new Date().toISOString();
+          // Turning summaries on starts the window now, so the first email
+          // covers calls from this moment rather than the whole history.
+          const startWindow = parsed.settings.enabled && workspace?.callDigest?.enabled !== true;
+          await store.saveCallDigest(
+            workspaceId,
+            { ...parsed.settings, updatedAt: nowIso, updatedBy: actorDisplayName(event, actor) },
+            startWindow ? nowIso : undefined,
+          );
+          return json(200, await loadCallDigest(store, workspaceId, emailSenderAddress));
+        }
+
+        if (path === "/workspaces/me/call-digest/test" && method === "POST") {
+          const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+          const recipient = normalizeDigestEmail(actor.membership?.email ?? claims.email);
+          if (!recipient) {
+            return json(400, { message: "Your account has no email address to send a test to" });
+          }
+          let result;
+          try {
+            result = await invokeCallDigest({ action: "send-test", workspaceId, recipient });
+          } catch (error) {
+            console.error("Call summary test invoke failed", { name: error?.name, message: error?.message });
+            result = null;
+          }
+          if (result?.sent !== true) {
+            return json(502, {
+              message: result?.error ?? "The test email could not be sent",
+              error: "call_digest_test_failed",
+            });
+          }
+          return json(200, result);
+        }
+
+        return json(405, { message: "Method not allowed" });
       }
 
       if (path === "/workspaces/me/usage" && method === "GET") {
@@ -5328,6 +5485,23 @@ export function createDynamoStore(client, commands, tableNames) {
       return workspace;
     },
 
+    // A targeted update rather than putWorkspace: the digest Lambda writes the
+    // cursor and last-run fields on the same item concurrently.
+    async saveCallDigest(workspaceId, callDigest, cursor) {
+      const values = { ":digest": callDigest };
+      let update = "SET callDigest = :digest";
+      if (cursor) {
+        values[":cursor"] = cursor;
+        update += ", callDigestCursor = :cursor";
+      }
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: update,
+        ExpressionAttributeValues: marshall(values),
+      }));
+    },
+
     async createWorkspaceBundle({ workspace, membership, template }) {
       const { id: templateId, ...templateValue } = template;
       await client.send(new commands.TransactWriteItemsCommand({
@@ -6518,6 +6692,25 @@ export async function getDefaultStore() {
 }
 
 let userDirectoryPromise;
+
+let callDigestLambdaPromise;
+
+// "Send me a test" runs the real digest code path synchronously, so the admin
+// sees exactly what the scheduled email will look like.
+async function defaultInvokeCallDigest(payload) {
+  const functionName = process.env.CALL_DIGEST_FUNCTION_NAME;
+  if (!functionName) throw new Error("CALL_DIGEST_FUNCTION_NAME is required");
+  callDigestLambdaPromise ??= import("@aws-sdk/client-lambda")
+    .then((lambda) => ({ lambda, client: new lambda.LambdaClient({}) }));
+  const { lambda, client } = await callDigestLambdaPromise;
+  const result = await client.send(new lambda.InvokeCommand({
+    FunctionName: functionName,
+    Payload: new TextEncoder().encode(JSON.stringify(payload)),
+  }));
+  if (result.FunctionError) throw new Error(`Call summary function failed: ${result.FunctionError}`);
+  const text = new TextDecoder().decode(result.Payload ?? new Uint8Array());
+  return text ? JSON.parse(text) : null;
+}
 
 async function getDefaultUserDirectory() {
   const userPoolId = process.env.COGNITO_USER_POOL_ID;
