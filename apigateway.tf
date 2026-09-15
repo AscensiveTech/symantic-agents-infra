@@ -104,7 +104,7 @@ resource "aws_apigatewayv2_api" "bff" {
 
   cors_configuration {
     allow_credentials = false
-    allow_headers     = ["authorization", "content-type", "x-retell-signature"]
+    allow_headers     = ["authorization", "content-type", "x-retell-signature", "x-product"]
     allow_methods     = ["DELETE", "GET", "PATCH", "POST", "PUT", "OPTIONS"]
     allow_origins     = distinct(compact(["http://localhost:3000", var.app_url]))
     max_age           = 300

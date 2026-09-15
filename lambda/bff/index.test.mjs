@@ -5980,6 +5980,79 @@ test("most-asked-questions uses the company's own Anthropic key when the super a
   assert.deepEqual(overridesSeen, ["sk-ant-company-specific-key"]);
 });
 
+test("legal acceptance is scoped per product - the X-Product header picks which product's document/gate applies", async () => {
+  const { invalidateActiveLegalCache } = await loadBff();
+  invalidateActiveLegalCache();
+  const calls = [];
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-technovate", role: "company-admin", status: "active" };
+    },
+    async getActiveLegalDocument(documentType, product = "rapidproposal") {
+      calls.push(["getActiveLegalDocument", documentType, product]);
+      return { version: "v1.0", title: `${product} ${documentType}`, content: "body", activeVersion: "v1.0" };
+    },
+    async getLatestLegalAcceptance(userId, documentType, product = "rapidproposal") {
+      calls.push(["getLatestLegalAcceptance", documentType, product]);
+      return { documentVersion: "v1.0", acceptedAt: "2026-09-01T00:00:00.000Z" };
+    },
+    async putLegalDocumentVersion() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  // No X-Product header at all - defaults to rapidproposal, exactly as
+  // every pre-existing client (which never sent this header) already did.
+  const legacyEvent = authenticatedEvent("GET", "/workspaces/me/legal");
+  legacyEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  await handler(legacyEvent);
+  assert.ok(calls.some(([fn, , product]) => fn === "getActiveLegalDocument" && product === "rapidproposal"));
+
+  calls.length = 0;
+  const receptionistEvent = authenticatedEvent("GET", "/workspaces/me/legal");
+  receptionistEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  receptionistEvent.headers = { "x-product": "receptionist" };
+  await handler(receptionistEvent);
+  assert.ok(calls.some(([fn, , product]) => fn === "getActiveLegalDocument" && product === "receptionist"));
+  assert.ok(calls.every(([fn, , product]) => fn !== "getActiveLegalDocument" || product === "receptionist"));
+  invalidateActiveLegalCache();
+});
+
+test("publishing a legal document for one product never touches the other's active cache", async () => {
+  const { invalidateActiveLegalCache } = await loadBff();
+  invalidateActiveLegalCache();
+  const published = [];
+  let activeDoc = { version: "v1.0", title: "Old", content: "old", contentHash: "old-hash", activeVersion: "v1.0" };
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-technovate", role: "company-admin", status: "active" };
+    },
+    async getActiveLegalDocument() { return activeDoc; },
+    async getLatestLegalAcceptance() { return null; },
+    async putLegalDocumentVersion(documentType, doc, opts, product) {
+      published.push({ documentType, product });
+      activeDoc = { ...doc, activeVersion: doc.version };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const event = authenticatedEvent("POST", "/platform/legal", {
+    documentType: "TERMS_AND_CONDITIONS",
+    version: "v2.0",
+    title: "New Terms",
+    content: "brand new content",
+    product: "receptionist",
+  });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 201);
+  assert.deepEqual(JSON.parse(response.body), { documentType: "TERMS_AND_CONDITIONS", product: "receptionist", version: "v2.0" });
+  assert.deepEqual(published, [{ documentType: "TERMS_AND_CONDITIONS", product: "receptionist" }]);
+  invalidateActiveLegalCache();
+});
+
 test("PATCH company anthropicApiKey is accepted, stored, and never echoed back raw", async () => {
   const { createHandler } = await loadBff();
   let saved;
