@@ -750,6 +750,46 @@ test("PUT agent invalidates a successful test when launch configuration changes"
   assert.equal(saved.agent.status, "draft");
 });
 
+test("PUT agent does NOT invalidate a successful test when only call-handling/progress fields change", async () => {
+  // These must mirror UNTESTED_DRAFT_FIELDS in agent-wizard.tsx exactly - a
+  // regression here means passing a test can invalidate itself on the very
+  // next autosave (platformDid, for one, is *set by* running the test).
+  let saved;
+  const existing = receptionistAgent();
+  const changed = {
+    ...existing,
+    configuration: {
+      ...existing.configuration,
+      platformDid: "+17035550199",
+      completedSteps: ["profile", "identity", "knowledge", "handling", "connections", "launch"],
+      spamScreening: false,
+      silenceTimeoutSec: 45,
+      maxCallDurationMin: 15,
+      allowedInboundCountries: ["US", "CA"],
+      testRunCount: (existing.configuration.testRunCount ?? 0) + 1,
+    },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async putAgent(_workspaceId, _agentId, agent, options) {
+      saved = { agent, options };
+      return agent;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    changed,
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.options.invalidateTest, false);
+});
+
 test("PUT agent keeps an already-active agent active and pushes the edit to Retell", async () => {
   const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
   const changed = {

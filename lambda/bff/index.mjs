@@ -5602,6 +5602,11 @@ function sameLaunchConfiguration(left, right) {
     JSON.stringify(canonicalLaunchConfiguration(right));
 }
 
+// Must mirror UNTESTED_DRAFT_FIELDS in components/agent-wizard.tsx exactly -
+// fields that change without changing what was actually tested. A mismatch
+// here is self-defeating: e.g. platformDid is *set by* running a test, so if
+// it isn't excluded on both sides, passing a test would invalidate itself on
+// the very next autosave.
 function canonicalLaunchConfiguration(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const {
@@ -5609,6 +5614,10 @@ function canonicalLaunchConfiguration(value) {
     testRunCount: _testRunCount,
     platformDid: _platformDid,
     completedSteps: _completedSteps,
+    spamScreening: _spamScreening,
+    silenceTimeoutSec: _silenceTimeoutSec,
+    maxCallDurationMin: _maxCallDurationMin,
+    allowedInboundCountries: _allowedInboundCountries,
     ...configuration
   } = value;
   return configuration;
