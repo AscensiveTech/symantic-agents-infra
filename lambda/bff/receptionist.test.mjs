@@ -49,7 +49,8 @@ const agent = {
     voice: "Calm and natural",
     tone: "Warm, concise, and professional",
     greeting: "Thanks for calling Arc Dental. How can I help?",
-    guidance: "Never provide a diagnosis or promise insurance coverage.",
+    roleInstructions: "You are the front-desk receptionist for a dental clinic.",
+    restrictions: "Never provide a diagnosis or promise insurance coverage.",
     intents: ["Scheduling", "Insurance", "Urgent care"],
     booking: true,
     escalation:
@@ -73,7 +74,20 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /severe bleeding or trouble breathing/);
   assert.match(prompt, /chest pain/);
   assert.match(prompt, /can't breathe/);
+  assert.match(prompt, /Role and approach\nYou are the front-desk receptionist for a dental clinic\./);
+  assert.match(prompt, /Restrictions - what NOT to say or do\nNever provide a diagnosis or promise insurance coverage\./);
   assert.match(prompt, /\+17035550102/);
+});
+
+test("Restrictions section is omitted entirely when the receptionist has none configured", () => {
+  const noRestrictions = {
+    ...agent,
+    configuration: { ...agent.configuration, restrictions: "" },
+  };
+  const prompt = buildReceptionistPrompt(noRestrictions, profile);
+
+  assert.doesNotMatch(prompt, /Restrictions - what NOT to say or do/);
+  assert.match(prompt, /Role and approach\nYou are the front-desk receptionist for a dental clinic\./);
 });
 
 test("a 'decline' emergency rule tells the agent to say a message instead of transferring", () => {

@@ -13,8 +13,9 @@ export const DEFAULT_DIGEST_SETTINGS = Object.freeze({
   frequency: "daily",
   sendHour: 8,
   weekday: 1,
-  timezone: "UTC",
+  timezone: "America/New_York",
   recipients: [],
+  skipIfEmpty: true,
 });
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -56,6 +57,7 @@ export function normalizeDigestSettings(value) {
     recipients: Array.isArray(source.recipients)
       ? source.recipients.filter((item) => typeof item === "string")
       : [],
+    skipIfEmpty: source.skipIfEmpty !== false,
   };
 }
 

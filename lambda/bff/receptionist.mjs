@@ -253,9 +253,12 @@ export function buildReceptionistPrompt(agent, profile) {
     "Approved caller intents",
     intents || "Use the approved FAQs and take a message for anything else.",
     "",
-    "Approved answering guidance",
-    text(behavior.guidance) || text(agent?.description) || "Answer only from the approved business information below.",
+    "Role and approach",
+    text(behavior.roleInstructions) || text(agent?.description) || "Answer only from the approved business information below.",
     "",
+    ...(text(behavior.restrictions)
+      ? ["Restrictions - what NOT to say or do", text(behavior.restrictions), ""]
+      : []),
     "Policies",
     text(profile?.policies) || "No additional policies are configured.",
     "",

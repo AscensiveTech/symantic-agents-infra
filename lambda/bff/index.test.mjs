@@ -683,7 +683,7 @@ test("PUT agent invalidates a successful test when launch configuration changes"
     ...existing,
     configuration: {
       ...existing.configuration,
-      guidance: "Updated answering restrictions.",
+      restrictions: "Updated answering restrictions.",
       tested: false,
     },
   };
@@ -717,7 +717,7 @@ test("PUT agent keeps an already-active agent active and pushes the edit to Rete
     ...existing,
     configuration: {
       ...existing.configuration,
-      guidance: "Updated answering restrictions.",
+      restrictions: "Updated answering restrictions.",
       tested: false,
     },
   };
@@ -5096,7 +5096,7 @@ function receptionistAgent() {
       voice: "Calm and natural",
       tone: "Warm and concise",
       greeting: "Thanks for calling Arc Dental.",
-      guidance: "Never provide a diagnosis.",
+      restrictions: "Never provide a diagnosis.",
       intents: ["Scheduling", "Insurance"],
       booking: true,
       connections: ["google-calendar"],

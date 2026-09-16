@@ -41,12 +41,12 @@ export function renderDigest({
   const subject = isTest
     ? `Test: ${company} notification`
     : `${company}: ${count} new ${plural}`;
-  const heading = isTest
-    ? "This is a test notification"
-    : `${count} new ${plural} since your last check`;
+  const heading = count
+    ? `${count} new ${plural} since your last check`
+    : "No new calls since your last check";
   const body = count
     ? `Open Call History to see ${count === 1 ? "it" : "them"}.`
-    : "There were no new calls in this window.";
+    : "There were no new calls since your last check.";
   const preheader = count ? `${count} new ${plural} — ${body}` : body;
 
   const html = `<!doctype html>
@@ -65,12 +65,12 @@ export function renderDigest({
             <h1 style="margin:0 0 6px;font-size:22px;line-height:1.25;color:${INK};">${escapeHtml(heading)}</h1>
             <p style="margin:0 0 4px;font-size:13px;color:${MUTED};">${escapeHtml(range)}</p>
             <p style="margin:14px 0 18px;font-size:14px;line-height:1.55;color:${INK};">${escapeHtml(body)}</p>
-            <a href="${escapeHtml(dashboardUrl)}" style="display:inline-block;padding:11px 18px;border-radius:10px;background:${INK};color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;">Open call history</a>
+            <a href="${escapeHtml(dashboardUrl)}" style="display:inline-block;padding:11px 18px;border-radius:10px;background:${INK};color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;">Open Call History</a>
           </div>
         </td></tr>
         <tr><td style="padding:16px 4px 0;font-size:12px;line-height:1.6;color:${MUTED};">
-          You receive this because ${escapeHtml(company)} turned on call notifications for its AI Receptionist.
-          An administrator can change the schedule or recipients in <a href="${escapeHtml(settingsUrl)}" style="color:${INK};">Notifications &amp; Alerts settings</a>.
+          You received this because ${escapeHtml(company)} turned on call notifications for its AI Receptionist.
+          If you would like to change the schedule, frequency, or recipients, please contact your administrator.
         </td></tr>
       </table>
     </td></tr>
@@ -84,8 +84,8 @@ export function renderDigest({
     "",
     body,
     "",
-    `Open call history: ${dashboardUrl}`,
-    `Change these emails: ${settingsUrl}`,
+    `Open Call History: ${dashboardUrl}`,
+    "If you would like to change the schedule, frequency, or recipients, please contact your administrator.",
   ].join("\n");
 
   return { subject, html, text };

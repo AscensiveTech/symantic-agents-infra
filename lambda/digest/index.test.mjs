@@ -215,6 +215,24 @@ test("an interval with no calls sends nothing but still moves the window on", as
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
 });
 
+test("skipIfEmpty:false sends a confirmation even when there are zero calls", async () => {
+  const store = memoryStore({
+    workspaces: [workspace({ callDigest: settings({ skipIfEmpty: false }) })],
+    calls: [],
+    admins: ["dana@arcdental.com"],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results, { sent: 1 });
+  assert.equal(sender.sent.length, 1);
+  assert.match(sender.sent[0].html, /No new calls since your last check/);
+  const run = store.state.get("ws-1").callDigestLastRun;
+  assert.equal(run.status, "sent");
+  assert.equal(run.callCount, 0);
+});
+
 test("only calls analyzed inside the window are included", async () => {
   const store = memoryStore({
     workspaces: [workspace()],

@@ -60,7 +60,7 @@ export function createDigestHandler({
     if (!await store.claimWindow(workspace.workspaceId, cursor, windowEnd)) return "claimed_elsewhere";
 
     const calls = await store.listCallsAnalyzedBetween(workspace.workspaceId, cursor, windowEnd);
-    if (!calls.length) {
+    if (!calls.length && settings.skipIfEmpty) {
       await store.recordRun(workspace.workspaceId, { at: windowEnd, status: "no_calls", callCount: 0 });
       return "no_calls";
     }
