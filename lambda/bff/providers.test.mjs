@@ -16,6 +16,10 @@ function response(body, status = 200) {
 }
 
 test("Telnyx provisioning reuses customer reference and orders one local DID", async () => {
+  // The order response's phone_numbers[].id is a "number_order_phone_number"
+  // id, a different resource from the actual /v2/phone_numbers/{id} record -
+  // it must never be trusted directly. Give it a different id from the real
+  // polled resource below so a regression back to trusting it would fail.
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push([String(url), init]);
@@ -23,15 +27,20 @@ test("Telnyx provisioning reuses customer reference and orders one local DID", a
     if (calls.length === 2) {
       return response({ data: [{ phone_number: "+17035550177" }] });
     }
+    if (calls.length === 3) {
+      return response({
+        data: {
+          id: "order-123",
+          status: "pending",
+          phone_numbers: [{
+            id: "number-order-phone-number-id-not-a-real-resource",
+            phone_number: "+17035550177",
+          }],
+        },
+      });
+    }
     return response({
-      data: {
-        id: "order-123",
-        status: "pending",
-        phone_numbers: [{
-          id: "telnyx-number-123",
-          phone_number: "+17035550177",
-        }],
-      },
+      data: [{ id: "telnyx-number-real-123", phone_number: "+17035550177" }],
     });
   };
   const client = createTelnyxClient({
@@ -47,7 +56,7 @@ test("Telnyx provisioning reuses customer reference and orders one local DID", a
   });
 
   assert.deepEqual(number, {
-    telnyxNumberId: "telnyx-number-123",
+    telnyxNumberId: "telnyx-number-real-123",
     telnyxPhoneNumber: "+17035550177",
     telnyxOrderId: "order-123",
   });
@@ -65,9 +74,10 @@ test("Telnyx provisioning reuses customer reference and orders one local DID", a
     calls[2][1].headers["Idempotency-Key"],
     "symantic-workspace-123-agent-123",
   );
+  assert.match(calls[3][0], /filter%5Bphone_number%5D=%2B17035550177/);
 });
 
-test("Telnyx provisioning tags the new number with the agent's Receptionist Name", async () => {
+test("Telnyx provisioning tags the new number with the agent's Receptionist Name, using the real resource id (not the order's sub-record id)", async () => {
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push([String(url), init]);
@@ -81,13 +91,18 @@ test("Telnyx provisioning tags the new number with the agent's Receptionist Name
           id: "order-123",
           status: "pending",
           phone_numbers: [{
-            id: "telnyx-number-123",
+            id: "number-order-phone-number-id-not-a-real-resource",
             phone_number: "+17035550177",
           }],
         },
       });
     }
-    return response({ id: "telnyx-number-123" });
+    if (calls.length === 4) {
+      return response({
+        data: [{ id: "telnyx-number-real-123", phone_number: "+17035550177" }],
+      });
+    }
+    return response({ id: "telnyx-number-real-123" });
   };
   const client = createTelnyxClient({
     apiKey: "telnyx-key",
@@ -102,10 +117,10 @@ test("Telnyx provisioning tags the new number with the agent's Receptionist Name
     agentName: "Alpine Shadows - Acme",
   });
 
-  assert.equal(calls.length, 4);
-  assert.equal(calls[3][0], "https://api.telnyx.com/v2/phone_numbers/telnyx-number-123");
-  assert.equal(calls[3][1].method, "PATCH");
-  assert.deepEqual(JSON.parse(calls[3][1].body), { tags: ["Alpine Shadows - Acme"] });
+  assert.equal(calls.length, 5);
+  assert.equal(calls[4][0], "https://api.telnyx.com/v2/phone_numbers/telnyx-number-real-123");
+  assert.equal(calls[4][1].method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[4][1].body), { tags: ["Alpine Shadows - Acme"] });
 });
 
 test("Telnyx provisioning skips tagging entirely when no agent name is given", async () => {
@@ -116,15 +131,20 @@ test("Telnyx provisioning skips tagging entirely when no agent name is given", a
     if (calls.length === 2) {
       return response({ data: [{ phone_number: "+17035550177" }] });
     }
+    if (calls.length === 3) {
+      return response({
+        data: {
+          id: "order-123",
+          status: "pending",
+          phone_numbers: [{
+            id: "number-order-phone-number-id-not-a-real-resource",
+            phone_number: "+17035550177",
+          }],
+        },
+      });
+    }
     return response({
-      data: {
-        id: "order-123",
-        status: "pending",
-        phone_numbers: [{
-          id: "telnyx-number-123",
-          phone_number: "+17035550177",
-        }],
-      },
+      data: [{ id: "telnyx-number-real-123", phone_number: "+17035550177" }],
     });
   };
   const client = createTelnyxClient({
@@ -139,8 +159,8 @@ test("Telnyx provisioning skips tagging entirely when no agent name is given", a
     preferredPhone: "+17035550100",
   });
 
-  assert.equal(calls.length, 3);
-  assert.equal(number.telnyxNumberId, "telnyx-number-123");
+  assert.equal(calls.length, 4);
+  assert.equal(number.telnyxNumberId, "telnyx-number-real-123");
 });
 
 test("Telnyx provisioning returns an already-owned DID without ordering", async () => {
@@ -172,15 +192,20 @@ test("Telnyx ensureNumber orders a customer-chosen desiredPhone directly, skippi
   const fetchImpl = async (url, init = {}) => {
     calls.push([String(url), init]);
     if (calls.length === 1) return response({ data: [] });
+    if (calls.length === 2) {
+      return response({
+        data: {
+          id: "order-456",
+          status: "pending",
+          phone_numbers: [{
+            id: "number-order-phone-number-id-not-a-real-resource",
+            phone_number: "+17035550188",
+          }],
+        },
+      });
+    }
     return response({
-      data: {
-        id: "order-456",
-        status: "pending",
-        phone_numbers: [{
-          id: "telnyx-number-456",
-          phone_number: "+17035550188",
-        }],
-      },
+      data: [{ id: "telnyx-number-real-456", phone_number: "+17035550188" }],
     });
   };
   const client = createTelnyxClient({
@@ -197,12 +222,13 @@ test("Telnyx ensureNumber orders a customer-chosen desiredPhone directly, skippi
   });
 
   assert.deepEqual(number, {
-    telnyxNumberId: "telnyx-number-456",
+    telnyxNumberId: "telnyx-number-real-456",
     telnyxPhoneNumber: "+17035550188",
     telnyxOrderId: "order-456",
   });
-  // Only 2 calls (owned-number check, then order) - no available_phone_numbers search.
-  assert.equal(calls.length, 2);
+  // Only 3 calls (owned-number check, order, then the real-resource poll) -
+  // no available_phone_numbers search.
+  assert.equal(calls.length, 3);
   assert.equal(calls[1][0], "https://api.telnyx.com/v2/number_orders");
   assert.deepEqual(JSON.parse(calls[1][1].body), {
     phone_numbers: [{ phone_number: "+17035550188" }],

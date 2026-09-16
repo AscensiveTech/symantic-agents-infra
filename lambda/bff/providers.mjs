@@ -159,17 +159,13 @@ export function createTelnyxClient({
         },
       );
       const order = orderResult?.data ?? orderResult;
-      const orderedNumber = order?.phone_numbers?.find(
-        (candidate) => candidate?.phone_number === phoneNumber,
-      ) ?? order?.phone_numbers?.[0];
-      if (isProvisionedNumber(orderedNumber)) {
-        await tagNumber(orderedNumber.id, agentName);
-        return {
-          ...telnyxNumber(orderedNumber),
-          telnyxOrderId: stringOrUndefined(order?.id),
-        };
-      }
 
+      // order.phone_numbers[].id is a "number_order_phone_number" id, a
+      // different resource/id space from the actual /v2/phone_numbers/{id}
+      // record - it can never be used to tag or release the number. The
+      // real phone-number resource (and its real id) only exists once the
+      // order provisions, so always resolve it via a genuine lookup rather
+      // than trusting anything on the order response itself.
       for (let attempt = 0; attempt < 4; attempt += 1) {
         if (attempt > 0) await sleep(250 * attempt);
         const provisioned = await getPhoneNumber({
