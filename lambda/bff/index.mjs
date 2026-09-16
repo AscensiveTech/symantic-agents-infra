@@ -5597,9 +5597,26 @@ function launchReadinessIssue(agent, profile, calendar) {
   return null;
 }
 
+// DynamoDB does not preserve attribute order on read, so a raw
+// JSON.stringify comparison can report "changed" purely from key reordering
+// even when nothing semantically differs. Sort keys recursively before
+// comparing - mirrors testConfigurationKey() in components/agent-wizard.tsx.
+function canonicalizeForComparison(value) {
+  if (Array.isArray(value)) return value.map(canonicalizeForComparison);
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = canonicalizeForComparison(value[key]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
 function sameLaunchConfiguration(left, right) {
-  return JSON.stringify(canonicalLaunchConfiguration(left)) ===
-    JSON.stringify(canonicalLaunchConfiguration(right));
+  return JSON.stringify(canonicalizeForComparison(canonicalLaunchConfiguration(left))) ===
+    JSON.stringify(canonicalizeForComparison(canonicalLaunchConfiguration(right)));
 }
 
 // Must mirror UNTESTED_DRAFT_FIELDS in components/agent-wizard.tsx exactly -

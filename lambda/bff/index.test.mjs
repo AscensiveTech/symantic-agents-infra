@@ -790,6 +790,40 @@ test("PUT agent does NOT invalidate a successful test when only call-handling/pr
   assert.equal(saved.options.invalidateTest, false);
 });
 
+test("PUT agent does NOT invalidate a successful test when only key order differs (DynamoDB read-back reordering)", async () => {
+  // DynamoDB does not preserve attribute order, so `existing.configuration`
+  // (read back from the store) can have different key order than
+  // `agent.configuration` (as sent by the client) with zero semantic
+  // change. A raw JSON.stringify comparison would treat that as a real
+  // config change and wrongly invalidate a passed test on every autosave.
+  let saved;
+  const existing = receptionistAgent();
+  const reordered = {};
+  for (const key of Object.keys(existing.configuration).reverse()) {
+    reordered[key] = existing.configuration[key];
+  }
+  const changed = { ...existing, configuration: reordered };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async putAgent(_workspaceId, _agentId, agent, options) {
+      saved = { agent, options };
+      return agent;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    changed,
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.options.invalidateTest, false);
+});
+
 test("PUT agent keeps an already-active agent active and pushes the edit to Retell", async () => {
   const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
   const changed = {
