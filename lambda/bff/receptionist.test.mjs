@@ -74,8 +74,8 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /severe bleeding or trouble breathing/);
   assert.match(prompt, /chest pain/);
   assert.match(prompt, /can't breathe/);
-  assert.match(prompt, /Role and approach\nYou are the front-desk receptionist for a dental clinic\./);
-  assert.match(prompt, /Restrictions - what NOT to say or do\nNever provide a diagnosis or promise insurance coverage\./);
+  assert.match(prompt, /# ROLE AND APPROACH\nYou are the front-desk receptionist for a dental clinic\./);
+  assert.match(prompt, /# RESTRICTIONS - WHAT NOT TO SAY OR DO\nNever provide a diagnosis or promise insurance coverage\./);
   assert.match(prompt, /\+17035550102/);
 });
 
@@ -86,8 +86,8 @@ test("Restrictions section is omitted entirely when the receptionist has none co
   };
   const prompt = buildReceptionistPrompt(noRestrictions, profile);
 
-  assert.doesNotMatch(prompt, /Restrictions - what NOT to say or do/);
-  assert.match(prompt, /Role and approach\nYou are the front-desk receptionist for a dental clinic\./);
+  assert.doesNotMatch(prompt, /# RESTRICTIONS - WHAT NOT TO SAY OR DO/);
+  assert.match(prompt, /# ROLE AND APPROACH\nYou are the front-desk receptionist for a dental clinic\./);
 });
 
 test("a 'decline' emergency rule tells the agent to say a message instead of transferring", () => {
@@ -116,7 +116,7 @@ test("prompt always instructs honesty about being an AI - never claim to be huma
 
 test("prompt carries spam / robocall handling rules by default and drops them when screening is off", () => {
   const withScreening = buildReceptionistPrompt(agent, profile);
-  assert.match(withScreening, /Spam and robocall handling/);
+  assert.match(withScreening, /# SPAM & ROBOCALLS/);
   assert.match(withScreening, /telemarketer reading a script/);
   assert.match(withScreening, /call the end_call tool/);
 
@@ -124,7 +124,29 @@ test("prompt carries spam / robocall handling rules by default and drops them wh
     { ...agent, configuration: { ...agent.configuration, spamScreening: false } },
     profile,
   );
-  assert.doesNotMatch(off, /Spam and robocall handling/);
+  assert.doesNotMatch(off, /# SPAM & ROBOCALLS/);
+});
+
+test("prompt follows the ROLE / CRITICAL RULES / ONE THING AT A TIME structure and carries the new behavioral sections", () => {
+  const prompt = buildReceptionistPrompt(agent, profile);
+
+  assert.match(prompt, /^# ROLE\n/);
+  assert.match(prompt, /# CRITICAL RULES/);
+  assert.match(prompt, /Never confirm a booking, callback, or any other action until the matching Symantic tool has actually returned success/);
+  assert.match(prompt, /# ONE THING AT A TIME/);
+  assert.match(prompt, /Never ask two questions in the same turn/);
+  assert.match(prompt, /# LIVE PERSON REQUESTS/);
+  assert.match(prompt, /# OFF-TOPIC, ABUSE & NONSENSE/);
+  assert.match(prompt, /Abuse, insults, or gibberish\/nonsense speech: don't engage, argue, or match their tone/);
+  assert.match(prompt, /Off-topic requests .*give one polite redirect/);
+  assert.match(prompt, /# CLOSING/);
+  assert.match(prompt, /wait for a real answer - hesitation .*is not a no/);
+});
+
+test("prompt always instructs the AI-disclosure rule as part of CRITICAL RULES", () => {
+  const prompt = buildReceptionistPrompt(agent, profile);
+  assert.match(prompt, /# CRITICAL RULES[\s\S]*always answer honestly.*yes, you are an AI receptionist/);
+  assert.match(prompt, /Never claim to be human/);
 });
 
 test("resolveCallHandling applies defaults and clamps to the Retell range", () => {
