@@ -5550,7 +5550,11 @@ function launchReadinessIssue(agent, profile, calendar) {
     return "Complete the agent details and behavior before activation";
   }
   // Only validate phone-shaped fields that are actually present - owner/
-  // fallback/escalation/transfer numbers are all optional now.
+  // fallback/escalation/transfer numbers are all optional now. A "decline"
+  // emergency rule never dials transferTarget (it only speaks its message -
+  // see formatEmergencyRules/buildTransferTools in receptionist.mjs), so a
+  // stale or half-entered value left over from switching a rule's action
+  // away from "transfer" must never block activation.
   const phoneValues = [
     profile.phone,
     agent?.configuration?.phone,
@@ -5558,7 +5562,9 @@ function launchReadinessIssue(agent, profile, calendar) {
     profile.fallbackPhone,
     profile.escalationContact,
     ...(Array.isArray(agent?.configuration?.emergencyRules)
-      ? agent.configuration.emergencyRules.map(({ transferTarget }) => transferTarget)
+      ? agent.configuration.emergencyRules
+        .filter((rule) => rule?.action !== "decline")
+        .map(({ transferTarget }) => transferTarget)
       : []),
   ].filter((value) => typeof value === "string" && value.trim());
   if (phoneValues.some((value) => !isValidPhone(value))) {

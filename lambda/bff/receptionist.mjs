@@ -482,6 +482,11 @@ function buildTransferTools(agent, profile) {
     : [];
   const destinations = [
     ...rules.flatMap((rule) => {
+      // A "decline" rule only speaks its configured message - see
+      // formatEmergencyRules above - so its transferTarget (often a stale
+      // leftover from when the rule was previously set to "transfer") must
+      // never turn into a real transfer_call tool.
+      if (rule?.action === "decline") return [];
       const number = toE164(rule?.transferTarget);
       if (!number) return [];
       const phrases = Array.isArray(rule?.phrases)

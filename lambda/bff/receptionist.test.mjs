@@ -150,6 +150,30 @@ test("prompt always instructs the AI-disclosure rule as part of CRITICAL RULES",
   assert.match(prompt, /Never claim to be human/);
 });
 
+test("a 'decline' emergency rule's transferTarget never becomes a transfer_call tool, even if it looks like a valid phone number", () => {
+  const declineAgent = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      emergencyRules: [
+        { phrases: ["talk to a human"], action: "decline", transferTarget: "+17035550102", message: "We'll call you back." },
+      ],
+    },
+  };
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: declineAgent,
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  // "+17035550102" is the decline rule's own transferTarget - it must never
+  // appear as a transfer destination. profile still legitimately contributes
+  // its own 3 (escalationContact, ownerPhone, fallbackPhone).
+  assert.ok(!config.transferNumbers.includes("+17035550102"));
+  assert.equal(config.tools.filter(({ type }) => type === "transfer_call").length, 3);
+});
+
 test("resolveGreeting uses the configured greeting when set, otherwise builds one from the real business/receptionist name", () => {
   assert.equal(resolveGreeting(agent, profile), agent.configuration.greeting);
   assert.equal(

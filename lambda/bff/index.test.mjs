@@ -1437,6 +1437,72 @@ test("POST activate syncs Retell only - no phone number is touched", async () =>
   ));
 });
 
+test("POST activate ignores an invalid transferTarget left over on a 'decline' emergency rule", async () => {
+  // A decline rule only speaks its message - it never dials transferTarget
+  // (see formatEmergencyRules/buildTransferTools in receptionist.mjs) - so a
+  // stale or malformed value from before the rule was switched to "decline"
+  // must never block activation.
+  const agent = receptionistAgent();
+  agent.configuration.knowledgeBaseText = "Appointments require 24 hours notice for cancellation.";
+  agent.configuration.emergencyRules = [
+    {
+      id: "rule-1",
+      phrases: ["talk to a human"],
+      action: "decline",
+      transferTarget: "720431997",
+      message: "Please leave a message and we'll call you back.",
+    },
+  ];
+  const profile = receptionistProfile();
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getProfile() { return profile; },
+    async getCalendarConnection() {
+      return { provider: "google-calendar", selectedCalendarId: "primary", connectionState: "connected" };
+    },
+    async getPhoneNumberForAgent() { return null; },
+    async updateAgentRuntime(workspaceId, agentId, updates) {
+      return { ...agent, ...updates };
+    },
+    async createKnowledgeBase(workspaceId, knowledgeBaseId, record) {
+      return { workspaceId, knowledgeBaseId, ...record };
+    },
+    async putAgent(workspaceId, agentId, nextAgent) {
+      Object.assign(agent, nextAgent);
+      return nextAgent;
+    },
+  };
+  const providers = {
+    telnyx: { async ensureNumber() { throw new Error("must not provision a number"); } },
+    retell: {
+      async createKnowledgeBase() { return { knowledgeBaseId: "knowledge-base-123", status: "in_progress" }; },
+      async upsertAgent(input) {
+        // Confirm the decline rule's own transferTarget never turned into a
+        // transfer destination (profile.escalation still legitimately does).
+        assert.ok(!input.config.transferNumbers.includes("720431997"));
+        return { retellAgentId: "retell-agent-123" };
+      },
+      async importPhoneNumber() { throw new Error("must not import a number"); },
+    },
+    resolveVoiceId() { return "retell-Cimo"; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => providers,
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/activate",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).agent.status, "active");
+});
+
 test("POST attach-phone-number provisions the DID and imports it into an already-active agent", async () => {
   const events = [];
   const agent = receptionistAgent();
