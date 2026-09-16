@@ -733,7 +733,7 @@ async function findAgentBySymanticId(retellRequest, symanticAgentId) {
     method: "POST",
     body: {
       filter_criteria: {
-        channel: { op: "eq", value: "voice" },
+        channel: { type: "string", op: "eq", value: "voice" },
       },
     },
   });

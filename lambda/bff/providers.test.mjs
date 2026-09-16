@@ -214,7 +214,7 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
   });
   assert.equal(calls[0][0], "https://api.retellai.com/v2/list-agents?limit=1000");
   assert.deepEqual(JSON.parse(calls[0][1].body), {
-    filter_criteria: { channel: { op: "eq", value: "voice" } },
+    filter_criteria: { channel: { type: "string", op: "eq", value: "voice" } },
   });
   assert.equal(calls[1][0], "https://api.retellai.com/create-retell-llm");
   assert.deepEqual(JSON.parse(calls[1][1].body), {
