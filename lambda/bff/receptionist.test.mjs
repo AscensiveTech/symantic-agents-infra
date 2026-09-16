@@ -8,6 +8,7 @@ import {
   resolveAllowedInboundCountries,
   resolveCallHandling,
   resolveConfiguredVoiceId,
+  resolveGreeting,
   resolveLanguage,
   resolvePauseBeforeSpeakingMs,
   resolveStartSpeaker,
@@ -147,6 +148,22 @@ test("prompt always instructs the AI-disclosure rule as part of CRITICAL RULES",
   const prompt = buildReceptionistPrompt(agent, profile);
   assert.match(prompt, /# CRITICAL RULES[\s\S]*always answer honestly.*yes, you are an AI receptionist/);
   assert.match(prompt, /Never claim to be human/);
+});
+
+test("resolveGreeting uses the configured greeting when set, otherwise builds one from the real business/receptionist name", () => {
+  assert.equal(resolveGreeting(agent, profile), agent.configuration.greeting);
+  assert.equal(
+    resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "" } }, profile),
+    "Thanks for calling Arc Dental. I'm Maya. How can I help today?",
+  );
+  assert.equal(
+    resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "  " } }, { ...profile, businessName: "" }),
+    "Thanks for calling the business. I'm Maya. How can I help today?",
+  );
+  assert.equal(
+    resolveGreeting({ configuration: {} }, { businessName: "Rivertown Plumbing" }),
+    "Thanks for calling Rivertown Plumbing. I'm the AI receptionist. How can I help today?",
+  );
 });
 
 test("resolveCallHandling applies defaults and clamps to the Retell range", () => {

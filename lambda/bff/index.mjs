@@ -7,7 +7,7 @@ import {
   ProviderRequestError,
   resolveRetellVoiceId,
 } from "./providers.mjs";
-import { buildReceptionistConfig, resolveConfiguredVoiceId } from "./receptionist.mjs";
+import { buildReceptionistConfig, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
@@ -5030,7 +5030,7 @@ export async function syncRetellAgent({
     retellAgentId: agent.retellAgentId,
     symanticAgentId: agentId,
     agentName: agent?.configuration?.name ?? agent.name,
-    greeting: agent?.configuration?.greeting ?? "",
+    greeting: resolveGreeting(agent, profile),
     config,
   });
   try {

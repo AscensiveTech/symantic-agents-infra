@@ -223,6 +223,18 @@ const CORE_TOOLS = [
   },
 ];
 
+// The greeting the receptionist speaks first. Uses the configured Custom
+// Greeting Message when the customer has set one; otherwise builds one from
+// the real business/receptionist name rather than ever sending a blank or
+// placeholder greeting live.
+export function resolveGreeting(agent, profile) {
+  const configured = text(agent?.configuration?.greeting);
+  if (configured) return configured;
+  const businessName = text(profile?.businessName) || "the business";
+  const receptionistName = text(agent?.configuration?.name) || text(agent?.name) || "the AI receptionist";
+  return `Thanks for calling ${businessName}. I'm ${receptionistName}. How can I help today?`;
+}
+
 export function buildReceptionistPrompt(agent, profile) {
   const behavior = agent?.configuration ?? {};
   const businessName = text(profile?.businessName) || "the business";
