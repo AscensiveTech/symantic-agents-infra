@@ -80,6 +80,43 @@ test("call_started writes a minimal ongoing row without touching usage or record
   assert.equal(usageIncremented, false);
 });
 
+test("a web_call (Retell's own dashboard Test button) is ignored entirely, never persisted", async () => {
+  let upsertCalled = false;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async upsertCall() {
+        upsertCalled = true;
+        return { record: {}, created: true, previous: null };
+      },
+    }),
+    getRecordingStore: async () => null,
+    getUsageStore: async () => ({
+      async getTimezone() { return "America/New_York"; },
+      async increment() {},
+    }),
+  });
+
+  const startedResponse = await handler(callStartedEvent({
+    call_id: "retell-call-webrtc",
+    call_type: "web_call",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    start_timestamp: Date.parse("2026-09-30T23:30:00-04:00"),
+  }));
+  const analyzedResponse = await handler(callAnalyzedEvent({
+    call_id: "retell-call-webrtc",
+    call_type: "web_call",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    start_timestamp: 1_800_000_000_000,
+    end_timestamp: 1_800_000_030_000,
+  }));
+
+  assert.equal(startedResponse.statusCode, 204);
+  assert.equal(analyzedResponse.statusCode, 204);
+  assert.equal(upsertCalled, false);
+});
+
 test("call_analyzed falls back to the transcript for the caller name and flags the source", async () => {
   let persistedCall;
   const handler = createHandler({

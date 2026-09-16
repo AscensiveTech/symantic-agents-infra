@@ -134,6 +134,14 @@ export function createHandler({
     if (!call || typeof call !== "object" || Array.isArray(call)) {
       return json(400, { message: "A call payload is required" });
     }
+    // Retell's own dashboard "Test" button places a browser-based
+    // (call_type "web_call") call directly to the agent - no phone number,
+    // no Telnyx, no real caller. It still fires this same webhook, but it
+    // isn't a customer call and must never show up in Call History. Only
+    // real PSTN calls (call_type "phone_call") are ingested.
+    if (stringValue(call.call_type) === "web_call") {
+      return noContent();
+    }
 
     const toolLog = normalizeToolLog(call.transcript_with_tool_calls);
     let workspaceId = callContextValue(call, toolLog, "workspaceId");
