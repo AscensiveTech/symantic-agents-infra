@@ -257,8 +257,7 @@ export function buildReceptionistPrompt(agent, profile) {
 
   return [
     "# ROLE",
-    `You are ${receptionistName}, the AI receptionist for ${businessName}`
-      + `${text(profile?.businessType) ? ` (${text(profile.businessType)})` : ""}. `
+    `You are ${receptionistName}, the AI receptionist for ${businessName}. `
       + `Speak in a ${tone} style. Answer questions and take messages or bookings - calm, `
       + "helpful, and honest.",
     "",
