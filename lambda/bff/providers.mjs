@@ -53,6 +53,19 @@ export function createTelnyxClient({
     }, "Telnyx");
   }
 
+  // Tags a Telnyx number with the agent's Receptionist Name, so it's
+  // identifiable in Telnyx's own number list (the "Connection/Application"
+  // column can't do this - every number intentionally shares one SIP
+  // connection - but Telnyx's per-number "tags" field is built for exactly
+  // this). Cosmetic only: a failure here must never fail provisioning.
+  async function tagNumber(telnyxNumberId, agentName) {
+    if (typeof agentName !== "string" || !agentName.trim()) return;
+    await telnyxRequest(
+      `${TELNYX_BASE_URL}/phone_numbers/${encodeURIComponent(telnyxNumberId)}`,
+      { method: "PATCH", body: { tags: [agentName.trim()] } },
+    ).catch(() => {});
+  }
+
   return {
     // Lets the customer pick from real available numbers (by area code)
     // before an agent orders one, instead of only the best-effort
@@ -87,6 +100,7 @@ export function createTelnyxClient({
       agentId,
       preferredPhone,
       desiredPhone,
+      agentName,
     }) {
       const customerReference = `${required(workspaceId, "workspaceId")}:${
         required(agentId, "agentId")
@@ -149,6 +163,7 @@ export function createTelnyxClient({
         (candidate) => candidate?.phone_number === phoneNumber,
       ) ?? order?.phone_numbers?.[0];
       if (isProvisionedNumber(orderedNumber)) {
+        await tagNumber(orderedNumber.id, agentName);
         return {
           ...telnyxNumber(orderedNumber),
           telnyxOrderId: stringOrUndefined(order?.id),
@@ -161,6 +176,7 @@ export function createTelnyxClient({
           "filter[phone_number]": phoneNumber,
         });
         if (provisioned) {
+          await tagNumber(provisioned.id, agentName);
           return {
             ...telnyxNumber(provisioned),
             telnyxOrderId: stringOrUndefined(order?.id),

@@ -67,6 +67,82 @@ test("Telnyx provisioning reuses customer reference and orders one local DID", a
   );
 });
 
+test("Telnyx provisioning tags the new number with the agent's Receptionist Name", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (calls.length === 1) return response({ data: [] });
+    if (calls.length === 2) {
+      return response({ data: [{ phone_number: "+17035550177" }] });
+    }
+    if (calls.length === 3) {
+      return response({
+        data: {
+          id: "order-123",
+          status: "pending",
+          phone_numbers: [{
+            id: "telnyx-number-123",
+            phone_number: "+17035550177",
+          }],
+        },
+      });
+    }
+    return response({ id: "telnyx-number-123" });
+  };
+  const client = createTelnyxClient({
+    apiKey: "telnyx-key",
+    connectionId: "connection-123",
+    fetchImpl,
+  });
+
+  await client.ensureNumber({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    preferredPhone: "+17035550100",
+    agentName: "Alpine Shadows - Acme",
+  });
+
+  assert.equal(calls.length, 4);
+  assert.equal(calls[3][0], "https://api.telnyx.com/v2/phone_numbers/telnyx-number-123");
+  assert.equal(calls[3][1].method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[3][1].body), { tags: ["Alpine Shadows - Acme"] });
+});
+
+test("Telnyx provisioning skips tagging entirely when no agent name is given", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (calls.length === 1) return response({ data: [] });
+    if (calls.length === 2) {
+      return response({ data: [{ phone_number: "+17035550177" }] });
+    }
+    return response({
+      data: {
+        id: "order-123",
+        status: "pending",
+        phone_numbers: [{
+          id: "telnyx-number-123",
+          phone_number: "+17035550177",
+        }],
+      },
+    });
+  };
+  const client = createTelnyxClient({
+    apiKey: "telnyx-key",
+    connectionId: "connection-123",
+    fetchImpl,
+  });
+
+  const number = await client.ensureNumber({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    preferredPhone: "+17035550100",
+  });
+
+  assert.equal(calls.length, 3);
+  assert.equal(number.telnyxNumberId, "telnyx-number-123");
+});
+
 test("Telnyx provisioning returns an already-owned DID without ordering", async () => {
   const fetchImpl = async () => response({
     data: [{

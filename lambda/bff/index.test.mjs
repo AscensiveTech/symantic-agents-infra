@@ -1387,6 +1387,8 @@ test("POST attach-phone-number provisions the DID and imports it into an already
   );
   const persistedPhone = events.find(([name]) => name === "putPhoneNumber")[1];
   assert.equal(persistedPhone.phoneNumberId, "phone-agent-123");
+  const telnyxInput = events.find(([name]) => name === "telnyx")[1];
+  assert.equal(telnyxInput.agentName, "Maya");
   assert.equal(persistedPhone.retellPhoneNumberId, "+17035550177");
 });
 
