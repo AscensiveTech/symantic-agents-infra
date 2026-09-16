@@ -418,6 +418,45 @@ test("PUT agent returns 404 when the agent is missing", async () => {
   assert.equal(JSON.parse(response.body).message, "Agent not found");
 });
 
+test("PUT agent refuses to resurrect a deleted agent (404, never calls putAgent)", async () => {
+  let putAgentCalled = false;
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-deleted",
+        name: "Maya",
+        status: "deleted",
+        deletedAt: "2026-09-16T00:00:00.000Z",
+        retellAgentId: "retell-agent-now-invalid",
+      };
+    },
+    async putAgent() {
+      putAgentCalled = true;
+      throw new Error("must not resurrect a deleted agent");
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-deleted",
+    {
+      id: "agent-deleted",
+      name: "Maya",
+      role: "Phone operations",
+      description: "Answers calls",
+      status: "preview",
+      capabilities: ["Inbound calls"],
+    },
+  ));
+
+  assert.equal(response.statusCode, 404);
+  assert.equal(JSON.parse(response.body).message, "Agent not found");
+  assert.equal(putAgentCalled, false);
+});
+
 test("PUT agent uses the route id and returns the updated agent", async () => {
   const calls = [];
   const store = {

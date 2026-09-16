@@ -1531,6 +1531,16 @@ export function createHandler({
           const existing = typeof store.getAgent === "function"
             ? await store.getAgent(workspaceId, agentId)
             : null;
+          // A deleted agent's row is kept for records (deletedAt/deletedByName/
+          // callsHandledAtDeletion), but it must never be resurrected by a
+          // stray PUT - a stale client-side draft id reused for a genuinely
+          // new agent would otherwise silently revive the old DB row while
+          // its now-invalid retellAgentId (the Retell agent was correctly
+          // deleted) stays attached untouched, since this update only SETs
+          // the fields the client actually sent.
+          if (existing?.status === "deleted") {
+            return json(404, { message: "Agent not found" });
+          }
           if (existing && existing.name !== agent.name && await agentNameTaken(store, workspaceId, agent.name, agentId)) {
             return json(409, { message: `An agent named "${agent.name}" already exists in this workspace - choose a different name.` });
           }
