@@ -7544,23 +7544,29 @@ const secretPromises = new Map();
 async function getProviderSecret(secretArn, provider) {
   if (!secretArn) throw new Error(`${provider} secret ARN is required`);
   if (!secretPromises.has(secretArn)) {
-    secretPromises.set(
-      secretArn,
-      import("@aws-sdk/client-secrets-manager").then(async (commands) => {
-        const client = new commands.SecretsManagerClient({});
-        const result = await client.send(new commands.GetSecretValueCommand({
-          SecretId: secretArn,
-        }));
-        if (!result.SecretString) {
-          throw new Error(`${provider} secret string is empty`);
-        }
-        try {
-          return JSON.parse(result.SecretString);
-        } catch {
-          throw new Error(`${provider} secret must contain JSON`);
-        }
-      }),
-    );
+    const promise = import("@aws-sdk/client-secrets-manager").then(async (commands) => {
+      const client = new commands.SecretsManagerClient({});
+      const result = await client.send(new commands.GetSecretValueCommand({
+        SecretId: secretArn,
+      }));
+      if (!result.SecretString) {
+        throw new Error(`${provider} secret string is empty`);
+      }
+      try {
+        return JSON.parse(result.SecretString);
+      } catch {
+        throw new Error(`${provider} secret must contain JSON`);
+      }
+    }).catch((error) => {
+      // Only successful reads are worth caching for the container's
+      // lifetime - a transient failure (secret not populated yet, a
+      // momentary Secrets Manager blip) must never get stuck cached as a
+      // permanent failure until the next cold start. Evict so the very
+      // next call retries fresh.
+      secretPromises.delete(secretArn);
+      throw error;
+    });
+    secretPromises.set(secretArn, promise);
   }
   return secretPromises.get(secretArn);
 }
