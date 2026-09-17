@@ -584,6 +584,7 @@ test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared 
       return [
         { agentId: "agent-123" },
         { agentId: "agent-123" },
+        { agentId: "agent-123", demoSeed: true },
         { agentId: "agent-456" },
       ];
     },
@@ -620,6 +621,8 @@ test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared 
   assert.equal(response.statusCode, 200);
   const body = JSON.parse(response.body);
   assert.equal(body.status, "deleted");
+  // 2, not 3 - the demoSeed:true call for this same agent is sample data,
+  // never a real customer call, and must not inflate this count.
   assert.equal(body.callsHandledAtDeletion, 2);
   assert.ok(body.deletedAt);
   assert.equal(body.deletedByName, "user-123");
@@ -5397,6 +5400,37 @@ test("GET /workspaces/me/usage?agentId= scopes the cycle and months to just that
   // Only agent-1's 90-second call (1.5 -> 2 billed minutes) counts.
   assert.equal(body.billingCycle.calls, 1);
   assert.ok(body.calls.every((call) => call.agentId === "agent-1"));
+});
+
+test("GET /workspaces/me/usage?agentId= depends on listCallsForUsage actually returning agentId - regression guard for the missing ProjectionExpression field bug", async () => {
+  // The real DynamoDB-backed listCallsForUsage() once omitted agentId from
+  // its ProjectionExpression, so every call it returned had agentId
+  // undefined - the per-agent filter below (call.agentId === agentId)
+  // could then never match anything, silently zeroing out every
+  // agent-scoped Billing & Usage view. This test exercises
+  // listCallsForUsage specifically (not the listCalls fallback the other
+  // tests above use) to pin down that agentId must always come through.
+  const { createHandler } = await loadBff();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const store = meteringStore({
+    async listCallsForUsage() {
+      return [
+        { ...minuteCall(`${period}-05T10:00:00-04:00`, 90_000), agentId: "agent-1" },
+        { ...minuteCall(`${period}-06T11:00:00-04:00`, 30_000), agentId: "agent-2" },
+      ];
+    },
+    async listAgents() {
+      return [{ id: "agent-1", name: "Maya" }, { id: "agent-2", name: "Samantha" }];
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/usage", undefined, { agentId: "agent-1" }));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.billingCycle.calls, 1);
+  assert.equal(body.billingCycle.minutes, 2);
 });
 
 test("GET /workspaces/me/usage always returns monthlyByAgent for every agent, regardless of the agentId filter", async () => {

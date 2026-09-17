@@ -179,7 +179,10 @@ function numberOrNull(value) {
  */
 export function buildUsage(allCalls, { now, timezone, plan }) {
   const tz = timezone || "UTC";
-  const calls = Array.isArray(allCalls) ? allCalls : [];
+  // Demo-seeded calls ("Reset Demo Data"/"Add Sample Calls" content, never
+  // a real customer conversation) must never count toward real billed
+  // minutes or overage - they're sample data, not usage.
+  const calls = (Array.isArray(allCalls) ? allCalls : []).filter((call) => call?.demoSeed !== true);
   const { period, startsOn, endsOn } = monthBounds(now, tz);
 
   const allowance = numberOrNull(plan?.minutes);

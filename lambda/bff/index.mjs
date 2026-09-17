@@ -1627,7 +1627,10 @@ export function createHandler({
           store.listCalls(workspaceId),
           store.listAgents(workspaceId),
         ]);
-        const callsHandledAtDeletion = calls.filter((call) => call.agentId === agentId).length;
+        // demoSeed calls ("Reset Demo Data"/"Add Sample Calls" content) are
+        // sample data, never a real customer call - excluded so a deleted
+        // agent's history reflects what actually happened, not demo output.
+        const callsHandledAtDeletion = calls.filter((call) => call.agentId === agentId && call.demoSeed !== true).length;
 
         const knowledgeBaseIds = Array.isArray(agent?.configuration?.knowledgeBaseIds)
           ? agent.configuration.knowledgeBaseIds
@@ -2150,6 +2153,7 @@ async function listCallsForUsage(store, workspaceId) {
 function buildMonthlyByAgent(calls, { timezone, agentNames }) {
   const byKey = new Map();
   for (const call of calls) {
+    if (call?.demoSeed === true) continue;
     const started = callStart(call);
     if (!started) continue;
     const at = new Date(started);
@@ -6203,7 +6207,7 @@ export function createDynamoStore(client, commands, tableNames) {
           ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
           ConsistentRead: false,
           ProjectionExpression:
-            "callId, callerName, callerNameSource, callerNumber, startedAt, createdAt, durationMs, outcome, callSummary, recordingKey",
+            "callId, agentId, callerName, callerNameSource, callerNumber, startedAt, createdAt, durationMs, outcome, callSummary, recordingKey, demoSeed",
           ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
         }));
         items.push(...(result.Items ?? []).map((item) => unmarshall(item)));

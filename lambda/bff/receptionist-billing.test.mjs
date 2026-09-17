@@ -32,6 +32,23 @@ test("periodKey uses the workspace timezone for the billing month", () => {
   assert.equal(periodKey("2026-09-30T23:30:00-04:00", "UTC"), "2026-10");
 });
 
+test("buildUsage never counts demo-seeded calls toward real billed minutes", () => {
+  const now = new Date("2026-09-15T12:00:00Z");
+  const plan = { plan: "starter", ...RECEPTIONIST_PLANS.starter };
+  const usage = buildUsage(
+    [
+      call("2026-09-10T10:00:00Z", 60_000),
+      call("2026-09-11T10:00:00Z", 120_000, { demoSeed: true }),
+      call("2026-09-12T10:00:00Z", 180_000, { demoSeed: true }),
+    ],
+    { now, timezone: "UTC", plan },
+  );
+  // Only the one real, non-demo call (60s -> 1 billed minute) counts -
+  // the 2 demo-seeded calls (2min + 3min) must never inflate real usage.
+  assert.equal(usage.billingCycle.minutes, 1);
+  assert.equal(usage.billingCycle.calls, 1);
+});
+
 test("buildUsage attributes a late-night call to the tz-local month", () => {
   const now = new Date("2026-09-15T12:00:00Z");
   const plan = { plan: "starter", ...RECEPTIONIST_PLANS.starter };
