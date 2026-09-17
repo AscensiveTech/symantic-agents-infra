@@ -495,7 +495,7 @@ const CALL_DIGEST_FREQUENCIES = new Set([
 const CALL_DIGEST_MAX_RECIPIENTS = 6;
 const CALL_DIGEST_DEFAULTS = Object.freeze({
   enabled: false,
-  frequency: "daily",
+  frequency: "every_10_minutes",
   sendHour: 8,
   weekday: 1,
   timezone: "UTC",

@@ -10,7 +10,7 @@ export const DIGEST_FREQUENCIES = [
 
 export const DEFAULT_DIGEST_SETTINGS = Object.freeze({
   enabled: false,
-  frequency: "daily",
+  frequency: "every_10_minutes",
   sendHour: 8,
   weekday: 1,
   timezone: "America/New_York",
