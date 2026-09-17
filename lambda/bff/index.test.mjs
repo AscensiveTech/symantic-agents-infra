@@ -5151,6 +5151,86 @@ test("GET call-digest returns safe defaults", async () => {
   assert.equal(body.lastRun, null);
 });
 
+function callHistoryStore({ membership, calls = [] } = {}) {
+  let self = membership ?? {
+    userId: "user-123",
+    workspaceId: "user-123",
+    role: "company-admin",
+    status: "active",
+  };
+  const saved = [];
+  return {
+    saved,
+    async getMembership(userId) {
+      return userId === self.userId ? self : null;
+    },
+    async putMembership(next) {
+      self = next;
+      saved.push(next);
+      return next;
+    },
+    async listCalls() {
+      return calls;
+    },
+  };
+}
+
+test("POST call-history/viewed stamps the actor's own membership with now", async () => {
+  const store = callHistoryStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const before = Date.now();
+
+  const response = await handler(companyAdminEvent("POST", "/workspaces/me/call-history/viewed"));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.ok(Date.parse(body.lastViewedCallHistoryAt) >= before);
+  assert.equal(store.saved.length, 1);
+  assert.equal(store.saved[0].userId, "user-123");
+});
+
+test("GET call-history/unread-count starts a brand-new membership at 0 and seeds a view time", async () => {
+  const store = callHistoryStore({
+    calls: [{ callId: "c1", startedAt: new Date().toISOString() }],
+  });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/call-history/unread-count"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { count: 0 });
+  assert.equal(store.saved.length, 1);
+  assert.ok(store.saved[0].lastViewedCallHistoryAt);
+});
+
+test("GET call-history/unread-count counts every call newer than the last view, any outcome", async () => {
+  const now = Date.now();
+  const store = callHistoryStore({
+    membership: {
+      userId: "user-123",
+      workspaceId: "user-123",
+      role: "company-admin",
+      status: "active",
+      lastViewedCallHistoryAt: new Date(now - 60_000).toISOString(),
+    },
+    calls: [
+      { callId: "before", startedAt: new Date(now - 120_000).toISOString(), outcome: "missed" },
+      { callId: "after-1", startedAt: new Date(now - 30_000).toISOString(), outcome: "booked" },
+      { callId: "after-2", startedAt: new Date(now - 10_000).toISOString(), outcome: "answered" },
+    ],
+  });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/call-history/unread-count"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { count: 2 });
+  assert.equal(store.saved.length, 0);
+});
+
 test("turning call summaries on saves the settings and starts the window now", async () => {
   const store = callDigestStore();
   const { createHandler } = await loadBff();

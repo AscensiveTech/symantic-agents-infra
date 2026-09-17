@@ -1176,6 +1176,34 @@ export function createHandler({
         return json(405, { message: "Method not allowed" });
       }
 
+      // Call History unread badge - tracked per user (not per admin/workspace),
+      // so it's correct across devices without being an admin-only setting.
+      if (path === "/workspaces/me/call-history/viewed" && method === "POST") {
+        const self = await store.getMembership(actor.userId);
+        if (!self || self.workspaceId !== workspaceId) return json(404, { message: "Workspace user not found" });
+        const updated = { ...self, lastViewedCallHistoryAt: new Date().toISOString() };
+        await store.putMembership(updated);
+        return json(200, { lastViewedCallHistoryAt: updated.lastViewedCallHistoryAt });
+      }
+
+      if (path === "/workspaces/me/call-history/unread-count" && method === "GET") {
+        const self = await store.getMembership(actor.userId);
+        if (!self || self.workspaceId !== workspaceId) return json(404, { message: "Workspace user not found" });
+        // A membership with no recorded view yet (brand new, or created
+        // before this field existed) starts at 0 rather than counting the
+        // whole call history as "unread" - seeded to "now" the moment
+        // that's discovered, so every later call increments it normally.
+        if (!self.lastViewedCallHistoryAt) {
+          const nowIso = new Date().toISOString();
+          await store.putMembership({ ...self, lastViewedCallHistoryAt: nowIso });
+          return json(200, { count: 0 });
+        }
+        const calls = await store.listCalls(workspaceId);
+        const sinceMs = Date.parse(self.lastViewedCallHistoryAt);
+        const count = calls.filter((call) => callTimestamp(call) > sinceMs).length;
+        return json(200, { count });
+      }
+
       if (path === "/workspaces/me/usage" && method === "GET") {
         await store.ensureWorkspace(workspaceId);
         const usageAgentId = typeof event?.queryStringParameters?.agentId === "string" && event.queryStringParameters.agentId
