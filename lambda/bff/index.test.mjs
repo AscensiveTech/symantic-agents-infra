@@ -6588,6 +6588,9 @@ function mostAskedStore(overrides = {}) {
     async getWorkspace() {
       return { workspaceId: "user-123", mostAskedQuestionsEnabled: true };
     },
+    async getProfile() {
+      return { timezone: "America/New_York" };
+    },
     async listCalls() {
       return [
         { callId: "c1", agentId: "agent-1", startedAt: new Date().toISOString(), callSummary: "Asked about walk-ins." },
@@ -6619,6 +6622,58 @@ test("most-asked-questions is blocked for a workspace without the premium entitl
   const response = await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30 }));
   assert.equal(response.statusCode, 402);
   assert.equal(store.digests.length, 0);
+});
+
+test("most-asked-questions refuses a second manual refresh in the same billing cycle for a regular user", async () => {
+  const { createHandler } = await loadBff();
+  const store = mostAskedStore();
+  store.digests.push({
+    digestId: "digest-1",
+    workspaceId: "user-123",
+    agentId: "all",
+    generatedAt: new Date().toISOString(),
+    questions: [],
+  });
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30 }));
+  assert.equal(response.statusCode, 429);
+  assert.match(JSON.parse(response.body).message, /once per billing cycle/i);
+  assert.equal(store.digests.length, 1, "no new digest was generated");
+});
+
+test("most-asked-questions allows a super admin to refresh as many times as needed, bypassing the once-per-cycle limit", async () => {
+  const { createHandler } = await loadBff();
+  const store = mostAskedStore();
+  store.digests.push({
+    digestId: "digest-1",
+    workspaceId: "user-123",
+    agentId: "all",
+    generatedAt: new Date().toISOString(),
+    questions: [],
+  });
+  // A store without getMembership() always resolves to a hardcoded
+  // company-admin actor (see resolveActor) - a real membership lookup is
+  // required for the "super-admin" claim below to actually take effect.
+  store.getMembership = async () => ({
+    userId: "user-123", workspaceId: "user-123", role: "super-admin", status: "active",
+  });
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      anthropic: {
+        async summarizeMostAskedQuestions() {
+          return { questions: [], model: "claude-haiku-4-5-20251001", usage: { inputTokens: 0, outputTokens: 0 }, costCents: 0 };
+        },
+      },
+    }),
+  });
+  const event = authenticatedEvent("POST", "/workspaces/me/most-asked-questions", { windowDays: 30 });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 201);
+  assert.equal(store.digests.length, 2, "the super admin's refresh went through despite this cycle already being used");
 });
 
 test("most-asked-questions generates a digest from eligible calls in the window and persists cost", async () => {

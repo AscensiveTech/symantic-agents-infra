@@ -897,6 +897,22 @@ export function createHandler({
         if (!await isMostAskedQuestionsEnabled(store, workspaceId)) {
           return json(402, { message: "Most asked questions is a premium feature - contact your account manager to turn it on." });
         }
+        // Everyone else gets exactly one manual refresh per billing cycle - a
+        // super admin is exempt entirely and can refresh as many times as
+        // needed, any time, regardless of what a regular user has already
+        // used this cycle.
+        if (!actor.roles.includes("super-admin")) {
+          const [profile, digests] = await Promise.all([
+            store.getProfile(workspaceId),
+            store.listMostAskedDigests(workspaceId),
+          ]);
+          const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+          if (mostAskedQuestionsCycleLimitReached(digests, timezone)) {
+            return json(429, {
+              message: "Most asked questions can only be refreshed once per billing cycle. It resets automatically at the start of your next cycle - ask a super admin if you need it refreshed sooner.",
+            });
+          }
+        }
         const body = readBody(event) ?? {};
         // Only a 30-day window now - the 7/30/90 picker was removed from the UI.
         const windowDays = 30;
@@ -2520,6 +2536,18 @@ async function countProposalGenerated(store, workspaceId, proposalId, { loaded =
 async function isMostAskedQuestionsEnabled(store, workspaceId) {
   const workspace = typeof store.getWorkspace === "function" ? await store.getWorkspace(workspaceId) : null;
   return workspace?.mostAskedQuestionsEnabled === true;
+}
+
+// A workspace gets exactly one manual regeneration per billing cycle - the
+// same monthly cycle receptionist-billing.mjs already anchors usage/overage
+// to (periodKey, workspace timezone), so "per billing cycle" means the same
+// thing everywhere in the app. Compares against the most recent digest
+// across every agent (not per-agent) - the entitlement, and its cost, are
+// workspace-wide. A super admin is exempt entirely (see the call site).
+function mostAskedQuestionsCycleLimitReached(digests, timezone) {
+  const latest = digests[0];
+  if (!latest?.generatedAt) return false;
+  return periodKey(latest.generatedAt, timezone) === periodKey(new Date(), timezone);
 }
 
 // Caps the number of calls fed to the LLM per digest run - bounds both cost
