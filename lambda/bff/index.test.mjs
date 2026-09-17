@@ -954,6 +954,37 @@ test("GET calls lists workspace calls without exposing Retell identifiers", asyn
   assert.doesNotMatch(response.body, /calls\/call-123\.wav/); // recordingKey is not exposed
 });
 
+test("GET calls merges companyName from the contacts table onto matching rows only", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [
+        { callId: "call-1", callerNumber: "+17205551234", outcome: "answered" },
+        { callId: "call-2", callerNumber: "+14155559999", outcome: "answered" },
+        { callId: "call-3", callerNumber: "+16505551111", outcome: "answered" },
+      ];
+    },
+    async listContacts() {
+      return [
+        { phoneNumber: "+17205551234", companyName: "Arc Dental", hidden: false },
+        // A hidden (soft-deleted) contact's company name should never surface.
+        { phoneNumber: "+16505551111", companyName: "Should Not Appear", hidden: true },
+      ];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/calls"));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  const byId = Object.fromEntries(body.map((call) => [call.callId, call.companyName]));
+  assert.equal(byId["call-1"], "Arc Dental");
+  assert.equal(byId["call-2"], undefined);
+  assert.equal(byId["call-3"], undefined);
+});
+
 test("GET call detail uses the product call id and hides provider keys", async () => {
   let requested;
   const store = {

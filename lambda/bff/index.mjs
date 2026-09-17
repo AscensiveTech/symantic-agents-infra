@@ -959,8 +959,23 @@ export function createHandler({
       if (path === "/workspaces/me/calls" && method === "GET") {
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
-        const calls = await store.listCalls(workspaceId);
-        return json(200, calls.map(toPublicCallSummary));
+        const [calls, contactRows] = await Promise.all([
+          store.listCalls(workspaceId),
+          typeof store.listContacts === "function" ? store.listContacts(workspaceId) : [],
+        ]);
+        // Company name lives in the contacts override table, not on the call
+        // record itself - joined in here (a small, bounded table, unlike the
+        // full call history) so Call History can show it without a separate
+        // per-row fetch, the same way /contacts/summary already does.
+        const companyByPhone = new Map(
+          contactRows
+            .filter((row) => row.hidden !== true && row.companyName)
+            .map((row) => [row.phoneNumber, row.companyName]),
+        );
+        return json(200, calls.map((call) => toPublicCallSummary({
+          ...call,
+          companyName: companyByPhone.get(call.callerNumber) ?? undefined,
+        })));
       }
 
       if (path === "/workspaces/me/calls/seed-demo" && method === "POST") {
