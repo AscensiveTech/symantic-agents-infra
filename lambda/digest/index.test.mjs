@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createDigestHandler } from "./index.mjs";
-import { describeSendFailure, normalizeEmail } from "./email.mjs";
+import { createSesSender, describeSendFailure, normalizeEmail } from "./email.mjs";
+import { renderNegativeSentimentAlert } from "./render.mjs";
 import { isDigestDue, normalizeDigestSettings } from "./schedule.mjs";
 
 const HOUR = 3_600_000;
@@ -44,14 +45,18 @@ function call(overrides = {}) {
   };
 }
 
-function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], claimSucceeds = true } = {}) {
+function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], claimSucceeds = true, negativeSentimentCalls = [] } = {}) {
   const log = [];
   const state = new Map(workspaces.map((workspace) => [workspace.workspaceId, { ...workspace }]));
+  const pendingAlerts = new Map(negativeSentimentCalls.map((item) => [`${item.workspaceId}:${item.callId}`, { ...item }]));
   return {
     log,
     state,
+    pendingAlerts,
     async listDigestWorkspaces() {
-      return [...state.values()].filter((workspace) => workspace.callDigest?.enabled === true);
+      return [...state.values()].filter((workspace) => (
+        workspace.callDigest?.enabled === true || workspace.negativeSentimentAlert?.enabled === true
+      ));
     },
     async getWorkspace(workspaceId) {
       return state.get(workspaceId) ?? null;
@@ -60,6 +65,15 @@ function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], cl
       log.push(["listCalls", workspaceId, start, end]);
       if (workspaceId === "broken") throw new Error("boom");
       return calls.filter((item) => item.analyzedAt > start && item.analyzedAt <= end);
+    },
+    async listPendingNegativeSentimentCalls(workspaceId) {
+      log.push(["listPendingNegativeSentimentCalls", workspaceId]);
+      return [...pendingAlerts.values()].filter((item) => item.workspaceId === workspaceId);
+    },
+    async markNegativeSentimentAlerted(workspaceId, callId) {
+      log.push(["markNegativeSentimentAlerted", workspaceId, callId]);
+      pendingAlerts.delete(`${workspaceId}:${callId}`);
+      return true;
     },
     async listAgents() {
       return agents;
@@ -177,7 +191,7 @@ test("a due summary goes to every configured recipient, once each", async () => 
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { sent: 1 });
+  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 } });
   assert.deepEqual(
     sender.sent.map((message) => message.to).sort(),
     ["dana@arcdental.com", "frontdesk@arcdental.com", "sam@arcdental.com"],
@@ -209,7 +223,7 @@ test("an interval with no calls sends nothing but still moves the window on", as
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { no_calls: 1 });
+  assert.deepEqual(results, { no_calls: 1, negativeSentimentAlerts: { disabled: 1 } });
   assert.equal(store.state.get("ws-1").notifications, undefined);
   assert.equal(sender.sent.length, 0);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
@@ -225,7 +239,7 @@ test("skipIfEmpty:false sends a confirmation even when there are zero calls", as
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { sent: 1 });
+  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 } });
   assert.equal(sender.sent.length, 1);
   assert.match(sender.sent[0].html, /No new calls since your last check/);
   const run = store.state.get("ws-1").callDigestLastRun;
@@ -262,7 +276,7 @@ test("a summary that is not yet due does nothing", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { not_due: 1 });
+  assert.deepEqual(results, { not_due: 1, negativeSentimentAlerts: { disabled: 1 } });
   assert.equal(sender.sent.length, 0);
   assert.equal(store.log.some(([kind]) => kind === "claim"), false);
 });
@@ -277,7 +291,7 @@ test("a workspace without a cursor starts its window now instead of mailing hist
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { initialized: 1 });
+  assert.deepEqual(results, { initialized: 1, negativeSentimentAlerts: { disabled: 1 } });
   assert.equal(sender.sent.length, 0);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
 });
@@ -289,7 +303,7 @@ test("when nobody could be emailed, the window is handed back for the next run",
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { failed: 1 });
+  assert.deepEqual(results, { failed: 1, negativeSentimentAlerts: { disabled: 1 } });
   assert.equal(store.state.get("ws-1").callDigestCursor, previous);
   assert.equal(store.state.get("ws-1").callDigestLastRun.status, "failed");
   assert.match(store.state.get("ws-1").callDigestLastRun.error, /verified addresses/);
@@ -322,7 +336,7 @@ test("a window claimed by an overlapping run is never sent twice", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { claimed_elsewhere: 1 });
+  assert.deepEqual(results, { claimed_elsewhere: 1, negativeSentimentAlerts: { disabled: 1 } });
   assert.equal(sender.sent.length, 0);
 });
 
@@ -339,7 +353,151 @@ test("one workspace failing does not stop the others", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { error: 1, sent: 1 });
+  assert.deepEqual(results, { error: 1, sent: 1, negativeSentimentAlerts: { disabled: 2 } });
+});
+
+// --- negative-sentiment alerts ----------------------------------------------
+
+function negativeCall(overrides = {}) {
+  return {
+    workspaceId: "ws-1",
+    callId: "call-neg-1",
+    callerName: "Jordan Miles",
+    callerNumber: "+17035550123",
+    startedAt: hoursBefore(0.2),
+    callSummary: "Caller was upset about a billing error.",
+    transcript: [
+      { speaker: "Agent", text: "Thanks for calling Arc Dental." },
+      { speaker: "Caller", text: "I was charged twice and nobody has fixed it." },
+    ],
+    ...overrides,
+  };
+}
+
+test("a workspace with negative-sentiment alerts on (even with call-digest off) sends one email per pending call and marks each", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"] },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall(), negativeCall({ callId: "call-neg-2" })],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results.negativeSentimentAlerts, { sent: 1 });
+  assert.equal(sender.sent.length, 2);
+  assert.ok(sender.sent.every((message) => message.to === "dana@arcdental.com"));
+  assert.ok(sender.sent.every((message) => message.subject.includes("Jordan Miles")));
+  assert.ok(sender.sent.every((message) => message.attachment?.filename?.endsWith(".txt")));
+  assert.ok(sender.sent[0].text.includes("This alert was sent to: dana@arcdental.com."));
+  assert.equal(store.pendingAlerts.size, 0);
+});
+
+test("negative-sentiment alerts are skipped when disabled or when there are no recipients", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({ workspaceId: "off", negativeSentimentAlert: { enabled: false, recipients: ["dana@arcdental.com"] } }),
+      workspace({ workspaceId: "no-recipients", callDigest: settings({ enabled: false }), negativeSentimentAlert: { enabled: true, recipients: [] } }),
+    ],
+    negativeSentimentCalls: [negativeCall({ workspaceId: "no-recipients" })],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  // "off" workspace's callDigest is enabled (default from workspace()), so
+  // it still gets a digest outcome - only the alert side is being checked.
+  assert.equal(results.negativeSentimentAlerts.no_recipients, 1);
+  assert.equal(sender.sent.length, 0);
+});
+
+test("a fully-failed negative-sentiment send leaves the call pending for the next tick", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"] },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall()],
+  });
+  const sender = recordingSender({ failFor: ["dana@arcdental.com"] });
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results.negativeSentimentAlerts, { failed: 1 });
+  assert.equal(store.pendingAlerts.size, 1);
+});
+
+test("a partial failure across multiple recipients still marks the call sent", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com", "sam@arcdental.com"] },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall()],
+  });
+  const sender = recordingSender({ failFor: ["sam@arcdental.com"] });
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results.negativeSentimentAlerts, { sent: 1 });
+  assert.equal(sender.sent.length, 1);
+  assert.equal(store.pendingAlerts.size, 0);
+});
+
+test("renderNegativeSentimentAlert caps the inline transcript preview at 500 characters but attaches the full thing", () => {
+  const longLine = "Caller: ".padEnd(30, "x") + "a".repeat(600);
+  const message = renderNegativeSentimentAlert({
+    workspaceName: "Arc Dental",
+    call: negativeCall({ transcript: [{ speaker: "Caller", text: longLine }] }),
+    recipients: ["dana@arcdental.com", "sam@arcdental.com"],
+    timezone: "America/New_York",
+    dashboardUrl: "https://agents.example.com/call-history",
+  });
+
+  const previewMatch = message.text.match(/Transcript preview:\n([\s\S]*?)\n\nThe full transcript/);
+  assert.ok(previewMatch);
+  assert.ok(previewMatch[1].length <= 501); // 500 chars + the trailing ellipsis
+  assert.ok(message.attachment.content.length > 500);
+  assert.ok(message.attachment.filename.includes(negativeCall().callId));
+  assert.ok(message.text.includes("This alert was sent to: dana@arcdental.com, sam@arcdental.com."));
+  assert.ok(message.text.includes("https://agents.example.com/call-history?callId=call-neg-1"));
+  assert.ok(message.subject.includes("Jordan Miles"));
+});
+
+test("createSesSender sends a raw MIME message (not Simple content) when an attachment is present", async () => {
+  let sentCommand;
+  const client = { send: async (command) => { sentCommand = command; return { MessageId: "m-1" }; } };
+  class SendEmailCommand {
+    constructor(input) { this.input = input; }
+  }
+  const send = createSesSender({ client, SendEmailCommand, from: "info@example.com" });
+
+  await send({
+    to: "dana@arcdental.com",
+    subject: "Test",
+    html: "<p>hi</p>",
+    text: "hi",
+    attachment: { filename: "transcript-call-1.txt", content: "full transcript text" },
+  });
+
+  assert.ok(sentCommand.input.Content.Raw);
+  assert.ok(!sentCommand.input.Content.Simple);
+  const raw = new TextDecoder().decode(sentCommand.input.Content.Raw.Data);
+  assert.match(raw, /Content-Disposition: attachment; filename="transcript-call-1\.txt"/);
+  assert.match(raw, /multipart\/mixed/);
+
+  // No attachment - falls back to the existing Simple content shape unchanged.
+  await send({ to: "dana@arcdental.com", subject: "Test", html: "<p>hi</p>", text: "hi" });
+  assert.ok(sentCommand.input.Content.Simple);
+  assert.ok(!sentCommand.input.Content.Raw);
 });
 
 test("a test send goes only to the requester and leaves the schedule alone", async () => {

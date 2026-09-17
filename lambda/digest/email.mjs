@@ -23,14 +23,61 @@ export function normalizeEmail(value) {
   return trimmed.length <= 254 && EMAIL_PATTERN.test(trimmed) ? trimmed : null;
 }
 
+// A .txt attachment is just text - a few KB even for a long call - so a raw
+// MIME message (the only SES v2 content shape that supports attachments) is
+// built by hand here rather than pulling in a MIME library for one caller.
+function buildRawMimeMessage({ from, to, subject, html, text, attachment }) {
+  const boundaryMixed = `mixed_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const boundaryAlt = `alt_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const lines = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: ${singleLine(subject, 250)}`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/mixed; boundary="${boundaryMixed}"`,
+    "",
+    `--${boundaryMixed}`,
+    `Content-Type: multipart/alternative; boundary="${boundaryAlt}"`,
+    "",
+    `--${boundaryAlt}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    text,
+    "",
+    `--${boundaryAlt}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    html,
+    "",
+    `--${boundaryAlt}--`,
+  ];
+  if (attachment) {
+    const base64 = Buffer.from(attachment.content, "utf8").toString("base64").replace(/(.{76})/g, "$1\r\n");
+    lines.push(
+      `--${boundaryMixed}`,
+      `Content-Type: text/plain; charset="UTF-8"; name="${attachment.filename}"`,
+      `Content-Disposition: attachment; filename="${attachment.filename}"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      base64,
+    );
+  }
+  lines.push(`--${boundaryMixed}--`, "");
+  return lines.join("\r\n");
+}
+
 export function createSesSender({ client, SendEmailCommand, from, configurationSet }) {
   if (!from) throw new Error("EMAIL_FROM is required");
-  return async function send({ to, subject, html, text }) {
-    const result = await client.send(new SendEmailCommand({
-      FromEmailAddress: from,
-      Destination: { ToAddresses: [to] },
-      ...(configurationSet ? { ConfigurationSetName: configurationSet } : {}),
-      Content: {
+  return async function send({ to, subject, html, text, attachment }) {
+    const content = attachment
+      ? {
+        Raw: {
+          Data: new TextEncoder().encode(buildRawMimeMessage({ from, to, subject, html, text, attachment })),
+        },
+      }
+      : {
         Simple: {
           Subject: { Data: singleLine(subject, 250), Charset: "UTF-8" },
           Body: {
@@ -38,7 +85,12 @@ export function createSesSender({ client, SendEmailCommand, from, configurationS
             Text: { Data: text, Charset: "UTF-8" },
           },
         },
-      },
+      };
+    const result = await client.send(new SendEmailCommand({
+      FromEmailAddress: from,
+      Destination: { ToAddresses: [to] },
+      ...(configurationSet ? { ConfigurationSetName: configurationSet } : {}),
+      Content: content,
     }));
     return { messageId: result?.MessageId ?? null };
   };

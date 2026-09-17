@@ -1,6 +1,6 @@
 import { describeSendFailure, getDefaultSender, normalizeEmail } from "./email.mjs";
-import { renderDigest } from "./render.mjs";
-import { isDigestDue, normalizeDigestSettings } from "./schedule.mjs";
+import { renderDigest, renderNegativeSentimentAlert } from "./render.mjs";
+import { isDigestDue, normalizeDigestSettings, normalizeNegativeSentimentSettings } from "./schedule.mjs";
 
 const TEST_WINDOW_MS = 24 * 3_600_000;
 
@@ -124,6 +124,55 @@ export function createDigestHandler({
     return "sent";
   }
 
+  // Independent of the call-digest schedule above - runs every tick
+  // (the Lambda's own 5-minute EventBridge schedule), for any workspace with
+  // this feature enabled and recipients configured, regardless of whether
+  // call-digest summaries are even turned on. One email per pending call,
+  // rather than batching several calls into one message, since each needs
+  // its own summary/transcript/Call History link.
+  async function runNegativeSentimentAlerts(store, workspace) {
+    const settings = normalizeNegativeSentimentSettings(workspace.negativeSentimentAlert);
+    if (!settings.enabled) return "disabled";
+    const recipients = recipientsFor(settings);
+    if (!recipients.length) return "no_recipients";
+    const pending = await store.listPendingNegativeSentimentCalls(workspace.workspaceId);
+    if (!pending.length) return "no_calls";
+
+    const send = await getSender();
+    let sentCount = 0;
+    for (const call of pending) {
+      const message = renderNegativeSentimentAlert({
+        workspaceName: workspace.name,
+        call,
+        recipients,
+        timezone: normalizeDigestSettings(workspace.callDigest).timezone,
+        dashboardUrl: links.dashboardUrl,
+      });
+      let anySent = false;
+      for (const to of recipients) {
+        try {
+          await send({ to, ...message });
+          anySent = true;
+        } catch (error) {
+          log.error("Negative sentiment alert email failed", {
+            workspaceId: workspace.workspaceId,
+            callId: call.callId,
+            name: error?.name,
+            message: error?.message,
+          });
+        }
+      }
+      // Marked once anyone got it - a fully-failed send (e.g. every address
+      // rejected) is left pending so the next tick retries it, same
+      // "hand the window back on total failure" idea as the digest above.
+      if (anySent) {
+        await store.markNegativeSentimentAlerted(workspace.workspaceId, call.callId);
+        sentCount += 1;
+      }
+    }
+    return sentCount > 0 ? "sent" : "failed";
+  }
+
   async function sendTest(store, { workspaceId, recipient }) {
     const to = normalizeEmail(recipient);
     if (typeof workspaceId !== "string" || !workspaceId || !to) {
@@ -166,6 +215,7 @@ export function createDigestHandler({
 
     const current = now();
     const results = {};
+    const alertResults = {};
     for (const workspace of await store.listDigestWorkspaces()) {
       try {
         const outcome = await runWorkspace(store, workspace, current);
@@ -179,9 +229,23 @@ export function createDigestHandler({
           message: error?.message,
         });
       }
+      // Independent of the digest outcome above - a workspace with
+      // call-digest off can still have this on, and vice versa.
+      try {
+        const outcome = await runNegativeSentimentAlerts(store, workspace);
+        alertResults[outcome] = (alertResults[outcome] ?? 0) + 1;
+      } catch (error) {
+        alertResults.error = (alertResults.error ?? 0) + 1;
+        log.error("Negative sentiment alert run failed", {
+          workspaceId: workspace.workspaceId,
+          name: error?.name,
+          message: error?.message,
+        });
+      }
     }
     log.info("Call summary run complete", results);
-    return results;
+    log.info("Negative sentiment alert run complete", alertResults);
+    return { ...results, negativeSentimentAlerts: alertResults };
   };
 }
 
@@ -258,12 +322,20 @@ export function createDynamoDigestStore(client, commands, tableNames) {
   }
 
   return {
+    // A workspace qualifies if EITHER call-digest summaries or negative-
+    // sentiment alerts are on - the two are independent features that just
+    // happen to share this same per-tick scan and Lambda.
     listDigestWorkspaces() {
       return queryAll(client, (startKey) => new commands.ScanCommand({
         TableName: tableNames.workspaces,
-        FilterExpression: "#digest.#enabled = :true",
-        ProjectionExpression: "workspaceId, #name, #digest, callDigestCursor, notifications",
-        ExpressionAttributeNames: { "#digest": "callDigest", "#enabled": "enabled", "#name": "name" },
+        FilterExpression: "#digest.#enabled = :true OR #alert.#enabled = :true",
+        ProjectionExpression: "workspaceId, #name, #digest, callDigestCursor, notifications, #alert",
+        ExpressionAttributeNames: {
+          "#digest": "callDigest",
+          "#alert": "negativeSentimentAlert",
+          "#enabled": "enabled",
+          "#name": "name",
+        },
         ExpressionAttributeValues: marshall({ ":true": true }),
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
       }));
@@ -294,6 +366,29 @@ export function createDynamoDigestStore(client, commands, tableNames) {
           ":true": true,
         }),
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+    },
+
+    // Set to NULL (not omitted) by the postcall Lambda the moment a call's
+    // sentiment comes back negative - a plain equality filter against the
+    // NULL type finds every call still awaiting its alert. Never touched
+    // again here once set to a real timestamp by markNegativeSentimentAlerted.
+    listPendingNegativeSentimentCalls(workspaceId) {
+      return queryAll(client, (startKey) => new commands.QueryCommand({
+        TableName: tableNames.calls,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        FilterExpression: "negativeSentimentAlertedAt = :null",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":null": null }),
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+    },
+
+    markNegativeSentimentAlerted(workspaceId, callId) {
+      return client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "SET negativeSentimentAlertedAt = :now",
+        ExpressionAttributeValues: marshall({ ":now": new Date().toISOString() }),
       }));
     },
 

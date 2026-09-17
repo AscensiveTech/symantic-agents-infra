@@ -61,6 +61,18 @@ export function normalizeDigestSettings(value) {
   };
 }
 
+const NEGATIVE_SENTIMENT_MAX_RECIPIENTS = 6;
+
+export function normalizeNegativeSentimentSettings(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    enabled: source.enabled === true,
+    recipients: Array.isArray(source.recipients)
+      ? source.recipients.filter((item) => typeof item === "string").slice(0, NEGATIVE_SENTIMENT_MAX_RECIPIENTS)
+      : [],
+  };
+}
+
 export function localParts(date, timezone) {
   const zone = isValidTimezone(timezone) ? timezone : "UTC";
   const parts = new Intl.DateTimeFormat("en-US", {
