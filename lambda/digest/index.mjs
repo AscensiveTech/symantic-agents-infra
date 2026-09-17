@@ -209,9 +209,58 @@ export function createDigestHandler({
     }
   }
 
+  // Uses the workspace's most recent negative-sentiment call as the sample
+  // when one exists, so a test looks like a real alert - falls back to a
+  // synthetic placeholder call so a test can still be sent even when the
+  // workspace has never actually had one.
+  async function sendNegativeSentimentTest(store, { workspaceId, recipient }) {
+    const to = normalizeEmail(recipient);
+    if (typeof workspaceId !== "string" || !workspaceId || !to) {
+      return { sent: false, error: "A workspace and a valid recipient are required." };
+    }
+    const workspace = await store.getWorkspace(workspaceId);
+    if (!workspace) return { sent: false, error: "Workspace not found." };
+    const windowEnd = now();
+    const windowStart = new Date(0);
+    const calls = await store.listCallsAnalyzedBetween(workspaceId, windowStart.toISOString(), windowEnd.toISOString());
+    const negativeCalls = calls
+      .filter((call) => String(call.userSentiment ?? "").toLowerCase() === "negative")
+      .sort((a, b) => String(b.startedAt ?? "").localeCompare(String(a.startedAt ?? "")));
+    const sampleCall = negativeCalls[0] ?? {
+      callId: "sample-call",
+      callerName: "Jordan Miles",
+      callerNumber: "+15555550123",
+      startedAt: windowEnd.toISOString(),
+      callSummary: "This is a sample - no negative-sentiment call has happened yet. A caller was upset about a billing error and asked to speak with a manager.",
+      transcript: [
+        { speaker: "Agent", text: "Thanks for calling - how can I help?" },
+        { speaker: "Caller", text: "I've been charged twice and nobody has fixed it yet." },
+      ],
+    };
+    const message = renderNegativeSentimentAlert({
+      workspaceName: workspace.name,
+      call: sampleCall,
+      recipients: [to],
+      timezone: normalizeDigestSettings(workspace.callDigest).timezone,
+      dashboardUrl: links.dashboardUrl,
+    });
+    try {
+      await (await getSender())({ to, ...message });
+      return { sent: true, to, sample: !negativeCalls.length };
+    } catch (error) {
+      log.error("Test negative sentiment alert email failed", {
+        workspaceId,
+        name: error?.name,
+        message: error?.message,
+      });
+      return { sent: false, to, error: describeSendFailure(error) };
+    }
+  }
+
   return async function handle(event) {
     const store = await getStore();
     if (event?.action === "send-test") return sendTest(store, event);
+    if (event?.action === "send-negative-sentiment-test") return sendNegativeSentimentTest(store, event);
 
     const current = now();
     const results = {};

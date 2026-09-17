@@ -1216,6 +1216,31 @@ export function createHandler({
         return json(405, { message: "Method not allowed" });
       }
 
+      if (path === "/workspaces/me/negative-sentiment-alert/test" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can manage negative-sentiment alerts" });
+        }
+        const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+        const recipient = normalizeDigestEmail(actor.membership?.email ?? claims.email);
+        if (!recipient) {
+          return json(400, { message: "Your account has no email address to send a test to" });
+        }
+        let result;
+        try {
+          result = await invokeCallDigest({ action: "send-negative-sentiment-test", workspaceId, recipient });
+        } catch (error) {
+          console.error("Negative sentiment alert test invoke failed", { name: error?.name, message: error?.message });
+          result = null;
+        }
+        if (result?.sent !== true) {
+          return json(502, {
+            message: result?.error ?? "The test email could not be sent",
+            error: "negative_sentiment_test_failed",
+          });
+        }
+        return json(200, result);
+      }
+
       if (path === "/workspaces/me/notifications" || path.startsWith("/workspaces/me/notifications/")) {
         if (!isWorkspaceAdmin(actor)) {
           return json(403, { message: "Only workspace admins can manage notifications" });

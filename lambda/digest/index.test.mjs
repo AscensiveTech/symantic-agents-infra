@@ -521,6 +521,43 @@ test("a test send goes only to the requester and leaves the schedule alone", asy
   assert.equal(store.state.get("ws-1").callDigestCursor, cursor);
 });
 
+test("send-negative-sentiment-test uses the workspace's most recent real negative-sentiment call when one exists", async () => {
+  const oldOne = { ...negativeCall({ callId: "old-one", startedAt: hoursBefore(5) }), userSentiment: "Negative", analyzedAt: hoursBefore(5) };
+  const newest = { ...negativeCall({ callId: "newest", startedAt: hoursBefore(1) }), userSentiment: "Negative", analyzedAt: hoursBefore(1) };
+  const store = memoryStore({
+    workspaces: [workspace({ callDigest: settings({ enabled: false }) })],
+    calls: [oldOne, newest],
+    negativeSentimentCalls: [oldOne, newest],
+  });
+  const sender = recordingSender();
+
+  const result = await handlerFor(store, sender)({
+    action: "send-negative-sentiment-test",
+    workspaceId: "ws-1",
+    recipient: "dana@arcdental.com",
+  });
+
+  assert.deepEqual(result, { sent: true, to: "dana@arcdental.com", sample: false });
+  assert.equal(sender.sent.length, 1);
+  // Still pending (never marked alerted) - a test send must not consume it.
+  assert.equal(store.pendingAlerts.size, 2);
+});
+
+test("send-negative-sentiment-test falls back to a synthetic sample call when the workspace has never had a real one", async () => {
+  const store = memoryStore({ workspaces: [workspace({ callDigest: settings({ enabled: false }) })] });
+  const sender = recordingSender();
+
+  const result = await handlerFor(store, sender)({
+    action: "send-negative-sentiment-test",
+    workspaceId: "ws-1",
+    recipient: "dana@arcdental.com",
+  });
+
+  assert.deepEqual(result, { sent: true, to: "dana@arcdental.com", sample: true });
+  assert.equal(sender.sent.length, 1);
+  assert.match(sender.sent[0].subject, /negative-sentiment call with Jordan Miles/);
+});
+
 test("a test send reports sandbox rejection in plain language", async () => {
   const store = memoryStore({ workspaces: [workspace()], calls: [] });
   const sender = recordingSender({ failFor: ["new@example.com"] });
