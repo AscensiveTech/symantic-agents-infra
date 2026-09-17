@@ -1071,6 +1071,93 @@ test("PATCH call with a blank/whitespace-only name clears it instead of rejectin
   assert.equal(body.callerNameSource, undefined);
 });
 
+test("PATCH contacts/:phone/name bulk-renames every call sharing that phone number, sequentially not in parallel", async () => {
+  const updateCalls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [
+        { callId: "call-1", callerNumber: "+17205551234" },
+        { callId: "call-2", callerNumber: "+17205551234" },
+        { callId: "call-3", callerNumber: "+14155559999" },
+      ];
+    },
+    async updateCallerName(workspaceId, callId, callerName) {
+      updateCalls.push({ workspaceId, callId, callerName });
+      return { workspaceId, callId, callerName };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    `/workspaces/me/contacts/${encodeURIComponent("+17205551234")}/name`,
+    { callerName: "Jordan Miles" },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { updated: 2, failed: 0, total: 2 });
+  assert.deepEqual(updateCalls.map((c) => c.callId), ["call-1", "call-2"]);
+  assert.ok(updateCalls.every((c) => c.callerName === "Jordan Miles"));
+});
+
+test("PATCH contacts/:phone/name retries a failed call once before counting it as failed", async () => {
+  let attempts = 0;
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [{ callId: "call-1", callerNumber: "+17205551234" }];
+    },
+    async updateCallerName() {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient DynamoDB blip");
+      return { callId: "call-1", callerName: "Jordan Miles" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    `/workspaces/me/contacts/${encodeURIComponent("+17205551234")}/name`,
+    { callerName: "Jordan Miles" },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { updated: 1, failed: 0, total: 1 });
+  assert.equal(attempts, 2);
+});
+
+test("PATCH contacts/:phone/name clears the name (not rename) when callerName is blank", async () => {
+  let cleared = null;
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [{ callId: "call-1", callerNumber: "+17205551234" }];
+    },
+    async updateCallerName() {
+      throw new Error("should not be called for a blank name");
+    },
+    async clearCallerName(workspaceId, callId) {
+      cleared = { workspaceId, callId };
+      return { callId, callerName: undefined };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    `/workspaces/me/contacts/${encodeURIComponent("+17205551234")}/name`,
+    { callerName: "   " },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { updated: 1, failed: 0, total: 1 });
+  assert.deepEqual(cleared, { workspaceId: "user-123", callId: "call-1" });
+});
+
 test("POST calls/seed-demo is super-admin only and writes ~120 tagged demo calls", async () => {
   const { createHandler } = await loadBff();
 

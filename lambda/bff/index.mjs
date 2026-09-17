@@ -1059,7 +1059,10 @@ export function createHandler({
       // set for a phone number (a rename, a manually-added contact with no
       // calls yet, or a delete), so a single PATCH (upsert) is enough; no
       // separate POST create route.
-      const contactTarget = path.match(/^\/workspaces\/me\/contacts\/(.+)$/)?.[1];
+      // [^/]+ (not .+) so this never swallows the more specific
+      // /workspaces/me/contacts/:phone/name bulk-rename route below - a
+      // URL-encoded phone number never itself contains a literal slash.
+      const contactTarget = path.match(/^\/workspaces\/me\/contacts\/([^/]+)$/)?.[1];
       if (contactTarget && (method === "PATCH" || method === "DELETE")) {
         await store.ensureWorkspace(workspaceId);
         let decodedTarget;
@@ -1375,6 +1378,58 @@ export function createHandler({
           ? await store.updateCallerName(workspaceId, callId, callerName)
           : await store.clearCallerName(workspaceId, callId);
         return json(200, toPublicCall(updated));
+      }
+
+      // Renaming a caller is meant to apply everywhere that phone number
+      // appears in Call History - previously the frontend fired one
+      // parallel PATCH per matching call (Promise.allSettled), so any single
+      // transient failure (a cold start, a network blip) showed up as "1
+      // could not be updated" with no deterministic cause. One bulk route,
+      // sequential inside a single invocation with a retry per item, instead.
+      const contactsNameMatch = path.match(/^\/workspaces\/me\/contacts\/([^/]+)\/name$/);
+      if (contactsNameMatch && method === "PATCH") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        let decodedPhone;
+        try {
+          decodedPhone = decodeURIComponent(contactsNameMatch[1]);
+        } catch {
+          decodedPhone = contactsNameMatch[1];
+        }
+        const phoneNumber = normalizeE164(decodedPhone);
+        if (!phoneNumber) return json(400, { message: "A valid phone number is required" });
+        const body = readBody(event) ?? {};
+        if (typeof body?.callerName !== "string") {
+          return json(400, { message: "callerName is required" });
+        }
+        const callerName = body.callerName.trim().slice(0, 120);
+        const calls = (await store.listCalls(workspaceId))
+          .filter((call) => call.callerNumber === phoneNumber);
+
+        let updated = 0;
+        let failed = 0;
+        for (const call of calls) {
+          let attempt = 0;
+          let ok = false;
+          while (attempt < 2 && !ok) {
+            try {
+              await (callerName
+                ? store.updateCallerName(workspaceId, call.callId, callerName)
+                : store.clearCallerName(workspaceId, call.callId));
+              ok = true;
+            } catch (error) {
+              attempt += 1;
+              if (attempt >= 2) {
+                console.error("Bulk caller rename failed for a call after retry", {
+                  workspaceId, callId: call.callId, name: error?.name, message: error?.message,
+                });
+              }
+            }
+          }
+          if (ok) updated += 1;
+          else failed += 1;
+        }
+        return json(200, { updated, failed, total: calls.length });
       }
 
       const agentAction = getAgentAction(event, path);
