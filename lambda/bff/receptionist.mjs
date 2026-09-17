@@ -231,14 +231,14 @@ export function resolveGreeting(agent, profile) {
   const configured = text(agent?.configuration?.greeting);
   if (configured) return configured;
   const businessName = text(profile?.businessName) || "the business";
-  const receptionistName = text(agent?.configuration?.name) || text(agent?.name) || "the AI receptionist";
+  const receptionistName = text(agent?.configuration?.name) || text(agent?.name) || "the AI voice agent";
   return `Thanks for calling ${businessName}. I'm ${receptionistName}. How can I help today?`;
 }
 
 export function buildReceptionistPrompt(agent, profile) {
   const behavior = agent?.configuration ?? {};
   const businessName = text(profile?.businessName) || "the business";
-  const receptionistName = text(behavior.name) || text(agent?.name) || "the AI receptionist";
+  const receptionistName = text(behavior.name) || text(agent?.name) || "the AI voice agent";
   const tone = text(behavior.tone) || text(profile?.communicationStyle) || "clear, professional";
   const faqs = Array.isArray(profile?.faqs) && profile.faqs.length
     ? profile.faqs
@@ -257,7 +257,7 @@ export function buildReceptionistPrompt(agent, profile) {
 
   return [
     "# ROLE",
-    `You are ${receptionistName}, the AI receptionist for ${businessName}. `
+    `You are ${receptionistName}, the AI voice agent for ${businessName}. `
       + `Speak in a ${tone} style. Answer questions and take messages or bookings - calm, `
       + "helpful, and honest.",
     "",
@@ -270,7 +270,7 @@ export function buildReceptionistPrompt(agent, profile) {
     "3) If a tool fails, say so briefly and offer to take a message or try again. Never "
       + "pretend it worked.",
     "4) If asked whether you are an AI, a bot, or a real person, always answer honestly - "
-      + "yes, you are an AI receptionist. Never claim to be human. Say so plainly and "
+      + "yes, you are an AI voice agent. Never claim to be human. Say so plainly and "
       + "briefly, then keep helping with their call.",
     "5) Preserve the caller's meaning and collect only the minimum information required - "
       + "never interrogate or run a checklist.",

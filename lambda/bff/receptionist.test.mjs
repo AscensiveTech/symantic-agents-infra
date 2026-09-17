@@ -111,7 +111,7 @@ test("a 'decline' emergency rule tells the agent to say a message instead of tra
 
 test("prompt always instructs honesty about being an AI - never claim to be human", () => {
   const prompt = buildReceptionistPrompt(agent, profile);
-  assert.match(prompt, /always answer honestly.*yes, you are an AI receptionist/is);
+  assert.match(prompt, /always answer honestly.*yes, you are an AI voice agent/is);
   assert.match(prompt, /Never claim to be human/);
 });
 
@@ -146,7 +146,7 @@ test("prompt follows the ROLE / CRITICAL RULES / ONE THING AT A TIME structure a
 
 test("prompt always instructs the AI-disclosure rule as part of CRITICAL RULES", () => {
   const prompt = buildReceptionistPrompt(agent, profile);
-  assert.match(prompt, /# CRITICAL RULES[\s\S]*always answer honestly.*yes, you are an AI receptionist/);
+  assert.match(prompt, /# CRITICAL RULES[\s\S]*always answer honestly.*yes, you are an AI voice agent/);
   assert.match(prompt, /Never claim to be human/);
 });
 
@@ -186,7 +186,7 @@ test("resolveGreeting uses the configured greeting when set, otherwise builds on
   );
   assert.equal(
     resolveGreeting({ configuration: {} }, { businessName: "Rivertown Plumbing" }),
-    "Thanks for calling Rivertown Plumbing. I'm the AI receptionist. How can I help today?",
+    "Thanks for calling Rivertown Plumbing. I'm the AI voice agent. How can I help today?",
   );
 });
 
