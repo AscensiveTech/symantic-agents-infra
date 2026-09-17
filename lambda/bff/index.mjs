@@ -46,6 +46,20 @@ import {
   parseAcceptBody,
 } from "./legal.mjs";
 
+const COMPANY_NAME_MAX_LENGTH = 150;
+// Mirrors sanitizeCompanyName() in lib/domain/validation.ts on the
+// frontend - letters (unicode-aware), digits, spaces, and a small set of
+// punctuation real legal business names use (apostrophe, hyphen,
+// ampersand, period). Defense in depth: the frontend already strips this
+// live as the user types, this guards a direct API call bypassing it.
+const COMPANY_NAME_DISALLOWED = /[^\p{L}\p{N}\s'&.-]/gu;
+
+function sanitizeCompanyName(raw) {
+  return typeof raw === "string"
+    ? raw.replace(COMPANY_NAME_DISALLOWED, "").slice(0, COMPANY_NAME_MAX_LENGTH)
+    : "";
+}
+
 const PROFILE_FIELDS = {
   businessType: "string",
   businessName: "string",
@@ -168,6 +182,7 @@ function isProfile(value) {
 function pickProfile(value) {
   return {
     ...Object.fromEntries(Object.keys(PROFILE_FIELDS).map((field) => [field, value[field]])),
+    businessName: sanitizeCompanyName(value.businessName),
     ...(isBusinessHours(value.businessHours) ? { businessHours: value.businessHours } : {}),
   };
 }
@@ -1771,7 +1786,7 @@ async function handlePlatformCompanies(event, {
       const hasProposalPrice = body && Object.hasOwn(body, "proposalPlanPriceOverride");
       const hasAnchor = body && Object.hasOwn(body, "billingAnchorDate");
       const hasCredit = body && Object.hasOwn(body, "billingCreditBalance");
-      const name = typeof body?.name === "string" ? body.name.trim() : "";
+      const name = sanitizeCompanyName(typeof body?.name === "string" ? body.name.trim() : "");
       const proposalPrice = body?.proposalPlanPriceOverride;
       const proposalPriceValid = proposalPrice === null || proposalPrice === ""
         || (typeof proposalPrice === "number" && Number.isFinite(proposalPrice) && proposalPrice >= 0);
@@ -1785,7 +1800,7 @@ async function handlePlatformCompanies(event, {
       if (
         (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
         (hasEntitlements && !isValidEntitlements(body.entitlements)) ||
-        (hasName && (name.length < 2 || name.length > 120)) ||
+        (hasName && name.length < 2) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
         (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
         (hasMostAskedQuestions && typeof body.mostAskedQuestionsEnabled !== "boolean") ||
@@ -2022,7 +2037,7 @@ async function handlePlatformCompanies(event, {
   if (method !== "POST") return json(404, { message: "Not found" });
 
   const body = readBody(event);
-  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  const name = sanitizeCompanyName(typeof body?.name === "string" ? body.name.trim() : "");
   // The workspace's own company email - required from here on (see
   // handleCompanyProfile's PATCH, which never allows clearing it once set).
   // Distinct from adminEmail below, which only creates/identifies the Org
@@ -2053,7 +2068,6 @@ async function handlePlatformCompanies(event, {
   const billingAnchorValid = /^\d{4}-\d{2}-\d{2}$/.test(billingAnchorDate) && billingAnchorDate >= todayKey;
   if (
     name.length < 2 ||
-    name.length > 120 ||
     !email ||
     email.length > 320 ||
     !EMAIL_PATTERN.test(adminEmail) ||
@@ -3593,8 +3607,8 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
   }
   if (method === "PATCH") {
     const body = readBody(event);
-    const name = typeof body?.name === "string" ? body.name.trim() : "";
-    if (name.length < 2 || name.length > 120) {
+    const name = sanitizeCompanyName(typeof body?.name === "string" ? body.name.trim() : "");
+    if (name.length < 2) {
       return json(400, { message: "Invalid company name" });
     }
     // Company email is required from here on and, once set, can never be

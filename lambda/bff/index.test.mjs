@@ -252,6 +252,39 @@ test("PUT profile round-trips valid structured business hours and rejects malfor
   assert.equal(stored.length, 1);
 });
 
+test("PUT profile strips disallowed symbols from businessName", async () => {
+  const base = {
+    businessType: "dental",
+    businessName: "Arc Dental — 🦷 \"Smiles\" & Co.",
+    address: "123 Main Street",
+    timezone: "America/New_York",
+    phone: "(703) 555-0133",
+    description: "Family dental care",
+    hours: "Mon–Fri 8:00 AM–5:00 PM, Sat–Sun closed",
+    faqs: [],
+    policies: "",
+    escalationContact: "",
+    ownerPhone: "(703) 555-0100",
+    fallbackPhone: "",
+    communicationStyle: "Warm, concise, and professional",
+  };
+  const stored = [];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => ({
+      async ensureWorkspace() {},
+      async putProfile(_workspaceId, value) {
+        stored.push(value);
+        return value;
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", base));
+  assert.equal(response.statusCode, 200);
+  assert.equal(stored[0].businessName, "Arc Dental   Smiles & Co.");
+});
+
 test("POST and GET agents preserve product agent ids", async () => {
   const agents = new Map();
   const store = {
@@ -3556,6 +3589,45 @@ test("super administrators onboard a company with an isolated default template",
   assert.deepEqual(directoryCalls.map((call) => call[0]), ["create", "role"]);
 });
 
+test("company onboarding strips disallowed symbols from the name and caps it at 150 characters", async () => {
+  let bundle;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async createWorkspaceBundle(value) {
+      bundle = value;
+      return value;
+    },
+  };
+  const directory = {
+    async createUser() { return { userId: "id-1", username: "cognito-id-1" }; },
+    async setRole() {},
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+
+  const event = authenticatedEvent("POST", "/platform/companies", {
+    name: "  Smith & Sons — O'Brien's \"Best\" Co. 🎉  ".repeat(6),
+    email: "billing@smithsons.example",
+    adminEmail: "admin@smithsons.example",
+    adminName: "Admin",
+    temporaryPassword: "Temporary123!",
+    tier: "basic",
+    billingAnchorDate: "2099-01-01",
+  });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 201);
+  // Em dash, curly/straight quotes, and emoji are stripped; apostrophe,
+  // ampersand, and period survive; the whole thing is capped at 150 chars.
+  assert.ok(bundle.workspace.name.length <= 150);
+  assert.ok(!/[—"🎉]/.test(bundle.workspace.name));
+  assert.match(bundle.workspace.name, /Smith & Sons\s+O'Brien's\s+Best\s+Co\./);
+});
+
 test("company onboarding requires an email, and a receptionist-only company can omit RapidProposal's section pickers", async () => {
   let bundle;
   const store = {
@@ -3954,6 +4026,29 @@ test("company profile APIs read and update the signed-in workspace name", async 
   assert.deepEqual(JSON.parse(patchResponse.body), { name: "Technovate Group", email: "" });
   assert.equal(workspace.name, "Technovate Group");
   assert.equal(workspace.tier, "basic");
+});
+
+test("PATCH /workspaces/me/company strips disallowed symbols from the name", async () => {
+  let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design", email: "billing@technovate.test", tier: "basic" };
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: workspace.workspaceId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return workspace; },
+    async putWorkspace(value) { workspace = value; return value; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const patchEvent = authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/company",
+    { name: "Smith & Sons — O'Brien's \"Best\" Co." },
+  );
+  patchEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(patchEvent);
+  assert.equal(response.statusCode, 200);
+  assert.equal(workspace.name, "Smith & Sons  O'Brien's Best Co.");
 });
 
 function knowledgeBaseTestStore(overrides = {}) {
