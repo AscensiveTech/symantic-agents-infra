@@ -5527,10 +5527,18 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
 
   const knowledgeBaseId = `kb-${randomUUID()}`;
   const nowIso = new Date().toISOString();
+  // File uploads already carry their real byte size (checked against
+  // MAX_KNOWLEDGE_TOTAL_BYTES above); pasted text is sized as the .txt file
+  // it effectively becomes. A URL source's actual scraped size isn't known
+  // to us (Retell does the fetching), so it's left unset rather than guessed.
+  const sizeBytes = fileMetadata.length
+    ? fileMetadata.reduce((total, file) => total + file.size, 0)
+    : (!url && text ? Buffer.byteLength(text, "utf8") : undefined);
   const record = {
     name,
     kind: url ? "url" : fileMetadata.length ? "file" : "text",
     sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
+    ...(sizeBytes !== undefined ? { sizeBytes } : {}),
     ...(created ? { retellKnowledgeBaseId: created.knowledgeBaseId } : {}),
     enableAutoRefresh,
     // Only pasted-text items keep their raw content server-side - it's what
@@ -5626,6 +5634,7 @@ async function updateKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
       name,
       sourceText: text,
       sourceLabel: "Pasted text",
+      sizeBytes: Buffer.byteLength(text, "utf8"),
       retellKnowledgeBaseId: created.knowledgeBaseId,
       updatedAt,
     };

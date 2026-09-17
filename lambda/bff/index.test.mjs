@@ -4469,6 +4469,49 @@ test("POST knowledge-bases still creates a website item, marked as failed-to-ref
   assert.equal(created[0].kind, "url");
 });
 
+test("POST knowledge-bases stores pasted text's sizeBytes as its UTF-8 byte length", async () => {
+  const created = [];
+  const store = {
+    ...knowledgeBaseTestStore(),
+    async listKnowledgeBases() { return []; },
+    async createKnowledgeBase(workspaceId, knowledgeBaseId, record) { created.push(record); },
+  };
+  const providers = {
+    retell: { async createKnowledgeBase() { return { knowledgeBaseId: "retell-kb-1" }; } },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const textEvent = authenticatedEvent("POST", "/workspaces/me/knowledge-bases", { name: "Policy", text: "Café closes at 5pm." });
+  textEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const textResponse = await handler(textEvent);
+  assert.equal(textResponse.statusCode, 201);
+  // "é" is 2 bytes in UTF-8, so byte length differs from .length (19 chars).
+  assert.equal(created[0].sizeBytes, Buffer.byteLength("Café closes at 5pm.", "utf8"));
+});
+
+test("PATCH knowledge-bases/{id} recomputes sizeBytes when the pasted text changes", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "text", name: "Old", sourceText: "old", sizeBytes: 3, retellKnowledgeBaseId: "retell-kb-old" }]],
+  });
+  const providers = {
+    retell: {
+      async createKnowledgeBase() { return { knowledgeBaseId: "retell-kb-new" }; },
+      async deleteKnowledgeBase() {},
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("PATCH", "/workspaces/me/knowledge-bases/kb-1", { name: "Old", text: "a much longer replacement text" });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.item.sizeBytes, Buffer.byteLength("a much longer replacement text", "utf8"));
+});
+
 test("DELETE knowledge-bases/{id} rejects an unknown item", async () => {
   const store = knowledgeBaseTestStore();
   const { createHandler } = await loadBff();
