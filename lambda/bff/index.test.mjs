@@ -1359,6 +1359,88 @@ test("GET contacts/summary flags demoSeed true once any of a contact's calls wer
   assert.equal(row.demoSeed, true);
 });
 
+test("GET contacts/summary uses listRecentCalls (not the full-history scan) and caps the default response at 100 unique callers", async () => {
+  const recentCalls = Array.from({ length: 150 }, (_, i) => ({
+    callerNumber: `+1703555${String(i).padStart(4, "0")}`,
+    callerName: `Caller ${i}`,
+    startedAt: new Date(2026, 0, 1 + i).toISOString(),
+  }));
+  let listCallsCalled = false;
+  let recentCallsArgs;
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() { listCallsCalled = true; return []; },
+    async listRecentCalls(workspaceId, limit) {
+      recentCallsArgs = { workspaceId, limit };
+      return recentCalls;
+    },
+    async listContacts() { return []; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary"));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.length, 100);
+  assert.equal(listCallsCalled, false);
+  assert.equal(recentCallsArgs.workspaceId, "user-123");
+  assert.ok(recentCallsArgs.limit >= 100);
+  // Most recent first.
+  assert.equal(body[0].phoneNumber, "+17035550149");
+});
+
+test("GET contacts/summary falls back to the full scan when the store has no listRecentCalls", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [{ callerNumber: "+17035550123", callerName: "Jordan Miles", startedAt: "2026-01-01T00:00:00.000Z" }];
+    },
+    async listContacts() { return []; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary"));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).length, 1);
+});
+
+test("GET contacts/summary?q= searches the full history, finding a contact outside the recent window", async () => {
+  let recentCallsCalled = false;
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [
+        { callerNumber: "+17035550123", callerName: "Jordan Miles", startedAt: "2020-01-01T00:00:00.000Z" },
+        { callerNumber: "+17035550199", callerName: "Alicia Chen", startedAt: "2026-01-01T00:00:00.000Z" },
+      ];
+    },
+    async listRecentCalls() { recentCallsCalled = true; return []; },
+    async listContacts() {
+      return [{ phoneNumber: "+15715550001", name: "No Calls Yet", companyName: "Acme Co", hidden: false }];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const byName = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary", undefined, { q: "jordan" }));
+  assert.deepEqual(JSON.parse(byName.body).map((r) => r.phoneNumber), ["+17035550123"]);
+
+  const byCompany = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary", undefined, { q: "acme" }));
+  assert.deepEqual(JSON.parse(byCompany.body).map((r) => r.phoneNumber), ["+15715550001"]);
+
+  const byPhoneDigits = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary", undefined, { q: "5550199" }));
+  assert.deepEqual(JSON.parse(byPhoneDigits.body).map((r) => r.phoneNumber), ["+17035550199"]);
+
+  const noMatch = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary", undefined, { q: "nobody" }));
+  assert.deepEqual(JSON.parse(noMatch.body), []);
+
+  assert.equal(recentCallsCalled, false);
+});
+
 test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid number or missing name", async () => {
   let saved;
   const store = {

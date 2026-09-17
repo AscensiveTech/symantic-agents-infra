@@ -1022,50 +1022,46 @@ export function createHandler({
       // server-side so the page doesn't have to pull the full call history
       // just to render a contacts list. Keyed on E164 throughout, since both
       // calls and contact overrides already store phone numbers that way.
+      //
+      // Default (no ?q=): bounded work via the startedAt-index GSI - only
+      // enough of the most recent calls to cover CONTACTS_DEFAULT_LIMIT
+      // unique callers, not the whole history. ?q= is the deliberate,
+      // opt-in escape hatch back to a full scan, for finding a contact
+      // outside that recent window.
       if (path === "/workspaces/me/contacts/summary" && method === "GET") {
         await store.ensureWorkspace(workspaceId);
+        const query = typeof event?.queryStringParameters?.q === "string"
+          ? event.queryStringParameters.q.trim()
+          : "";
+
+        if (query) {
+          const [calls, contactRows] = await Promise.all([
+            store.listCalls(workspaceId),
+            store.listContacts(workspaceId),
+          ]);
+          const rows = buildContactsSummaryRows(calls, contactRows);
+          const needle = query.toLowerCase();
+          const needleDigits = query.replace(/\D/g, "");
+          const matches = rows.filter((row) => (
+            (needleDigits.length > 0 && row.phoneNumber.replace(/\D/g, "").includes(needleDigits)) ||
+            row.name?.toLowerCase().includes(needle) ||
+            row.companyName?.toLowerCase().includes(needle)
+          ));
+          return json(200, matches);
+        }
+
+        const CONTACTS_DEFAULT_LIMIT = 100;
+        // Pull well past the target unique-contact count so repeat callers
+        // don't starve it - a bounded, fixed-size read either way, never a
+        // full-history scan.
+        const RECENT_CALLS_FETCH = 500;
         const [calls, contactRows] = await Promise.all([
-          store.listCalls(workspaceId),
+          typeof store.listRecentCalls === "function"
+            ? store.listRecentCalls(workspaceId, RECENT_CALLS_FETCH)
+            : store.listCalls(workspaceId),
           store.listContacts(workspaceId),
         ]);
-        const byPhone = new Map();
-        for (const call of calls) {
-          const phoneNumber = call.callerNumber;
-          if (!phoneNumber) continue;
-          const name = call.callerName?.trim() || undefined;
-          const startedAt = call.startedAt ?? "";
-          const existing = byPhone.get(phoneNumber);
-          if (!existing) {
-            byPhone.set(phoneNumber, { phoneNumber, name, callCount: 1, latestCallISO: startedAt, demoSeed: call.demoSeed === true });
-            continue;
-          }
-          existing.callCount += 1;
-          if (!existing.name && name) existing.name = name;
-          if (startedAt > existing.latestCallISO) existing.latestCallISO = startedAt;
-          if (call.demoSeed === true) existing.demoSeed = true;
-        }
-        for (const override of contactRows) {
-          if (override.hidden) {
-            byPhone.delete(override.phoneNumber);
-            continue;
-          }
-          const existing = byPhone.get(override.phoneNumber);
-          if (existing) {
-            if (override.name) existing.name = override.name;
-            if (override.companyName) existing.companyName = override.companyName;
-            if (override.updatedByName) existing.updatedByName = override.updatedByName;
-          } else if (override.name || override.companyName) {
-            byPhone.set(override.phoneNumber, {
-              phoneNumber: override.phoneNumber,
-              name: override.name,
-              companyName: override.companyName,
-              updatedByName: override.updatedByName,
-              callCount: 0,
-              latestCallISO: "",
-            });
-          }
-        }
-        const rows = Array.from(byPhone.values()).sort((a, b) => b.latestCallISO.localeCompare(a.latestCallISO));
+        const rows = buildContactsSummaryRows(calls, contactRows).slice(0, CONTACTS_DEFAULT_LIMIT);
         return json(200, rows);
       }
 
@@ -5949,6 +5945,52 @@ function toPublicPhoneNumber(item) {
   };
 }
 
+// Shared by both the bounded default Contacts view and the full-scan search
+// path (GET /workspaces/me/contacts/summary) - groups calls by phone number,
+// then layers each phone's contact-table override (name/companyName/hidden)
+// on top, same aggregation either way regardless of which set of calls was
+// fetched.
+function buildContactsSummaryRows(calls, contactRows) {
+  const byPhone = new Map();
+  for (const call of calls) {
+    const phoneNumber = call.callerNumber;
+    if (!phoneNumber) continue;
+    const name = call.callerName?.trim() || undefined;
+    const startedAt = call.startedAt ?? "";
+    const existing = byPhone.get(phoneNumber);
+    if (!existing) {
+      byPhone.set(phoneNumber, { phoneNumber, name, callCount: 1, latestCallISO: startedAt, demoSeed: call.demoSeed === true });
+      continue;
+    }
+    existing.callCount += 1;
+    if (!existing.name && name) existing.name = name;
+    if (startedAt > existing.latestCallISO) existing.latestCallISO = startedAt;
+    if (call.demoSeed === true) existing.demoSeed = true;
+  }
+  for (const override of contactRows) {
+    if (override.hidden) {
+      byPhone.delete(override.phoneNumber);
+      continue;
+    }
+    const existing = byPhone.get(override.phoneNumber);
+    if (existing) {
+      if (override.name) existing.name = override.name;
+      if (override.companyName) existing.companyName = override.companyName;
+      if (override.updatedByName) existing.updatedByName = override.updatedByName;
+    } else if (override.name || override.companyName) {
+      byPhone.set(override.phoneNumber, {
+        phoneNumber: override.phoneNumber,
+        name: override.name,
+        companyName: override.companyName,
+        updatedByName: override.updatedByName,
+        callCount: 0,
+        latestCallISO: "",
+      });
+    }
+  }
+  return Array.from(byPhone.values()).sort((a, b) => b.latestCallISO.localeCompare(a.latestCallISO));
+}
+
 function toPublicCall(item) {
   const {
     workspaceId: _workspaceId,
@@ -6221,6 +6263,26 @@ export function createDynamoStore(client, commands, tableNames) {
       return (result.Items ?? [])
         .map((item) => unmarshall(item))
         .sort((left, right) => callTimestamp(right) - callTimestamp(left));
+    },
+
+    // Bounded, cheap "just the recent calls" read via the startedAt-index
+    // GSI (ScanIndexForward: false, Limit) - unlike listCalls above, this
+    // never pulls the entire call history, so it's safe to call on every
+    // Contacts page load rather than only for the full-history views
+    // (billing usage, most-asked-questions, digest) that genuinely need it.
+    // A call written before this GSI existed, or one missing startedAt
+    // entirely, simply isn't projected into it - acceptable here since the
+    // full-scan search path (listCalls) still covers that rare case.
+    async listRecentCalls(workspaceId, limit) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.calls,
+        IndexName: "startedAt-index",
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ScanIndexForward: false,
+        Limit: limit,
+      }));
+      return (result.Items ?? []).map((item) => unmarshall(item));
     },
 
     async getCall(workspaceId, callId) {

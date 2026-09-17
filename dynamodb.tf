@@ -98,6 +98,7 @@ resource "aws_dynamodb_table" "control_plane" {
       each.value.range_key,
       each.key == "phone_numbers" ? "telnyxPhoneNumber" : null,
       each.key == "agents" ? "retellAgentId" : null,
+      each.key == "calls" ? "startedAt" : null,
     ]))
 
     content {
@@ -122,6 +123,22 @@ resource "aws_dynamodb_table" "control_plane" {
     content {
       name            = "retellAgentId-index"
       hash_key        = "retellAgentId"
+      projection_type = "ALL"
+    }
+  }
+
+  // Lets Contacts (and any other "just the recent calls" view) Query the
+  // most recent calls directly, ScanIndexForward: false + Limit, instead of
+  // pulling the entire call history into the Lambda and sorting in memory -
+  // the calls table's own key (workspaceId + a random callId) has no way to
+  // ask for "recent" cheaply otherwise.
+  dynamic "global_secondary_index" {
+    for_each = each.key == "calls" ? [1] : []
+
+    content {
+      name            = "startedAt-index"
+      hash_key        = "workspaceId"
+      range_key       = "startedAt"
       projection_type = "ALL"
     }
   }
