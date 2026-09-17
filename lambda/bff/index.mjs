@@ -2533,7 +2533,7 @@ async function countProposalGenerated(store, workspaceId, proposalId, { loaded =
 }
 
 // Whether the premium call blocklist is available to this workspace right now.
-async function isMostAskedQuestionsEnabled(store, workspaceId) {
+export async function isMostAskedQuestionsEnabled(store, workspaceId) {
   const workspace = typeof store.getWorkspace === "function" ? await store.getWorkspace(workspaceId) : null;
   return workspace?.mostAskedQuestionsEnabled === true;
 }
@@ -2544,7 +2544,7 @@ async function isMostAskedQuestionsEnabled(store, workspaceId) {
 // thing everywhere in the app. Compares against the most recent digest
 // across every agent (not per-agent) - the entitlement, and its cost, are
 // workspace-wide. A super admin is exempt entirely (see the call site).
-function mostAskedQuestionsCycleLimitReached(digests, timezone) {
+export function mostAskedQuestionsCycleLimitReached(digests, timezone) {
   const latest = digests[0];
   if (!latest?.generatedAt) return false;
   return periodKey(latest.generatedAt, timezone) === periodKey(new Date(), timezone);
@@ -2554,7 +2554,7 @@ function mostAskedQuestionsCycleLimitReached(digests, timezone) {
 // and prompt size regardless of how busy the workspace's call history is.
 const MOST_ASKED_QUESTIONS_MAX_CALLS = 150;
 
-async function generateMostAskedQuestionsDigest({ store, providers, workspaceId, windowDays, agentId }) {
+export async function generateMostAskedQuestionsDigest({ store, providers, workspaceId, windowDays, agentId }) {
   const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
   const allCalls = await store.listCalls(workspaceId);
   // "deleted" is a sentinel, not a real agent id - it buckets calls from
