@@ -251,6 +251,14 @@ export function createHandler({
       actions: describeActions(toolLog),
       callSummary: stringValue(analysis.call_summary),
       userSentiment: stringValue(analysis.user_sentiment),
+      // Present (and unset) as soon as a call's sentiment analysis comes
+      // back negative - the digest Lambda's own per-tick loop picks these
+      // up and sends+marks them, on its existing 5-minute schedule. Never
+      // touched again here once written (see upsertCall's if_not_exists
+      // handling), so a retried webhook can't un-send an alert.
+      ...(String(analysis.user_sentiment ?? "").toLowerCase() === "negative"
+        ? { negativeSentimentAlertedAt: null }
+        : {}),
       callSuccessful: typeof analysis.call_successful === "boolean" ? analysis.call_successful : undefined,
       inVoicemail: typeof analysis.in_voicemail === "boolean" ? analysis.in_voicemail : undefined,
       ...(truncated
@@ -792,7 +800,7 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
     },
 
     async upsertCall(record) {
-      const reserved = new Set(["workspaceId", "callId", "createdAt", "analyzedAt"]);
+      const reserved = new Set(["workspaceId", "callId", "createdAt", "analyzedAt", "negativeSentimentAlertedAt"]);
       const entries = Object.entries(record)
         .filter(([key, value]) => value !== undefined && !reserved.has(key));
       const names = { "#createdAt": "createdAt" };
@@ -802,6 +810,14 @@ export function createDynamoPostcallStore(client, commands, tableNames) {
         names["#analyzedAt"] = "analyzedAt";
         values[":analyzedAt"] = record.analyzedAt;
         sets.push("#analyzedAt = if_not_exists(#analyzedAt, :analyzedAt)");
+      }
+      if (Object.hasOwn(record, "negativeSentimentAlertedAt")) {
+        // if_not_exists so a retried/duplicate webhook for the same call
+        // can never reset an already-sent alert's real timestamp back to
+        // null, which would make the digest Lambda send it a second time.
+        names["#negativeSentimentAlertedAt"] = "negativeSentimentAlertedAt";
+        values[":negativeSentimentAlertedAt"] = record.negativeSentimentAlertedAt;
+        sets.push("#negativeSentimentAlertedAt = if_not_exists(#negativeSentimentAlertedAt, :negativeSentimentAlertedAt)");
       }
       entries.forEach(([key, value], index) => {
         names[`#k${index}`] = key;

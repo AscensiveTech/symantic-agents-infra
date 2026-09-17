@@ -430,6 +430,42 @@ test("call_analyzed persists the summary + sentiment and copies the recording to
   assert.equal(testedAgent, undefined); // markAgentTested is call_ended's job
 });
 
+test("call_analyzed tags a negative-sentiment call with negativeSentimentAlertedAt: null; positive/neutral get nothing", async () => {
+  let persistedCall;
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({ async upsertCall(record) { persistedCall = record; } }),
+    getRecordingStore: async () => ({ async putRecording() {} }),
+    fetchImpl: async () => ({ ok: true, headers: { get: () => "audio/wav" }, arrayBuffer: async () => new Uint8Array([1]).buffer }),
+    now: () => new Date("2026-08-16T14:05:00.000Z"),
+  });
+  const baseCall = {
+    call_id: "retell-call-neg",
+    direction: "inbound",
+    from_number: "+17035550100",
+    to_number: "+17035550177",
+    start_timestamp: 1_800_000_000_000,
+    end_timestamp: 1_800_000_123_000,
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    transcript_object: [],
+    transcript_with_tool_calls: [],
+  };
+
+  await handler(callAnalyzedEvent({ ...baseCall, call_analysis: { user_sentiment: "Negative" } }));
+  assert.equal(persistedCall.negativeSentimentAlertedAt, null);
+  assert.ok(Object.hasOwn(persistedCall, "negativeSentimentAlertedAt"));
+
+  await handler(callAnalyzedEvent({ ...baseCall, call_analysis: { user_sentiment: "negative" } }));
+  assert.ok(Object.hasOwn(persistedCall, "negativeSentimentAlertedAt")); // case-insensitive
+
+  await handler(callAnalyzedEvent({ ...baseCall, call_analysis: { user_sentiment: "Positive" } }));
+  assert.equal(Object.hasOwn(persistedCall, "negativeSentimentAlertedAt"), false);
+
+  await handler(callAnalyzedEvent({ ...baseCall, call_analysis: { user_sentiment: "Neutral" } }));
+  assert.equal(Object.hasOwn(persistedCall, "negativeSentimentAlertedAt"), false);
+});
+
 test("call_analyzed still succeeds when the recording download fails", async () => {
   let persistedCall;
   const handler = createHandler({
@@ -853,6 +889,33 @@ test("Dynamo store synchronously writes calls, conditional backfills, and tested
   assert.equal(sent[4].input.ConditionExpression, "attribute_exists(agentId)");
   assert.match(sent[4].input.UpdateExpression, /tested = :tested/);
   assert.match(sent[4].input.UpdateExpression, /testedAt = :testedAt/);
+});
+
+test("Dynamo store's upsertCall never resets an already-set negativeSentimentAlertedAt back to null", async () => {
+  class UpdateItemCommand {
+    constructor(input) { this.input = input; }
+  }
+  const sent = [];
+  const client = { async send(command) { sent.push(command); return {}; } };
+  const store = createDynamoPostcallStore(
+    client,
+    { UpdateItemCommand },
+    { calls: "calls-table" },
+  );
+
+  await store.upsertCall({
+    workspaceId: "workspace-123",
+    callId: "call-123",
+    retellCallId: "retell-call-123",
+    negativeSentimentAlertedAt: null,
+  });
+
+  assert.match(
+    sent[0].input.UpdateExpression,
+    /#negativeSentimentAlertedAt = if_not_exists\(#negativeSentimentAlertedAt, :negativeSentimentAlertedAt\)/,
+  );
+  // Never duplicated into the generic #k<N> entries too.
+  assert.doesNotMatch(JSON.stringify(sent[0].input.ExpressionAttributeNames), /"#k\d+":"negativeSentimentAlertedAt"/);
 });
 
 function callEndedEvent(call) {
