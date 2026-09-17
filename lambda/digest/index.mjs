@@ -4,6 +4,10 @@ import { isDigestDue, normalizeDigestSettings, normalizeNegativeSentimentSetting
 
 const TEST_WINDOW_MS = 24 * 3_600_000;
 
+function senderAddress() {
+  return process.env.EMAIL_FROM ?? "";
+}
+
 function recipientsFor(settings) {
   const seen = new Set();
   for (const candidate of settings.recipients) {
@@ -117,8 +121,9 @@ export function createDigestHandler({
     await store.appendNotification(workspace.workspaceId, {
       id: `${workspace.workspaceId}-${windowEnd}`,
       sentAt: windowEnd,
+      sender: senderAddress(),
       recipients: sentTo,
-      content: message.subject,
+      content: message.text ?? message.subject,
       read: false,
     }, workspace.notifications ?? []);
     return "sent";
@@ -140,6 +145,10 @@ export function createDigestHandler({
 
     const send = await getSender();
     let sentCount = 0;
+    // Tracked locally and threaded through each appendNotification call
+    // below - two alerts sent in the same tick must not each overwrite the
+    // other by both prepending onto the same stale pre-loop snapshot.
+    let notifications = workspace.notifications ?? [];
     for (const call of pending) {
       const message = renderNegativeSentimentAlert({
         workspaceName: workspace.name,
@@ -168,6 +177,16 @@ export function createDigestHandler({
       if (anySent) {
         await store.markNegativeSentimentAlerted(workspace.workspaceId, call.callId);
         sentCount += 1;
+        const entry = {
+          id: `${workspace.workspaceId}-negative-sentiment-${call.callId}`,
+          sentAt: now().toISOString(),
+          sender: senderAddress(),
+          recipients,
+          content: message.text ?? message.subject,
+          read: false,
+        };
+        await store.appendNotification(workspace.workspaceId, entry, notifications);
+        notifications = [entry, ...notifications].slice(0, 100);
       }
     }
     return sentCount > 0 ? "sent" : "failed";
@@ -198,6 +217,15 @@ export function createDigestHandler({
     );
     try {
       await (await getSender())({ to, ...message });
+      await store.appendNotification(workspaceId, {
+        id: `${workspaceId}-test-${windowEnd.getTime()}`,
+        sentAt: windowEnd.toISOString(),
+        sender: senderAddress(),
+        recipients: [to],
+        content: message.text ?? message.subject,
+        test: true,
+        read: false,
+      }, workspace.notifications ?? []);
       return { sent: true, to, callCount: calls.length };
     } catch (error) {
       log.error("Test call summary email failed", {
@@ -246,6 +274,15 @@ export function createDigestHandler({
     });
     try {
       await (await getSender())({ to, ...message });
+      await store.appendNotification(workspaceId, {
+        id: `${workspaceId}-negative-sentiment-test-${windowEnd.getTime()}`,
+        sentAt: windowEnd.toISOString(),
+        sender: senderAddress(),
+        recipients: [to],
+        content: message.text ?? message.subject,
+        test: true,
+        read: false,
+      }, workspace.notifications ?? []);
       return { sent: true, to, sample: !negativeCalls.length };
     } catch (error) {
       log.error("Test negative sentiment alert email failed", {

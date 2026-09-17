@@ -210,9 +210,12 @@ test("a due summary goes to every configured recipient, once each", async () => 
     callCount: 1,
     recipientCount: 3,
   });
-  // A history entry is recorded alongside the send.
+  // A history entry is recorded alongside the send, with the full
+  // plain-text body (not just the subject line) so Notification History
+  // can show what was actually sent.
   const [notification] = store.state.get("ws-1").notifications;
-  assert.equal(notification.content, "Arc Dental: 1 new call");
+  assert.equal(notification.content, message.text);
+  assert.match(notification.content, /1 new call since your last check/);
   assert.deepEqual(notification.recipients.sort(), ["dana@arcdental.com", "frontdesk@arcdental.com", "sam@arcdental.com"]);
   assert.equal(notification.read, false);
 });
@@ -395,6 +398,12 @@ test("a workspace with negative-sentiment alerts on (even with call-digest off) 
   assert.ok(sender.sent.every((message) => message.attachment?.filename?.endsWith(".txt")));
   assert.ok(sender.sent[0].text.includes("This alert was sent to: dana@arcdental.com."));
   assert.equal(store.pendingAlerts.size, 0);
+  // Both alerts land in Notification History - each call's own entry
+  // survives, not just the last one written in the loop.
+  const notifications = store.state.get("ws-1").notifications;
+  assert.equal(notifications.length, 2);
+  assert.deepEqual(new Set(notifications.map((n) => n.id)).size, 2);
+  assert.ok(notifications.every((n) => n.recipients.includes("dana@arcdental.com")));
 });
 
 test("negative-sentiment alerts are skipped when disabled or when there are no recipients", async () => {
@@ -519,6 +528,11 @@ test("a test send goes only to the requester and leaves the schedule alone", asy
   assert.equal(sender.sent.length, 1);
   assert.equal(sender.sent[0].subject, "Test: Arc Dental notification");
   assert.equal(store.state.get("ws-1").callDigestCursor, cursor);
+  // A test send shows up in Notification History too, tagged as a test.
+  const [notification] = store.state.get("ws-1").notifications;
+  assert.equal(notification.test, true);
+  assert.deepEqual(notification.recipients, ["dana@arcdental.com"]);
+  assert.equal(notification.content, sender.sent[0].text);
 });
 
 test("send-negative-sentiment-test uses the workspace's most recent real negative-sentiment call when one exists", async () => {
@@ -541,6 +555,9 @@ test("send-negative-sentiment-test uses the workspace's most recent real negativ
   assert.equal(sender.sent.length, 1);
   // Still pending (never marked alerted) - a test send must not consume it.
   assert.equal(store.pendingAlerts.size, 2);
+  const [notification] = store.state.get("ws-1").notifications;
+  assert.equal(notification.test, true);
+  assert.deepEqual(notification.recipients, ["dana@arcdental.com"]);
 });
 
 test("send-negative-sentiment-test falls back to a synthetic sample call when the workspace has never had a real one", async () => {
