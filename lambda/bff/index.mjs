@@ -500,7 +500,9 @@ const CALL_DIGEST_DEFAULTS = Object.freeze({
   weekday: 1,
   timezone: "UTC",
   recipients: [],
+  skipIfEmpty: true,
 });
+const NEGATIVE_SENTIMENT_MAX_RECIPIENTS = 6;
 const DIGEST_EMAIL_PATTERN = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]{2,}$/;
 
 function isIanaTimezone(value) {
@@ -536,6 +538,7 @@ function publicCallDigest(stored) {
     recipients: Array.isArray(value.recipients)
       ? value.recipients.map(normalizeDigestEmail).filter(Boolean)
       : [],
+    skipIfEmpty: value.skipIfEmpty !== false,
   };
 }
 
@@ -568,8 +571,35 @@ function readCallDigestSettings(body) {
       weekday: body.weekday,
       timezone: body.timezone,
       recipients,
+      skipIfEmpty: body.skipIfEmpty !== false,
     },
   };
+}
+
+function publicNegativeSentimentAlert(stored) {
+  const value = stored && typeof stored === "object" ? stored : {};
+  return {
+    enabled: value.enabled === true,
+    recipients: Array.isArray(value.recipients)
+      ? value.recipients.map(normalizeDigestEmail).filter(Boolean)
+      : [],
+  };
+}
+
+function readNegativeSentimentAlertSettings(body) {
+  if (!body || typeof body !== "object") return { error: "Invalid alert settings" };
+  if (typeof body.enabled !== "boolean") return { error: "enabled must be true or false" };
+  if (!Array.isArray(body.recipients)) return { error: "recipients must be a list" };
+  if (body.recipients.length > NEGATIVE_SENTIMENT_MAX_RECIPIENTS) {
+    return { error: `Add at most ${NEGATIVE_SENTIMENT_MAX_RECIPIENTS} recipients` };
+  }
+  const recipients = [];
+  for (const candidate of body.recipients) {
+    const email = normalizeDigestEmail(candidate);
+    if (!email) return { error: `"${String(candidate).slice(0, 80)}" is not a valid email address` };
+    if (!recipients.includes(email)) recipients.push(email);
+  }
+  return { settings: { enabled: body.enabled, recipients } };
 }
 
 async function loadCallDigest(store, workspaceId, senderAddress) {
@@ -578,6 +608,7 @@ async function loadCallDigest(store, workspaceId, senderAddress) {
     settings: publicCallDigest(workspace?.callDigest),
     sender: senderAddress ?? null,
     lastRun: workspace?.callDigestLastRun ?? null,
+    negativeSentimentAlert: publicNegativeSentimentAlert(workspace?.negativeSentimentAlert),
   };
 }
 
@@ -1155,6 +1186,31 @@ export function createHandler({
             });
           }
           return json(200, result);
+        }
+
+        return json(405, { message: "Method not allowed" });
+      }
+
+      if (path === "/workspaces/me/negative-sentiment-alert") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can manage negative-sentiment alerts" });
+        }
+        await store.ensureWorkspace(workspaceId);
+
+        if (method === "GET") {
+          const workspace = await store.getWorkspace(workspaceId);
+          return json(200, publicNegativeSentimentAlert(workspace?.negativeSentimentAlert));
+        }
+
+        if (method === "PUT") {
+          const parsed = readNegativeSentimentAlertSettings(readBody(event));
+          if (parsed.error) return json(400, { message: parsed.error });
+          await store.saveNegativeSentimentAlert(workspaceId, {
+            ...parsed.settings,
+            updatedAt: new Date().toISOString(),
+            updatedBy: actorDisplayName(event, actor),
+          });
+          return json(200, parsed.settings);
         }
 
         return json(405, { message: "Method not allowed" });
@@ -6142,6 +6198,15 @@ export function createDynamoStore(client, commands, tableNames) {
         Key: marshall({ workspaceId }),
         UpdateExpression: update,
         ExpressionAttributeValues: marshall(values),
+      }));
+    },
+
+    async saveNegativeSentimentAlert(workspaceId, settings) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: "SET negativeSentimentAlert = :alert",
+        ExpressionAttributeValues: marshall({ ":alert": settings }),
       }));
     },
 

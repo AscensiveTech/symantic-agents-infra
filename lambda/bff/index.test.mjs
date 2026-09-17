@@ -5312,6 +5312,10 @@ function callDigestStore({ workspace = { workspaceId: "user-123", name: "Arc Den
       saved.push({ workspaceId, callDigest, cursor });
       workspace = { ...workspace, callDigest, ...(cursor ? { callDigestCursor: cursor } : {}) };
     },
+    async saveNegativeSentimentAlert(workspaceId, settings) {
+      saved.push({ workspaceId, negativeSentimentAlert: settings });
+      workspace = { ...workspace, negativeSentimentAlert: settings };
+    },
   };
 }
 
@@ -5346,9 +5350,11 @@ test("GET call-digest returns safe defaults", async () => {
     weekday: 1,
     timezone: "UTC",
     recipients: [],
+    skipIfEmpty: true,
   });
   assert.equal(body.sender, "info@ascensivetech.com");
   assert.equal(body.lastRun, null);
+  assert.deepEqual(body.negativeSentimentAlert, { enabled: false, recipients: [] });
 });
 
 function callHistoryStore({ membership, calls = [] } = {}) {
@@ -5450,6 +5456,7 @@ test("turning call summaries on saves the settings and starts the window now", a
       weekday: 1,
       timezone: "Asia/Kolkata",
       recipients: ["dana@arcdental.com", "frontdesk@arcdental.com"],
+      skipIfEmpty: true,
       updatedAt: undefined,
       updatedBy: undefined,
     },
@@ -5547,6 +5554,69 @@ test("a failed test summary surfaces the reason instead of a blank error", async
 
   assert.equal(response.statusCode, 502);
   assert.match(JSON.parse(response.body).message, /verified addresses/);
+});
+
+// --- Negative-sentiment alert settings ---------------------------------------
+
+test("GET negative-sentiment-alert returns safe defaults", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => callDigestStore() });
+
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/negative-sentiment-alert"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { enabled: false, recipients: [] });
+});
+
+test("PUT negative-sentiment-alert saves enabled + recipients, deduped and case-normalized", async () => {
+  const store = callDigestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("PUT", "/workspaces/me/negative-sentiment-alert", {
+    enabled: true,
+    recipients: ["Dana@ArcDental.com", "dana@arcdental.com", "frontdesk@arcdental.com"],
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    enabled: true,
+    recipients: ["dana@arcdental.com", "frontdesk@arcdental.com"],
+  });
+  assert.equal(store.saved.length, 1);
+  assert.equal(store.saved[0].negativeSentimentAlert.enabled, true);
+});
+
+test("PUT negative-sentiment-alert rejects an invalid email, a missing enabled flag, or too many recipients", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => callDigestStore() });
+
+  const missingEnabled = await handler(companyAdminEvent("PUT", "/workspaces/me/negative-sentiment-alert", { recipients: [] }));
+  assert.equal(missingEnabled.statusCode, 400);
+
+  const badEmail = await handler(companyAdminEvent("PUT", "/workspaces/me/negative-sentiment-alert", {
+    enabled: true,
+    recipients: ["not-an-email"],
+  }));
+  assert.equal(badEmail.statusCode, 400);
+
+  const tooMany = await handler(companyAdminEvent("PUT", "/workspaces/me/negative-sentiment-alert", {
+    enabled: true,
+    recipients: Array.from({ length: 7 }, (_, i) => `person${i}@arcdental.com`),
+  }));
+  assert.equal(tooMany.statusCode, 400);
+});
+
+test("negative-sentiment-alert settings are an admin-only resource", async () => {
+  const store = { async ensureWorkspace() {}, async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; } };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/negative-sentiment-alert");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
 });
 
 // --- Notification history ------------------------------------------------------
