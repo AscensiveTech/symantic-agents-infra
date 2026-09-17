@@ -61,6 +61,25 @@ test("isBusinessHours accepts a full schedule and rejects malformed input", () =
   );
 });
 
+test("allDay: formatBusinessHours renders 'Open 24 hours' and groups with matching neighbors", () => {
+  const hours = schedule((key) =>
+    key === "sat" || key === "sun"
+      ? { closed: false, allDay: true, intervals: [] }
+      : { closed: false, intervals: [{ open: "08:00", close: "17:00" }] },
+  );
+  assert.equal(formatBusinessHours(hours), "Mon–Fri 8:00 AM–5:00 PM; Sat–Sun Open 24 hours");
+});
+
+test("allDay: isBusinessHours accepts an allDay day with empty intervals, rejects a non-boolean allDay", () => {
+  const hours = singleBlock();
+  hours.mon = { closed: false, allDay: true, intervals: [] };
+  assert.equal(isBusinessHours(hours), true);
+
+  const bad = singleBlock();
+  bad.mon = { closed: false, allDay: "yes", intervals: [] };
+  assert.equal(isBusinessHours(bad), false);
+});
+
 test("formatCurrentTime returns a readable string and tolerates a bad timezone", () => {
   assert.match(formatCurrentTime("America/New_York"), /\d/);
   assert.match(formatCurrentTime("Not/AZone"), /\d/);

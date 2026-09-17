@@ -241,6 +241,23 @@ test("prompt prefers structured business hours (with split intervals) and carrie
   assert.match(fallback, /Mon-Fri, 8:00 AM-5:00 PM/);
 });
 
+test("prompt renders an allDay day as 'Open 24 hours', not raw interval text", () => {
+  const open = (intervals) => ({ closed: false, intervals });
+  const prompt = buildReceptionistPrompt(agent, {
+    ...profile,
+    businessHours: {
+      mon: open([{ open: "08:00", close: "17:00" }]),
+      tue: open([{ open: "08:00", close: "17:00" }]),
+      wed: open([{ open: "08:00", close: "17:00" }]),
+      thu: open([{ open: "08:00", close: "17:00" }]),
+      fri: open([{ open: "08:00", close: "17:00" }]),
+      sat: { closed: false, allDay: true, intervals: [] },
+      sun: { closed: false, allDay: true, intervals: [] },
+    },
+  });
+  assert.match(prompt, /Mon–Fri 8:00 AM–5:00 PM; Sat–Sun Open 24 hours/);
+});
+
 test("cloned voice mode uses the stored voiceId instead of the catalog map", () => {
   const resolveVoiceId = (requested) => `mapped:${requested}`;
   assert.equal(

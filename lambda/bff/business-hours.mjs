@@ -31,10 +31,10 @@ function isInterval(value) {
 }
 
 function isDayHours(value) {
+  if (!value || typeof value !== "object" || typeof value.closed !== "boolean") return false;
+  if (value.allDay !== undefined && typeof value.allDay !== "boolean") return false;
+  if (value.allDay === true) return Array.isArray(value.intervals);
   return (
-    value &&
-    typeof value === "object" &&
-    typeof value.closed === "boolean" &&
     Array.isArray(value.intervals) &&
     value.intervals.length >= 1 &&
     value.intervals.every(isInterval)
@@ -58,6 +58,7 @@ function formatTime12h(hhmm) {
 }
 
 function daySummary(day) {
+  if (day.allDay) return "Open 24 hours";
   if (day.closed) return "closed";
   return day.intervals
     .map(({ open, close }) => `${formatTime12h(open)}–${formatTime12h(close)}`)
