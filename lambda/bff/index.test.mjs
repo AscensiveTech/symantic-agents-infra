@@ -517,7 +517,7 @@ test("PUT agent uses the route id and returns the updated agent", async () => {
   ));
 
   assert.equal(response.statusCode, 200);
-  const savedAgent = { ...agent, status: "draft" };
+  const savedAgent = { ...agent, status: "draft", pendingConfiguration: null, hasUnpublishedChanges: false };
   assert.deepEqual(JSON.parse(response.body), savedAgent);
   assert.deepEqual(calls, [["user-123", "agent-123", savedAgent]]);
 });
@@ -564,6 +564,94 @@ test("PUT agent saving under its own unchanged name is not a self-conflict", asy
   }));
 
   assert.equal(response.statusCode, 200);
+});
+
+test("PUT agent with ?draft=true saves an active agent's edits as pendingConfiguration only, without touching the live configuration or calling Retell", async () => {
+  const putCalls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Maya",
+        role: "Phone operations",
+        description: "Answers calls",
+        status: "active",
+        capabilities: [],
+        configuration: { greeting: "Live greeting" },
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      putCalls.push([workspaceId, agentId, patch]);
+      return patch;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => { throw new Error("must not call a provider on a draft autosave"); },
+  });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    {
+      id: "agent-123",
+      name: "Maya",
+      role: "Phone operations",
+      description: "Answers calls",
+      status: "active",
+      capabilities: [],
+      configuration: { greeting: "Draft greeting" },
+    },
+    { draft: "true" },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(putCalls.length, 1);
+  assert.deepEqual(putCalls[0], ["user-123", "agent-123", {
+    pendingConfiguration: { greeting: "Draft greeting" },
+    hasUnpublishedChanges: true,
+  }]);
+  const body = JSON.parse(response.body);
+  assert.equal(body.hasUnpublishedChanges, true);
+});
+
+test("POST agent discard-draft clears pendingConfiguration/hasUnpublishedChanges without touching the live configuration", async () => {
+  const putCalls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Maya",
+        status: "active",
+        configuration: { greeting: "Live greeting" },
+        pendingConfiguration: { greeting: "Draft greeting" },
+        hasUnpublishedChanges: true,
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      putCalls.push([workspaceId, agentId, patch]);
+      return patch;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/discard-draft",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(putCalls[0], ["user-123", "agent-123", {
+    pendingConfiguration: null,
+    hasUnpublishedChanges: false,
+  }]);
+  const body = JSON.parse(response.body);
+  assert.equal(body.configuration.greeting, "Live greeting");
+  assert.equal(body.hasUnpublishedChanges, false);
 });
 
 function companyAdminEvent(method, path, body, queryStringParameters) {

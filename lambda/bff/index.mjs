@@ -1751,6 +1751,21 @@ export function createHandler({
             return json(409, { message: `An agent named "${agent.name}" already exists in this workspace - choose a different name.` });
           }
           const wasActive = existing?.status === "active";
+          // Mid-edit autosave (?draft=true): the wizard saves every keystroke
+          // to the cloud so nothing is lost, but a live agent must keep
+          // answering calls with its last PUBLISHED configuration until the
+          // user explicitly clicks Save Changes - so this branch only ever
+          // writes pendingConfiguration/hasUnpublishedChanges, never the
+          // live `configuration`, `name`, `status`, etc, and never calls
+          // Retell/Telnyx at all.
+          const isDraftAutosave = wasActive && event?.queryStringParameters?.draft === "true";
+          if (isDraftAutosave) {
+            const updatedAgent = await store.putAgent(workspaceId, agentId, {
+              pendingConfiguration: agent.configuration ?? null,
+              hasUnpublishedChanges: true,
+            });
+            return json(200, { ...existing, ...updatedAgent });
+          }
           const invalidateTest = Boolean(
             existing &&
             !sameLaunchConfiguration(existing.configuration, agent.configuration),
@@ -1766,6 +1781,10 @@ export function createHandler({
               : agent.status === "active"
                 ? "draft"
                 : agent.status,
+            // A real, explicit save always publishes - any unpublished draft
+            // this configuration supersedes is cleared here too.
+            pendingConfiguration: null,
+            hasUnpublishedChanges: false,
           };
           const updatedAgent = await store.putAgent(
             workspaceId,
@@ -1801,6 +1820,22 @@ export function createHandler({
           }
           throw error;
         }
+      }
+
+      const discardDraftMatch = path.match(/^\/workspaces\/me\/agents\/([^/]+)\/discard-draft$/);
+      if (discardDraftMatch && method === "POST") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const targetAgentId = discardDraftMatch[1];
+        const existing = await store.getAgent(workspaceId, targetAgentId);
+        if (!existing || existing.status === "deleted") {
+          return json(404, { message: "Agent not found" });
+        }
+        const updatedAgent = await store.putAgent(workspaceId, targetAgentId, {
+          pendingConfiguration: null,
+          hasUnpublishedChanges: false,
+        });
+        return json(200, { ...existing, ...updatedAgent });
       }
 
       if (agentId && method === "DELETE") {
