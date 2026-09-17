@@ -123,6 +123,105 @@ test("Telnyx provisioning tags the new number with the agent's Receptionist Name
   assert.deepEqual(JSON.parse(calls[4][1].body), { tags: ["Alpine Shadows - Acme"] });
 });
 
+test("Telnyx provisioning tags with the combined business name and agent name, sanitized and length-capped", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (calls.length === 1) return response({ data: [] });
+    if (calls.length === 2) {
+      return response({ data: [{ phone_number: "+17035550177" }] });
+    }
+    if (calls.length === 3) {
+      return response({
+        data: {
+          id: "order-123",
+          status: "pending",
+          phone_numbers: [{
+            id: "number-order-phone-number-id-not-a-real-resource",
+            phone_number: "+17035550177",
+          }],
+        },
+      });
+    }
+    if (calls.length === 4) {
+      return response({
+        data: [{ id: "telnyx-number-real-123", phone_number: "+17035550177" }],
+      });
+    }
+    return response({ id: "telnyx-number-real-123" });
+  };
+  const client = createTelnyxClient({
+    apiKey: "telnyx-key",
+    connectionId: "connection-123",
+    fetchImpl,
+  });
+
+  await client.ensureNumber({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    preferredPhone: "+17035550100",
+    agentName: "Front Desk <script>",
+    businessName: "A Very Long Business Name That Goes On And On And On And On Past Fifty Characters LLC",
+  });
+
+  assert.equal(calls.length, 5);
+  const body = JSON.parse(calls[4][1].body);
+  assert.equal(body.tags.length, 1);
+  assert.ok(body.tags[0].length <= 50);
+  assert.ok(body.tags[0].startsWith("A Very Long Business Name"));
+  assert.ok(!body.tags[0].includes("<"));
+});
+
+test("Telnyx provisioning logs (instead of silently swallowing) a failed tag PATCH", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (calls.length === 1) return response({ data: [] });
+    if (calls.length === 2) {
+      return response({ data: [{ phone_number: "+17035550177" }] });
+    }
+    if (calls.length === 3) {
+      return response({
+        data: {
+          id: "order-123",
+          status: "pending",
+          phone_numbers: [{
+            id: "number-order-phone-number-id-not-a-real-resource",
+            phone_number: "+17035550177",
+          }],
+        },
+      });
+    }
+    if (calls.length === 4) {
+      return response({
+        data: [{ id: "telnyx-number-real-123", phone_number: "+17035550177" }],
+      });
+    }
+    return response({ errors: [{ detail: "tag rejected" }] }, 422);
+  };
+  const client = createTelnyxClient({
+    apiKey: "telnyx-key",
+    connectionId: "connection-123",
+    fetchImpl,
+  });
+  const originalError = console.error;
+  const errorCalls = [];
+  console.error = (...args) => errorCalls.push(args);
+  try {
+    await client.ensureNumber({
+      workspaceId: "workspace-123",
+      agentId: "agent-123",
+      preferredPhone: "+17035550100",
+      agentName: "Maya",
+      businessName: "Acme",
+    });
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(errorCalls.length, 1);
+  assert.equal(errorCalls[0][0], "Telnyx number tag PATCH failed");
+});
+
 test("Telnyx provisioning skips tagging entirely when no agent name is given", async () => {
   const calls = [];
   const fetchImpl = async (url, init = {}) => {

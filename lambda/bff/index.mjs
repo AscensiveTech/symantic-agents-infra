@@ -5149,6 +5149,7 @@ export async function syncPhoneNumber({
       preferredPhone: agent?.configuration?.phone ?? profile.phone,
       desiredPhone: agent?.configuration?.desiredPhoneNumber,
       agentName: agent?.configuration?.name ?? agent?.name,
+      businessName: profile?.businessName,
     });
     phoneNumber = {
       workspaceId,

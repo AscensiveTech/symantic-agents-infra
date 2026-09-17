@@ -58,12 +58,30 @@ export function createTelnyxClient({
   // column can't do this - every number intentionally shares one SIP
   // connection - but Telnyx's per-number "tags" field is built for exactly
   // this). Cosmetic only: a failure here must never fail provisioning.
-  async function tagNumber(telnyxNumberId, agentName) {
-    if (typeof agentName !== "string" || !agentName.trim()) return;
+  // Conservative cap and character set until Telnyx's real tag limit is
+  // confirmed from the logging below - letters/digits/spaces and a small
+  // set of punctuation a business name might legitimately contain.
+  function sanitizeTelnyxTag(value) {
+    return value.replace(/[^\p{L}\p{N}\s'&.,-]/gu, "").trim().slice(0, 50);
+  }
+
+  async function tagNumber(telnyxNumberId, agentName, businessName) {
+    const parts = [businessName, agentName]
+      .map((part) => (typeof part === "string" ? sanitizeTelnyxTag(part) : ""))
+      .filter(Boolean);
+    if (parts.length === 0) return;
+    const tag = sanitizeTelnyxTag(parts.join(" - "));
     await telnyxRequest(
       `${TELNYX_BASE_URL}/phone_numbers/${encodeURIComponent(telnyxNumberId)}`,
-      { method: "PATCH", body: { tags: [agentName.trim()] } },
-    ).catch(() => {});
+      { method: "PATCH", body: { tags: [tag] } },
+    ).catch((error) => {
+      console.error("Telnyx number tag PATCH failed", {
+        telnyxNumberId,
+        tag,
+        name: error?.name,
+        message: error?.message,
+      });
+    });
   }
 
   return {
@@ -101,6 +119,7 @@ export function createTelnyxClient({
       preferredPhone,
       desiredPhone,
       agentName,
+      businessName,
     }) {
       const customerReference = `${required(workspaceId, "workspaceId")}:${
         required(agentId, "agentId")
@@ -172,7 +191,7 @@ export function createTelnyxClient({
           "filter[phone_number]": phoneNumber,
         });
         if (provisioned) {
-          await tagNumber(provisioned.id, agentName);
+          await tagNumber(provisioned.id, agentName, businessName);
           return {
             ...telnyxNumber(provisioned),
             telnyxOrderId: stringOrUndefined(order?.id),
