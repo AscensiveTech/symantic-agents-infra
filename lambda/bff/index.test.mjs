@@ -948,6 +948,82 @@ test("PUT agent does NOT invalidate a successful test when only key order differ
   assert.equal(saved.options.invalidateTest, false);
 });
 
+test("PUT agent does NOT invalidate a successful test when only emergencyRules[].id (a client-side UI key) differs", async () => {
+  // The frontend's own testConfigurationKey() already strips this id before
+  // deciding "is this still the tested configuration" - the backend's
+  // stricter comparison must agree, or a client that correctly considers a
+  // test still valid can invalidate it anyway on save.
+  let saved;
+  const existing = receptionistAgent();
+  existing.configuration.emergencyRules = [
+    { id: "rule-original-id", phrases: ["fire", "gas leak"], action: "transfer", transferTarget: "+17035550100" },
+  ];
+  const changed = {
+    ...existing,
+    configuration: {
+      ...existing.configuration,
+      emergencyRules: [
+        { id: "rule-regenerated-id", phrases: ["fire", "gas leak"], action: "transfer", transferTarget: "+17035550100" },
+      ],
+    },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async putAgent(_workspaceId, _agentId, agent, options) {
+      saved = { agent, options };
+      return agent;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    changed,
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.options.invalidateTest, false);
+});
+
+test("PUT agent DOES invalidate a successful test when emergencyRules actually change (phrases, not just id)", async () => {
+  let saved;
+  const existing = receptionistAgent();
+  existing.configuration.emergencyRules = [
+    { id: "rule-1", phrases: ["fire"], action: "transfer", transferTarget: "+17035550100" },
+  ];
+  const changed = {
+    ...existing,
+    configuration: {
+      ...existing.configuration,
+      emergencyRules: [
+        { id: "rule-1", phrases: ["fire", "gas leak"], action: "transfer", transferTarget: "+17035550100" },
+      ],
+    },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async putAgent(_workspaceId, _agentId, agent, options) {
+      saved = { agent, options };
+      return agent;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    changed,
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.options.invalidateTest, true);
+});
+
 test("PUT agent keeps an already-active agent active and pushes the edit to Retell", async () => {
   const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
   const changed = {

@@ -1770,6 +1770,18 @@ export function createHandler({
             existing &&
             !sameLaunchConfiguration(existing.configuration, agent.configuration),
           );
+          if (invalidateTest && existing?.tested === true) {
+            // A previously-passing test just got invalidated by this save -
+            // log which top-level configuration keys actually differ so a
+            // real remaining mismatch (a field neither side excludes, or a
+            // normalization gap) is visible in CloudWatch instead of only
+            // showing up as a confusing "run a test" banner in the UI.
+            const before = canonicalizeForComparison(canonicalLaunchConfiguration(existing.configuration));
+            const after = canonicalizeForComparison(canonicalLaunchConfiguration(agent.configuration));
+            const changedKeys = Array.from(new Set([...Object.keys(before ?? {}), ...Object.keys(after ?? {})]))
+              .filter((key) => JSON.stringify(before?.[key]) !== JSON.stringify(after?.[key]));
+            console.warn("Save invalidated an already-passing test", { workspaceId, agentId, changedKeys });
+          }
           const saved = {
             ...agent,
             // Editing an already-active agent keeps it active and pushes the
@@ -5891,11 +5903,17 @@ function sameLaunchConfiguration(left, right) {
     JSON.stringify(canonicalizeForComparison(canonicalLaunchConfiguration(right)));
 }
 
-// Must mirror UNTESTED_DRAFT_FIELDS in components/agent-wizard.tsx exactly -
-// fields that change without changing what was actually tested. A mismatch
-// here is self-defeating: e.g. platformDid is *set by* running a test, so if
-// it isn't excluded on both sides, passing a test would invalidate itself on
-// the very next autosave.
+// Must mirror UNTESTED_DRAFT_FIELDS/testConfigurationKey in
+// components/agent-wizard.tsx exactly - fields that change without changing
+// what was actually tested. A mismatch here is self-defeating: e.g.
+// platformDid is *set by* running a test, so if it isn't excluded on both
+// sides, passing a test would invalidate itself on the very next autosave.
+// emergencyRules.id is a client-generated UI key, not a semantic field of
+// the rule - the frontend's own testConfigurationKey() already drops it
+// before comparing, so this must too, or a client that considers a
+// successful test still valid (because it correctly ignores id) can save a
+// configuration this stricter check considers "different", silently
+// invalidating a test the user just watched pass.
 function canonicalLaunchConfiguration(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const {
@@ -5907,9 +5925,20 @@ function canonicalLaunchConfiguration(value) {
     silenceTimeoutSec: _silenceTimeoutSec,
     maxCallDurationMin: _maxCallDurationMin,
     allowedInboundCountries: _allowedInboundCountries,
+    emergencyRules: _emergencyRules,
     ...configuration
   } = value;
-  return configuration;
+  return {
+    ...configuration,
+    emergencyRules: Array.isArray(value.emergencyRules)
+      ? value.emergencyRules.map((rule) => ({
+        phrases: Array.isArray(rule?.phrases) ? rule.phrases : [],
+        action: rule?.action === "decline" ? "decline" : "transfer",
+        transferTarget: typeof rule?.transferTarget === "string" ? rule.transferTarget : "",
+        ...(typeof rule?.message === "string" && rule.message ? { message: rule.message } : {}),
+      }))
+      : [],
+  };
 }
 
 function isValidPhone(value) {
