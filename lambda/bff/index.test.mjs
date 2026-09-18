@@ -1504,6 +1504,32 @@ test("GET contacts/summary joins calls and contact overrides server-side", async
   ]);
 });
 
+test("GET contacts/summary joins an email override onto both an existing caller and a not-yet-called contact", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listCalls() {
+      return [
+        { callerNumber: "+17035550123", callerName: "Jordan Miles", startedAt: "2026-02-01T00:00:00.000Z" },
+      ];
+    },
+    async listContacts() {
+      return [
+        { phoneNumber: "+17035550123", email: "jordan@example.com", hidden: false },
+        { phoneNumber: "+17035550111", name: "No Calls Yet", email: "no-calls@example.com", hidden: false },
+      ];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/contacts/summary"));
+
+  assert.equal(response.statusCode, 200);
+  const rows = JSON.parse(response.body);
+  assert.equal(rows.find((row) => row.phoneNumber === "+17035550123").email, "jordan@example.com");
+  assert.equal(rows.find((row) => row.phoneNumber === "+17035550111").email, "no-calls@example.com");
+});
+
 test("GET contacts/summary flags demoSeed true once any of a contact's calls were super-admin seeded", async () => {
   const store = {
     async ensureWorkspace() {},
@@ -1628,8 +1654,33 @@ test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid
   assert.deepEqual(saved, {
     workspaceId: "user-123",
     phoneNumber: "+17035550123",
-    patch: { name: "Jordan Miles", companyName: "Acme Co", updatedByName: "user-123", hidden: false },
+    patch: { name: "Jordan Miles", companyName: "Acme Co", email: undefined, updatedByName: "user-123", hidden: false },
   });
+});
+
+test("PATCH contacts/{phoneNumber} upserts an optional email, trimmed/lowercased, rejecting an invalid format", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async putContact(workspaceId, phoneNumber, patch) {
+      saved = { workspaceId, phoneNumber, patch };
+      return { workspaceId, phoneNumber, ...patch, createdAt: "t1", updatedAt: "t2" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const invalid = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Jordan Miles", email: "not-an-email" }));
+  assert.equal(invalid.statusCode, 400);
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Jordan Miles", email: "  Jordan@Example.com  " }));
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.patch.email, "jordan@example.com");
+
+  // Omitted entirely (not just blank) - stays undefined, never rejected.
+  const omitted = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Jordan Miles" }));
+  assert.equal(omitted.statusCode, 200);
+  assert.equal(saved.patch.email, undefined);
 });
 
 test("DELETE contacts/{phoneNumber} soft-deletes (hidden: true) rather than removing the row", async () => {

@@ -1083,9 +1083,17 @@ export function createHandler({
         if (typeof body.name !== "string") return json(400, { message: "name is required" });
         const name = body.name.trim().slice(0, 120);
         const companyName = typeof body.companyName === "string" ? body.companyName.trim().slice(0, 120) : undefined;
+        if (body.email !== undefined && body.email !== null && typeof body.email !== "string") {
+          return json(400, { message: "email must be a string" });
+        }
+        const email = typeof body.email === "string" ? body.email.trim().toLowerCase().slice(0, 254) : undefined;
+        if (email && !EMAIL_PATTERN.test(email)) {
+          return json(400, { message: "email must be a valid email address" });
+        }
         const saved = await store.putContact(workspaceId, phoneNumber, {
           name: name || undefined,
           companyName: companyName || undefined,
+          email: email || undefined,
           updatedByName: actorDisplayName(event, actor),
           hidden: false,
         });
@@ -6170,12 +6178,14 @@ function buildContactsSummaryRows(calls, contactRows) {
     if (existing) {
       if (override.name) existing.name = override.name;
       if (override.companyName) existing.companyName = override.companyName;
+      if (override.email) existing.email = override.email;
       if (override.updatedByName) existing.updatedByName = override.updatedByName;
-    } else if (override.name || override.companyName) {
+    } else if (override.name || override.companyName || override.email) {
       byPhone.set(override.phoneNumber, {
         phoneNumber: override.phoneNumber,
         name: override.name,
         companyName: override.companyName,
+        email: override.email,
         updatedByName: override.updatedByName,
         callCount: 0,
         latestCallISO: "",
