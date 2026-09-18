@@ -17,8 +17,9 @@ import {
   callStart,
   costBreakdown,
   periodKey,
+  resolveAccountPlan,
+  resolveAgentPlan,
   resolveCallBlocklist,
-  resolvePlan,
 } from "./receptionist-billing.mjs";
 import {
   billingAnchorDay,
@@ -187,71 +188,26 @@ function pickProfile(value) {
   };
 }
 
-const INVALID = Symbol("invalid");
 
-// receptionistPlan rides alongside the profile but is kept out of PROFILE_FIELDS
-// so the strict profile shape check and every existing client stay unaffected.
-// Returns undefined (absent), "" / a plan key (valid), or INVALID.
-function readReceptionistPlan(body) {
-  if (!body || !Object.hasOwn(body, "receptionistPlan")) return undefined;
-  const value = body.receptionistPlan;
-  if (value === "" || value === null) return "";
-  if (typeof value === "string" && PLAN_KEYS.includes(value)) return value;
-  return INVALID;
-}
-
-// Apply a customer plan choice: upgrades (more minutes) take effect immediately;
-// downgrades are queued for the first of next month. Always records planHistory.
-async function applyCustomerPlanChange(store, workspaceId, planKey, userId) {
-  if (typeof store.getWorkspace !== "function" || typeof store.putWorkspace !== "function") {
-    return planKey;
-  }
-  const [workspace, profile] = await Promise.all([
-    store.getWorkspace(workspaceId),
-    typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
-  ]);
+// Each agent picks its own plan independently (see resolveAgentPlan) - this
+// records the change in the workspace's shared audit trail (who changed
+// which agent to which plan, and when) whenever an agent's own PUT actually
+// changes its plan. Plan changes take effect immediately on save, same as
+// every other configuration field - there is no queued-downgrade delay here
+// (no live payment processor enforces cycle boundaries to protect against).
+async function recordAgentPlanChange(store, workspaceId, agentName, planKey, userId) {
+  if (typeof store.getWorkspace !== "function" || typeof store.putWorkspace !== "function") return;
+  const workspace = await store.getWorkspace(workspaceId);
   const ws = workspace ?? { workspaceId };
-  const currentPlan = profile?.receptionistPlan ?? "";
-  if (currentPlan === planKey && !ws.receptionistPlanPending) return planKey;
-
-  const now = new Date();
-  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-  const current = resolvePlan(profile, ws, now, timezone);
-
-  const nextMinutes = RECEPTIONIST_PLANS[planKey]?.minutes ?? null;
-  const isDowngrade = planKey !== "" &&
-    typeof nextMinutes === "number" &&
-    typeof current.minutes === "number" &&
-    nextMinutes < current.minutes;
-
-  const label = RECEPTIONIST_PLANS[planKey]?.label ?? "unset";
-  const at = now.toISOString();
-  const updated = {
+  const label = planKey ? (RECEPTIONIST_PLANS[planKey]?.label ?? planKey) : "unset";
+  await store.putWorkspace({
     ...ws,
     planHistory: [
       ...(Array.isArray(ws.planHistory) ? ws.planHistory : []),
-      { plan: label, at, changedBy: userId },
+      { plan: label, agentName, at: new Date().toISOString(), changedBy: userId },
     ],
-    updatedAt: at,
-  };
-  delete updated.receptionistPlanPending;
-  delete updated.receptionistPlanPendingFrom;
-  if (isDowngrade) {
-    updated.receptionistPlanPending = planKey;
-    updated.receptionistPlanPendingFrom = nextPeriodKey(now, timezone);
-  }
-  await store.putWorkspace(updated);
-  // Upgrades / first choices land on the profile now; a queued downgrade keeps
-  // the current plan on the profile until its effective month.
-  return isDowngrade ? currentPlan : planKey;
-}
-
-function nextPeriodKey(now, timezone) {
-  const period = periodKey(now, timezone);
-  const [year, month] = period.split("-").map(Number);
-  return month === 12
-    ? `${year + 1}-01`
-    : `${year}-${String(month + 1).padStart(2, "0")}`;
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 // Agent names are unique per workspace (case-insensitive, trimmed) - a
@@ -301,6 +257,11 @@ function pickAgent(value, routeAgentId) {
 }
 
 function isValidKnowledgeConfiguration(configuration) {
+  if (
+    configuration.receptionistPlan !== undefined &&
+    configuration.receptionistPlan !== "" &&
+    !PLAN_KEYS.includes(configuration.receptionistPlan)
+  ) return false;
   if (
     configuration.knowledgeBaseText !== undefined &&
     (typeof configuration.knowledgeBaseText !== "string" || configuration.knowledgeBaseText.length > 100_000)
@@ -824,17 +785,8 @@ export function createHandler({
       if (path === "/workspaces/me/profile" && method === "PUT") {
         const body = readBody(event);
         if (!isProfile(body)) return json(400, { message: "Invalid profile" });
-        const planKey = readReceptionistPlan(body);
-        if (planKey === INVALID) return json(400, { message: "Invalid receptionist plan" });
         await store.ensureWorkspace(workspaceId);
-        const effectivePlan = planKey !== undefined
-          ? await applyCustomerPlanChange(store, workspaceId, planKey, actor.userId)
-          : undefined;
-        const profile = {
-          ...pickProfile(body),
-          ...(effectivePlan !== undefined ? { receptionistPlan: effectivePlan } : {}),
-        };
-        const saved = await store.putProfile(workspaceId, profile);
+        const saved = await store.putProfile(workspaceId, pickProfile(body));
         return json(200, saved);
       }
 
@@ -1798,12 +1750,17 @@ export function createHandler({
             pendingConfiguration: null,
             hasUnpublishedChanges: false,
           };
+          const previousPlan = existing?.configuration?.receptionistPlan ?? "";
+          const nextPlan = agent.configuration?.receptionistPlan ?? "";
           const updatedAgent = await store.putAgent(
             workspaceId,
             agentId,
             saved,
             { invalidateTest },
           );
+          if (previousPlan !== nextPlan) {
+            await recordAgentPlanChange(store, workspaceId, agent.name, nextPlan, actor.userId);
+          }
           if (wasActive) {
             try {
               const profile = await store.getProfile(workspaceId);
@@ -2413,9 +2370,11 @@ function buildMonthlyByAgent(calls, { timezone, agentNames }) {
 }
 
 // Build the customer-facing usage view for a workspace (no cost/margin).
-// Pass `agentId` to scope billingCycle/months/calls to one AI Receptionist -
-// `monthlyByAgent` is always every agent, regardless of that filter, and
-// the plan/price fields always stay workspace-level (one shared bill).
+// Pass `agentId` to scope billingCycle/months/calls/plan to one AI Voice
+// Agent - each agent has its own plan now (see resolveAgentPlan), so the
+// unscoped (no agentId) view resolves the account's plan as the sum of
+// every live agent's own plan instead of one shared value.
+// `monthlyByAgent` is always every agent, regardless of that filter.
 async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
   const [allCalls, profile, workspace, agents] = await Promise.all([
     listCallsForUsage(store, workspaceId),
@@ -2425,7 +2384,10 @@ async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
   ]);
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-  const plan = resolvePlan(profile, workspace, now, timezone);
+  const scopedAgent = agentId ? (agents ?? []).find((candidate) => candidate.id === agentId) : null;
+  const plan = agentId
+    ? resolveAgentPlan(scopedAgent, workspace)
+    : resolveAccountPlan(agents, workspace);
   const agentNames = new Map((agents ?? []).map((agent) => [agent.id, agent.name]));
   const calls = agentId ? (allCalls ?? []).filter((call) => call.agentId === agentId) : (allCalls ?? []);
   const usage = buildUsage(calls, { now, timezone, plan });
@@ -2840,12 +2802,11 @@ export async function generateMostAskedQuestionsDigest({ store, providers, works
 }
 
 async function isCallBlocklistEnabled(store, workspaceId) {
-  const [profile, workspace] = await Promise.all([
-    typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
+  const [workspace, agents] = await Promise.all([
     typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
+    typeof store.listAgents === "function" ? store.listAgents(workspaceId).catch(() => []) : [],
   ]);
-  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-  const plan = resolvePlan(profile, workspace, new Date(), timezone);
+  const plan = resolveAccountPlan(agents, workspace);
   return resolveCallBlocklist(workspace, plan);
 }
 
@@ -3065,13 +3026,14 @@ async function handlePlatformBilling(event, { method, path, actor, store }) {
 
 async function platformBillingRow(store, workspace, period) {
   const workspaceId = workspace.workspaceId;
-  const [calls, profile] = await Promise.all([
+  const [calls, profile, agents] = await Promise.all([
     listCallsForUsage(store, workspaceId),
     store.getProfile(workspaceId),
+    typeof store.listAgents === "function" ? store.listAgents(workspaceId).catch(() => []) : [],
   ]);
   const now = periodMidpoint(period);
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-  const plan = resolvePlan(profile, workspace, now, timezone);
+  const plan = resolveAccountPlan(agents, workspace);
   const usage = buildUsage(calls ?? [], { now, timezone, plan });
   const cycle = usage.billingCycle;
   const cost = costBreakdown(cycle.actualSeconds, usage.priceMonthly, cycle.overageCharge);
@@ -5012,8 +4974,8 @@ async function handleInboundLookup(event, {
 // blocklist read entirely when the workspace isn't entitled.
 async function inboundCallerBlocked(store, workspaceId, profile, workspace, fromNumber) {
   if (typeof store.getBlockedNumber !== "function") return false;
-  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-  const plan = resolvePlan(profile, workspace, new Date(), timezone);
+  const agents = typeof store.listAgents === "function" ? await store.listAgents(workspaceId).catch(() => []) : [];
+  const plan = resolveAccountPlan(agents, workspace);
   if (!resolveCallBlocklist(workspace, plan)) return false;
   const caller = normalizeE164(fromNumber);
   if (!caller) return false;
@@ -5041,7 +5003,8 @@ async function inboundIsOverage(store, workspaceId, profile, workspace) {
   if (typeof store.getUsageCounter !== "function") return false;
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-  const plan = resolvePlan(profile, workspace, now, timezone);
+  const agents = typeof store.listAgents === "function" ? await store.listAgents(workspaceId).catch(() => []) : [];
+  const plan = resolveAccountPlan(agents, workspace);
   if (plan.minutes == null) return false;
   try {
     const counter = await store.getUsageCounter(workspaceId, periodKey(now, timezone));
@@ -5925,6 +5888,10 @@ function canonicalLaunchConfiguration(value) {
     silenceTimeoutSec: _silenceTimeoutSec,
     maxCallDurationMin: _maxCallDurationMin,
     allowedInboundCountries: _allowedInboundCountries,
+    // A plan is a billing/quota choice, not a behavioral one - changing it
+    // never affects how a call actually goes, so it must never invalidate
+    // an otherwise-still-valid test.
+    receptionistPlan: _receptionistPlan,
     emergencyRules: _emergencyRules,
     ...configuration
   } = value;

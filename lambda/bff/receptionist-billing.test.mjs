@@ -7,9 +7,17 @@ import {
   buildUsage,
   costBreakdown,
   periodKey,
+  resolveAccountPlan,
+  resolveAgentPlan,
   resolveCallBlocklist,
-  resolvePlan,
 } from "./receptionist-billing.mjs";
+
+const agent = (receptionistPlan, extra = {}) => ({
+  id: "agent-1",
+  status: "active",
+  configuration: { receptionistPlan },
+  ...extra,
+});
 
 const call = (startedAt, durationMs, extra = {}) => ({
   callId: `call-${startedAt}`,
@@ -108,40 +116,64 @@ test("buildUsage months lists every month with usage, totals only, newest first"
   assert.equal(usage.months[1].minutes, 2);
 });
 
-test("resolvePlan: override wins immediately", () => {
-  const plan = resolvePlan(
-    { receptionistPlan: "starter" },
-    { receptionistPlanOverride: "growth" },
-    new Date("2026-09-10T00:00:00Z"),
-    "UTC",
-  );
+test("resolveAgentPlan: reads the agent's own configuration.receptionistPlan", () => {
+  const plan = resolveAgentPlan(agent("growth"), {});
   assert.equal(plan.plan, "growth");
   assert.equal(plan.minutes, 2000);
 });
 
-test("resolvePlan: queued downgrade applies only from its effective month", () => {
-  const workspace = { receptionistPlanPending: "starter", receptionistPlanPendingFrom: "2026-10" };
-  const sept = resolvePlan({ receptionistPlan: "growth" }, workspace, new Date("2026-09-30T23:00:00Z"), "UTC");
-  assert.equal(sept.plan, "growth");
-  assert.equal(sept.pendingPlanLabel, "Starter");
-  assert.equal(sept.pendingPlanFrom, "2026-10");
-
-  const oct = resolvePlan({ receptionistPlan: "growth" }, workspace, new Date("2026-10-01T00:00:00Z"), "UTC");
-  assert.equal(oct.plan, "starter");
-  assert.equal(oct.pendingPlanLabel, undefined);
+test("resolveAgentPlan: a workspace-level super-admin override wins over the agent's own choice", () => {
+  const plan = resolveAgentPlan(agent("starter"), { receptionistPlanOverride: "growth" });
+  assert.equal(plan.plan, "growth");
+  assert.equal(plan.minutes, 2000);
 });
 
-test("resolvePlan: Enterprise override uses the workspace custom numbers", () => {
-  const plan = resolvePlan({}, {
+test("resolveAgentPlan: Enterprise override uses the workspace custom numbers", () => {
+  const plan = resolveAgentPlan(agent("starter"), {
     receptionistPlanOverride: "enterprise",
     enterpriseMinutes: 8000,
     enterprisePriceMonthly: 1999,
     enterpriseOveragePerMinute: 0.25,
-  }, new Date(), "UTC");
+  });
   assert.deepEqual(
     [plan.minutes, plan.priceMonthly, plan.overagePerMinute],
     [8000, 1999, 0.25],
   );
+});
+
+test("resolveAgentPlan: no plan chosen yet resolves to an empty, unmetered plan", () => {
+  const plan = resolveAgentPlan(agent(""), {});
+  assert.deepEqual(plan, { plan: "", label: null, priceMonthly: null, minutes: null, overagePerMinute: null });
+});
+
+test("resolveAccountPlan: sums every live agent's own plan for the account total", () => {
+  const plan = resolveAccountPlan([agent("starter"), agent("growth", { id: "agent-2" })], {});
+  assert.equal(plan.plan, "mixed");
+  assert.equal(plan.label, "2 Agent Plans");
+  assert.equal(plan.priceMonthly, 349 + 649);
+  assert.equal(plan.minutes, 1000 + 2000);
+});
+
+test("resolveAccountPlan: every agent on the same plan resolves to that one plan, not 'mixed'", () => {
+  const plan = resolveAccountPlan([agent("growth"), agent("growth", { id: "agent-2" })], {});
+  assert.equal(plan.plan, "growth");
+  assert.equal(plan.label, "Growth");
+  assert.equal(plan.priceMonthly, 649 * 2);
+});
+
+test("resolveAccountPlan: agents with no plan chosen, and deleted agents, don't count", () => {
+  const plan = resolveAccountPlan([
+    agent("starter"),
+    agent("", { id: "agent-2" }),
+    agent("pro", { id: "agent-3", status: "deleted" }),
+  ], {});
+  assert.equal(plan.plan, "starter");
+  assert.equal(plan.priceMonthly, 349);
+});
+
+test("resolveAccountPlan: no agent has chosen a plan yet resolves to an empty, unmetered plan", () => {
+  const plan = resolveAccountPlan([agent("")], {});
+  assert.deepEqual(plan, { plan: "", label: null, priceMonthly: null, minutes: null, overagePerMinute: null });
 });
 
 test("costBreakdown yields cost, profit and margin from actual talk time", () => {
@@ -167,7 +199,7 @@ test("buildUsage counts spam calls separately without dropping them from totals"
     call("2026-09-02T10:00:00Z", 60_000, { outcome: "answered" }),
     call("2026-09-03T10:00:00Z", 30_000, { outcome: "spam" }),
     call("2026-09-04T10:00:00Z", 30_000, { outcome: "spam" }),
-  ], { now, timezone: "UTC", plan: resolvePlan({ receptionistPlan: "starter" }, {}, now, "UTC") });
+  ], { now, timezone: "UTC", plan: resolveAgentPlan(agent("starter"), {}) });
   assert.equal(usage.billingCycle.calls, 3);
   assert.equal(usage.billingCycle.spamCalls, 2);
   assert.equal(usage.billingCycle.minutes, 3);
@@ -180,7 +212,7 @@ test("buildUsage breaks the cycle's minutes down per agent, most minutes first",
     call("2026-09-03T10:00:00Z", 60_000, { agentId: "agent-b" }),
     call("2026-09-04T10:00:00Z", 60_000, { agentId: "agent-b" }),
     call("2026-09-05T10:00:00Z", 30_000),
-  ], { now, timezone: "UTC", plan: resolvePlan({ receptionistPlan: "starter" }, {}, now, "UTC") });
+  ], { now, timezone: "UTC", plan: resolveAgentPlan(agent("starter"), {}) });
   assert.deepEqual(usage.billingCycle.agentBreakdown, [
     { agentId: "agent-a", minutes: 2, calls: 1 },
     { agentId: "agent-b", minutes: 2, calls: 2 },

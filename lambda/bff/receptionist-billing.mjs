@@ -112,59 +112,94 @@ export function callStart(call) {
   return call?.startedAt ?? call?.createdAt ?? null;
 }
 
-/**
- * Resolve the plan in effect for a workspace, honouring a super-admin override,
- * a queued downgrade whose effective month has arrived, and Enterprise customs.
- *
- * @returns {{plan:string,label:string|null,priceMonthly:number|null,minutes:number|null,
- *   overagePerMinute:number|null,pendingPlanLabel?:string,pendingPlanFrom?:string}}
- */
-export function resolvePlan(profile, workspace, now, timezone) {
+// A super-admin override on the workspace record always wins over any
+// individual agent's own plan choice - used for a negotiated Enterprise deal
+// (or, in principle, forcing every agent onto one plan) that should apply to
+// the whole account regardless of what each agent has picked.
+function accountOverridePlan(workspace) {
   const ws = workspace ?? {};
-  const currentPeriod = periodKey(now, timezone || "UTC");
-
-  // 1. Super-admin override always wins and is always immediate.
   const override = ws.receptionistPlanOverride;
-  if (override && PLAN_KEYS.includes(override)) {
-    if (override === "enterprise") {
-      return {
-        plan: "enterprise",
-        label: "Enterprise",
-        priceMonthly: numberOrNull(ws.enterprisePriceMonthly),
-        minutes: numberOrNull(ws.enterpriseMinutes),
-        overagePerMinute: numberOrNull(ws.enterpriseOveragePerMinute),
-      };
-    }
-    return { plan: override, ...RECEPTIONIST_PLANS[override] };
-  }
-
-  // 2. Customer choice, pending-aware.
-  let key = typeof profile?.receptionistPlan === "string" ? profile.receptionistPlan : "";
-  const pending = ws.receptionistPlanPending;
-  const pendingFrom = ws.receptionistPlanPendingFrom;
-  if (pending && PLAN_KEYS.includes(pending) && pendingFrom && currentPeriod >= pendingFrom) {
-    key = pending; // the queued downgrade is now effective
-  }
-
-  if (!PLAN_KEYS.includes(key) || key === "") {
-    return { plan: "", label: null, priceMonthly: null, minutes: null, overagePerMinute: null };
-  }
-  const base = key === "enterprise"
-    ? {
+  if (!override || !PLAN_KEYS.includes(override)) return null;
+  if (override === "enterprise") {
+    return {
       plan: "enterprise",
       label: "Enterprise",
       priceMonthly: numberOrNull(ws.enterprisePriceMonthly),
       minutes: numberOrNull(ws.enterpriseMinutes),
       overagePerMinute: numberOrNull(ws.enterpriseOveragePerMinute),
-    }
-    : { plan: key, ...RECEPTIONIST_PLANS[key] };
-
-  // Expose an unapplied queued downgrade for the UI.
-  if (pending && PLAN_KEYS.includes(pending) && pendingFrom && currentPeriod < pendingFrom) {
-    base.pendingPlanLabel = RECEPTIONIST_PLANS[pending]?.label ?? pending;
-    base.pendingPlanFrom = pendingFrom;
+    };
   }
-  return base;
+  return { plan: override, ...RECEPTIONIST_PLANS[override] };
+}
+
+/**
+ * Resolve the plan in effect for ONE agent - each agent on an account picks
+ * its own plan independently (see components/agent-wizard.tsx's Summary &
+ * Launch step). A workspace-level super-admin override still wins over any
+ * agent's own choice.
+ *
+ * @returns {{plan:string,label:string|null,priceMonthly:number|null,minutes:number|null,
+ *   overagePerMinute:number|null}}
+ */
+export function resolveAgentPlan(agent, workspace) {
+  const override = accountOverridePlan(workspace);
+  if (override) return override;
+
+  const key = typeof agent?.configuration?.receptionistPlan === "string"
+    ? agent.configuration.receptionistPlan
+    : "";
+  if (!PLAN_KEYS.includes(key) || key === "") {
+    return { plan: "", label: null, priceMonthly: null, minutes: null, overagePerMinute: null };
+  }
+  if (key === "enterprise") {
+    const ws = workspace ?? {};
+    return {
+      plan: "enterprise",
+      label: "Enterprise",
+      priceMonthly: numberOrNull(ws.enterprisePriceMonthly),
+      minutes: numberOrNull(ws.enterpriseMinutes),
+      overagePerMinute: numberOrNull(ws.enterpriseOveragePerMinute),
+    };
+  }
+  return { plan: key, ...RECEPTIONIST_PLANS[key] };
+}
+
+/**
+ * Resolve the account's overall plan for the unscoped (no single agent
+ * selected) Billing & Usage view and the super-admin billing report - the
+ * sum of every live agent's own plan, not a second, separate billing model.
+ * A single shared label/key when every agent is on the same plan, else a
+ * "Mixed" summary; null/unset when no agent has chosen a plan yet.
+ */
+export function resolveAccountPlan(agents, workspace) {
+  const override = accountOverridePlan(workspace);
+  if (override) return override;
+
+  const live = (Array.isArray(agents) ? agents : []).filter((agent) => agent?.status !== "deleted");
+  const plans = live
+    .map((agent) => resolveAgentPlan(agent, workspace))
+    .filter((plan) => plan.plan !== "");
+
+  if (!plans.length) {
+    return { plan: "", label: null, priceMonthly: null, minutes: null, overagePerMinute: null };
+  }
+  const priceMonthly = plans.every((plan) => plan.priceMonthly != null)
+    ? round2(plans.reduce((sum, plan) => sum + plan.priceMonthly, 0))
+    : null;
+  const minutes = plans.every((plan) => plan.minutes != null)
+    ? plans.reduce((sum, plan) => sum + plan.minutes, 0)
+    : null;
+  const overagePerMinute = plans.find((plan) => plan.overagePerMinute != null)?.overagePerMinute
+    ?? RECEPTIONIST_PLANS.starter.overagePerMinute;
+  const distinctKeys = new Set(plans.map((plan) => plan.plan));
+  const uniform = distinctKeys.size === 1;
+  return {
+    plan: uniform ? plans[0].plan : "mixed",
+    label: uniform ? plans[0].label : `${plans.length} Agent Plans`,
+    priceMonthly,
+    minutes,
+    overagePerMinute,
+  };
 }
 
 function numberOrNull(value) {

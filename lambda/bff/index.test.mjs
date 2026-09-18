@@ -5979,7 +5979,7 @@ function meteringStore(overrides = {}) {
   return {
     async ensureWorkspace() {},
     async getProfile() {
-      return { ...receptionistProfile(), receptionistPlan: "starter" };
+      return receptionistProfile();
     },
     async getWorkspace() {
       return { workspaceId: "workspace-123", name: "Arc Dental" };
@@ -5992,6 +5992,12 @@ function meteringStore(overrides = {}) {
     },
     async listCalls() {
       return [];
+    },
+    // Each agent picks its own plan now - a single default agent on
+    // "starter" matches the old single-workspace-plan fixtures unless a
+    // test overrides listAgents with its own set.
+    async listAgents() {
+      return [{ id: "agent-1", name: "Maya", status: "active", configuration: { receptionistPlan: "starter" } }];
     },
     ...overrides,
   };
@@ -6109,43 +6115,10 @@ test("GET /workspaces/me/usage always returns monthlyByAgent for every agent, re
   assert.ok(agentNamesInMonthly.has("Samantha"));
 });
 
-test("PUT /workspaces/me/profile queues a downgrade for next cycle", async () => {
-  const { createHandler } = await loadBff();
-  let savedWorkspace;
-  let savedProfile;
-  const store = meteringStore({
-    async getProfile() {
-      return { ...receptionistProfile(), receptionistPlan: "growth" };
-    },
-    async putWorkspace(value) {
-      savedWorkspace = value;
-      return value;
-    },
-    async putProfile(_workspaceId, value) {
-      savedProfile = value;
-      return value;
-    },
-  });
-  const handler = createHandler({ getStore: async () => store });
-  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
-    ...receptionistProfile(),
-    receptionistPlan: "starter",
-  }));
-
-  assert.equal(response.statusCode, 200);
-  assert.equal(savedProfile.receptionistPlan, "growth");
-  assert.equal(savedWorkspace.receptionistPlanPending, "starter");
-  assert.match(savedWorkspace.receptionistPlanPendingFrom, /^\d{4}-\d{2}$/);
-  assert.equal(savedWorkspace.planHistory.at(-1).plan, "Starter");
-});
-
-test("PUT /workspaces/me/profile applies an upgrade immediately", async () => {
+test("PUT /workspaces/me/profile no longer carries a plan - each agent picks its own via PUT .../agents/:id", async () => {
   const { createHandler } = await loadBff();
   let savedProfile;
   const store = meteringStore({
-    async getProfile() {
-      return { ...receptionistProfile(), receptionistPlan: "starter" };
-    },
     async putProfile(_workspaceId, value) {
       savedProfile = value;
       return value;
@@ -6158,16 +6131,61 @@ test("PUT /workspaces/me/profile applies an upgrade immediately", async () => {
   }));
 
   assert.equal(response.statusCode, 200);
-  assert.equal(savedProfile.receptionistPlan, "pro");
+  // A stray receptionistPlan on the body is silently ignored, not stored.
+  assert.equal(savedProfile.receptionistPlan, undefined);
 });
 
-test("PUT /workspaces/me/profile rejects an unknown plan key", async () => {
+test("PUT .../agents/:id changing configuration.receptionistPlan applies immediately and records it in the account's plan history", async () => {
+  const existing = {
+    id: "agent-123",
+    name: "Maya",
+    role: "Phone operations",
+    description: "Answers calls",
+    status: "draft",
+    capabilities: [],
+    configuration: { receptionistPlan: "starter" },
+  };
+  let savedAgent;
+  let savedWorkspace;
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async getWorkspace() { return { workspaceId: "workspace-123", planHistory: [] }; },
+    async putWorkspace(value) { savedWorkspace = value; return value; },
+    async putAgent(_workspaceId, _agentId, agent) { savedAgent = agent; return agent; },
+  };
   const { createHandler } = await loadBff();
-  const handler = createHandler({ getStore: async () => meteringStore() });
-  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
-    ...receptionistProfile(),
-    receptionistPlan: "platinum",
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", {
+    ...existing,
+    configuration: { receptionistPlan: "pro" },
   }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(savedAgent.configuration.receptionistPlan, "pro");
+  assert.equal(savedWorkspace.planHistory.at(-1).plan, "Pro");
+  assert.equal(savedWorkspace.planHistory.at(-1).agentName, "Maya");
+});
+
+test("PUT .../agents/:id rejects an unknown plan key in configuration.receptionistPlan", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return null; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", {
+    id: "agent-123",
+    name: "Maya",
+    role: "Phone operations",
+    description: "Answers calls",
+    status: "draft",
+    capabilities: [],
+    configuration: { receptionistPlan: "platinum" },
+  }));
+
   assert.equal(response.statusCode, 400);
 });
 
@@ -6182,10 +6200,13 @@ test("inbound lookup never rejects a call for being past the plan's minutes - it
       return { status: "active", retellAgentId: "retell-agent-1" };
     },
     async getProfile() {
-      return { ...receptionistProfile(), receptionistPlan: "starter" };
+      return receptionistProfile();
     },
     async getWorkspace() {
       return { workspaceId: "workspace-123" };
+    },
+    async listAgents() {
+      return [{ id: "agent-123", name: "Maya", status: "active", configuration: { receptionistPlan: "starter" } }];
     },
     async getUsageCounter() {
       // Starter's allowance is 1000 minutes - already well past it.
@@ -6695,8 +6716,12 @@ test("GET /platform/billing aggregates workspaces and is super-admin only", asyn
     { workspaceId: "ws-b", name: "Bravo" },
   ];
   const profiles = {
-    "ws-a": { timezone: "UTC", receptionistPlan: "starter" },
-    "ws-b": { timezone: "UTC", receptionistPlan: "" },
+    "ws-a": { timezone: "UTC" },
+    "ws-b": { timezone: "UTC" },
+  };
+  const agentsByWorkspace = {
+    "ws-a": [{ id: "agent-a", name: "Maya", status: "active", configuration: { receptionistPlan: "starter" } }],
+    "ws-b": [{ id: "agent-b", name: "Samantha", status: "active", configuration: { receptionistPlan: "" } }],
   };
   const now = new Date();
   const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
@@ -6713,6 +6738,9 @@ test("GET /platform/billing aggregates workspaces and is super-admin only", asyn
     },
     async listWorkspaces() {
       return workspaces;
+    },
+    async listAgents(id) {
+      return agentsByWorkspace[id] ?? [];
     },
     async listCalls(id) {
       return id === "ws-a"
