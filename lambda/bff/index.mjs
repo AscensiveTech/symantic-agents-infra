@@ -1728,14 +1728,33 @@ export function createHandler({
             return json(409, { message: `An agent named "${agent.name}" already exists in this workspace - choose a different name.` });
           }
           const wasActive = existing?.status === "active";
+          const wasDisabled = existing?.status === "disabled";
+          // The customer explicitly confirmed (via the Save Changes ->
+          // "this will reactivate the agent" dialog) that publishing these
+          // changes should also bring a disabled agent back online.
+          // Meaningless - and ignored - for anything other than a disabled
+          // agent, so a stray query param can never activate a fresh draft
+          // early.
+          const reactivating = wasDisabled && event?.queryStringParameters?.reactivate === "true";
           // Mid-edit autosave (?draft=true): the wizard saves every keystroke
-          // to the cloud so nothing is lost, but a live agent must keep
-          // answering calls with its last PUBLISHED configuration until the
-          // user explicitly clicks Save Changes - so this branch only ever
-          // writes pendingConfiguration/hasUnpublishedChanges, never the
-          // live `configuration`, `name`, `status`, etc, and never calls
-          // Retell/Telnyx at all.
-          const isDraftAutosave = wasActive && event?.queryStringParameters?.draft === "true";
+          // to the cloud so nothing is lost, but a live agent - active OR
+          // disabled - must keep its last PUBLISHED configuration and status
+          // exactly as they are until the user explicitly clicks Save
+          // Changes - so this branch only ever writes pendingConfiguration/
+          // hasUnpublishedChanges, never the live `configuration`, `name`,
+          // `status`, etc, and never calls Retell/Telnyx at all.
+          //
+          // A disabled agent used to be excluded here (only `wasActive`
+          // skipped this branch), which was the actual bug: every autosave
+          // keystroke on a disabled agent fell through to the real-save
+          // logic below instead, and since the wizard's autosave payload
+          // always carries status "active" (it doesn't know the agent is
+          // disabled), that real-save logic read it as "this agent wants to
+          // go active" and downgraded it to "draft" - flipping a disabled
+          // agent to draft the instant you started editing it, long before
+          // Save Changes was ever clicked.
+          const isDraftAutosave = (wasActive || (wasDisabled && !reactivating))
+            && event?.queryStringParameters?.draft === "true";
           if (isDraftAutosave) {
             const updatedAgent = await store.putAgent(workspaceId, agentId, {
               pendingConfiguration: agent.configuration ?? null,
@@ -1765,11 +1784,19 @@ export function createHandler({
             // change straight to Retell (below) instead of silently taking
             // it offline - a customer who edits a live receptionist expects
             // it to answer with the new config, not stop answering at all.
+            // A disabled agent stays disabled on an ordinary save - it only
+            // goes back to active when the customer explicitly confirmed
+            // that (reactivating, above); otherwise this is unreachable in
+            // practice (the wizard never sends a non-draft save for a
+            // disabled agent without ?reactivate=true), but stays defensive
+            // here rather than silently publishing a disabled agent live.
             status: wasActive
               ? "active"
-              : agent.status === "active"
-                ? "draft"
-                : agent.status,
+              : reactivating
+                ? "active"
+                : wasDisabled
+                  ? "disabled"
+                  : agent.status === "active" ? "draft" : agent.status,
             // A real, explicit save always publishes - any unpublished draft
             // this configuration supersedes is cleared here too.
             pendingConfiguration: null,
@@ -1786,7 +1813,7 @@ export function createHandler({
           if (previousPlan !== nextPlan) {
             await recordAgentPlanChange(store, workspaceId, agent.name, nextPlan, actor.userId);
           }
-          if (wasActive) {
+          if (wasActive || reactivating) {
             try {
               const profile = await store.getProfile(workspaceId);
               const providers = await getProviders();
