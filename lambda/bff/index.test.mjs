@@ -1605,6 +1605,69 @@ test("GET contacts/summary?q= searches the full history, finding a contact outsi
   assert.equal(recentCallsCalled, false);
 });
 
+test("POST /workspaces/me/activity records a login or page_view event, rejecting an unknown eventType", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async recordActivity(workspaceId, event) {
+      saved = { workspaceId, event };
+      return { workspaceId, eventId: "evt-1", occurredAt: "2026-09-18T00:00:00.000Z", ...event };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const bad = await handler(authenticatedEvent("POST", "/workspaces/me/activity", { eventType: "not-a-thing" }));
+  assert.equal(bad.statusCode, 400);
+
+  const login = await handler(authenticatedEvent("POST", "/workspaces/me/activity", { eventType: "login" }));
+  assert.equal(login.statusCode, 200);
+  assert.equal(saved.event.eventType, "login");
+  assert.equal(saved.event.userId, "user-123");
+
+  const pageView = await handler(authenticatedEvent("POST", "/workspaces/me/activity", { eventType: "page_view", page: "/overview" }));
+  assert.equal(pageView.statusCode, 200);
+  assert.equal(saved.event.eventType, "page_view");
+  assert.equal(saved.event.page, "/overview");
+});
+
+test("GET /platform/companies/{id}/activity returns the paginated login/page-view log (super admin only)", async () => {
+  const store = {
+    // Present (unlike most of this file's minimal test stores) specifically
+    // so resolveActor() reads the real cognito:groups claim instead of the
+    // "no membership methods" test shortcut, which always resolves to
+    // company-admin regardless of claims - this route needs a genuine
+    // super-admin check.
+    async getMembership(userId) {
+      return { workspaceId: userId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      return { workspaceId, name: "Existing Company" };
+    },
+    async listActivity(workspaceId, { limit, cursor }) {
+      return {
+        items: [
+          { eventId: "evt-2", occurredAt: "2026-09-18T12:00:00.000Z", eventType: "page_view", page: "/overview", userName: "Jordan Miles", userEmail: "jordan@example.com" },
+          { eventId: "evt-1", occurredAt: "2026-09-18T11:00:00.000Z", eventType: "login", userName: "Jordan Miles", userEmail: "jordan@example.com" },
+        ],
+        nextCursor: cursor ? null : "cursor-2",
+      };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const forbidden = await handler(authenticatedEvent("GET", "/platform/companies/workspace-existing/activity"));
+  assert.equal(forbidden.statusCode, 401);
+
+  const response = await handler(superAdminEvent("GET", "/platform/companies/workspace-existing/activity"));
+  assert.equal(response.statusCode, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.items.length, 2);
+  assert.equal(payload.items[0].eventType, "page_view");
+  assert.equal(payload.nextCursor, "cursor-2");
+});
+
 test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid number or missing name", async () => {
   let saved;
   const store = {

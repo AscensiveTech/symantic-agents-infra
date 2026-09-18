@@ -1000,6 +1000,31 @@ export function createHandler({
         })));
       }
 
+      // Fire-and-forget activity logging (login once per sign-in, one row
+      // per page navigation) - the data behind the super-admin "Uses"
+      // panel. Never blocks or fails the caller's real action: a logging
+      // write that fails is swallowed, not surfaced as an error.
+      if (path === "/workspaces/me/activity" && method === "POST") {
+        const body = readBody(event) ?? {};
+        const eventType = body.eventType === "login" ? "login" : body.eventType === "page_view" ? "page_view" : null;
+        if (!eventType) return json(400, { message: "eventType must be \"login\" or \"page_view\"" });
+        const page = eventType === "page_view" && typeof body.page === "string" ? body.page.trim().slice(0, 200) : undefined;
+        const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+        const userEmail = actor.membership?.email || (typeof claims.email === "string" ? claims.email : undefined);
+        try {
+          await store.recordActivity(workspaceId, {
+            eventType,
+            page,
+            userId: actor.userId,
+            userName: actorDisplayName(event, actor),
+            userEmail,
+          });
+        } catch (error) {
+          console.error("recordActivity failed", { name: error?.name, message: error?.message });
+        }
+        return json(200, { ok: true });
+      }
+
       // Same aggregation the Contacts page used to do client-side (fetch
       // every call, group by phone, layer contact overrides on top) - moved
       // server-side so the page doesn't have to pull the full call history
@@ -2032,6 +2057,26 @@ async function handlePlatformCompanies(event, {
       return json(200, await loadWorkspaceUsageWithCost(store, target.workspaceId));
     }
 
+    // Paginated login/page-view log for the "Uses" panel - most recent
+    // first, ?cursor= continues from the last page's nextCursor.
+    if (target.kind === "activity" && method === "GET") {
+      const limitParam = Number(event?.queryStringParameters?.limit);
+      const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 50;
+      const cursor = typeof event?.queryStringParameters?.cursor === "string" ? event.queryStringParameters.cursor : undefined;
+      const { items, nextCursor } = await store.listActivity(target.workspaceId, { limit, cursor });
+      return json(200, {
+        items: items.map((item) => ({
+          eventId: item.eventId,
+          occurredAt: item.occurredAt,
+          eventType: item.eventType,
+          page: item.page ?? null,
+          userName: item.userName ?? null,
+          userEmail: item.userEmail ?? null,
+        })),
+        nextCursor,
+      });
+    }
+
     if (target.kind === "legal-acceptances" && method === "GET") {
       const product = event?.queryStringParameters?.product === "receptionist" ? "receptionist" : "rapidproposal";
       return json(200, { acceptances: await buildLegalAcceptanceEvidence(store, target.workspaceId, product) });
@@ -2937,6 +2982,7 @@ function getPlatformCompanyTarget(event, path) {
     ["user", /^\/platform\/companies\/([^/]+)\/users\/([^/]+)$/],
     ["users", /^\/platform\/companies\/([^/]+)\/users$/],
     ["usage", /^\/platform\/companies\/([^/]+)\/usage$/],
+    ["activity", /^\/platform\/companies\/([^/]+)\/activity$/],
     ["proposal-usage", /^\/platform\/companies\/([^/]+)\/proposal-usage$/],
     ["proposal-payments", /^\/platform\/companies\/([^/]+)\/proposal-payments$/],
     ["proposal-payment", /^\/platform\/companies\/([^/]+)\/proposal-payments\/([A-Za-z0-9._-]{1,64})$/],
@@ -6885,6 +6931,48 @@ export function createDynamoStore(client, commands, tableNames) {
       return item;
     },
 
+    // One row per login or page view - the super-admin "Uses" panel's data
+    // source. Write-once (no update/delete route needed - a row is never
+    // edited, and the table's own TTL below expires it after ~90 days
+    // automatically, nothing here ever prunes one by hand).
+    async recordActivity(workspaceId, event) {
+      const occurredAt = new Date().toISOString();
+      const expiresAt = Math.floor(Date.now() / 1000) + 90 * 24 * 60 * 60;
+      const item = {
+        workspaceId,
+        eventId: randomUUID(),
+        occurredAt,
+        expiresAt,
+        ...event,
+      };
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.activityLog,
+        Item: marshall(item, { removeUndefinedValues: true }),
+      }));
+      return item;
+    },
+
+    // Most-recent-first, via the occurredAt-index (same "time-sorted GSI"
+    // shape as the calls table's own startedAt-index). `cursor` is last
+    // page's ExclusiveStartKey, base64'd so it's an opaque string to the
+    // frontend rather than a raw DynamoDB key shape.
+    async listActivity(workspaceId, { limit = 50, cursor } = {}) {
+      const result = await client.send(new commands.QueryCommand({
+        TableName: tableNames.activityLog,
+        IndexName: "occurredAt-index",
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ScanIndexForward: false,
+        Limit: limit,
+        ...(cursor ? { ExclusiveStartKey: JSON.parse(Buffer.from(cursor, "base64").toString("utf8")) } : {}),
+      }));
+      const items = (result.Items ?? []).map((item) => unmarshall(item));
+      const nextCursor = result.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey), "utf8").toString("base64")
+        : null;
+      return { items, nextCursor };
+    },
+
     async listAgents(workspaceId) {
       const result = await client.send(new commands.QueryCommand({
         TableName: tableNames.agents,
@@ -7603,6 +7691,7 @@ export async function getDefaultStore() {
       knowledgeBases: process.env.KNOWLEDGE_BASES_TABLE,
       mostAskedDigests: process.env.MOST_ASKED_DIGESTS_TABLE,
       contacts: process.env.CONTACTS_TABLE,
+      activityLog: process.env.ACTIVITY_LOG_TABLE,
     };
     if (Object.values(tableNames).some((value) => !value)) {
       throw new Error("BFF DynamoDB table environment variables are required");
