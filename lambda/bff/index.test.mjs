@@ -748,6 +748,97 @@ test("PUT agent with ?reactivate=true on a disabled agent goes active, publishes
   assert.equal(body.configuration.greeting, "New greeting");
 });
 
+test("PUT agent (real save) on an already-active agent never blanks a plan it already had, even if the outgoing payload's plan field came through empty", async () => {
+  let synced = false;
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Samantha",
+        status: "active",
+        capabilities: [],
+        configuration: { greeting: "Live greeting", voice: "voice-1", receptionistPlan: "growth" },
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      return { id: agentId, ...patch };
+    },
+    async getProfile() {
+      return { businessName: "Arc Dental", timezone: "America/New_York" };
+    },
+    async updateAgentRuntime() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      retell: {
+        async upsertAgent() { synced = true; return { retellAgentId: "retell-1" }; },
+      },
+      resolveVoiceId(requestedVoice) { return requestedVoice || "voice-1"; },
+    }),
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  // Unrelated edit (just the greeting) whose configuration - for whatever
+  // reason - carries no receptionistPlan at all, simulating the class of
+  // bug this guards against.
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    { id: "agent-123", name: "Samantha", role: "Phone operations", description: "Answers calls", status: "active", capabilities: [], configuration: { greeting: "New greeting" } },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.configuration.greeting, "New greeting");
+  assert.equal(body.configuration.receptionistPlan, "growth");
+  assert.equal(synced, true);
+});
+
+test("PUT agent (real save) on an already-active agent still applies a genuine, intentional plan change", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Samantha",
+        status: "active",
+        capabilities: [],
+        configuration: { greeting: "Live greeting", voice: "voice-1", receptionistPlan: "growth" },
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      return { id: agentId, ...patch };
+    },
+    async getProfile() {
+      return { businessName: "Arc Dental", timezone: "America/New_York" };
+    },
+    async updateAgentRuntime() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      retell: {
+        async upsertAgent() { return { retellAgentId: "retell-1" }; },
+      },
+      resolveVoiceId(requestedVoice) { return requestedVoice || "voice-1"; },
+    }),
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    { id: "agent-123", name: "Samantha", role: "Phone operations", description: "Answers calls", status: "active", capabilities: [], configuration: { greeting: "Live greeting", receptionistPlan: "starter" } },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).configuration.receptionistPlan, "starter");
+});
+
 test("POST agent discard-draft clears pendingConfiguration/hasUnpublishedChanges without touching the live configuration", async () => {
   const putCalls = [];
   const store = {
