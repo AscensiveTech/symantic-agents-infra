@@ -6809,6 +6809,116 @@ test("PATCH /platform/companies sets a plan override with custom Enterprise numb
   assert.equal(saved.planHistory.at(-1).plan, "Enterprise");
 });
 
+function billingDiscountStore(overrides = {}) {
+  let saved;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "ws-platform", role: "super-admin", status: "active" };
+    },
+    async ensureWorkspace() {},
+    async getWorkspace() {
+      return { workspaceId: "ws-tech", name: "Technovate" };
+    },
+    async putWorkspace(value) {
+      saved = value;
+      return value;
+    },
+    async getProfile() { return null; },
+    async listCalls() { return []; },
+    async listAgents() { return []; },
+    async listMemberships() { return []; },
+    async listProposals() { return []; },
+    async listProposalTemplates() { return []; },
+    ...overrides,
+  };
+  return { store, getSaved: () => saved };
+}
+
+test("PATCH /platform/companies sets a one-month billing discount for a product", async () => {
+  const { createHandler } = await loadBff();
+  const { store, getSaved } = billingDiscountStore();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("PATCH", "/platform/companies/ws-tech", {
+    billingDiscount: { period: "2026-10", product: "receptionist", percent: 20 },
+  });
+  event.pathParameters = { workspaceId: "ws-tech" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(getSaved().billingDiscounts, { "2026-10": { receptionist: 20 } });
+  assert.equal(JSON.parse(response.body).billingDiscounts["2026-10"].receptionist, 20);
+});
+
+test("PATCH /platform/companies rejects a discount that isn't a multiple of 5, or over 100", async () => {
+  const { createHandler } = await loadBff();
+  const { store } = billingDiscountStore();
+  const handler = createHandler({ getStore: async () => store });
+  for (const percent of [7, 101, -5]) {
+    const event = authenticatedEvent("PATCH", "/platform/companies/ws-tech", {
+      billingDiscount: { period: "2026-10", product: "receptionist", percent },
+    });
+    event.pathParameters = { workspaceId: "ws-tech" };
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+    const response = await handler(event);
+    assert.equal(response.statusCode, 400, `percent ${percent} should be rejected`);
+  }
+});
+
+test("PATCH /platform/companies clears a discount when percent is null, dropping the empty period entirely", async () => {
+  const { createHandler } = await loadBff();
+  const { store, getSaved } = billingDiscountStore({
+    async getWorkspace() {
+      return { workspaceId: "ws-tech", name: "Technovate", billingDiscounts: { "2026-10": { receptionist: 20, proposal: 10 } } };
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("PATCH", "/platform/companies/ws-tech", {
+    billingDiscount: { period: "2026-10", product: "receptionist", percent: null },
+  });
+  event.pathParameters = { workspaceId: "ws-tech" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(getSaved().billingDiscounts, { "2026-10": { proposal: 10 } });
+});
+
+test("GET /platform/billing applies the receptionist discount for that month to totalDue and margin, and reports the pre-discount amount", async () => {
+  const { createHandler } = await loadBff();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "ws-platform", role: "super-admin", status: "active" };
+    },
+    async ensureWorkspace() {},
+    async getWorkspace() {
+      return { workspaceId: "ws-a", name: "Alpha", billingDiscounts: { [period]: { receptionist: 50 } } };
+    },
+    async listWorkspaces() {
+      return [{ workspaceId: "ws-a", name: "Alpha", billingDiscounts: { [period]: { receptionist: 50 } } }];
+    },
+    async getProfile() { return { timezone: "UTC" }; },
+    async listAgents() {
+      return [{ id: "agent-a", name: "Maya", status: "active", configuration: { receptionistPlan: "starter" } }];
+    },
+    async listCalls() { return []; },
+    async listMemberships() { return []; },
+    async listProposals() { return []; },
+    async listProposalTemplates() { return []; },
+  };
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(superAdminEvent("GET", "/platform/billing"));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  const row = body.rows.find((r) => r.workspaceId === "ws-a");
+  assert.equal(row.discountPct, 50);
+  assert.equal(row.rawTotalDue, 349);
+  assert.equal(row.totalDue, 174.5);
+});
+
 test("Dynamo list reads page past the 1 MB limit and skip strong consistency", async () => {
   class QueryCommand {
     constructor(input) {

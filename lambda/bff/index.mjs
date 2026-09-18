@@ -1965,6 +1965,7 @@ async function handlePlatformCompanies(event, {
       const hasProposalPrice = body && Object.hasOwn(body, "proposalPlanPriceOverride");
       const hasAnchor = body && Object.hasOwn(body, "billingAnchorDate");
       const hasCredit = body && Object.hasOwn(body, "billingCreditBalance");
+      const hasDiscount = body && Object.hasOwn(body, "billingDiscount");
       const name = sanitizeCompanyName(typeof body?.name === "string" ? body.name.trim() : "");
       const proposalPrice = body?.proposalPlanPriceOverride;
       const proposalPriceValid = proposalPrice === null || proposalPrice === ""
@@ -1977,7 +1978,7 @@ async function handlePlatformCompanies(event, {
       const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
         || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
       if (
-        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements) ||
+        (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements && !hasDiscount) ||
         (hasEntitlements && !isValidEntitlements(body.entitlements)) ||
         (hasName && name.length < 2) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
@@ -1985,7 +1986,8 @@ async function handlePlatformCompanies(event, {
         (hasMostAskedQuestions && typeof body.mostAskedQuestionsEnabled !== "boolean") ||
         (hasProposalPrice && !proposalPriceValid) ||
         (hasAnchor && !anchorValid) ||
-        (hasCredit && !creditValid)
+        (hasCredit && !creditValid) ||
+        (hasDiscount && !isValidBillingDiscountPatch(body))
       ) {
         return json(400, { message: "Invalid company update" });
       }
@@ -2018,6 +2020,9 @@ async function handlePlatformCompanies(event, {
       if (hasPlan) {
         updated = applyPlanPatch(updated, body, actor.userId);
         if (!updated) return json(400, { message: "Invalid plan update" });
+      }
+      if (hasDiscount) {
+        updated = applyBillingDiscountPatch(updated, body, actor.userId);
       }
       await store.putWorkspace(updated);
       return json(200, await platformCompanySummary(store, updated));
@@ -2392,8 +2397,14 @@ async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
   const calls = agentId ? (allCalls ?? []).filter((call) => call.agentId === agentId) : (allCalls ?? []);
   const usage = buildUsage(calls, { now, timezone, plan });
   const monthlyByAgent = buildMonthlyByAgent(allCalls ?? [], { timezone, agentNames });
+  // A super-admin discount for this specific calendar month - shown to the
+  // customer too (it's genuinely what they're being charged), the overage
+  // cap/allowance stay computed off the real plan, untouched by it.
+  const discountPct = billingDiscountPct(workspace, "receptionist", usage.billingCycle.period);
   return {
     ...usage,
+    priceMonthly: applyDiscountToAmount(usage.priceMonthly, discountPct),
+    discountPct: discountPct || undefined,
     billingCycle: {
       ...usage.billingCycle,
       agentBreakdown: usage.billingCycle.agentBreakdown.map((entry) => ({
@@ -2604,7 +2615,9 @@ async function loadProposalBilling(store, workspaceId) {
   ]);
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
   const tier = normalizeCompanyTier(workspace?.tier);
-  return buildProposalBilling(workspace, tier, payments ?? [], { now: new Date(), timezone });
+  const now = new Date();
+  const discountPct = billingDiscountPct(workspace, "proposal", periodKey(now, timezone));
+  return buildProposalBilling(workspace, tier, payments ?? [], { now, timezone, discountPct });
 }
 
 // Throws {status:403, error} when the workspace has hit its monthly quota for
@@ -2862,9 +2875,17 @@ async function platformCompanySummary(store, workspace) {
     callBlocklistEnabled: workspace.callBlocklistEnabled === true,
     mostAskedQuestionsEnabled: workspace.mostAskedQuestionsEnabled === true,
     proposalPlanPriceOverride: numberOrNullValue(workspace.proposalPlanPriceOverride),
-    proposalMonthlyPrice: resolveProposalMonthlyPrice(normalizeCompanyTier(workspace.tier), workspace),
+    proposalMonthlyPrice: applyDiscountToAmount(
+      resolveProposalMonthlyPrice(normalizeCompanyTier(workspace.tier), workspace),
+      billingDiscountPct(workspace, "proposal", periodKey(new Date(), "UTC")),
+    ),
     billingAnchorDate: typeof workspace.billingAnchorDate === "string" ? workspace.billingAnchorDate : null,
     billingCreditBalance: numberOrNullValue(workspace.billingCreditBalance),
+    // { "2026-10": { proposal: 20, receptionist: 50 } } - a goodwill/promo
+    // discount percentage, scoped to one product and one calendar month.
+    billingDiscounts: workspace.billingDiscounts && typeof workspace.billingDiscounts === "object"
+      ? workspace.billingDiscounts
+      : {},
     ...(await workspaceUsageState(store, workspace)),
     proposalUsage: await proposalUsageSummary(store, workspace.workspaceId),
   };
@@ -2997,6 +3018,52 @@ function applyPlanPatch(workspace, body, userId) {
   return patch;
 }
 
+// A super-admin discount for one product, for one specific calendar month -
+// a goodwill credit or promo, not a plan change. Stored per-period so it
+// never silently carries into a later month. 0-100 in 5-point steps only,
+// matching the UI's slider; percent:null (or 0) clears that entry.
+const DISCOUNT_PRODUCTS = new Set(["proposal", "receptionist"]);
+
+function isValidBillingDiscountPatch(body) {
+  const value = body?.billingDiscount;
+  if (!value || typeof value !== "object") return false;
+  const { period, product, percent } = value;
+  if (typeof period !== "string" || !/^\d{4}-\d{2}$/.test(period)) return false;
+  if (!DISCOUNT_PRODUCTS.has(product)) return false;
+  if (percent === null) return true;
+  return typeof percent === "number" && Number.isInteger(percent) &&
+    percent >= 0 && percent <= 100 && percent % 5 === 0;
+}
+
+// Returns the updated workspace. Clearing down to 0/null for both products
+// in a period drops that period entirely, so the stored map never grows
+// unbounded with empty entries.
+function applyBillingDiscountPatch(workspace, body, userId) {
+  const { period, product, percent } = body.billingDiscount;
+  const discounts = { ...(workspace.billingDiscounts && typeof workspace.billingDiscounts === "object" ? workspace.billingDiscounts : {}) };
+  const entry = { ...(discounts[period] ?? {}) };
+  if (!percent) delete entry[product];
+  else entry[product] = percent;
+  if (Object.keys(entry).length) discounts[period] = entry;
+  else delete discounts[period];
+  return {
+    ...workspace,
+    billingDiscounts: discounts,
+    updatedAt: new Date().toISOString(),
+    updatedBy: userId,
+  };
+}
+
+function billingDiscountPct(workspace, product, period) {
+  const pct = workspace?.billingDiscounts?.[period]?.[product];
+  return typeof pct === "number" && pct > 0 && pct <= 100 ? pct : 0;
+}
+
+function applyDiscountToAmount(amount, pct) {
+  if (amount == null || !pct) return amount;
+  return Math.round(amount * (1 - pct / 100) * 100) / 100;
+}
+
 // Super-admin billing report across every workspace for a calendar month.
 async function handlePlatformBilling(event, { method, path, actor, store }) {
   if (path !== "/platform/billing") return null;
@@ -3036,10 +3103,14 @@ async function platformBillingRow(store, workspace, period) {
   const plan = resolveAccountPlan(agents, workspace);
   const usage = buildUsage(calls ?? [], { now, timezone, plan });
   const cycle = usage.billingCycle;
-  const cost = costBreakdown(cycle.actualSeconds, usage.priceMonthly, cycle.overageCharge);
-  const totalDue = usage.priceMonthly == null
+  const discountPct = billingDiscountPct(workspace, "receptionist", period);
+  const rawTotalDue = usage.priceMonthly == null
     ? null
     : Math.round((usage.priceMonthly + cycle.overageCharge + Number.EPSILON) * 100) / 100;
+  const totalDue = applyDiscountToAmount(rawTotalDue, discountPct);
+  // Margin is modeled off what's actually being collected, not the sticker
+  // price, so a discounted month correctly shows the thinner margin it is.
+  const cost = costBreakdown(cycle.actualSeconds, totalDue, 0);
   return {
     workspaceId,
     companyName: workspace.name || workspaceId,
@@ -3054,6 +3125,8 @@ async function platformBillingRow(store, workspace, period) {
     overageChargeCapped: cycle.overageChargeCapped,
     usageState: cycle.usageState,
     blocked: cycle.blocked,
+    discountPct: discountPct || undefined,
+    rawTotalDue: discountPct ? rawTotalDue : undefined,
     totalDue,
     estimatedCost: cost.estimatedCost,
     grossProfit: cost.grossProfit,

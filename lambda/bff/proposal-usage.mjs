@@ -375,7 +375,7 @@ export function paymentWithinEditWindow(paidAt, now = new Date()) {
  * @param {Array} paymentRows       `payment#...` rows
  * @param {{now:Date, timezone:string}} ctx
  */
-export function buildProposalBilling(workspace, tier, paymentRows, { now, timezone }) {
+export function buildProposalBilling(workspace, tier, paymentRows, { now, timezone, discountPct = 0 }) {
   const normalizedTier = PROPOSAL_LIMITS[tier] ? tier : "basic";
   const tz = timezone || "UTC";
   const monthlyPrice = resolveProposalMonthlyPrice(normalizedTier, workspace);
@@ -400,10 +400,13 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
     ? workspace.billingAnchorDate
     : null;
   const notStarted = startDate != null && startDate > today;
+  const rawAmount = notStarted ? monthlyPrice : (money(monthlyPrice - creditApplied) ?? monthlyPrice);
   const upcoming = {
     dueOn: notStarted ? startDate : nextBillingDate(today, anchorDay),
     planLabel,
-    amount: notStarted ? monthlyPrice : (money(monthlyPrice - creditApplied) ?? monthlyPrice),
+    amount: discountPct > 0 ? (money(rawAmount * (1 - discountPct / 100)) ?? rawAmount) : rawAmount,
+    rawAmount: discountPct > 0 ? rawAmount : undefined,
+    discountPct: discountPct > 0 ? discountPct : undefined,
     billingDay: anchorDay,
     creditBalance,
     creditApplied: notStarted ? 0 : creditApplied,

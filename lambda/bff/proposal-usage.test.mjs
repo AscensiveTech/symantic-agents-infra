@@ -249,6 +249,20 @@ test("buildProposalBilling: billingAnchorDate overrides the join date and credit
   assert.equal(billing.upcoming.amount, 89); // 119 - 30
 });
 
+test("buildProposalBilling applies a discount percent to the upcoming charge, and reports the pre-discount amount", () => {
+  const workspace = { tier: "repository", createdAt: "2026-09-16T10:00:00.000Z" };
+
+  const discounted = buildProposalBilling(workspace, "repository", [], { now, timezone: "UTC", discountPct: 25 });
+  assert.equal(discounted.upcoming.amount, 89.25); // 119 * 0.75
+  assert.equal(discounted.upcoming.rawAmount, 119);
+  assert.equal(discounted.upcoming.discountPct, 25);
+
+  const undiscounted = buildProposalBilling(workspace, "repository", [], { now, timezone: "UTC" });
+  assert.equal(undiscounted.upcoming.amount, 119);
+  assert.equal(undiscounted.upcoming.rawAmount, undefined);
+  assert.equal(undiscounted.upcoming.discountPct, undefined);
+});
+
 test("buildProposalBilling honours a per-company price override", () => {
   const paid = [{ paymentId: "p1", paidAt: "2026-08-05", planLabel: "Pro", amount: 80, receivedBy: "x" }];
   const custom = buildProposalBilling(
