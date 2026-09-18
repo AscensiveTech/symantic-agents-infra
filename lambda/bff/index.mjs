@@ -1786,8 +1786,25 @@ export function createHandler({
               .filter((key) => JSON.stringify(before?.[key]) !== JSON.stringify(after?.[key]));
             console.warn("Save invalidated an already-passing test", { workspaceId, agentId, changedKeys });
           }
+          const willBeLive = wasActive || reactivating;
+          const previousPlan = existing?.configuration?.receptionistPlan ?? "";
+          const incomingPlan = agent.configuration?.receptionistPlan ?? "";
+          // A save's whole point is "publish whatever the wizard currently
+          // has" - but an already-published, still-live agent must never
+          // have its billed plan silently blanked by that, even if the
+          // outgoing payload's plan field came through empty (a stale
+          // client-side draft, a partial PUT, or any future bug like it).
+          // The plan only ever actually changes when the customer picks a
+          // new one on the launch step, which always sends a real value.
+          // Only overrides `configuration` at all when this guard actually
+          // needs to fix something - otherwise `agent`'s own shape (which a
+          // couple of tests assert on key-for-key) is left untouched.
+          const planFix = willBeLive && !incomingPlan && previousPlan && agent.configuration
+            ? { configuration: { ...agent.configuration, receptionistPlan: previousPlan } }
+            : {};
           const saved = {
             ...agent,
+            ...planFix,
             // Editing an already-active agent keeps it active and pushes the
             // change straight to Retell (below) instead of silently taking
             // it offline - a customer who edits a live receptionist expects
@@ -1810,8 +1827,7 @@ export function createHandler({
             pendingConfiguration: null,
             hasUnpublishedChanges: false,
           };
-          const previousPlan = existing?.configuration?.receptionistPlan ?? "";
-          const nextPlan = agent.configuration?.receptionistPlan ?? "";
+          const nextPlan = saved.configuration?.receptionistPlan ?? "";
           const updatedAgent = await store.putAgent(
             workspaceId,
             agentId,
