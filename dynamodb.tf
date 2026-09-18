@@ -81,6 +81,13 @@ locals {
       name_suffix = "most-asked-digests"
       range_key   = "digestId"
     }
+    activity_log = {
+      // One row per login or page view, for the super-admin "Uses" panel
+      // (which user, how often, which pages) - self-expiring via TTL below,
+      // nothing to manually prune.
+      name_suffix = "activity-log"
+      range_key   = "eventId"
+    }
   }
 }
 
@@ -99,6 +106,7 @@ resource "aws_dynamodb_table" "control_plane" {
       each.key == "phone_numbers" ? "telnyxPhoneNumber" : null,
       each.key == "agents" ? "retellAgentId" : null,
       each.key == "calls" ? "startedAt" : null,
+      each.key == "activity_log" ? "occurredAt" : null,
     ]))
 
     content {
@@ -143,8 +151,21 @@ resource "aws_dynamodb_table" "control_plane" {
     }
   }
 
+  // Time-sorted pagination for the super-admin "Uses" panel, same shape as
+  // the calls table's own startedAt-index just above.
+  dynamic "global_secondary_index" {
+    for_each = each.key == "activity_log" ? [1] : []
+
+    content {
+      name            = "occurredAt-index"
+      hash_key        = "workspaceId"
+      range_key       = "occurredAt"
+      projection_type = "ALL"
+    }
+  }
+
   dynamic "ttl" {
-    for_each = contains(["workspace_usage", "blocked_numbers"], each.key) ? [1] : []
+    for_each = contains(["workspace_usage", "blocked_numbers", "activity_log"], each.key) ? [1] : []
 
     content {
       attribute_name = "expiresAt"

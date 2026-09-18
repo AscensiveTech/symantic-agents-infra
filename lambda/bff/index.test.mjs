@@ -617,6 +617,137 @@ test("PUT agent with ?draft=true saves an active agent's edits as pendingConfigu
   assert.equal(body.hasUnpublishedChanges, true);
 });
 
+test("PUT agent with ?draft=true on a DISABLED agent also stages pendingConfiguration only - it must not flip status to draft or call Retell (the actual bug: this used to fall through to the real-save path on every keystroke)", async () => {
+  const putCalls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Grace",
+        role: "Phone operations",
+        description: "Answers calls",
+        status: "disabled",
+        capabilities: [],
+        configuration: { greeting: "Live greeting" },
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      putCalls.push([workspaceId, agentId, patch]);
+      return patch;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => { throw new Error("must not call a provider on a draft autosave"); },
+  });
+
+  // The wizard's autosave payload always carries status "active" (it has
+  // no way to know the agent is disabled) - the bug was this being taken
+  // at face value instead of being ignored during a draft autosave.
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    {
+      id: "agent-123",
+      name: "Grace",
+      role: "Phone operations",
+      description: "Answers calls",
+      status: "active",
+      capabilities: [],
+      configuration: { greeting: "Draft greeting" },
+    },
+    { draft: "true" },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(putCalls.length, 1);
+  assert.deepEqual(putCalls[0], ["user-123", "agent-123", {
+    pendingConfiguration: { greeting: "Draft greeting" },
+    hasUnpublishedChanges: true,
+  }]);
+  const body = JSON.parse(response.body);
+  assert.equal(body.status, "disabled");
+});
+
+test("PUT agent (real save, no ?draft=true) on a disabled agent without ?reactivate=true stays disabled and never calls Retell", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Grace",
+        status: "disabled",
+        capabilities: [],
+        configuration: { greeting: "Live greeting" },
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      return { id: agentId, ...patch };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => { throw new Error("must not call a provider without an explicit reactivate"); },
+  });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    { id: "agent-123", name: "Grace", role: "Phone operations", description: "Answers calls", status: "active", capabilities: [], configuration: { greeting: "New greeting" } },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).status, "disabled");
+});
+
+test("PUT agent with ?reactivate=true on a disabled agent goes active, publishes the new configuration, and syncs to Retell", async () => {
+  let synced = false;
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Grace",
+        status: "disabled",
+        capabilities: [],
+        configuration: { greeting: "Live greeting" },
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      return { id: agentId, ...patch };
+    },
+    async getProfile() {
+      return { businessName: "Arc Dental", timezone: "America/New_York" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      retell: {
+        async updateAgent() { synced = true; return { agent_id: "retell-1" }; },
+        async createLlm() { return { llm_id: "llm-1" }; },
+        async updateLlm() {},
+      },
+    }),
+  });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    { id: "agent-123", name: "Grace", role: "Phone operations", description: "Answers calls", status: "active", capabilities: [], configuration: { greeting: "New greeting" } },
+    { reactivate: "true" },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.status, "active");
+  assert.equal(body.configuration.greeting, "New greeting");
+});
+
 test("POST agent discard-draft clears pendingConfiguration/hasUnpublishedChanges without touching the live configuration", async () => {
   const putCalls = [];
   const store = {
@@ -1629,6 +1760,69 @@ test("GET contacts/summary?q= searches the full history, finding a contact outsi
   assert.deepEqual(JSON.parse(noMatch.body), []);
 
   assert.equal(recentCallsCalled, false);
+});
+
+test("POST /workspaces/me/activity records a login or page_view event, rejecting an unknown eventType", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async recordActivity(workspaceId, event) {
+      saved = { workspaceId, event };
+      return { workspaceId, eventId: "evt-1", occurredAt: "2026-09-18T00:00:00.000Z", ...event };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const bad = await handler(authenticatedEvent("POST", "/workspaces/me/activity", { eventType: "not-a-thing" }));
+  assert.equal(bad.statusCode, 400);
+
+  const login = await handler(authenticatedEvent("POST", "/workspaces/me/activity", { eventType: "login" }));
+  assert.equal(login.statusCode, 200);
+  assert.equal(saved.event.eventType, "login");
+  assert.equal(saved.event.userId, "user-123");
+
+  const pageView = await handler(authenticatedEvent("POST", "/workspaces/me/activity", { eventType: "page_view", page: "/overview" }));
+  assert.equal(pageView.statusCode, 200);
+  assert.equal(saved.event.eventType, "page_view");
+  assert.equal(saved.event.page, "/overview");
+});
+
+test("GET /platform/companies/{id}/activity returns the paginated login/page-view log (super admin only)", async () => {
+  const store = {
+    // Present (unlike most of this file's minimal test stores) specifically
+    // so resolveActor() reads the real cognito:groups claim instead of the
+    // "no membership methods" test shortcut, which always resolves to
+    // company-admin regardless of claims - this route needs a genuine
+    // super-admin check.
+    async getMembership(userId) {
+      return { workspaceId: userId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace(workspaceId) {
+      return { workspaceId, name: "Existing Company" };
+    },
+    async listActivity(workspaceId, { limit, cursor }) {
+      return {
+        items: [
+          { eventId: "evt-2", occurredAt: "2026-09-18T12:00:00.000Z", eventType: "page_view", page: "/overview", userName: "Jordan Miles", userEmail: "jordan@example.com" },
+          { eventId: "evt-1", occurredAt: "2026-09-18T11:00:00.000Z", eventType: "login", userName: "Jordan Miles", userEmail: "jordan@example.com" },
+        ],
+        nextCursor: cursor ? null : "cursor-2",
+      };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const forbidden = await handler(authenticatedEvent("GET", "/platform/companies/workspace-existing/activity"));
+  assert.equal(forbidden.statusCode, 401);
+
+  const response = await handler(superAdminEvent("GET", "/platform/companies/workspace-existing/activity"));
+  assert.equal(response.statusCode, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.items.length, 2);
+  assert.equal(payload.items[0].eventType, "page_view");
+  assert.equal(payload.nextCursor, "cursor-2");
 });
 
 test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid number or missing name", async () => {

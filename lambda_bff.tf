@@ -106,6 +106,20 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Resource = aws_dynamodb_table.control_plane["contacts"].arn
       },
       {
+        Sid    = "ManageActivityLog"
+        Effect = "Allow"
+        # PutItem only - every login/page-view write; Query (+ its
+        # occurredAt-index) for the super-admin "Uses" panel to read it back
+        # paginated. No UpdateItem/DeleteItem - rows are write-once and
+        # self-expire via the table's own TTL, nothing here ever edits or
+        # manually deletes one.
+        Action = ["dynamodb:PutItem", "dynamodb:Query"]
+        Resource = [
+          aws_dynamodb_table.control_plane["activity_log"].arn,
+          "${aws_dynamodb_table.control_plane["activity_log"].arn}/index/*",
+        ]
+      },
+      {
         Sid    = "ManagePhoneNumbers"
         Effect = "Allow"
         # DeleteItem is needed to release a number when its agent is deleted -
@@ -285,6 +299,7 @@ resource "aws_lambda_function" "bff" {
       KNOWLEDGE_BASES_TABLE       = aws_dynamodb_table.control_plane["knowledge_bases"].name
       MOST_ASKED_DIGESTS_TABLE    = aws_dynamodb_table.control_plane["most_asked_digests"].name
       CONTACTS_TABLE              = aws_dynamodb_table.control_plane["contacts"].name
+      ACTIVITY_LOG_TABLE          = aws_dynamodb_table.control_plane["activity_log"].name
       COGNITO_USER_POOL_ID        = aws_cognito_user_pool.frontend.id
       PROPOSAL_ASSETS_BUCKET      = aws_s3_bucket.proposal_assets.bucket
       CALL_ARTIFACTS_BUCKET       = aws_s3_bucket.call_artifacts.bucket
