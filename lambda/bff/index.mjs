@@ -5933,14 +5933,16 @@ async function deleteKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
 }
 
 function launchReadinessIssue(agent, profile, calendar) {
-  // businessType, ownerPhone, and fallbackPhone are no longer collected up
-  // front - only the business phone matters at this stage. A forwarding
-  // number gets configured separately, at phone-number setup.
+  // businessType and fallbackPhone are still not collected up front.
+  // ownerPhone ("Forward All Incoming Calls To") IS required again - it
+  // has its own wizard step now (between Calendar and Summary & Launch),
+  // but activation still requires it filled in either way.
   const requiredProfileFields = [
     "businessName",
     "timezone",
     "hours",
     "phone",
+    "ownerPhone",
   ];
   if (
     !profile ||
@@ -5990,26 +5992,6 @@ function launchReadinessIssue(agent, profile, calendar) {
     )
   ) {
     return "Connect and select a booking calendar before activation";
-  }
-  if (
-    agent?.tested !== true ||
-    typeof agent?.testedAt !== "string" ||
-    Number.isNaN(Date.parse(agent.testedAt))
-  ) {
-    return "Run a successful current-config test before activation";
-  }
-  if (
-    agent.configuration?.booking === true &&
-    agent.configuration?.calendarSelectionId !== calendar.selectedCalendarId
-  ) {
-    return "Run a successful current-config test after selecting the booking calendar";
-  }
-  const testedAt = Date.parse(agent.testedAt);
-  if (
-    isTimestampAfter(profile?.updatedAt, testedAt) ||
-    isTimestampAfter(calendar?.updatedAt, testedAt)
-  ) {
-    return "Run a successful current-config test after profile or calendar changes";
   }
   return null;
 }
@@ -6087,11 +6069,6 @@ function isValidPhone(value) {
     (digits.length === 11 && digits.startsWith("1"));
 }
 
-function isTimestampAfter(value, timestamp) {
-  if (typeof value !== "string") return false;
-  const parsed = Date.parse(value);
-  return !Number.isNaN(parsed) && parsed > timestamp;
-}
 
 export function verifyRetellSignature(
   rawBody,
