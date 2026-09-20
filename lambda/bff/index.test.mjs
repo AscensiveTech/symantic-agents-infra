@@ -2330,19 +2330,51 @@ test("POST attach-phone-number is refused for a non-admin and refuses a second a
   assert.equal(already.statusCode, 409);
 });
 
-test("POST activate rejects an untested current configuration", async () => {
+test("POST activate no longer requires a successful test - an untested current configuration still activates", async () => {
+  const agent = receptionistAgent();
+  delete agent.tested;
+  delete agent.testedAt;
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getProfile() { return receptionistProfile(); },
+    async getCalendarConnection() {
+      return { provider: "google-calendar", selectedCalendarId: "primary", connectionState: "connected" };
+    },
+    async getPhoneNumberForAgent() { return null; },
+    async updateAgentRuntime(workspaceId, agentId, updates) { return { ...agent, ...updates }; },
+    async putAgent(workspaceId, agentId, nextAgent) { Object.assign(agent, nextAgent); return nextAgent; },
+  };
+  const providers = {
+    telnyx: { async ensureNumber() { throw new Error("activate must never provision a phone number"); } },
+    retell: { async upsertAgent() { return { retellAgentId: "retell-agent-123" }; } },
+    resolveVoiceId(requestedVoice) { return requestedVoice || "retell-Cimo"; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => providers,
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/activate",
+  ));
+
+  assert.equal(response.statusCode, 200);
+});
+
+test("POST activate rejects a missing Forward All Incoming Calls To (ownerPhone)", async () => {
   const { createHandler } = await loadBff();
   const handler = createHandler({
     getStore: async () => ({
       async ensureWorkspace() {},
       async getAgent() {
-        const agent = receptionistAgent();
-        delete agent.tested;
-        delete agent.testedAt;
-        return agent;
+        return receptionistAgent();
       },
       async getProfile() {
-        return receptionistProfile();
+        return { ...receptionistProfile(), ownerPhone: "" };
       },
       async getCalendarConnection() {
         return {
@@ -2360,7 +2392,7 @@ test("POST activate rejects an untested current configuration", async () => {
   ));
 
   assert.equal(response.statusCode, 409);
-  assert.match(JSON.parse(response.body).message, /successful current-config test/i);
+  assert.match(JSON.parse(response.body).message, /business profile/i);
 });
 
 test("POST activate rejects booking without a connected selected calendar", async () => {
