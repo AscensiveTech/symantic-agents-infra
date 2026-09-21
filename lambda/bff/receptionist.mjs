@@ -249,6 +249,9 @@ export function buildReceptionistPrompt(agent, profile) {
   const hoursLine = isBusinessHours(profile?.businessHours)
     ? formatBusinessHours(profile.businessHours)
     : (text(profile?.hours) || "Not provided");
+  const holidaysLine = formatHolidayClosures(profile?.holidays);
+  const contactEmailsLine = formatContactEmails(profile?.contactEmails);
+  const serviceAreaLine = formatServiceAreas(profile?.serviceAreas);
   const bookingInstruction = behavior.booking === true
     ? "Booking is enabled. Check availability before offering a time, and create a booking only after explicit caller confirmation."
     : "Booking is disabled. Do not promise or create appointments; take a message for office follow-up.";
@@ -291,8 +294,23 @@ export function buildReceptionistPrompt(agent, profile) {
     `- Address: ${text(profile?.address) || "Not provided"}`,
     `- Timezone: ${text(profile?.timezone) || "UTC"}`,
     `- Hours: ${hoursLine}`,
+    ...(holidaysLine ? [`- Holiday closures: ${holidaysLine}`] : []),
     "- Current local time at the start of this call: {{currentTime}} ({{timezone}}). "
       + "Treat this as the authoritative clock when the caller asks whether you are open right now.",
+    ...(contactEmailsLine ? ["", "# CONTACT EMAILS", contactEmailsLine] : []),
+    ...(serviceAreaLine
+      ? [
+        "",
+        "# SERVICE AREA",
+        `Published coverage: ${serviceAreaLine}`,
+        "- If a caller's location matches or is near one of these areas, say it's likely within the "
+          + "service area and that the team will confirm the exact address.",
+        "- If it's outside these areas, don't refuse - say it's outside the generally published "
+          + "service area, but offer to take their details so the team can confirm.",
+        "- Never guarantee coverage for an exact address, quote a mileage/travel-time radius, or "
+          + "guess which office serves a location.",
+      ]
+      : []),
     "",
     "# APPROVED CALLER INTENTS",
     intents || "Use the approved FAQs and take a message for anything else.",
@@ -537,6 +555,30 @@ export function resolveConfiguredVoiceId(configuration, resolveVoiceId) {
     if (cloned) return cloned;
   }
   return resolveVoiceId(configuration?.voice);
+}
+
+function formatHolidayClosures(holidays) {
+  if (!Array.isArray(holidays) || !holidays.length) return "";
+  return holidays
+    .filter((holiday) => holiday?.closed && text(holiday?.name) && text(holiday?.date))
+    .map((holiday) => `${text(holiday.name)} (${text(holiday.date)})`)
+    .join(", ");
+}
+
+function formatContactEmails(contactEmails) {
+  if (!Array.isArray(contactEmails) || !contactEmails.length) return "";
+  return contactEmails
+    .filter((entry) => text(entry?.email))
+    .map((entry) => {
+      const label = text(entry?.label);
+      return label ? `- ${label}: ${text(entry.email)}` : `- ${text(entry.email)}`;
+    })
+    .join("\n");
+}
+
+function formatServiceAreas(serviceAreas) {
+  if (!Array.isArray(serviceAreas) || !serviceAreas.length) return "";
+  return serviceAreas.map(text).filter(Boolean).join(", ");
 }
 
 function formatEmergencyRules(rules) {

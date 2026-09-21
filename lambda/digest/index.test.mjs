@@ -45,14 +45,16 @@ function call(overrides = {}) {
   };
 }
 
-function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], claimSucceeds = true, negativeSentimentCalls = [] } = {}) {
+function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], claimSucceeds = true, negativeSentimentCalls = [], pendingBookings = [] } = {}) {
   const log = [];
   const state = new Map(workspaces.map((workspace) => [workspace.workspaceId, { ...workspace }]));
   const pendingAlerts = new Map(negativeSentimentCalls.map((item) => [`${item.workspaceId}:${item.callId}`, { ...item }]));
+  const pendingBookingAlerts = new Map(pendingBookings.map((item) => [`${item.workspaceId}:${item.callId}`, { ...item }]));
   return {
     log,
     state,
     pendingAlerts,
+    pendingBookingAlerts,
     async listDigestWorkspaces() {
       return [...state.values()].filter((workspace) => (
         workspace.callDigest?.enabled === true || workspace.negativeSentimentAlert?.enabled === true
@@ -73,6 +75,15 @@ function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], cl
     async markNegativeSentimentAlerted(workspaceId, callId) {
       log.push(["markNegativeSentimentAlerted", workspaceId, callId]);
       pendingAlerts.delete(`${workspaceId}:${callId}`);
+      return true;
+    },
+    async listPendingBookingAlerts(workspaceId) {
+      log.push(["listPendingBookingAlerts", workspaceId]);
+      return [...pendingBookingAlerts.values()].filter((item) => item.workspaceId === workspaceId);
+    },
+    async markBookingAlerted(workspaceId, callId) {
+      log.push(["markBookingAlerted", workspaceId, callId]);
+      pendingBookingAlerts.delete(`${workspaceId}:${callId}`);
       return true;
     },
     async listAgents() {
@@ -191,7 +202,7 @@ test("a due summary goes to every configured recipient, once each", async () => 
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 } });
   assert.deepEqual(
     sender.sent.map((message) => message.to).sort(),
     ["dana@arcdental.com", "frontdesk@arcdental.com", "sam@arcdental.com"],
@@ -226,7 +237,7 @@ test("an interval with no calls sends nothing but still moves the window on", as
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { no_calls: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { no_calls: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 } });
   assert.equal(store.state.get("ws-1").notifications, undefined);
   assert.equal(sender.sent.length, 0);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
@@ -242,7 +253,7 @@ test("skipIfEmpty:false sends a confirmation even when there are zero calls", as
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 } });
   assert.equal(sender.sent.length, 1);
   assert.match(sender.sent[0].html, /No new calls since your last check/);
   const run = store.state.get("ws-1").callDigestLastRun;
@@ -279,7 +290,7 @@ test("a summary that is not yet due does nothing", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { not_due: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { not_due: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 } });
   assert.equal(sender.sent.length, 0);
   assert.equal(store.log.some(([kind]) => kind === "claim"), false);
 });
@@ -294,7 +305,7 @@ test("a workspace without a cursor starts its window now instead of mailing hist
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { initialized: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { initialized: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 } });
   assert.equal(sender.sent.length, 0);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
 });
@@ -306,7 +317,7 @@ test("when nobody could be emailed, the window is handed back for the next run",
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { failed: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { failed: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 } });
   assert.equal(store.state.get("ws-1").callDigestCursor, previous);
   assert.equal(store.state.get("ws-1").callDigestLastRun.status, "failed");
   assert.match(store.state.get("ws-1").callDigestLastRun.error, /verified addresses/);
@@ -339,7 +350,7 @@ test("a window claimed by an overlapping run is never sent twice", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { claimed_elsewhere: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { claimed_elsewhere: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 } });
   assert.equal(sender.sent.length, 0);
 });
 
@@ -356,7 +367,7 @@ test("one workspace failing does not stop the others", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { error: 1, sent: 1, negativeSentimentAlerts: { disabled: 2 } });
+  assert.deepEqual(results, { error: 1, sent: 1, negativeSentimentAlerts: { disabled: 2 }, bookingAlerts: { no_calls: 2 } });
 });
 
 // --- negative-sentiment alerts ----------------------------------------------
@@ -404,6 +415,43 @@ test("a workspace with negative-sentiment alerts on (even with call-digest off) 
   assert.equal(notifications.length, 2);
   assert.deepEqual(new Set(notifications.map((n) => n.id)).size, 2);
   assert.ok(notifications.every((n) => n.recipients.includes("dana@arcdental.com")));
+});
+
+test("a pending booking sends a short confirmation email to the call-digest recipients and marks it", async () => {
+  const bookingCall = call({
+    outcome: "booked",
+    bookingSummary: { callerName: "Jordan Miles", service: "On-Site Visit", startTime: hoursBefore(-24) },
+    workspaceId: "ws-1",
+  });
+  const store = memoryStore({
+    workspaces: [workspace({ callDigest: settings({ recipients: ["dana@arcdental.com"] }) })],
+    pendingBookings: [bookingCall],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results.bookingAlerts, { sent: 1 });
+  assert.equal(sender.sent.length, 1);
+  const [message] = sender.sent;
+  assert.equal(message.to, "dana@arcdental.com");
+  assert.match(message.subject, /new booking - Jordan Miles/);
+  assert.match(message.text, /Type: On-Site Visit/);
+  assert.doesNotMatch(message.text, /transcript/i);
+  assert.equal(store.pendingBookingAlerts.size, 0);
+});
+
+test("booking alerts are skipped when there are no call-digest recipients configured", async () => {
+  const store = memoryStore({
+    workspaces: [workspace({ workspaceId: "no-recipients", callDigest: settings({ recipients: [] }) })],
+    pendingBookings: [call({ workspaceId: "no-recipients", bookingSummary: { callerName: "Jordan Miles", service: "Quick Call" } })],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.equal(results.bookingAlerts.no_recipients, 1);
+  assert.equal(sender.sent.length, 0);
 });
 
 test("negative-sentiment alerts are skipped when disabled or when there are no recipients", async () => {

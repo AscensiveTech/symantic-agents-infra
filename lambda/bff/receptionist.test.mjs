@@ -241,6 +241,34 @@ test("prompt prefers structured business hours (with split intervals) and carrie
   assert.match(fallback, /Mon-Fri, 8:00 AM-5:00 PM/);
 });
 
+test("prompt includes configured holiday closures, contact emails, and service area coverage", () => {
+  const withAll = buildReceptionistPrompt(agent, {
+    ...profile,
+    holidays: [
+      { id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true },
+      { id: "h2", name: "Not Closed", date: "2026-12-01", closed: false },
+    ],
+    contactEmails: [
+      { label: "Billing / AR", email: "billing@example.com" },
+      { label: "", email: "info@example.com" },
+    ],
+    serviceAreas: ["Maryland", "Washington D.C."],
+  });
+
+  assert.match(withAll, /Holiday closures: Thanksgiving \(2026-11-26\)/);
+  assert.doesNotMatch(withAll, /Not Closed/);
+  assert.match(withAll, /# CONTACT EMAILS/);
+  assert.match(withAll, /Billing \/ AR: billing@example\.com/);
+  assert.match(withAll, /- info@example\.com/);
+  assert.match(withAll, /# SERVICE AREA/);
+  assert.match(withAll, /Published coverage: Maryland, Washington D\.C\./);
+
+  const withNone = buildReceptionistPrompt(agent, profile);
+  assert.doesNotMatch(withNone, /Holiday closures:/);
+  assert.doesNotMatch(withNone, /# CONTACT EMAILS/);
+  assert.doesNotMatch(withNone, /# SERVICE AREA/);
+});
+
 test("prompt renders an allDay day as 'Open 24 hours', not raw interval text", () => {
   const open = (intervals) => ({ closed: false, intervals });
   const prompt = buildReceptionistPrompt(agent, {

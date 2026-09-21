@@ -220,6 +220,7 @@ export function createHandler({
       const transcriptName = summary.callerName
         ? undefined
         : extractCallerNameFromTranscript(transcript);
+      const outcome = inferOutcome(call, toolLog);
       return {
       workspaceId,
       callId,
@@ -259,6 +260,14 @@ export function createHandler({
       ...(String(analysis.user_sentiment ?? "").toLowerCase() === "negative"
         ? { negativeSentimentAlertedAt: null }
         : {}),
+      // Same pattern as negativeSentimentAlertedAt above - present (and
+      // unset) only when this call ended with a real booking, so the
+      // digest Lambda's per-tick loop can pick it up and send a short
+      // confirmation email on its existing 5-minute schedule. Written once
+      // (upsertCall's if_not_exists handling), never touched again here.
+      ...(outcome === "booked"
+        ? { bookingAlertedAt: null, bookingSummary: extractBookingSummary(toolLog) }
+        : {}),
       callSuccessful: typeof analysis.call_successful === "boolean" ? analysis.call_successful : undefined,
       inVoicemail: typeof analysis.in_voicemail === "boolean" ? analysis.in_voicemail : undefined,
       ...(truncated
@@ -268,7 +277,7 @@ export function createHandler({
             "Transcript and tool log were truncated to stay within the Calls item size limit.",
         }
         : {}),
-      outcome: inferOutcome(call, toolLog),
+      outcome,
       createdAt: timestamp,
       updatedAt: timestamp,
       };
@@ -651,6 +660,21 @@ function durationMs(call) {
 
 function isSuccessfulTestOutcome(outcome) {
   return outcome !== "failed" && outcome !== "abandoned" && outcome !== "spam";
+}
+
+// Very short, structured summary for the booking-confirmation email - just
+// who called, what type of appointment, and when. No transcript, no call
+// recording link, deliberately kept minimal per the product requirement.
+function extractBookingSummary(toolLog) {
+  const booking = toolActions(toolLog)
+    .find(({ name, successful }) => name === "calendar_create_booking" && successful);
+  if (!booking) return undefined;
+  const args = booking.arguments ?? {};
+  return {
+    callerName: stringValue(args?.customer?.name),
+    service: stringValue(args?.service),
+    startTime: stringValue(args?.startTime),
+  };
 }
 
 function inferOutcome(call, toolLog) {

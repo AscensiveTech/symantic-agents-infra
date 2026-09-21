@@ -180,3 +180,60 @@ export function renderNegativeSentimentAlert({
     },
   };
 }
+
+// Sent as soon as a call ends with a real appointment booked. Deliberately
+// minimal per the product requirement - who called, what appointment type,
+// and when - no transcript, no recording link, no attachment.
+export function renderBookingAlert({
+  workspaceName,
+  call,
+  recipients,
+  timezone,
+}) {
+  const company = workspaceName || "Your workspace";
+  const booking = call.bookingSummary ?? {};
+  const callerLabel = booking.callerName?.trim() || call.callerName?.trim() || call.callerNumber || "An unknown caller";
+  const appointmentType = booking.service?.trim() || "Appointment";
+  const when = booking.startTime ? formatDateTime(booking.startTime, timezone) : "Time not captured";
+  const subject = `${company}: new booking - ${callerLabel}`;
+  const sentToLine = `This alert was sent to: ${recipients.join(", ")}.`;
+
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:${PAPER};font-family:${FONT};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${PAPER};">
+    <tr><td align="center" style="padding:28px 12px;">
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;">
+        <tr><td style="padding:0 4px 18px;">
+          <span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#68823d;border:1px solid ${INK};vertical-align:middle;"></span>
+          <span style="margin-left:8px;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:${MUTED};vertical-align:middle;">${escapeHtml(company)} · New Booking</span>
+        </td></tr>
+        <tr><td style="padding:0 0 22px;background:${SURFACE};border:1px solid ${LINE};border-radius:12px;">
+          <div style="padding:22px 24px;">
+            <h1 style="margin:0 0 14px;font-size:20px;line-height:1.3;color:${INK};">${escapeHtml(callerLabel)} booked an appointment</h1>
+            <p style="margin:0 0 4px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:${MUTED};">Type</p>
+            <p style="margin:0 0 14px;font-size:14px;line-height:1.5;color:${INK};">${escapeHtml(appointmentType)}</p>
+            <p style="margin:0 0 4px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:${MUTED};">When</p>
+            <p style="margin:0;font-size:14px;line-height:1.5;color:${INK};">${escapeHtml(when)}</p>
+          </div>
+        </td></tr>
+        <tr><td style="padding:16px 4px 0;font-size:12px;line-height:1.6;color:${MUTED};">
+          ${escapeHtml(sentToLine)}
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+  const text = [
+    `${company} · New Booking`,
+    `${callerLabel} booked an appointment`,
+    "",
+    `Type: ${appointmentType}`,
+    `When: ${when}`,
+    "",
+    sentToLine,
+  ].join("\n");
+
+  return { subject, html, text };
+}

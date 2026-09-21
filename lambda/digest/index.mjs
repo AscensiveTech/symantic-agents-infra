@@ -1,5 +1,5 @@
 import { describeSendFailure, getDefaultSender, normalizeEmail } from "./email.mjs";
-import { renderDigest, renderNegativeSentimentAlert } from "./render.mjs";
+import { renderDigest, renderNegativeSentimentAlert, renderBookingAlert } from "./render.mjs";
 import { isDigestDue, normalizeDigestSettings, normalizeNegativeSentimentSettings } from "./schedule.mjs";
 
 const TEST_WINDOW_MS = 24 * 3_600_000;
@@ -192,6 +192,59 @@ export function createDigestHandler({
     return sentCount > 0 ? "sent" : "failed";
   }
 
+  // Same independent-of-digest-schedule pattern as runNegativeSentimentAlerts
+  // above, reusing the existing call-digest recipient list rather than its
+  // own dedicated settings/recipients - per the product decision, anyone who
+  // wants the periodic call digest also gets booking confirmations.
+  async function runBookingAlerts(store, workspace) {
+    const settings = normalizeDigestSettings(workspace.callDigest);
+    const recipients = recipientsFor(settings);
+    if (!recipients.length) return "no_recipients";
+    const pending = await store.listPendingBookingAlerts(workspace.workspaceId);
+    if (!pending.length) return "no_calls";
+
+    const send = await getSender();
+    let sentCount = 0;
+    let notifications = workspace.notifications ?? [];
+    for (const call of pending) {
+      const message = renderBookingAlert({
+        workspaceName: workspace.name,
+        call,
+        recipients,
+        timezone: settings.timezone,
+      });
+      let anySent = false;
+      for (const to of recipients) {
+        try {
+          await send({ to, ...message });
+          anySent = true;
+        } catch (error) {
+          log.error("Booking alert email failed", {
+            workspaceId: workspace.workspaceId,
+            callId: call.callId,
+            name: error?.name,
+            message: error?.message,
+          });
+        }
+      }
+      if (anySent) {
+        await store.markBookingAlerted(workspace.workspaceId, call.callId);
+        sentCount += 1;
+        const entry = {
+          id: `${workspace.workspaceId}-booking-${call.callId}`,
+          sentAt: now().toISOString(),
+          sender: senderAddress(),
+          recipients,
+          content: message.text ?? message.subject,
+          read: false,
+        };
+        await store.appendNotification(workspace.workspaceId, entry, notifications);
+        notifications = [entry, ...notifications].slice(0, 100);
+      }
+    }
+    return sentCount > 0 ? "sent" : "failed";
+  }
+
   async function sendTest(store, { workspaceId, recipient }) {
     const to = normalizeEmail(recipient);
     if (typeof workspaceId !== "string" || !workspaceId || !to) {
@@ -302,6 +355,7 @@ export function createDigestHandler({
     const current = now();
     const results = {};
     const alertResults = {};
+    const bookingResults = {};
     for (const workspace of await store.listDigestWorkspaces()) {
       try {
         const outcome = await runWorkspace(store, workspace, current);
@@ -328,10 +382,24 @@ export function createDigestHandler({
           message: error?.message,
         });
       }
+      // Independent of both the digest and the negative-sentiment alert
+      // above - a workspace can have any combination of the three on or off.
+      try {
+        const outcome = await runBookingAlerts(store, workspace);
+        bookingResults[outcome] = (bookingResults[outcome] ?? 0) + 1;
+      } catch (error) {
+        bookingResults.error = (bookingResults.error ?? 0) + 1;
+        log.error("Booking alert run failed", {
+          workspaceId: workspace.workspaceId,
+          name: error?.name,
+          message: error?.message,
+        });
+      }
     }
     log.info("Call summary run complete", results);
     log.info("Negative sentiment alert run complete", alertResults);
-    return { ...results, negativeSentimentAlerts: alertResults };
+    log.info("Booking alert run complete", bookingResults);
+    return { ...results, negativeSentimentAlerts: alertResults, bookingAlerts: bookingResults };
   };
 }
 
@@ -474,6 +542,27 @@ export function createDynamoDigestStore(client, commands, tableNames) {
         TableName: tableNames.calls,
         Key: marshall({ workspaceId, callId }),
         UpdateExpression: "SET negativeSentimentAlertedAt = :now",
+        ExpressionAttributeValues: marshall({ ":now": new Date().toISOString() }),
+      }));
+    },
+
+    // Same pattern as listPendingNegativeSentimentCalls/
+    // markNegativeSentimentAlerted above, keyed on bookingAlertedAt instead.
+    listPendingBookingAlerts(workspaceId) {
+      return queryAll(client, (startKey) => new commands.QueryCommand({
+        TableName: tableNames.calls,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        FilterExpression: "bookingAlertedAt = :null",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":null": null }),
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+    },
+
+    markBookingAlerted(workspaceId, callId) {
+      return client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "SET bookingAlertedAt = :now",
         ExpressionAttributeValues: marshall({ ":now": new Date().toISOString() }),
       }));
     },
