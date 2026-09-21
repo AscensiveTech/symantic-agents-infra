@@ -45,17 +45,21 @@ function call(overrides = {}) {
   };
 }
 
-function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], claimSucceeds = true, negativeSentimentCalls = [] } = {}) {
+function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], claimSucceeds = true, negativeSentimentCalls = [], pendingBookings = [], usageCallsByWorkspace = {}, usageAgentsByWorkspace = {} } = {}) {
   const log = [];
   const state = new Map(workspaces.map((workspace) => [workspace.workspaceId, { ...workspace }]));
   const pendingAlerts = new Map(negativeSentimentCalls.map((item) => [`${item.workspaceId}:${item.callId}`, { ...item }]));
+  const pendingBookingAlerts = new Map(pendingBookings.map((item) => [`${item.workspaceId}:${item.callId}`, { ...item }]));
   return {
     log,
     state,
     pendingAlerts,
+    pendingBookingAlerts,
     async listDigestWorkspaces() {
       return [...state.values()].filter((workspace) => (
-        workspace.callDigest?.enabled === true || workspace.negativeSentimentAlert?.enabled === true
+        workspace.callDigest?.enabled === true
+        || workspace.negativeSentimentAlert?.enabled === true
+        || workspace.usageThresholdAlert?.enabled !== false
       ));
     },
     async getWorkspace(workspaceId) {
@@ -73,6 +77,15 @@ function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], cl
     async markNegativeSentimentAlerted(workspaceId, callId) {
       log.push(["markNegativeSentimentAlerted", workspaceId, callId]);
       pendingAlerts.delete(`${workspaceId}:${callId}`);
+      return true;
+    },
+    async listPendingBookingAlerts(workspaceId) {
+      log.push(["listPendingBookingAlerts", workspaceId]);
+      return [...pendingBookingAlerts.values()].filter((item) => item.workspaceId === workspaceId);
+    },
+    async markBookingAlerted(workspaceId, callId) {
+      log.push(["markBookingAlerted", workspaceId, callId]);
+      pendingBookingAlerts.delete(`${workspaceId}:${callId}`);
       return true;
     },
     async listAgents() {
@@ -104,7 +117,23 @@ function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], cl
     },
     async appendNotification(workspaceId, entry, current) {
       log.push(["appendNotification", workspaceId, entry]);
-      state.get(workspaceId).notifications = [entry, ...(current ?? [])].slice(0, 100);
+      state.get(workspaceId).notifications = [entry, ...(current ?? [])];
+      return true;
+    },
+    async pruneOldNotifications(workspaceId, notifications) {
+      log.push(["pruneOldNotifications", workspaceId]);
+      state.get(workspaceId).notifications = notifications;
+      return true;
+    },
+    async listAgentsForUsage(workspaceId) {
+      return usageAgentsByWorkspace[workspaceId] ?? agents;
+    },
+    async listCallsForUsage(workspaceId) {
+      return usageCallsByWorkspace[workspaceId] ?? calls;
+    },
+    async saveUsageThresholdTracking(workspaceId, settingsValue) {
+      log.push(["saveUsageThresholdTracking", workspaceId, settingsValue]);
+      state.get(workspaceId).usageThresholdAlert = settingsValue;
       return true;
     },
   };
@@ -191,7 +220,7 @@ test("a due summary goes to every configured recipient, once each", async () => 
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 }, usageThresholdAlerts: { no_recipients: 1 }, notificationRetention: { nothing_expired: 1 } });
   assert.deepEqual(
     sender.sent.map((message) => message.to).sort(),
     ["dana@arcdental.com", "frontdesk@arcdental.com", "sam@arcdental.com"],
@@ -226,7 +255,7 @@ test("an interval with no calls sends nothing but still moves the window on", as
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { no_calls: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { no_calls: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 }, usageThresholdAlerts: { no_recipients: 1 }, notificationRetention: { empty: 1 } });
   assert.equal(store.state.get("ws-1").notifications, undefined);
   assert.equal(sender.sent.length, 0);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
@@ -242,7 +271,7 @@ test("skipIfEmpty:false sends a confirmation even when there are zero calls", as
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { sent: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 }, usageThresholdAlerts: { no_recipients: 1 }, notificationRetention: { nothing_expired: 1 } });
   assert.equal(sender.sent.length, 1);
   assert.match(sender.sent[0].html, /No new calls since your last check/);
   const run = store.state.get("ws-1").callDigestLastRun;
@@ -279,7 +308,7 @@ test("a summary that is not yet due does nothing", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { not_due: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { not_due: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 }, usageThresholdAlerts: { no_recipients: 1 }, notificationRetention: { empty: 1 } });
   assert.equal(sender.sent.length, 0);
   assert.equal(store.log.some(([kind]) => kind === "claim"), false);
 });
@@ -294,7 +323,7 @@ test("a workspace without a cursor starts its window now instead of mailing hist
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { initialized: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { initialized: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 }, usageThresholdAlerts: { no_recipients: 1 }, notificationRetention: { empty: 1 } });
   assert.equal(sender.sent.length, 0);
   assert.equal(store.state.get("ws-1").callDigestCursor, NOW.toISOString());
 });
@@ -306,7 +335,7 @@ test("when nobody could be emailed, the window is handed back for the next run",
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { failed: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { failed: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 }, usageThresholdAlerts: { no_recipients: 1 }, notificationRetention: { empty: 1 } });
   assert.equal(store.state.get("ws-1").callDigestCursor, previous);
   assert.equal(store.state.get("ws-1").callDigestLastRun.status, "failed");
   assert.match(store.state.get("ws-1").callDigestLastRun.error, /verified addresses/);
@@ -339,7 +368,7 @@ test("a window claimed by an overlapping run is never sent twice", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { claimed_elsewhere: 1, negativeSentimentAlerts: { disabled: 1 } });
+  assert.deepEqual(results, { claimed_elsewhere: 1, negativeSentimentAlerts: { disabled: 1 }, bookingAlerts: { no_calls: 1 }, usageThresholdAlerts: { no_recipients: 1 }, notificationRetention: { empty: 1 } });
   assert.equal(sender.sent.length, 0);
 });
 
@@ -356,7 +385,7 @@ test("one workspace failing does not stop the others", async () => {
 
   const results = await handlerFor(store, sender)({});
 
-  assert.deepEqual(results, { error: 1, sent: 1, negativeSentimentAlerts: { disabled: 2 } });
+  assert.deepEqual(results, { error: 1, sent: 1, negativeSentimentAlerts: { disabled: 2 }, bookingAlerts: { no_calls: 2 }, usageThresholdAlerts: { no_recipients: 2 }, notificationRetention: { empty: 1, nothing_expired: 1 } });
 });
 
 // --- negative-sentiment alerts ----------------------------------------------
@@ -404,6 +433,147 @@ test("a workspace with negative-sentiment alerts on (even with call-digest off) 
   assert.equal(notifications.length, 2);
   assert.deepEqual(new Set(notifications.map((n) => n.id)).size, 2);
   assert.ok(notifications.every((n) => n.recipients.includes("dana@arcdental.com")));
+});
+
+test("a pending booking sends a short confirmation email to the call-digest recipients and marks it", async () => {
+  const bookingCall = call({
+    outcome: "booked",
+    bookingSummary: { callerName: "Jordan Miles", service: "On-Site Visit", startTime: hoursBefore(-24) },
+    workspaceId: "ws-1",
+  });
+  const store = memoryStore({
+    workspaces: [workspace({ callDigest: settings({ recipients: ["dana@arcdental.com"] }) })],
+    pendingBookings: [bookingCall],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results.bookingAlerts, { sent: 1 });
+  assert.equal(sender.sent.length, 1);
+  const [message] = sender.sent;
+  assert.equal(message.to, "dana@arcdental.com");
+  assert.match(message.subject, /new booking - Jordan Miles/);
+  assert.match(message.text, /Type: On-Site Visit/);
+  assert.doesNotMatch(message.text, /transcript/i);
+  assert.equal(store.pendingBookingAlerts.size, 0);
+});
+
+test("booking alerts are skipped when there are no call-digest recipients configured", async () => {
+  const store = memoryStore({
+    workspaces: [workspace({ workspaceId: "no-recipients", callDigest: settings({ recipients: [] }) })],
+    pendingBookings: [call({ workspaceId: "no-recipients", bookingSummary: { callerName: "Jordan Miles", service: "Quick Call" } })],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.equal(results.bookingAlerts.no_recipients, 1);
+  assert.equal(sender.sent.length, 0);
+});
+
+// --- usage threshold alerts -------------------------------------------------
+
+function usageAgent(receptionistPlan = "starter") {
+  return { agentId: "agent-1", status: "active", configuration: { receptionistPlan } };
+}
+
+function usageCallOfMinutes(minutes) {
+  return {
+    callId: `usage-call-${minutes}`,
+    agentId: "agent-1",
+    startedAt: NOW.toISOString(),
+    durationMs: minutes * 60_000,
+    outcome: "answered",
+  };
+}
+
+test("usage threshold alert: enabled by default, fires once at 90%, once at 100%, then once daily while still over", async () => {
+  const workspaceId = "usage-ws";
+  const store = memoryStore({
+    workspaces: [workspace({ workspaceId, callDigest: settings({ enabled: false }) })],
+    usageAgentsByWorkspace: { [workspaceId]: [usageAgent()] },
+    usageCallsByWorkspace: { [workspaceId]: [usageCallOfMinutes(900)] }, // starter plan = 1000 min -> 90%
+  });
+  store.state.get(workspaceId).usageThresholdAlert = { enabled: true, recipients: ["owner@arcdental.com"] };
+  const sender = recordingSender();
+  const handler = handlerFor(store, sender);
+
+  const first = await handler({});
+  assert.equal(first.usageThresholdAlerts.sent, 1);
+  assert.equal(sender.sent.length, 1);
+  assert.match(sender.sent[0].subject, /90%/);
+  assert.equal(store.state.get(workspaceId).usageThresholdAlert.sentAt90, true);
+  assert.equal(store.state.get(workspaceId).usageThresholdAlert.sentAt100, false);
+
+  // Same day, already checked - no second email even though still >= 90%.
+  const second = await handler({});
+  assert.equal(second.usageThresholdAlerts.already_checked_today, 1);
+  assert.equal(sender.sent.length, 1);
+
+  // A new day, now over 100% - fires the 100% email.
+  store.state.get(workspaceId).usageThresholdAlert.lastCheckedOn = "2026-09-14";
+  const overStore = { ...store, listCallsForUsage: async () => [usageCallOfMinutes(1200)] };
+  const overHandler = handlerFor(overStore, sender);
+  const third = await overHandler({});
+  assert.equal(third.usageThresholdAlerts.sent, 1);
+  assert.equal(sender.sent.length, 2);
+  assert.match(sender.sent[1].subject, /100%|over plan limit/);
+  assert.equal(store.state.get(workspaceId).usageThresholdAlert.sentAt100, true);
+
+  // Another new day, still over 100% - the once-daily repeat fires. (The
+  // clock is stubbed to a fixed NOW in this test, so lastDailySentOn from
+  // the previous check has to be rolled back by hand too, exactly like
+  // lastCheckedOn - in real usage both would naturally be "yesterday" once
+  // a real day has passed.)
+  store.state.get(workspaceId).usageThresholdAlert.lastCheckedOn = "2026-09-14";
+  store.state.get(workspaceId).usageThresholdAlert.lastDailySentOn = "2026-09-14";
+  const fourth = await overHandler({});
+  assert.equal(fourth.usageThresholdAlerts.sent, 1);
+  assert.equal(sender.sent.length, 3);
+});
+
+test("a workspace with every alert type off (including usage threshold) is never scanned at all", async () => {
+  const workspaceId = "usage-ws-2";
+  const store = memoryStore({
+    workspaces: [workspace({ workspaceId, callDigest: settings({ enabled: false }), usageThresholdAlert: { enabled: false, recipients: ["owner@arcdental.com"] } })],
+  });
+  const sender = recordingSender();
+  const results = await handlerFor(store, sender)({});
+  assert.deepEqual(results.usageThresholdAlerts, {});
+  assert.equal(sender.sent.length, 0);
+});
+
+test("usage threshold alert is skipped when explicitly disabled on an otherwise-scanned workspace", async () => {
+  const workspaceId = "usage-ws-3";
+  const store = memoryStore({
+    workspaces: [workspace({ workspaceId, usageThresholdAlert: { enabled: false, recipients: ["owner@arcdental.com"] } })],
+  });
+  const sender = recordingSender();
+  const results = await handlerFor(store, sender)({});
+  assert.equal(results.usageThresholdAlerts.disabled, 1);
+  assert.equal(sender.sent.length, 0);
+});
+
+test("notification retention: deletes notifications older than 12 months, keeps newer ones", async () => {
+  const workspaceId = "retention-ws";
+  const old = new Date(NOW.getTime() - 400 * 24 * 3_600_000).toISOString(); // > 12 months
+  const recent = new Date(NOW.getTime() - 10 * 24 * 3_600_000).toISOString();
+  const store = memoryStore({
+    workspaces: [workspace({
+      workspaceId,
+      callDigest: settings({ enabled: false }),
+      notifications: [
+        { id: "old-1", sentAt: old, content: "old" },
+        { id: "recent-1", sentAt: recent, content: "recent" },
+      ],
+    })],
+  });
+  const results = await handlerFor(store, recordingSender())({});
+  assert.equal(results.notificationRetention.pruned, 1);
+  const kept = store.state.get(workspaceId).notifications;
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].id, "recent-1");
 });
 
 test("negative-sentiment alerts are skipped when disabled or when there are no recipients", async () => {

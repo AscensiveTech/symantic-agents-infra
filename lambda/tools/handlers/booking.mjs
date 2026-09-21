@@ -6,6 +6,7 @@ import {
   stableId,
 } from "./records.mjs";
 import { resolveTimeRange } from "./time.mjs";
+import { enforceMinimumLeadTime, paddedProviderRange, resolveAppointmentType } from "./appointment-types.mjs";
 
 export async function handleFindAppointment(input, { store }) {
   const callerPhone = normalizePhone(
@@ -71,10 +72,28 @@ export async function handleCreateBooking(input, {
 
   const profile = await store.getBusinessProfile(input.workspaceId);
   const timezone = profile?.timezone || "UTC";
-  const range = resolveTimeRange(input, timezone, now);
+  const agent = await store.getAgent(input.workspaceId, input.agentId);
+  const appointmentType = resolveAppointmentType(agent, input.appointmentType);
+
+  // When a configured type matches, its Duration is authoritative - the
+  // agent isn't meant to override how long a "Quick Call" or "On-Site
+  // Visit" runs on a per-call basis.
+  const range = resolveTimeRange(
+    appointmentType
+      ? { ...input, durationMinutes: appointmentType.durationMin, endTime: undefined }
+      : input,
+    timezone,
+    now,
+  );
+  if (appointmentType) enforceMinimumLeadTime(appointmentType, range.startTimeUtc, now);
+  // Before/After buffers only ever reach the provider-facing calls below -
+  // the appointment record keeps the unpadded, spoken range (see
+  // paddedProviderRange's own comment).
+  const providerRange = appointmentType ? paddedProviderRange(range, appointmentType) : range;
+
   const availability = await calendar.getAvailability({
     workspaceId: input.workspaceId,
-    ...range,
+    ...providerRange,
   });
   requireAvailable(availability);
 
@@ -84,9 +103,9 @@ export async function handleCreateBooking(input, {
   );
   const providerBooking = await calendar.createBooking({
     workspaceId: input.workspaceId,
-    ...range,
+    ...providerRange,
     ...providerIds,
-    service: stringOrUndefined(input.service),
+    service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service),
     description: stringOrUndefined(input.description),
     location: stringOrUndefined(input.location) || profile?.address || undefined,
     customer: normalizeCustomer(input.customer),
@@ -107,7 +126,7 @@ export async function handleCreateBooking(input, {
     provider: providerBooking.provider,
     providerEventId: providerBooking.providerEventId,
     htmlLink: providerBooking.htmlLink,
-    service: stringOrUndefined(input.service) || "Appointment",
+    service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service) || "Appointment",
     customer: normalizeCustomer(input.customer),
     ...range,
     status: "confirmed",

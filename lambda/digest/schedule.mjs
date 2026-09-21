@@ -73,6 +73,26 @@ export function normalizeNegativeSentimentSettings(value) {
   };
 }
 
+const USAGE_THRESHOLD_MAX_RECIPIENTS = 5;
+
+// Enabled by default (absent, or not explicitly false, both read as on) -
+// the one alert type on this page that ships on rather than off, per the
+// product decision.
+export function normalizeUsageThresholdSettings(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    enabled: source.enabled !== false,
+    recipients: Array.isArray(source.recipients)
+      ? source.recipients.filter((item) => typeof item === "string").slice(0, USAGE_THRESHOLD_MAX_RECIPIENTS)
+      : [],
+    period: typeof source.period === "string" ? source.period : null,
+    sentAt90: source.sentAt90 === true,
+    sentAt100: source.sentAt100 === true,
+    lastDailySentOn: typeof source.lastDailySentOn === "string" ? source.lastDailySentOn : null,
+    lastCheckedOn: typeof source.lastCheckedOn === "string" ? source.lastCheckedOn : null,
+  };
+}
+
 export function localParts(date, timezone) {
   const zone = isValidTimezone(timezone) ? timezone : "UTC";
   const parts = new Intl.DateTimeFormat("en-US", {

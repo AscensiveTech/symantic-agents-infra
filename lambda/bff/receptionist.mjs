@@ -105,7 +105,13 @@ const CALENDAR_TOOLS = [
       },
       durationMinutes: {
         type: "number",
-        description: "Appointment duration in minutes when endTime is omitted.",
+        description: "Appointment duration in minutes when endTime is omitted and no appointmentType is given.",
+      },
+      appointmentType: {
+        type: "string",
+        description:
+          "Name of one of this agent's configured appointment types, exactly as listed in # APPOINTMENT TYPES - "
+          + "when given, its Duration and Minimum Lead Time are authoritative and durationMinutes is ignored.",
       },
     },
     required: ["startTime"],
@@ -126,11 +132,17 @@ const CALENDAR_TOOLS = [
       },
       durationMinutes: {
         type: "number",
-        description: "Appointment duration in minutes when endTime is omitted.",
+        description: "Appointment duration in minutes when endTime is omitted and no appointmentType is given.",
+      },
+      appointmentType: {
+        type: "string",
+        description:
+          "Name of one of this agent's configured appointment types, exactly as listed in # APPOINTMENT TYPES - "
+          + "when given, its Duration and Minimum Lead Time are authoritative and durationMinutes is ignored.",
       },
       service: {
         type: "string",
-        description: "Service the caller is booking.",
+        description: "Service the caller is booking - omit when appointmentType is given, since its name is used instead.",
       },
       description: {
         type: "string",
@@ -249,11 +261,17 @@ export function buildReceptionistPrompt(agent, profile) {
   const hoursLine = isBusinessHours(profile?.businessHours)
     ? formatBusinessHours(profile.businessHours)
     : (text(profile?.hours) || "Not provided");
+  const holidaysLine = formatHolidayClosures(profile?.holidays);
+  const contactEmailsLine = formatContactEmails(profile?.contactEmails);
+  const serviceAreaLine = formatServiceAreas(profile?.serviceAreas);
   const bookingInstruction = behavior.booking === true
     ? "Booking is enabled. Check availability before offering a time, and create a booking only after explicit caller confirmation."
     : "Booking is disabled. Do not promise or create appointments; take a message for office follow-up.";
+  const appointmentTypesLine = formatAppointmentTypes(behavior.appointmentTypes);
   const emergencyRules = formatEmergencyRules(behavior.emergencyRules);
   const escalation = text(behavior.escalation);
+  const exampleDialogues = text(behavior.exampleDialogues);
+  const finalReminders = text(behavior.finalReminders);
 
   return [
     "# ROLE",
@@ -291,8 +309,23 @@ export function buildReceptionistPrompt(agent, profile) {
     `- Address: ${text(profile?.address) || "Not provided"}`,
     `- Timezone: ${text(profile?.timezone) || "UTC"}`,
     `- Hours: ${hoursLine}`,
+    ...(holidaysLine ? [`- Holiday closures: ${holidaysLine}`] : []),
     "- Current local time at the start of this call: {{currentTime}} ({{timezone}}). "
       + "Treat this as the authoritative clock when the caller asks whether you are open right now.",
+    ...(contactEmailsLine ? ["", "# CONTACT EMAILS", contactEmailsLine] : []),
+    ...(serviceAreaLine
+      ? [
+        "",
+        "# SERVICE AREA",
+        `Published coverage: ${serviceAreaLine}`,
+        "- If a caller's location matches or is near one of these areas, say it's likely within the "
+          + "service area and that the team will confirm the exact address.",
+        "- If it's outside these areas, don't refuse - say it's outside the generally published "
+          + "service area, but offer to take their details so the team can confirm.",
+        "- Never guarantee coverage for an exact address, quote a mileage/travel-time radius, or "
+          + "guess which office serves a location.",
+      ]
+      : []),
     "",
     "# APPROVED CALLER INTENTS",
     intents || "Use the approved FAQs and take a message for anything else.",
@@ -303,6 +336,15 @@ export function buildReceptionistPrompt(agent, profile) {
     ...(text(behavior.restrictions)
       ? ["# RESTRICTIONS - WHAT NOT TO SAY OR DO", text(behavior.restrictions), ""]
       : []),
+    ...(exampleDialogues
+      ? [
+        "# EXAMPLE DIALOGUES",
+        "These are illustrative only - match this tone and approach, but never read them aloud "
+          + "verbatim or treat their specifics (names, dates, numbers) as real.",
+        exampleDialogues,
+        "",
+      ]
+      : []),
     "# POLICIES",
     text(profile?.policies) || "No additional policies are configured.",
     "",
@@ -311,6 +353,7 @@ export function buildReceptionistPrompt(agent, profile) {
     "",
     "# BOOKING",
     bookingInstruction,
+    ...(appointmentTypesLine ? ["", "# APPOINTMENT TYPES", appointmentTypesLine] : []),
     "",
     "# EMERGENCY & ESCALATION",
     [emergencyRules, escalation].filter(Boolean).join("\n") ||
@@ -350,6 +393,11 @@ export function buildReceptionistPrompt(agent, profile) {
     + "request is clearly finished, say a brief polite closing line and call the end_call tool. "
     + "Don't let the call trail off in silence, cut the caller off mid-sentence, or keep "
     + "talking after they're done.",
+    // Deliberately last - models tend to weigh instructions stated most
+    // recently more heavily, so this short recap of the agent's own
+    // already-configured rules reinforces what matters most right before
+    // the prompt ends.
+    ...(finalReminders ? ["", "# FINAL REMINDERS", finalReminders] : []),
   ].join("\n");
 }
 
@@ -537,6 +585,57 @@ export function resolveConfiguredVoiceId(configuration, resolveVoiceId) {
     if (cloned) return cloned;
   }
   return resolveVoiceId(configuration?.voice);
+}
+
+function formatHolidayClosures(holidays) {
+  if (!Array.isArray(holidays) || !holidays.length) return "";
+  return holidays
+    .filter((holiday) => holiday?.closed && text(holiday?.name) && text(holiday?.date))
+    .map((holiday) => `${text(holiday.name)} (${text(holiday.date)})`)
+    .join(", ");
+}
+
+function formatContactEmails(contactEmails) {
+  if (!Array.isArray(contactEmails) || !contactEmails.length) return "";
+  return contactEmails
+    .filter((entry) => text(entry?.email))
+    .map((entry) => {
+      const label = text(entry?.label);
+      return label ? `- ${label}: ${text(entry.email)}` : `- ${text(entry.email)}`;
+    })
+    .join("\n");
+}
+
+function formatServiceAreas(serviceAreas) {
+  if (!Array.isArray(serviceAreas) || !serviceAreas.length) return "";
+  return serviceAreas.map(text).filter(Boolean).join(", ");
+}
+
+// Caller-facing only - Name, Duration, and Minimum Lead Time. The
+// Before/After calendar buffers are deliberately never rendered here or
+// anywhere else in the prompt - they only ever reach the actual booking
+// tool call (see lambda/tools/handlers/appointment-types.mjs).
+function formatAppointmentTypes(appointmentTypes) {
+  if (!Array.isArray(appointmentTypes) || !appointmentTypes.length) return "";
+  return appointmentTypes
+    .filter((type) => text(type?.name))
+    .map((type) => {
+      const duration = formatMinutesLabel(type.durationMin);
+      const leadTime = Number(type.minimumLeadTimeMin) > 0
+        ? `, must be booked at least ${formatMinutesLabel(type.minimumLeadTimeMin)} in advance`
+        : "";
+      return `- ${text(type.name)} (${duration}${leadTime})`;
+    })
+    .join("\n");
+}
+
+function formatMinutesLabel(minutes) {
+  const value = Number(minutes) || 0;
+  if (value % 60 === 0 && value > 0) {
+    const hours = value / 60;
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${value} minutes`;
 }
 
 function formatEmergencyRules(rules) {

@@ -1,6 +1,10 @@
 import { describeSendFailure, getDefaultSender, normalizeEmail } from "./email.mjs";
-import { renderDigest, renderNegativeSentimentAlert } from "./render.mjs";
-import { isDigestDue, normalizeDigestSettings, normalizeNegativeSentimentSettings } from "./schedule.mjs";
+import { renderDigest, renderNegativeSentimentAlert, renderBookingAlert, renderUsageThresholdAlert } from "./render.mjs";
+import { isDigestDue, normalizeDigestSettings, normalizeNegativeSentimentSettings, normalizeUsageThresholdSettings } from "./schedule.mjs";
+// Reused rather than duplicated - see lambda_digest.tf for how the whole
+// bff module set is packaged alongside this Lambda's own files so this
+// import resolves at runtime, same pattern as lambda/kb-refresh/index.mjs.
+import { buildUsage, resolveAccountPlan } from "../bff/receptionist-billing.mjs";
 
 const TEST_WINDOW_MS = 24 * 3_600_000;
 
@@ -186,10 +190,235 @@ export function createDigestHandler({
           read: false,
         };
         await store.appendNotification(workspace.workspaceId, entry, notifications);
-        notifications = [entry, ...notifications].slice(0, 100);
+        notifications = [entry, ...notifications];
       }
     }
     return sentCount > 0 ? "sent" : "failed";
+  }
+
+  // Same independent-of-digest-schedule pattern as runNegativeSentimentAlerts
+  // above, reusing the existing call-digest recipient list rather than its
+  // own dedicated settings/recipients - per the product decision, anyone who
+  // wants the periodic call digest also gets booking confirmations.
+  async function runBookingAlerts(store, workspace) {
+    const settings = normalizeDigestSettings(workspace.callDigest);
+    const recipients = recipientsFor(settings);
+    if (!recipients.length) return "no_recipients";
+    const pending = await store.listPendingBookingAlerts(workspace.workspaceId);
+    if (!pending.length) return "no_calls";
+
+    const send = await getSender();
+    let sentCount = 0;
+    let notifications = workspace.notifications ?? [];
+    for (const call of pending) {
+      const message = renderBookingAlert({
+        workspaceName: workspace.name,
+        call,
+        recipients,
+        timezone: settings.timezone,
+      });
+      let anySent = false;
+      for (const to of recipients) {
+        try {
+          await send({ to, ...message });
+          anySent = true;
+        } catch (error) {
+          log.error("Booking alert email failed", {
+            workspaceId: workspace.workspaceId,
+            callId: call.callId,
+            name: error?.name,
+            message: error?.message,
+          });
+        }
+      }
+      if (anySent) {
+        await store.markBookingAlerted(workspace.workspaceId, call.callId);
+        sentCount += 1;
+        const entry = {
+          id: `${workspace.workspaceId}-booking-${call.callId}`,
+          sentAt: now().toISOString(),
+          sender: senderAddress(),
+          recipients,
+          content: message.text ?? message.subject,
+          read: false,
+        };
+        await store.appendNotification(workspace.workspaceId, entry, notifications);
+        notifications = [entry, ...notifications];
+      }
+    }
+    return sentCount > 0 ? "sent" : "failed";
+  }
+
+  // Deletes notifications older than 12 months from sentAt - real deletion,
+  // not just a display cap (see appendNotification's own comment above).
+  // Runs every tick against whatever `notifications` listDigestWorkspaces
+  // already projected, so it's a cheap in-memory filter, no extra read.
+  async function runNotificationRetention(store, workspace) {
+    const all = Array.isArray(workspace.notifications) ? workspace.notifications : [];
+    if (!all.length) return "empty";
+    const cutoff = new Date(now());
+    cutoff.setMonth(cutoff.getMonth() - 12);
+    const kept = all.filter((entry) => {
+      const sentAt = entry?.sentAt ? new Date(entry.sentAt) : null;
+      return !sentAt || Number.isNaN(sentAt.getTime()) || sentAt >= cutoff;
+    });
+    if (kept.length === all.length) return "nothing_expired";
+    await store.pruneOldNotifications(workspace.workspaceId, kept);
+    return "pruned";
+  }
+
+  function usageComputationInputs(usage) {
+    const allowance = usage.minuteAllowance;
+    return {
+      usagePercent: allowance ? usage.billingCycle.minutes / allowance : 0,
+      minutesUsed: usage.billingCycle.minutes,
+      minuteAllowance: allowance,
+      overageMinutes: usage.billingCycle.overageMinutes,
+      overageCharge: usage.billingCycle.overageCharge,
+      overagePerMinute: usage.overagePerMinute ?? 0.5,
+      cycleStartsOn: usage.billingCycle.startsOn,
+      cycleEndsOn: usage.billingCycle.endsOn,
+    };
+  }
+
+  // Independent of the other alert types above, same per-tick scan - but
+  // the actual usage computation (fetching every call + every agent for the
+  // workspace, same as the Billing & Usage page) only runs once per
+  // workspace per calendar day, not every 5-minute tick, since it's a much
+  // heavier read than the other alert checks. 90%/100% don't need
+  // minute-level detection to satisfy "send once when crossed", and the
+  // post-100% repeat is explicitly already a once-daily email.
+  async function runUsageThresholdAlerts(store, workspace) {
+    const settings = normalizeUsageThresholdSettings(workspace.usageThresholdAlert);
+    if (!settings.enabled) return "disabled";
+    const recipients = recipientsFor(settings);
+    if (!recipients.length) return "no_recipients";
+
+    const timezone = normalizeDigestSettings(workspace.callDigest).timezone;
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(now());
+    if (settings.lastCheckedOn === today) return "already_checked_today";
+
+    const [fullWorkspace, agents, calls] = await Promise.all([
+      store.getWorkspace(workspace.workspaceId),
+      store.listAgentsForUsage(workspace.workspaceId),
+      store.listCallsForUsage(workspace.workspaceId),
+    ]);
+    const plan = resolveAccountPlan(agents, fullWorkspace);
+    const usage = buildUsage(calls, { now: now(), timezone, plan });
+
+    let tracking = settings;
+    if (tracking.period !== usage.billingCycle.period) {
+      tracking = { ...settings, period: usage.billingCycle.period, sentAt90: false, sentAt100: false, lastDailySentOn: null };
+    }
+
+    if (usage.minuteAllowance == null) {
+      await store.saveUsageThresholdTracking(workspace.workspaceId, { ...tracking, lastCheckedOn: today });
+      return "no_cap";
+    }
+
+    const inputs = usageComputationInputs(usage);
+    let trigger = null;
+    if (inputs.usagePercent >= 1) {
+      trigger = !tracking.sentAt100 ? "100" : (tracking.lastDailySentOn !== today ? "daily" : null);
+    } else if (inputs.usagePercent >= 0.9 && !tracking.sentAt90) {
+      trigger = "90";
+    }
+
+    if (!trigger) {
+      await store.saveUsageThresholdTracking(workspace.workspaceId, { ...tracking, lastCheckedOn: today });
+      return "no_trigger";
+    }
+
+    const message = renderUsageThresholdAlert({
+      workspaceName: workspace.name,
+      trigger,
+      ...inputs,
+      recipients,
+      timezone,
+    });
+    const send = await getSender();
+    let anySent = false;
+    for (const to of recipients) {
+      try {
+        await send({ to, ...message });
+        anySent = true;
+      } catch (error) {
+        log.error("Usage threshold alert email failed", {
+          workspaceId: workspace.workspaceId,
+          trigger,
+          name: error?.name,
+          message: error?.message,
+        });
+      }
+    }
+
+    const nextTracking = {
+      ...tracking,
+      lastCheckedOn: today,
+      sentAt90: trigger === "90" ? true : tracking.sentAt90,
+      sentAt100: trigger === "100" ? true : tracking.sentAt100,
+      lastDailySentOn: trigger === "100" || trigger === "daily" ? today : tracking.lastDailySentOn,
+    };
+    await store.saveUsageThresholdTracking(workspace.workspaceId, nextTracking);
+
+    if (anySent) {
+      const entry = {
+        id: `${workspace.workspaceId}-usage-${trigger}-${today}`,
+        sentAt: now().toISOString(),
+        sender: senderAddress(),
+        recipients,
+        content: message.text ?? message.subject,
+        read: false,
+      };
+      await store.appendNotification(workspace.workspaceId, entry, workspace.notifications ?? []);
+      return "sent";
+    }
+    return "failed";
+  }
+
+  async function sendUsageThresholdTest(store, { workspaceId, recipient }) {
+    const to = normalizeEmail(recipient);
+    if (typeof workspaceId !== "string" || !workspaceId || !to) {
+      return { sent: false, error: "A workspace and a valid recipient are required." };
+    }
+    const [workspace, agents, calls] = await Promise.all([
+      store.getWorkspace(workspaceId),
+      store.listAgentsForUsage(workspaceId),
+      store.listCallsForUsage(workspaceId),
+    ]);
+    if (!workspace) return { sent: false, error: "Workspace not found." };
+    const timezone = normalizeDigestSettings(workspace.callDigest).timezone;
+    const plan = resolveAccountPlan(agents, workspace);
+    const usage = buildUsage(calls, { now: now(), timezone, plan });
+    const inputs = usageComputationInputs(usage);
+    const trigger = inputs.usagePercent >= 1 ? "100" : "90";
+    const message = renderUsageThresholdAlert({
+      workspaceName: workspace.name,
+      trigger,
+      ...inputs,
+      recipients: [to],
+      timezone,
+    });
+    try {
+      await (await getSender())({ to, ...message });
+      await store.appendNotification(workspaceId, {
+        id: `${workspaceId}-usage-test-${now().getTime()}`,
+        sentAt: now().toISOString(),
+        sender: senderAddress(),
+        recipients: [to],
+        content: message.text ?? message.subject,
+        test: true,
+        read: false,
+      }, workspace.notifications ?? []);
+      return { sent: true, to };
+    } catch (error) {
+      log.error("Test usage threshold alert email failed", {
+        workspaceId,
+        name: error?.name,
+        message: error?.message,
+      });
+      return { sent: false, to, error: describeSendFailure(error) };
+    }
   }
 
   async function sendTest(store, { workspaceId, recipient }) {
@@ -298,10 +527,14 @@ export function createDigestHandler({
     const store = await getStore();
     if (event?.action === "send-test") return sendTest(store, event);
     if (event?.action === "send-negative-sentiment-test") return sendNegativeSentimentTest(store, event);
+    if (event?.action === "send-usage-threshold-test") return sendUsageThresholdTest(store, event);
 
     const current = now();
     const results = {};
     const alertResults = {};
+    const bookingResults = {};
+    const usageResults = {};
+    const pruneResults = {};
     for (const workspace of await store.listDigestWorkspaces()) {
       try {
         const outcome = await runWorkspace(store, workspace, current);
@@ -328,10 +561,58 @@ export function createDigestHandler({
           message: error?.message,
         });
       }
+      // Independent of both the digest and the negative-sentiment alert
+      // above - a workspace can have any combination of the three on or off.
+      try {
+        const outcome = await runBookingAlerts(store, workspace);
+        bookingResults[outcome] = (bookingResults[outcome] ?? 0) + 1;
+      } catch (error) {
+        bookingResults.error = (bookingResults.error ?? 0) + 1;
+        log.error("Booking alert run failed", {
+          workspaceId: workspace.workspaceId,
+          name: error?.name,
+          message: error?.message,
+        });
+      }
+      // Independent of everything above - can be on regardless of any other
+      // alert's state, and defaults to on for every workspace.
+      try {
+        const outcome = await runUsageThresholdAlerts(store, workspace);
+        usageResults[outcome] = (usageResults[outcome] ?? 0) + 1;
+      } catch (error) {
+        usageResults.error = (usageResults.error ?? 0) + 1;
+        log.error("Usage threshold alert run failed", {
+          workspaceId: workspace.workspaceId,
+          name: error?.name,
+          message: error?.message,
+        });
+      }
+      // Real 12-month deletion, not a display cap - see
+      // runNotificationRetention's own comment above.
+      try {
+        const outcome = await runNotificationRetention(store, workspace);
+        pruneResults[outcome] = (pruneResults[outcome] ?? 0) + 1;
+      } catch (error) {
+        pruneResults.error = (pruneResults.error ?? 0) + 1;
+        log.error("Notification retention run failed", {
+          workspaceId: workspace.workspaceId,
+          name: error?.name,
+          message: error?.message,
+        });
+      }
     }
     log.info("Call summary run complete", results);
     log.info("Negative sentiment alert run complete", alertResults);
-    return { ...results, negativeSentimentAlerts: alertResults };
+    log.info("Booking alert run complete", bookingResults);
+    log.info("Usage threshold alert run complete", usageResults);
+    log.info("Notification retention run complete", pruneResults);
+    return {
+      ...results,
+      negativeSentimentAlerts: alertResults,
+      bookingAlerts: bookingResults,
+      usageThresholdAlerts: usageResults,
+      notificationRetention: pruneResults,
+    };
   };
 }
 
@@ -414,15 +695,20 @@ export function createDynamoDigestStore(client, commands, tableNames) {
     listDigestWorkspaces() {
       return queryAll(client, (startKey) => new commands.ScanCommand({
         TableName: tableNames.workspaces,
-        FilterExpression: "#digest.#enabled = :true OR #alert.#enabled = :true",
-        ProjectionExpression: "workspaceId, #name, #digest, callDigestCursor, notifications, #alert",
+        // usageThresholdAlert defaults to enabled when absent (a workspace
+        // that has never touched this setting is still "on" by default per
+        // the product decision), so it needs its own not-explicitly-false
+        // clause rather than an enabled=true check like the other two.
+        FilterExpression: "#digest.#enabled = :true OR #alert.#enabled = :true OR #usage.#enabled <> :false OR attribute_not_exists(#usage)",
+        ProjectionExpression: "workspaceId, #name, #digest, callDigestCursor, notifications, #alert, #usage",
         ExpressionAttributeNames: {
           "#digest": "callDigest",
           "#alert": "negativeSentimentAlert",
+          "#usage": "usageThresholdAlert",
           "#enabled": "enabled",
           "#name": "name",
         },
-        ExpressionAttributeValues: marshall({ ":true": true }),
+        ExpressionAttributeValues: marshall({ ":true": true, ":false": false }),
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
       }));
     },
@@ -478,6 +764,27 @@ export function createDynamoDigestStore(client, commands, tableNames) {
       }));
     },
 
+    // Same pattern as listPendingNegativeSentimentCalls/
+    // markNegativeSentimentAlerted above, keyed on bookingAlertedAt instead.
+    listPendingBookingAlerts(workspaceId) {
+      return queryAll(client, (startKey) => new commands.QueryCommand({
+        TableName: tableNames.calls,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        FilterExpression: "bookingAlertedAt = :null",
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":null": null }),
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+    },
+
+    markBookingAlerted(workspaceId, callId) {
+      return client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "SET bookingAlertedAt = :now",
+        ExpressionAttributeValues: marshall({ ":now": new Date().toISOString() }),
+      }));
+    },
+
     async listAgents(workspaceId) {
       const agents = await queryAll(client, (startKey) => new commands.QueryCommand({
         TableName: tableNames.agents,
@@ -488,6 +795,54 @@ export function createDynamoDigestStore(client, commands, tableNames) {
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
       }));
       return agents.filter((agent) => typeof agent.agentId === "string");
+    },
+
+    // Fuller agent projection than listAgents above - only used by the
+    // usage-threshold alert's once-a-day check (see runUsageThresholdAlerts),
+    // which needs each agent's status + configuration.receptionistPlan to
+    // call resolveAccountPlan the same way the Billing & Usage page does.
+    async listAgentsForUsage(workspaceId) {
+      const agents = await queryAll(client, (startKey) => new commands.QueryCommand({
+        TableName: tableNames.agents,
+        KeyConditionExpression: "workspaceId = :workspaceId",
+        ProjectionExpression: "agentId, #status, configuration",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+      return agents.filter((agent) => typeof agent.agentId === "string");
+    },
+
+    // Mirrors listCallsForUsage in lambda/bff/index.mjs - same table, same
+    // lean projection, same 20k cap - kept as a separate copy here rather
+    // than a shared export since the two Lambdas' store factories aren't
+    // otherwise unified.
+    async listCallsForUsage(workspaceId) {
+      const items = [];
+      let exclusiveStartKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tableNames.calls,
+          KeyConditionExpression: "workspaceId = :workspaceId",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+          ConsistentRead: false,
+          ProjectionExpression: "callId, agentId, startedAt, createdAt, durationMs, outcome, demoSeed",
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map((item) => unmarshall(item)));
+        exclusiveStartKey = result.LastEvaluatedKey;
+        if (items.length >= 20_000) break;
+      } while (exclusiveStartKey);
+      return items;
+    },
+
+    async saveUsageThresholdTracking(workspaceId, settings) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: "SET usageThresholdAlert = :alert",
+        ExpressionAttributeValues: marshall({ ":alert": settings }),
+      }));
     },
 
     async listAdminEmails(workspaceId) {
@@ -542,12 +897,27 @@ export function createDynamoDigestStore(client, commands, tableNames) {
       });
     },
 
-    // The last 100 sent notifications, newest first - kept as a single list
-    // on the workspace item so the settings page can show a history without
-    // a dedicated table. `current` is passed in by the caller (already held
-    // from the same scan that drove this run) to avoid an extra read.
+    // Sent notifications, newest first - kept as a single list on the
+    // workspace item so the settings page can show a history without a
+    // dedicated table. No count cap here - retention is time-based (12
+    // months, see pruneOldNotifications below), not a fixed item count, so
+    // a busy workspace doesn't lose real history just from volume.
+    // `current` is passed in by the caller (already held from the same scan
+    // that drove this run) to avoid an extra read.
     appendNotification(workspaceId, entry, current) {
-      const notifications = [entry, ...(Array.isArray(current) ? current : [])].slice(0, 100);
+      const notifications = [entry, ...(Array.isArray(current) ? current : [])];
+      return client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: "SET notifications = :list",
+        ExpressionAttributeValues: marshall({ ":list": notifications }),
+      }));
+    },
+
+    // Removes notifications older than 12 months from `sentAt`. Called once
+    // per workspace per tick, alongside the other independent-of-digest
+    // per-tick jobs.
+    pruneOldNotifications(workspaceId, notifications) {
       return client.send(new commands.UpdateItemCommand({
         TableName: tableNames.workspaces,
         Key: marshall({ workspaceId }),

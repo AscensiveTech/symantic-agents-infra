@@ -5,9 +5,37 @@
 
 data "archive_file" "digest" {
   type        = "zip"
-  source_dir  = "${path.module}/lambda/digest"
   output_path = "${path.module}/.terraform/digest.zip"
-  excludes    = ["index.test.mjs"]
+
+  # digest's own files now live under digest/ in the zip (not the zip root)
+  # so its "../bff/..." import resolves the same way it does on disk in this
+  # repo - identical relative layout to lambda_kb_refresh.tf's own
+  # kb-refresh/ + bff/ sibling-folder packaging.
+  dynamic "source" {
+    for_each = toset([
+      for f in fileset("${path.module}/lambda/digest", "**") : f
+      if !can(regex("\\.test\\.mjs$", f))
+    ])
+    content {
+      content  = file("${path.module}/lambda/digest/${source.value}")
+      filename = "digest/${source.value}"
+    }
+  }
+
+  # digest imports lambda/bff/receptionist-billing.mjs directly (to reuse
+  # buildUsage/resolveAccountPlan for the usage-threshold alert rather than
+  # duplicating the billing/plan math), so the whole bff module set rides
+  # along in the same zip - identical pattern to lambda_kb_refresh.tf.
+  dynamic "source" {
+    for_each = toset([
+      for f in fileset("${path.module}/lambda/bff", "*.mjs") : f
+      if !can(regex("\\.test\\.mjs$", f))
+    ])
+    content {
+      content  = file("${path.module}/lambda/bff/${source.value}")
+      filename = "bff/${source.value}"
+    }
+  }
 }
 
 resource "aws_iam_role" "digest_lambda" {
@@ -83,7 +111,7 @@ resource "aws_lambda_function" "digest" {
   description   = "Scheduled call-summary emails, plus on-demand test sends from the BFF."
   role          = aws_iam_role.digest_lambda.arn
   runtime       = "nodejs20.x"
-  handler       = "index.handler"
+  handler       = "digest/index.handler"
   architectures = ["arm64"]
   memory_size   = 256
   # SES in the sandbox allows one message a second, and every recipient gets

@@ -241,6 +241,85 @@ test("prompt prefers structured business hours (with split intervals) and carrie
   assert.match(fallback, /Mon-Fri, 8:00 AM-5:00 PM/);
 });
 
+test("prompt includes configured holiday closures, contact emails, and service area coverage", () => {
+  const withAll = buildReceptionistPrompt(agent, {
+    ...profile,
+    holidays: [
+      { id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true },
+      { id: "h2", name: "Not Closed", date: "2026-12-01", closed: false },
+    ],
+    contactEmails: [
+      { label: "Billing / AR", email: "billing@example.com" },
+      { label: "", email: "info@example.com" },
+    ],
+    serviceAreas: ["Maryland", "Washington D.C."],
+  });
+
+  assert.match(withAll, /Holiday closures: Thanksgiving \(2026-11-26\)/);
+  assert.doesNotMatch(withAll, /Not Closed/);
+  assert.match(withAll, /# CONTACT EMAILS/);
+  assert.match(withAll, /Billing \/ AR: billing@example\.com/);
+  assert.match(withAll, /- info@example\.com/);
+  assert.match(withAll, /# SERVICE AREA/);
+  assert.match(withAll, /Published coverage: Maryland, Washington D\.C\./);
+
+  const withNone = buildReceptionistPrompt(agent, profile);
+  assert.doesNotMatch(withNone, /Holiday closures:/);
+  assert.doesNotMatch(withNone, /# CONTACT EMAILS/);
+  assert.doesNotMatch(withNone, /# SERVICE AREA/);
+});
+
+test("prompt renders configured appointment types by name, duration, and lead time only - never the before/after buffers", () => {
+  const withTypes = buildReceptionistPrompt({
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      appointmentTypes: [
+        { id: "t1", name: "Quick Call", durationMin: 15, minimumLeadTimeMin: 60, blockBeforeMin: 0, blockAfterMin: 0, happensAtCustomerLocation: false },
+        { id: "t2", name: "On-Site Visit", durationMin: 30, minimumLeadTimeMin: 1440, blockBeforeMin: 60, blockAfterMin: 60, happensAtCustomerLocation: true },
+        { id: "t3", name: "No Restriction", durationMin: 45, minimumLeadTimeMin: 0 },
+      ],
+    },
+  }, profile);
+
+  assert.match(withTypes, /# APPOINTMENT TYPES/);
+  assert.match(withTypes, /Quick Call \(15 minutes, must be booked at least 1 hour in advance\)/);
+  assert.match(withTypes, /On-Site Visit \(30 minutes, must be booked at least 24 hours in advance\)/);
+  assert.match(withTypes, /No Restriction \(45 minutes\)$/m);
+  const typesSection = withTypes.split("# APPOINTMENT TYPES")[1].split("\n\n")[0];
+  assert.doesNotMatch(typesSection, /\b60\b/); // no raw buffer minutes ever rendered
+  assert.doesNotMatch(typesSection, /blockBefore|blockAfter/i);
+
+  const withNone = buildReceptionistPrompt(agent, profile);
+  assert.doesNotMatch(withNone, /# APPOINTMENT TYPES/);
+});
+
+test("prompt renders Example Dialogues after Restrictions, and Final Reminders last (deliberately, for the recency effect)", () => {
+  const withBoth = buildReceptionistPrompt({
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      exampleDialogues: "Caller: Hi, do you have any openings?\nYou: We do - what day works for you?",
+      finalReminders: "- Never guess.\n- Wait for the caller to finish before closing.",
+    },
+  }, profile);
+
+  assert.match(withBoth, /# EXAMPLE DIALOGUES/);
+  assert.match(withBoth, /Caller: Hi, do you have any openings\?/);
+  assert.match(withBoth, /# FINAL REMINDERS/);
+  assert.match(withBoth, /- Never guess\./);
+
+  // Restrictions -> Example Dialogues -> ... -> Final Reminders, in that order
+  assert.ok(withBoth.indexOf("# RESTRICTIONS") < withBoth.indexOf("# EXAMPLE DIALOGUES"));
+  assert.ok(withBoth.indexOf("# FINAL REMINDERS") > withBoth.lastIndexOf("# CLOSING"));
+  // Final Reminders is the very last section in the whole prompt
+  assert.ok(withBoth.trimEnd().endsWith("Wait for the caller to finish before closing."));
+
+  const withNeither = buildReceptionistPrompt(agent, profile);
+  assert.doesNotMatch(withNeither, /# EXAMPLE DIALOGUES/);
+  assert.doesNotMatch(withNeither, /# FINAL REMINDERS/);
+});
+
 test("prompt renders an allDay day as 'Open 24 hours', not raw interval text", () => {
   const open = (intervals) => ({ closed: false, intervals });
   const prompt = buildReceptionistPrompt(agent, {

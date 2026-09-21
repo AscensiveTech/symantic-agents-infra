@@ -563,6 +563,60 @@ function readNegativeSentimentAlertSettings(body) {
   return { settings: { enabled: body.enabled, recipients } };
 }
 
+// Usage Threshold Alerts - the only alert on this page enabled by default
+// (a brand-new workspace with no settings row yet reads as enabled:true,
+// see publicUsageThresholdAlert's fallback below) - same shape/pattern as
+// the negative-sentiment alert otherwise, just a 5-recipient cap instead
+// of 6 per the product decision for this alert type.
+const USAGE_THRESHOLD_MAX_RECIPIENTS = 5;
+
+function publicUsageThresholdAlert(stored) {
+  const value = stored && typeof stored === "object" ? stored : {};
+  return {
+    enabled: value.enabled !== false,
+    recipients: Array.isArray(value.recipients)
+      ? value.recipients.map(normalizeDigestEmail).filter(Boolean)
+      : [],
+  };
+}
+
+function readUsageThresholdAlertSettings(body) {
+  if (!body || typeof body !== "object") return { error: "Invalid alert settings" };
+  if (typeof body.enabled !== "boolean") return { error: "enabled must be true or false" };
+  if (!Array.isArray(body.recipients)) return { error: "recipients must be a list" };
+  if (body.recipients.length > USAGE_THRESHOLD_MAX_RECIPIENTS) {
+    return { error: `Add at most ${USAGE_THRESHOLD_MAX_RECIPIENTS} recipients` };
+  }
+  const recipients = [];
+  for (const candidate of body.recipients) {
+    const email = normalizeDigestEmail(candidate);
+    if (!email) return { error: `"${String(candidate).slice(0, 80)}" is not a valid email address` };
+    if (!recipients.includes(email)) recipients.push(email);
+  }
+  return { settings: { enabled: body.enabled, recipients } };
+}
+
+// Call History's optional per-call follow-up: a comment (replaced wholesale
+// on every edit, no history kept), an assignee (any active workspace
+// member, reassignable any time), and a status. Every field is optional -
+// the whole thing is opt-in, and any combination of blank/set fields is
+// valid (e.g. a status with no comment).
+const FOLLOW_UP_STATUSES = new Set(["not_started", "in_progress", "resolved"]);
+const FOLLOW_UP_COMMENT_MAX = 500;
+
+function readFollowUp(value) {
+  if (value === null) {
+    // Explicit clear - removes the whole follow-up, not just some fields.
+    return { followUp: null };
+  }
+  if (!value || typeof value !== "object") return { error: "Invalid follow-up" };
+  const comment = typeof value.comment === "string" ? value.comment.slice(0, FOLLOW_UP_COMMENT_MAX) : "";
+  const status = FOLLOW_UP_STATUSES.has(value.status) ? value.status : "not_started";
+  const assigneeUserId = typeof value.assigneeUserId === "string" && value.assigneeUserId ? value.assigneeUserId : null;
+  const assigneeName = typeof value.assigneeName === "string" ? value.assigneeName.slice(0, 120) : null;
+  return { followUp: { comment, status, assigneeUserId, assigneeName } };
+}
+
 async function loadCallDigest(store, workspaceId, senderAddress) {
   const workspace = await store.getWorkspace(workspaceId);
   return {
@@ -1226,31 +1280,155 @@ export function createHandler({
         return json(200, result);
       }
 
-      if (path === "/workspaces/me/notifications" || path.startsWith("/workspaces/me/notifications/")) {
+      if (path === "/workspaces/me/usage-threshold-alert") {
         if (!isWorkspaceAdmin(actor)) {
-          return json(403, { message: "Only workspace admins can manage notifications" });
+          return json(403, { message: "Only workspace admins can manage usage threshold alerts" });
         }
+        await store.ensureWorkspace(workspaceId);
+
+        if (method === "GET") {
+          const workspace = await store.getWorkspace(workspaceId);
+          return json(200, publicUsageThresholdAlert(workspace?.usageThresholdAlert));
+        }
+
+        if (method === "PUT") {
+          const parsed = readUsageThresholdAlertSettings(readBody(event));
+          if (parsed.error) return json(400, { message: parsed.error });
+          const workspace = await store.getWorkspace(workspaceId);
+          await store.saveUsageThresholdAlert(workspaceId, {
+            ...(workspace?.usageThresholdAlert && typeof workspace.usageThresholdAlert === "object"
+              ? workspace.usageThresholdAlert
+              : {}),
+            ...parsed.settings,
+            updatedAt: new Date().toISOString(),
+            updatedBy: actorDisplayName(event, actor),
+          });
+          return json(200, parsed.settings);
+        }
+
+        return json(405, { message: "Method not allowed" });
+      }
+
+      if (path === "/workspaces/me/usage-threshold-alert/test" && method === "POST") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can manage usage threshold alerts" });
+        }
+        const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+        const recipient = normalizeDigestEmail(actor.membership?.email ?? claims.email);
+        if (!recipient) {
+          return json(400, { message: "Your account has no email address to send a test to" });
+        }
+        let result;
+        try {
+          result = await invokeCallDigest({ action: "send-usage-threshold-test", workspaceId, recipient });
+        } catch (error) {
+          console.error("Usage threshold alert test invoke failed", { name: error?.name, message: error?.message });
+          result = null;
+        }
+        if (result?.sent !== true) {
+          return json(502, {
+            message: result?.error ?? "The test email could not be sent",
+            error: "usage_threshold_test_failed",
+          });
+        }
+        return json(200, result);
+      }
+
+      if (path === "/workspaces/me/notifications" || path.startsWith("/workspaces/me/notifications/")) {
+        // Viewing history is open to any workspace member - only the
+        // mutating actions below (delete, mark read/unread) are admin-only.
+        // Each mutating branch checks isWorkspaceAdmin(actor) individually.
         await store.ensureWorkspace(workspaceId);
 
         if (path === "/workspaces/me/notifications" && method === "GET") {
           const workspace = await store.getWorkspace(workspaceId);
-          return json(200, (workspace?.notifications ?? []).slice(0, 100));
+          // Soft-deleted entries (an org admin's "Delete") are hidden from
+          // every view but not actually removed from storage - see the
+          // delete branch below for why.
+          const all = (workspace?.notifications ?? [])
+            .filter((entry) => entry.deleted !== true)
+            .slice()
+            .sort((a, b) => (b.sentAt ?? "").localeCompare(a.sentAt ?? ""));
+          const query = event?.queryStringParameters ?? {};
+          const limit = Math.min(200, Math.max(1, Number.parseInt(query.limit, 10) || 50));
+          const offset = Math.max(0, Number.parseInt(query.offset, 10) || 0);
+          const windowMonths = Number.parseInt(query.months, 10);
+          const windowed = Number.isInteger(windowMonths) && windowMonths > 0
+            ? all.filter((entry) => {
+              const sentAt = entry.sentAt ? new Date(entry.sentAt) : null;
+              if (!sentAt || Number.isNaN(sentAt.getTime())) return true;
+              const cutoff = new Date();
+              cutoff.setMonth(cutoff.getMonth() - windowMonths);
+              return sentAt >= cutoff;
+            })
+            : all;
+          return json(200, {
+            items: windowed.slice(offset, offset + limit),
+            total: windowed.length,
+          });
         }
 
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can manage notifications" });
+        }
+
+        // "Delete" is a soft delete - the entry is hidden from the UI
+        // immediately (see the GET branch's filter above) but stays in
+        // storage until the 12-month-from-generation retention sweep
+        // actually removes it (lambda/digest's runNotificationRetention,
+        // keyed on sentAt - a soft-deleted row ages out exactly like any
+        // other). This is deliberate: it means a super admin can still
+        // recover an accidentally-deleted notification with a backend fix
+        // within that window, even though there's no UI to do it - nothing
+        // here is ever truly gone until 12 months have passed.
         if (path === "/workspaces/me/notifications" && method === "DELETE") {
-          await store.saveNotifications(workspaceId, []);
+          const workspace = await store.getWorkspace(workspaceId);
+          const notifications = (workspace?.notifications ?? []).map((entry) => (
+            entry.deleted === true ? entry : { ...entry, deleted: true, deletedAt: new Date().toISOString() }
+          ));
+          await store.saveNotifications(workspaceId, notifications);
           return json(200, { cleared: true });
+        }
+
+        if (path === "/workspaces/me/notifications/delete" && method === "POST") {
+          const body = readBody(event);
+          const ids = Array.isArray(body?.ids) ? body.ids.filter((id) => typeof id === "string") : null;
+          if (!ids || !ids.length) return json(400, { message: "ids must be a non-empty list" });
+          const workspace = await store.getWorkspace(workspaceId);
+          const idSet = new Set(ids);
+          const nowIso = new Date().toISOString();
+          const notifications = (workspace?.notifications ?? []).map((entry) => (
+            idSet.has(entry.id) ? { ...entry, deleted: true, deletedAt: nowIso } : entry
+          ));
+          await store.saveNotifications(workspaceId, notifications);
+          return json(200, { deleted: ids.length });
+        }
+
+        if (path === "/workspaces/me/notifications/mark-read" && method === "POST") {
+          const body = readBody(event);
+          const ids = Array.isArray(body?.ids) ? body.ids.filter((id) => typeof id === "string") : null;
+          if (!ids || !ids.length) return json(400, { message: "ids must be a non-empty list" });
+          if (typeof body?.read !== "boolean") return json(400, { message: "read must be true or false" });
+          const workspace = await store.getWorkspace(workspaceId);
+          const idSet = new Set(ids);
+          const notifications = (workspace?.notifications ?? []).map((entry) => (
+            idSet.has(entry.id) ? { ...entry, read: body.read } : entry
+          ));
+          await store.saveNotifications(workspaceId, notifications);
+          return json(200, { updated: ids.length, read: body.read });
         }
 
         const notificationMatch = path.match(/^\/workspaces\/me\/notifications\/([^/]+)$/);
         if (notificationMatch && method === "PATCH") {
           const notificationId = decodeURIComponent(notificationMatch[1]);
+          const body = readBody(event);
+          const read = typeof body?.read === "boolean" ? body.read : true;
           const workspace = await store.getWorkspace(workspaceId);
           const notifications = (workspace?.notifications ?? []).map((entry) => (
-            entry.id === notificationId ? { ...entry, read: true } : entry
+            entry.id === notificationId ? { ...entry, read } : entry
           ));
           await store.saveNotifications(workspaceId, notifications);
-          return json(200, { id: notificationId, read: true });
+          return json(200, { id: notificationId, read });
         }
 
         return json(405, { message: "Method not allowed" });
@@ -1414,6 +1592,20 @@ export function createHandler({
         return json(404, { message: "Not found" });
       }
 
+      // Minimal, non-admin-gated member listing for the Call History
+      // follow-up assignee picker - any active workspace member is
+      // assignable, so this deliberately doesn't require isWorkspaceAdmin
+      // like /workspaces/me/users does (that route also returns role/audit
+      // fields this one intentionally omits).
+      if (path === "/workspaces/me/team-members" && method === "GET") {
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        const members = typeof store.listMemberships === "function" ? await store.listMemberships(workspaceId) : [];
+        return json(200, members
+          .filter((member) => member?.status !== "disabled")
+          .map((member) => ({ userId: member.userId, name: member.name || member.email, email: member.email })));
+      }
+
       const recordingCallId = getCallRecordingId(event, path);
       if (recordingCallId && method === "GET") {
         const store = await getStore();
@@ -1442,6 +1634,22 @@ export function createHandler({
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
         const body = readBody(event) ?? {};
+
+        // Two independent shapes share this route: {callerName} (existing,
+        // unchanged) and {followUp} (the optional per-call action-tracking
+        // field - comment/assignee/status). A request carries exactly one.
+        if (body && typeof body === "object" && "followUp" in body) {
+          const existing = await store.getCall(workspaceId, callId);
+          if (!existing) return json(404, { message: "Call not found" });
+          const parsed = readFollowUp(body.followUp);
+          if (parsed.error) return json(400, { message: parsed.error });
+          const followUp = parsed.followUp === null
+            ? null
+            : { ...parsed.followUp, updatedAt: new Date().toISOString(), updatedBy: actorDisplayName(event, actor) };
+          const updated = await store.updateCallFollowUp(workspaceId, callId, followUp);
+          return json(200, toPublicCall(updated));
+        }
+
         if (typeof body?.callerName !== "string") {
           return json(400, { message: "callerName is required" });
         }
@@ -6424,6 +6632,15 @@ export function createDynamoStore(client, commands, tableNames) {
       }));
     },
 
+    async saveUsageThresholdAlert(workspaceId, settings) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: "SET usageThresholdAlert = :alert",
+        ExpressionAttributeValues: marshall({ ":alert": settings }),
+      }));
+    },
+
     async saveNotifications(workspaceId, notifications) {
       await client.send(new commands.UpdateItemCommand({
         TableName: tableNames.workspaces,
@@ -6596,6 +6813,23 @@ export function createDynamoStore(client, commands, tableNames) {
         TableName: tableNames.calls,
         Key: marshall({ workspaceId, callId }),
         UpdateExpression: "REMOVE callerName, callerNameSource",
+        ReturnValues: "ALL_NEW",
+      }));
+      return unmarshall(result.Attributes);
+    },
+
+    // The whole followUp value is replaced wholesale on every edit (no
+    // history kept, per the product decision) - null removes it entirely.
+    async updateCallFollowUp(workspaceId, callId, followUp) {
+      const result = await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        ...(followUp === null
+          ? { UpdateExpression: "REMOVE followUp" }
+          : {
+            UpdateExpression: "SET followUp = :followUp",
+            ExpressionAttributeValues: marshall({ ":followUp": followUp }),
+          }),
         ReturnValues: "ALL_NEW",
       }));
       return unmarshall(result.Attributes);
