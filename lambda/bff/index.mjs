@@ -6390,6 +6390,27 @@ function unmarshall(item) {
   );
 }
 
+// Deletes many items via BatchWriteItem (25 per request, DynamoDB's cap)
+// instead of one DeleteItem per key - a sequential per-item loop over a
+// few hundred demo calls/contacts was slow enough to blow past API
+// Gateway's 29s integration timeout, so the deletes finished successfully
+// in the background while the caller still got a 500. Retries
+// UnprocessedItems, since a batch can come back partially applied without
+// throwing.
+async function batchDeleteItems(client, commands, tableName, keys) {
+  for (let start = 0; start < keys.length; start += 25) {
+    let requestItems = keys.slice(start, start + 25).map((key) => ({
+      DeleteRequest: { Key: marshall(key) },
+    }));
+    while (requestItems.length > 0) {
+      const result = await client.send(new commands.BatchWriteItemCommand({
+        RequestItems: { [tableName]: requestItems },
+      }));
+      requestItems = result.UnprocessedItems?.[tableName] ?? [];
+    }
+  }
+}
+
 function toAgentRecord(item) {
   if (!item) return null;
   const { workspaceId: _workspaceId, agentId, ...agent } = item;
@@ -6873,12 +6894,7 @@ export function createDynamoStore(client, commands, tableNames) {
         ConsistentRead: true,
       }));
       const items = (result.Items ?? []).map((item) => unmarshall(item));
-      for (const item of items) {
-        await client.send(new commands.DeleteItemCommand({
-          TableName: tableNames.calls,
-          Key: marshall({ workspaceId, callId: item.callId }),
-        }));
-      }
+      await batchDeleteItems(client, commands, tableNames.calls, items.map((item) => ({ workspaceId, callId: item.callId })));
       return items.length;
     },
 
@@ -7170,12 +7186,7 @@ export function createDynamoStore(client, commands, tableNames) {
         ConsistentRead: true,
       }));
       const items = (result.Items ?? []).map((item) => unmarshall(item));
-      for (const item of items) {
-        await client.send(new commands.DeleteItemCommand({
-          TableName: tableNames.contacts,
-          Key: marshall({ workspaceId, phoneNumber: item.phoneNumber }),
-        }));
-      }
+      await batchDeleteItems(client, commands, tableNames.contacts, items.map((item) => ({ workspaceId, phoneNumber: item.phoneNumber })));
       return items.length;
     },
 
