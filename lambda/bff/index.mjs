@@ -6446,6 +6446,13 @@ function toAgentRecord(item) {
 
 function toPublicAgent(item) {
   if (!item) return null;
+  // Older agents (deleted before the everPublished field existed) never got
+  // it backfilled, so a deleted-but-once-live agent like this could show
+  // "No" in the Deleted table even though it really was published. A
+  // retellAgentId/activatedAt only ever gets set by the activate flow, so
+  // either one is durable proof it was published at some point, regardless
+  // of whether the explicit flag is present on the stored record.
+  const everPublished = item.everPublished === true || Boolean(item.retellAgentId) || Boolean(item.activatedAt);
   const {
     workspaceId: _workspaceId,
     agentId,
@@ -6457,7 +6464,7 @@ function toPublicAgent(item) {
     telnyxPhoneNumber: _telnyxPhoneNumber,
     ...agent
   } = item;
-  return { id: agentId, ...agent };
+  return { id: agentId, ...agent, everPublished };
 }
 
 function toPublicPhoneNumber(item) {
