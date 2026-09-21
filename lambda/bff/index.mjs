@@ -89,8 +89,13 @@ const KNOWLEDGE_ASSET_KEY_PATTERN = /^knowledge-base\/[0-9a-f-]{36}\/[A-Za-z0-9.
 const COMPANY_LOGO_KEY_PATTERN = /^company\/logo-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_CONTENT_TYPE_PATTERN = /^image\/[A-Za-z0-9][A-Za-z0-9.+-]*$/;
 const MAX_COMPANY_LOGO_BYTES = 10 * 1024 * 1024;
-const MAX_KNOWLEDGE_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_KNOWLEDGE_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_KNOWLEDGE_TOTAL_BYTES = 100 * 1024 * 1024;
+// Retell allows far more, but the whole point of capping this is keeping
+// prompt/context size (and per-call cost) down - not maxing out what the
+// platform technically permits. Counts only file/URL items - a pasted-text
+// item's auto-generated .txt doesn't count against it.
+const MAX_KNOWLEDGE_FILE_COUNT = 15;
 const MAX_DYNAMO_RECORD_BYTES = 350 * 1024;
 const WORKSPACE_ROLES = new Set(["super-admin", "company-admin", "quotation-builder"]);
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -568,7 +573,7 @@ function readNegativeSentimentAlertSettings(body) {
 // see publicUsageThresholdAlert's fallback below) - same shape/pattern as
 // the negative-sentiment alert otherwise, just a 5-recipient cap instead
 // of 6 per the product decision for this alert type.
-const USAGE_THRESHOLD_MAX_RECIPIENTS = 5;
+const USAGE_THRESHOLD_MAX_RECIPIENTS = 6;
 
 function publicUsageThresholdAlert(stored) {
   const value = stored && typeof stored === "object" ? stored : {};
@@ -1047,6 +1052,7 @@ export function createHandler({
           phoneNumber: row.phoneNumber,
           name: row.name,
           companyName: row.companyName,
+          extension: row.extension,
           updatedByName: row.updatedByName,
           hidden: row.hidden === true,
           createdAt: row.createdAt,
@@ -1169,10 +1175,15 @@ export function createHandler({
         if (email && !EMAIL_PATTERN.test(email)) {
           return json(400, { message: "email must be a valid email address" });
         }
+        const extensionRaw = typeof body.extension === "string" ? body.extension.trim() : undefined;
+        if (extensionRaw && !/^\d{1,10}$/.test(extensionRaw)) {
+          return json(400, { message: "extension must be numeric, up to 10 digits" });
+        }
         const saved = await store.putContact(workspaceId, phoneNumber, {
           name: name || undefined,
           companyName: companyName || undefined,
           email: email || undefined,
+          extension: extensionRaw || undefined,
           updatedByName: actorDisplayName(event, actor),
           hidden: false,
         });
@@ -1755,6 +1766,7 @@ export function createHandler({
               retellAgentId: synced.retellAgentId,
               activatedAt,
               updatedAt: activatedAt,
+              everPublished: true,
             },
           );
         } catch (error) {
@@ -1856,6 +1868,7 @@ export function createHandler({
           const updated = await store.updateAgentRuntime(workspaceId, agentAction.agentId, {
             status: "active",
             updatedAt,
+            everPublished: true,
           });
           return json(200, toPublicAgent(updated));
         } catch (error) {
@@ -2698,6 +2711,7 @@ async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
     ? resolveAgentPlan(scopedAgent, workspace)
     : resolveAccountPlan(agents, workspace);
   const agentNames = new Map((agents ?? []).map((agent) => [agent.id, agent.name]));
+  const liveAgentIds = new Set((agents ?? []).filter((agent) => agent.status !== "deleted").map((agent) => agent.id));
   const calls = agentId ? (allCalls ?? []).filter((call) => call.agentId === agentId) : (allCalls ?? []);
   const usage = buildUsage(calls, { now, timezone, plan });
   const monthlyByAgent = buildMonthlyByAgent(allCalls ?? [], { timezone, agentNames });
@@ -2711,10 +2725,17 @@ async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
     discountPct: discountPct || undefined,
     billingCycle: {
       ...usage.billingCycle,
-      agentBreakdown: usage.billingCycle.agentBreakdown.map((entry) => ({
-        ...entry,
-        agentName: entry.agentId === "unassigned" ? "Unassigned" : agentNames.get(entry.agentId) ?? entry.agentId,
-      })),
+      // A deleted agent's past calls still count toward this cycle's total
+      // minutes (cycleMinutes, computed separately above) - just dropped
+      // from this per-agent breakdown, since it's what drives the sidebar's
+      // "switch between agents" list and a deleted agent is nothing to
+      // switch to anymore.
+      agentBreakdown: usage.billingCycle.agentBreakdown
+        .filter((entry) => entry.agentId === "unassigned" || liveAgentIds.has(entry.agentId))
+        .map((entry) => ({
+          ...entry,
+          agentName: entry.agentId === "unassigned" ? "Unassigned" : agentNames.get(entry.agentId) ?? entry.agentId,
+        })),
     },
     monthlyByAgent,
     features: {
@@ -5900,6 +5921,12 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
       file.size > 0 &&
       file.size <= MAX_KNOWLEDGE_FILE_BYTES)
     : [];
+  if (fileMetadata.length > 0) {
+    const existingFiles = await store.listKnowledgeBases(workspaceId);
+    if (existingFiles.filter((item) => item.kind === "file").length >= MAX_KNOWLEDGE_FILE_COUNT) {
+      throw new Error(`This workspace already has the maximum of ${MAX_KNOWLEDGE_FILE_COUNT} uploaded files - remove one before adding another`);
+    }
+  }
   if (!text && !url && fileMetadata.length === 0) {
     throw new Error("Add pasted text, a file, or a website URL");
   }
@@ -6474,13 +6501,15 @@ function buildContactsSummaryRows(calls, contactRows) {
       if (override.name) existing.name = override.name;
       if (override.companyName) existing.companyName = override.companyName;
       if (override.email) existing.email = override.email;
+      if (override.extension) existing.extension = override.extension;
       if (override.updatedByName) existing.updatedByName = override.updatedByName;
-    } else if (override.name || override.companyName || override.email) {
+    } else if (override.name || override.companyName || override.email || override.extension) {
       byPhone.set(override.phoneNumber, {
         phoneNumber: override.phoneNumber,
         name: override.name,
         companyName: override.companyName,
         email: override.email,
+        extension: override.extension,
         updatedByName: override.updatedByName,
         callCount: 0,
         latestCallISO: "",

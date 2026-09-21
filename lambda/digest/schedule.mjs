@@ -73,7 +73,7 @@ export function normalizeNegativeSentimentSettings(value) {
   };
 }
 
-const USAGE_THRESHOLD_MAX_RECIPIENTS = 5;
+const USAGE_THRESHOLD_MAX_RECIPIENTS = 6;
 
 // Enabled by default (absent, or not explicitly false, both read as on) -
 // the one alert type on this page that ships on rather than off, per the
