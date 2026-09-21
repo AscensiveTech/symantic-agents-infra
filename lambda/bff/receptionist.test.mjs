@@ -269,6 +269,31 @@ test("prompt includes configured holiday closures, contact emails, and service a
   assert.doesNotMatch(withNone, /# SERVICE AREA/);
 });
 
+test("prompt renders configured appointment types by name, duration, and lead time only - never the before/after buffers", () => {
+  const withTypes = buildReceptionistPrompt({
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      appointmentTypes: [
+        { id: "t1", name: "Quick Call", durationMin: 15, minimumLeadTimeMin: 60, blockBeforeMin: 0, blockAfterMin: 0, happensAtCustomerLocation: false },
+        { id: "t2", name: "On-Site Visit", durationMin: 30, minimumLeadTimeMin: 1440, blockBeforeMin: 60, blockAfterMin: 60, happensAtCustomerLocation: true },
+        { id: "t3", name: "No Restriction", durationMin: 45, minimumLeadTimeMin: 0 },
+      ],
+    },
+  }, profile);
+
+  assert.match(withTypes, /# APPOINTMENT TYPES/);
+  assert.match(withTypes, /Quick Call \(15 minutes, must be booked at least 1 hour in advance\)/);
+  assert.match(withTypes, /On-Site Visit \(30 minutes, must be booked at least 24 hours in advance\)/);
+  assert.match(withTypes, /No Restriction \(45 minutes\)$/m);
+  const typesSection = withTypes.split("# APPOINTMENT TYPES")[1].split("\n\n")[0];
+  assert.doesNotMatch(typesSection, /\b60\b/); // no raw buffer minutes ever rendered
+  assert.doesNotMatch(typesSection, /blockBefore|blockAfter/i);
+
+  const withNone = buildReceptionistPrompt(agent, profile);
+  assert.doesNotMatch(withNone, /# APPOINTMENT TYPES/);
+});
+
 test("prompt renders an allDay day as 'Open 24 hours', not raw interval text", () => {
   const open = (intervals) => ({ closed: false, intervals });
   const prompt = buildReceptionistPrompt(agent, {

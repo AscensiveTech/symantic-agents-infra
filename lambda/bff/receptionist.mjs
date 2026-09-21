@@ -105,7 +105,13 @@ const CALENDAR_TOOLS = [
       },
       durationMinutes: {
         type: "number",
-        description: "Appointment duration in minutes when endTime is omitted.",
+        description: "Appointment duration in minutes when endTime is omitted and no appointmentType is given.",
+      },
+      appointmentType: {
+        type: "string",
+        description:
+          "Name of one of this agent's configured appointment types, exactly as listed in # APPOINTMENT TYPES - "
+          + "when given, its Duration and Minimum Lead Time are authoritative and durationMinutes is ignored.",
       },
     },
     required: ["startTime"],
@@ -126,11 +132,17 @@ const CALENDAR_TOOLS = [
       },
       durationMinutes: {
         type: "number",
-        description: "Appointment duration in minutes when endTime is omitted.",
+        description: "Appointment duration in minutes when endTime is omitted and no appointmentType is given.",
+      },
+      appointmentType: {
+        type: "string",
+        description:
+          "Name of one of this agent's configured appointment types, exactly as listed in # APPOINTMENT TYPES - "
+          + "when given, its Duration and Minimum Lead Time are authoritative and durationMinutes is ignored.",
       },
       service: {
         type: "string",
-        description: "Service the caller is booking.",
+        description: "Service the caller is booking - omit when appointmentType is given, since its name is used instead.",
       },
       description: {
         type: "string",
@@ -255,6 +267,7 @@ export function buildReceptionistPrompt(agent, profile) {
   const bookingInstruction = behavior.booking === true
     ? "Booking is enabled. Check availability before offering a time, and create a booking only after explicit caller confirmation."
     : "Booking is disabled. Do not promise or create appointments; take a message for office follow-up.";
+  const appointmentTypesLine = formatAppointmentTypes(behavior.appointmentTypes);
   const emergencyRules = formatEmergencyRules(behavior.emergencyRules);
   const escalation = text(behavior.escalation);
 
@@ -329,6 +342,7 @@ export function buildReceptionistPrompt(agent, profile) {
     "",
     "# BOOKING",
     bookingInstruction,
+    ...(appointmentTypesLine ? ["", "# APPOINTMENT TYPES", appointmentTypesLine] : []),
     "",
     "# EMERGENCY & ESCALATION",
     [emergencyRules, escalation].filter(Boolean).join("\n") ||
@@ -579,6 +593,33 @@ function formatContactEmails(contactEmails) {
 function formatServiceAreas(serviceAreas) {
   if (!Array.isArray(serviceAreas) || !serviceAreas.length) return "";
   return serviceAreas.map(text).filter(Boolean).join(", ");
+}
+
+// Caller-facing only - Name, Duration, and Minimum Lead Time. The
+// Before/After calendar buffers are deliberately never rendered here or
+// anywhere else in the prompt - they only ever reach the actual booking
+// tool call (see lambda/tools/handlers/appointment-types.mjs).
+function formatAppointmentTypes(appointmentTypes) {
+  if (!Array.isArray(appointmentTypes) || !appointmentTypes.length) return "";
+  return appointmentTypes
+    .filter((type) => text(type?.name))
+    .map((type) => {
+      const duration = formatMinutesLabel(type.durationMin);
+      const leadTime = Number(type.minimumLeadTimeMin) > 0
+        ? `, must be booked at least ${formatMinutesLabel(type.minimumLeadTimeMin)} in advance`
+        : "";
+      return `- ${text(type.name)} (${duration}${leadTime})`;
+    })
+    .join("\n");
+}
+
+function formatMinutesLabel(minutes) {
+  const value = Number(minutes) || 0;
+  if (value % 60 === 0 && value > 0) {
+    const hours = value / 60;
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${value} minutes`;
 }
 
 function formatEmergencyRules(rules) {

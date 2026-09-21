@@ -176,6 +176,103 @@ test("missing booking fields remain HTTP 400", async () => {
   assert.equal(JSON.parse(response.body).code, "invalid_request");
 });
 
+test("createBooking with a matching appointmentType uses its duration and pads the provider block with before/after buffers, but stores the unpadded range", async () => {
+  const providerCalls = [];
+  const store = createStore({
+    async getAgent() {
+      return {
+        configuration: {
+          appointmentTypes: [
+            {
+              id: "type-1",
+              name: "On-Site Visit",
+              durationMin: 30,
+              blockBeforeMin: 60,
+              blockAfterMin: 60,
+              minimumLeadTimeMin: 0,
+              happensAtCustomerLocation: true,
+            },
+          ],
+        },
+      };
+    },
+  });
+  const calendar = {
+    async getAvailability(input) {
+      providerCalls.push(["availability", input]);
+      return { available: true, busy: [] };
+    },
+    async createBooking(input) {
+      providerCalls.push(["create", input]);
+      return { providerEventId: "event-1", provider: "google-calendar" };
+    },
+  };
+  const handler = toolHandler({ store, calendar });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody({ appointmentType: "On-Site Visit", endTime: undefined, durationMinutes: 999 }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  // Stored/spoken range reflects the type's own 30-min duration, not the
+  // caller-supplied (and ignored) durationMinutes: 999.
+  assert.equal(body.startTimeUtc, "2026-08-17T18:00:00.000Z");
+  assert.equal(body.endTimeUtc, "2026-08-17T18:30:00.000Z");
+
+  const [, availabilityCall] = providerCalls.find(([name]) => name === "availability");
+  const [, createCall] = providerCalls.find(([name]) => name === "create");
+  // Provider-facing calls see the padded range (1hr before, 1hr after).
+  for (const call of [availabilityCall, createCall]) {
+    assert.equal(call.startTimeUtc, "2026-08-17T17:00:00.000Z");
+    assert.equal(call.endTimeUtc, "2026-08-17T19:30:00.000Z");
+  }
+  assert.equal(createCall.service, "On-Site Visit");
+});
+
+test("createBooking rejects a time that doesn't clear the appointment type's Minimum Lead Time", async () => {
+  const store = createStore({
+    async getAgent() {
+      return {
+        configuration: {
+          appointmentTypes: [{
+            id: "type-1",
+            name: "Quick Call",
+            durationMin: 15,
+            minimumLeadTimeMin: 120,
+          }],
+        },
+      };
+    },
+  });
+  const handler = toolHandler({ store });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    // now() is fixed at 2026-08-16T12:00:00Z in this harness; requesting a
+    // start only 1 hour out fails the 2-hour minimum lead time.
+    bookingBody({ appointmentType: "Quick Call", startTime: "2026-08-16T13:00:00.000Z", endTime: undefined }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.ok, false);
+  assert.match(body.message, /too soon/i);
+});
+
+test("createBooking with no matching appointmentType behaves exactly as before (raw durationMinutes/endTime)", async () => {
+  const handler = toolHandler();
+  const response = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody({ appointmentType: "Nonexistent Type" }),
+  ));
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.startTimeUtc, "2026-08-17T18:00:00.000Z");
+  assert.equal(body.endTimeUtc, "2026-08-17T18:30:00.000Z");
+});
+
 test("rescheduleBooking rechecks availability before writing", async () => {
   const appointment = {
     workspaceId,
