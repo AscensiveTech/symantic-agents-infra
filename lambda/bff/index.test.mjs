@@ -1044,7 +1044,7 @@ test("POST enable reactivates a disabled agent but refuses a deleted one", async
   const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/enable"));
   assert.equal(response.statusCode, 200);
   assert.equal(JSON.parse(response.body).status, "active");
-  assert.deepEqual(updates, [{ status: "active", updatedAt: updates[0].updatedAt }]);
+  assert.deepEqual(updates, [{ status: "active", updatedAt: updates[0].updatedAt, everPublished: true }]);
 });
 
 test("DELETE agent returns 404 when the agent is missing", async () => {
@@ -2046,8 +2046,36 @@ test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid
   assert.deepEqual(saved, {
     workspaceId: "user-123",
     phoneNumber: "+17035550123",
-    patch: { name: "Jordan Miles", companyName: "Acme Co", email: undefined, updatedByName: "user-123", hidden: false },
+    patch: { name: "Jordan Miles", companyName: "Acme Co", email: undefined, extension: undefined, updatedByName: "user-123", hidden: false },
   });
+});
+
+test("PATCH contacts/{phoneNumber} upserts an optional extension, digits only up to 10, rejecting anything else", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async putContact(workspaceId, phoneNumber, patch) {
+      saved = { workspaceId, phoneNumber, patch };
+      return { workspaceId, phoneNumber, ...patch, createdAt: "t1", updatedAt: "t2" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const invalid = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Jordan Miles", extension: "abc" }));
+  assert.equal(invalid.statusCode, 400);
+
+  const tooLong = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Jordan Miles", extension: "12345678901" }));
+  assert.equal(tooLong.statusCode, 400);
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Jordan Miles", extension: "  4521  " }));
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.patch.extension, "4521");
+
+  // Omitted entirely - stays undefined, never rejected (it's optional).
+  const omitted = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Jordan Miles" }));
+  assert.equal(omitted.statusCode, 200);
+  assert.equal(saved.patch.extension, undefined);
 });
 
 test("PATCH contacts/{phoneNumber} upserts an optional email, trimmed/lowercased, rejecting an invalid format", async () => {
@@ -2259,6 +2287,7 @@ test("POST activate syncs Retell only - no phone number is touched", async () =>
   const body = JSON.parse(response.body);
   assert.equal(body.agent.id, "agent-123");
   assert.equal(body.agent.status, "active");
+  assert.equal(body.agent.everPublished, true);
   assert.equal(body.phoneNumber, null);
   assert.ok(!events.some(([name]) => name === "telnyx" || name === "importPhoneNumber"));
   const retellInput = events.find(([name]) => name === "retell")[1];
@@ -5108,6 +5137,36 @@ test("POST knowledge-bases still creates a website item, marked as failed-to-ref
   assert.equal(created[0].kind, "url");
 });
 
+test("POST knowledge-bases rejects a new file once the workspace already has 15 uploaded files - text/url items don't count against it", async () => {
+  const existingFileItems = Array.from({ length: 15 }, (_, i) => ({ knowledgeBaseId: `kb-file-${i}`, kind: "file" }));
+  const store = {
+    ...knowledgeBaseTestStore(),
+    async listKnowledgeBases() { return [...existingFileItems, { knowledgeBaseId: "kb-text-1", kind: "text" }]; },
+    async createKnowledgeBase() { throw new Error("should not be reached"); },
+  };
+  // getProviders() is evaluated as part of building the call args regardless
+  // of what createKnowledgeBaseItem does with it, so it still needs a working
+  // (non-throwing) mock even though the cap check should reject before this
+  // is ever actually used.
+  const providers = { retell: { async createKnowledgeBase() { throw new Error("should not be reached"); } } };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const event = authenticatedEvent("POST", "/workspaces/me/knowledge-bases", {
+    name: "One Too Many",
+    files: [{
+      name: "policy.pdf",
+      key: "knowledge-base/11111111-1111-4111-8111-111111111111/policy.pdf",
+      contentType: "application/pdf",
+      size: 1024,
+    }],
+  });
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+  assert.equal(response.statusCode, 400);
+  assert.match(JSON.parse(response.body).message, /maximum of 15 uploaded files/);
+});
+
 test("POST knowledge-bases stores pasted text's sizeBytes as its UTF-8 byte length", async () => {
   const created = [];
   const store = {
@@ -6317,7 +6376,7 @@ test("GET usage-threshold-alert returns safe defaults - enabled by default, unli
   assert.deepEqual(JSON.parse(response.body), { enabled: true, recipients: [] });
 });
 
-test("PUT usage-threshold-alert saves enabled + recipients (capped at 5), deduped and case-normalized", async () => {
+test("PUT usage-threshold-alert saves enabled + recipients (capped at 6), deduped and case-normalized", async () => {
   const store = callDigestStore();
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
@@ -6337,7 +6396,7 @@ test("PUT usage-threshold-alert saves enabled + recipients (capped at 5), dedupe
 
   const tooMany = await handler(companyAdminEvent("PUT", "/workspaces/me/usage-threshold-alert", {
     enabled: true,
-    recipients: Array.from({ length: 6 }, (_, i) => `person${i}@arcdental.com`),
+    recipients: Array.from({ length: 7 }, (_, i) => `person${i}@arcdental.com`),
   }));
   assert.equal(tooMany.statusCode, 400);
 });
@@ -6634,6 +6693,35 @@ test("GET /workspaces/me/usage returns a tz-correct billing cycle with no cost d
   assert.equal(body.billingCycle.usageState, "ok");
   assert.equal(body.cost, undefined);
   assert.ok(Array.isArray(body.calls));
+});
+
+test("GET /workspaces/me/usage's agentBreakdown drops a deleted agent's entry, but its minutes still count toward the cycle total", async () => {
+  const { createHandler } = await loadBff();
+  const now = new Date();
+  const period = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const store = meteringStore({
+    async listCalls() {
+      return [
+        { callId: "call-live", agentId: "agent-live", startedAt: `${period}-05T10:00:00-04:00`, durationMs: 60_000, outcome: "answered" },
+        { callId: "call-deleted", agentId: "agent-deleted", startedAt: `${period}-06T10:00:00-04:00`, durationMs: 120_000, outcome: "answered" },
+      ];
+    },
+    async listAgents() {
+      return [
+        { id: "agent-live", name: "Samantha", status: "active", configuration: { receptionistPlan: "starter" } },
+        { id: "agent-deleted", name: "Grace", status: "deleted", configuration: { receptionistPlan: "starter" } },
+      ];
+    },
+  });
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/usage"));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  // Both agents' calls count toward the total (3 minutes billed).
+  assert.equal(body.billingCycle.minutes, 3);
+  const names = body.billingCycle.agentBreakdown.map((entry) => entry.agentName);
+  assert.deepEqual(names, ["Samantha"]);
 });
 
 test("GET /workspaces/me/usage?agentId= scopes the cycle and months to just that agent", async () => {
