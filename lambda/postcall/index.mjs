@@ -221,6 +221,7 @@ export function createHandler({
         ? undefined
         : extractCallerNameFromTranscript(transcript);
       const outcome = inferOutcome(call, toolLog);
+      const appointmentStatus = inferAppointmentStatus(toolLog);
       return {
       workspaceId,
       callId,
@@ -268,6 +269,11 @@ export function createHandler({
       ...(outcome === "booked"
         ? { bookingAlertedAt: null, bookingSummary: extractBookingSummary(toolLog) }
         : {}),
+      // Appointment column on Call History - present only when a booking
+      // tool actually succeeded on this call; absent (never rendered as a
+      // literal "No") for every other call, same optional-field pattern as
+      // the rest of this record.
+      ...(appointmentStatus ? { appointmentStatus } : {}),
       callSuccessful: typeof analysis.call_successful === "boolean" ? analysis.call_successful : undefined,
       inVoicemail: typeof analysis.in_voicemail === "boolean" ? analysis.in_voicemail : undefined,
       ...(truncated
@@ -675,6 +681,23 @@ function extractBookingSummary(toolLog) {
     service: stringValue(args?.service),
     startTime: stringValue(args?.startTime),
   };
+}
+
+// Drives Call History's "Appointment" column (replaces the old raw "End
+// Reason" column) - Yes/No plus which of the three booking tools actually
+// succeeded on this call. Checked in this order since a call could only
+// meaningfully end in one of these: a cancellation is the most final state,
+// so it wins if somehow more than one fired.
+function inferAppointmentStatus(toolLog) {
+  const successfulTools = new Set(
+    toolActions(toolLog)
+      .filter(({ successful }) => successful)
+      .map(({ name }) => name),
+  );
+  if (successfulTools.has("calendar_cancel_booking")) return "cancelled";
+  if (successfulTools.has("calendar_reschedule_booking")) return "modified";
+  if (successfulTools.has("calendar_create_booking")) return "created";
+  return undefined;
 }
 
 function inferOutcome(call, toolLog) {

@@ -294,6 +294,32 @@ test("prompt renders configured appointment types by name, duration, and lead ti
   assert.doesNotMatch(withNone, /# APPOINTMENT TYPES/);
 });
 
+test("prompt renders Example Dialogues after Restrictions, and Final Reminders last (deliberately, for the recency effect)", () => {
+  const withBoth = buildReceptionistPrompt({
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      exampleDialogues: "Caller: Hi, do you have any openings?\nYou: We do - what day works for you?",
+      finalReminders: "- Never guess.\n- Wait for the caller to finish before closing.",
+    },
+  }, profile);
+
+  assert.match(withBoth, /# EXAMPLE DIALOGUES/);
+  assert.match(withBoth, /Caller: Hi, do you have any openings\?/);
+  assert.match(withBoth, /# FINAL REMINDERS/);
+  assert.match(withBoth, /- Never guess\./);
+
+  // Restrictions -> Example Dialogues -> ... -> Final Reminders, in that order
+  assert.ok(withBoth.indexOf("# RESTRICTIONS") < withBoth.indexOf("# EXAMPLE DIALOGUES"));
+  assert.ok(withBoth.indexOf("# FINAL REMINDERS") > withBoth.lastIndexOf("# CLOSING"));
+  // Final Reminders is the very last section in the whole prompt
+  assert.ok(withBoth.trimEnd().endsWith("Wait for the caller to finish before closing."));
+
+  const withNeither = buildReceptionistPrompt(agent, profile);
+  assert.doesNotMatch(withNeither, /# EXAMPLE DIALOGUES/);
+  assert.doesNotMatch(withNeither, /# FINAL REMINDERS/);
+});
+
 test("prompt renders an allDay day as 'Open 24 hours', not raw interval text", () => {
   const open = (intervals) => ({ closed: false, intervals });
   const prompt = buildReceptionistPrompt(agent, {

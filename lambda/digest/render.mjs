@@ -237,3 +237,85 @@ export function renderBookingAlert({
 
   return { subject, html, text };
 }
+
+function formatDate(iso, timezone) {
+  const date = new Date(iso ?? "");
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("en-US", { timeZone: timezone, month: "short", day: "numeric", year: "numeric" }).format(date);
+}
+
+// One shared short template for all three usage-threshold triggers (90%,
+// 100%, and the once-daily repeat while still over 100%) - only the
+// headline and a couple of numbers change per trigger, per the product
+// decision that these don't need three separate templates.
+export function renderUsageThresholdAlert({
+  workspaceName,
+  trigger, // "90" | "100" | "daily"
+  usagePercent,
+  minutesUsed,
+  minuteAllowance,
+  overageMinutes,
+  overageCharge,
+  overagePerMinute,
+  cycleStartsOn,
+  cycleEndsOn,
+  recipients,
+  timezone,
+}) {
+  const company = workspaceName || "Your workspace";
+  const percentLabel = `${Math.round(usagePercent * 100)}%`;
+  const headline = trigger === "90"
+    ? `${company} has reached ${percentLabel} of its monthly minutes`
+    : trigger === "100"
+      ? `${company} has used its full monthly minute allowance`
+      : `${company} remains over its monthly minute allowance`;
+  const overOverage = overageMinutes > 0;
+  const subject = `${company}: usage at ${percentLabel}${overOverage ? " - over plan limit" : ""}`;
+  const cycleLine = `Billing cycle: ${formatDate(cycleStartsOn, timezone)} - ${formatDate(cycleEndsOn, timezone)}`;
+  const usageLine = `Usage: ${minutesUsed} of ${minuteAllowance} minutes (${percentLabel})`;
+  const overageLine = overOverage
+    ? `Over plan limit by ${overageMinutes} minute${overageMinutes === 1 ? "" : "s"} ($${overagePerMinute.toFixed(2)}/min - $${overageCharge.toFixed(2)} so far)`
+    : null;
+  const adminLine = "Contact your account administrator to change plan details.";
+  const sentToLine = `This alert was sent to: ${recipients.join(", ")}.`;
+
+  const bodyLines = [usageLine, overageLine, cycleLine].filter(Boolean);
+
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:${PAPER};font-family:${FONT};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${PAPER};">
+    <tr><td align="center" style="padding:28px 12px;">
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;">
+        <tr><td style="padding:0 4px 18px;">
+          <span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${overOverage ? "#943522" : ACCENT};border:1px solid ${INK};vertical-align:middle;"></span>
+          <span style="margin-left:8px;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:${MUTED};vertical-align:middle;">${escapeHtml(company)} · Usage Alert</span>
+        </td></tr>
+        <tr><td style="padding:0 0 22px;background:${SURFACE};border:1px solid ${LINE};border-radius:12px;">
+          <div style="padding:22px 24px;">
+            <h1 style="margin:0 0 14px;font-size:18px;line-height:1.35;color:${INK};">${escapeHtml(headline)}</h1>
+            ${bodyLines.map((line) => `<p style="margin:0 0 8px;font-size:13px;line-height:1.5;color:${INK};">${escapeHtml(line)}</p>`).join("")}
+            <p style="margin:14px 0 0;font-size:12px;line-height:1.5;color:${MUTED};">${escapeHtml(adminLine)}</p>
+          </div>
+        </td></tr>
+        <tr><td style="padding:16px 4px 0;font-size:12px;line-height:1.6;color:${MUTED};">
+          ${escapeHtml(sentToLine)}
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+  const text = [
+    `${company} · Usage Alert`,
+    headline,
+    "",
+    ...bodyLines,
+    "",
+    adminLine,
+    "",
+    sentToLine,
+  ].join("\n");
+
+  return { subject, html, text };
+}

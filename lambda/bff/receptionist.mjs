@@ -270,6 +270,8 @@ export function buildReceptionistPrompt(agent, profile) {
   const appointmentTypesLine = formatAppointmentTypes(behavior.appointmentTypes);
   const emergencyRules = formatEmergencyRules(behavior.emergencyRules);
   const escalation = text(behavior.escalation);
+  const exampleDialogues = text(behavior.exampleDialogues);
+  const finalReminders = text(behavior.finalReminders);
 
   return [
     "# ROLE",
@@ -334,6 +336,15 @@ export function buildReceptionistPrompt(agent, profile) {
     ...(text(behavior.restrictions)
       ? ["# RESTRICTIONS - WHAT NOT TO SAY OR DO", text(behavior.restrictions), ""]
       : []),
+    ...(exampleDialogues
+      ? [
+        "# EXAMPLE DIALOGUES",
+        "These are illustrative only - match this tone and approach, but never read them aloud "
+          + "verbatim or treat their specifics (names, dates, numbers) as real.",
+        exampleDialogues,
+        "",
+      ]
+      : []),
     "# POLICIES",
     text(profile?.policies) || "No additional policies are configured.",
     "",
@@ -382,6 +393,11 @@ export function buildReceptionistPrompt(agent, profile) {
     + "request is clearly finished, say a brief polite closing line and call the end_call tool. "
     + "Don't let the call trail off in silence, cut the caller off mid-sentence, or keep "
     + "talking after they're done.",
+    // Deliberately last - models tend to weigh instructions stated most
+    // recently more heavily, so this short recap of the agent's own
+    // already-configured rules reinforces what matters most right before
+    // the prompt ends.
+    ...(finalReminders ? ["", "# FINAL REMINDERS", finalReminders] : []),
   ].join("\n");
 }
 

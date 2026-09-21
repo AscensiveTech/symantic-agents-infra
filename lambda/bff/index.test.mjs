@@ -1440,6 +1440,113 @@ test("PATCH call sets a manual caller name and reports it back", async () => {
   assert.equal(body.callerNameSource, "manual");
 });
 
+test("PATCH call with a followUp body sets comment/assignee/status wholesale, capped at 500 chars", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall(workspaceId, callId) {
+      return { workspaceId, callId, outcome: "message" };
+    },
+    async updateCallFollowUp(workspaceId, callId, followUp) {
+      saved = { workspaceId, callId, followUp };
+      return { workspaceId, callId, outcome: "message", followUp };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const longComment = "x".repeat(600);
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/calls/call-123",
+    { followUp: { comment: longComment, status: "in_progress", assigneeUserId: "user-456", assigneeName: "Dana" } },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.followUp.comment.length, 500);
+  assert.equal(saved.followUp.status, "in_progress");
+  assert.equal(saved.followUp.assigneeUserId, "user-456");
+  assert.equal(typeof saved.followUp.updatedAt, "string");
+  const body = JSON.parse(response.body);
+  assert.equal(body.followUp.status, "in_progress");
+});
+
+test("PATCH call with followUp:null clears it entirely", async () => {
+  let cleared;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall() { return { outcome: "message" }; },
+    async updateCallFollowUp(workspaceId, callId, followUp) {
+      cleared = followUp;
+      return { workspaceId, callId, outcome: "message" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PATCH", "/workspaces/me/calls/call-123", { followUp: null }));
+  assert.equal(response.statusCode, 200);
+  assert.equal(cleared, null);
+});
+
+test("PATCH call rejects a malformed (non-object) followUp payload", async () => {
+  const store = { async ensureWorkspace() {}, async getCall() { return { outcome: "message" }; } };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/calls/call-123",
+    { followUp: "not-an-object" },
+  ));
+  assert.equal(response.statusCode, 400);
+});
+
+test("PATCH call with an unrecognized followUp status falls back to not_started rather than erroring", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async getCall() { return { outcome: "message" }; },
+    async updateCallFollowUp(workspaceId, callId, followUp) {
+      saved = followUp;
+      return { outcome: "message", followUp };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/calls/call-123",
+    { followUp: { status: "done" } },
+  ));
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.status, "not_started");
+});
+
+test("GET team-members lists active members without role/audit fields, open to any actor", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async listMemberships() {
+      return [
+        { userId: "u1", name: "Dana Lee", email: "dana@arcdental.com", role: "company-admin", status: "active" },
+        { userId: "u2", name: "", email: "sam@arcdental.com", role: "quotation-builder", status: "disabled" },
+      ];
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/team-members");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), [
+    { userId: "u1", name: "Dana Lee", email: "dana@arcdental.com" },
+  ]);
+});
+
 test("PATCH call rejects a missing callerName field and a call that doesn't exist", async () => {
   const store = {
     async ensureWorkspace() {},
@@ -5891,6 +5998,10 @@ function callDigestStore({ workspace = { workspaceId: "user-123", name: "Arc Den
       saved.push({ workspaceId, negativeSentimentAlert: settings });
       workspace = { ...workspace, negativeSentimentAlert: settings };
     },
+    async saveUsageThresholdAlert(workspaceId, settings) {
+      saved.push({ workspaceId, usageThresholdAlert: settings });
+      workspace = { ...workspace, usageThresholdAlert: settings };
+    },
   };
 }
 
@@ -6194,10 +6305,60 @@ test("negative-sentiment-alert settings are an admin-only resource", async () =>
   assert.equal(response.statusCode, 403);
 });
 
+// --- Usage threshold alert settings ------------------------------------------
+
+test("GET usage-threshold-alert returns safe defaults - enabled by default, unlike the other alert types", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => callDigestStore() });
+
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/usage-threshold-alert"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { enabled: true, recipients: [] });
+});
+
+test("PUT usage-threshold-alert saves enabled + recipients (capped at 5), deduped and case-normalized", async () => {
+  const store = callDigestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("PUT", "/workspaces/me/usage-threshold-alert", {
+    enabled: false,
+    recipients: ["Dana@ArcDental.com", "dana@arcdental.com", "frontdesk@arcdental.com"],
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    enabled: false,
+    recipients: ["dana@arcdental.com", "frontdesk@arcdental.com"],
+  });
+  assert.equal(store.saved.length, 1);
+  assert.equal(store.saved[0].usageThresholdAlert.enabled, false);
+
+  const tooMany = await handler(companyAdminEvent("PUT", "/workspaces/me/usage-threshold-alert", {
+    enabled: true,
+    recipients: Array.from({ length: 6 }, (_, i) => `person${i}@arcdental.com`),
+  }));
+  assert.equal(tooMany.statusCode, 400);
+});
+
+test("usage-threshold-alert settings are an admin-only resource", async () => {
+  const store = { async ensureWorkspace() {}, async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; } };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = authenticatedEvent("GET", "/workspaces/me/usage-threshold-alert");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 403);
+});
+
 // --- Notification history ------------------------------------------------------
 
-function notificationsStore({ notifications = [] } = {}) {
+function notificationsStore({ notifications: initial = [] } = {}) {
   let saved = null;
+  let notifications = initial;
   return {
     get saved() { return saved; },
     async ensureWorkspace() {},
@@ -6205,12 +6366,13 @@ function notificationsStore({ notifications = [] } = {}) {
       return { workspaceId: "user-123", name: "Arc Dental", notifications };
     },
     async saveNotifications(workspaceId, next) {
+      notifications = next;
       saved = { workspaceId, notifications: next };
     },
   };
 }
 
-test("GET notifications returns the stored history, newest first", async () => {
+test("GET notifications returns the stored history, newest first, paginated", async () => {
   const notifications = [
     { id: "n2", sentAt: "2026-09-15T08:00:00.000Z", recipients: ["dana@arcdental.com"], content: "Arc Dental: 2 new calls", read: false },
     { id: "n1", sentAt: "2026-09-15T07:00:00.000Z", recipients: ["dana@arcdental.com"], content: "Arc Dental: 1 new call", read: true },
@@ -6222,7 +6384,33 @@ test("GET notifications returns the stored history, newest first", async () => {
   const response = await handler(companyAdminEvent("GET", "/workspaces/me/notifications"));
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(JSON.parse(response.body), notifications);
+  assert.deepEqual(JSON.parse(response.body), { items: notifications, total: 2 });
+});
+
+// Note: today's role model only has super-admin/company-admin/quotation-
+// builder, and quotation-builder is already restricted to proposal-only
+// paths by an earlier, unrelated gate - so there is currently no reachable
+// "regular receptionist member, non-admin" fixture to exercise "view is
+// open to everyone" end to end. The GET branch below no longer runs its
+// own admin check ahead of the mutating branches, which is the forward-
+// looking-correct fix; it will become independently testable once a real
+// non-admin-but-receptionist-permitted role exists.
+
+test("GET notifications respects limit/offset and a months window", async () => {
+  const notifications = [
+    { id: "recent", sentAt: new Date().toISOString(), recipients: [], content: "new", read: false },
+    { id: "old", sentAt: "2020-01-01T00:00:00.000Z", recipients: [], content: "old", read: false },
+  ];
+  const store = notificationsStore({ notifications });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const windowed = await handler(companyAdminEvent("GET", "/workspaces/me/notifications", undefined, { months: "12" }));
+  assert.deepEqual(JSON.parse(windowed.body), { items: [notifications[0]], total: 1 });
+
+  const limited = await handler(companyAdminEvent("GET", "/workspaces/me/notifications", undefined, { limit: "1", offset: "0" }));
+  assert.deepEqual(JSON.parse(limited.body).items, [notifications[0]]);
+  assert.equal(JSON.parse(limited.body).total, 2);
 });
 
 test("PATCH notifications/{id} marks just that entry read", async () => {
@@ -6243,18 +6431,59 @@ test("PATCH notifications/{id} marks just that entry read", async () => {
   );
 });
 
-test("DELETE notifications clears the whole history", async () => {
-  const store = notificationsStore({ notifications: [{ id: "n1", sentAt: "x", recipients: [], content: "x", read: false }] });
+test("DELETE notifications soft-deletes the whole history - hidden from GET, still present in storage", async () => {
+  const notifications = [{ id: "n1", sentAt: "x", recipients: [], content: "x", read: false }];
+  const store = notificationsStore({ notifications });
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
 
   const response = await handler(companyAdminEvent("DELETE", "/workspaces/me/notifications"));
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(store.saved.notifications, []);
+  assert.equal(store.saved.notifications.length, 1);
+  assert.equal(store.saved.notifications[0].deleted, true);
+  assert.equal(typeof store.saved.notifications[0].deletedAt, "string");
+
+  const after = await handler(companyAdminEvent("GET", "/workspaces/me/notifications"));
+  assert.deepEqual(JSON.parse(after.body), { items: [], total: 0 });
 });
 
-test("notifications are an admin-only resource", async () => {
+test("POST notifications/delete soft-deletes only the given ids, leaving the rest untouched and visible", async () => {
+  const notifications = [
+    { id: "n1", sentAt: "2026-09-15T07:00:00.000Z", recipients: [], content: "keep", read: false },
+    { id: "n2", sentAt: "2026-09-15T08:00:00.000Z", recipients: [], content: "delete-me", read: false },
+    { id: "n3", sentAt: "2026-09-15T09:00:00.000Z", recipients: [], content: "delete-me-too", read: false },
+  ];
+  const store = notificationsStore({ notifications });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(companyAdminEvent("POST", "/workspaces/me/notifications/delete", { ids: ["n2", "n3"] }));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(store.saved.notifications.map((entry) => entry.id), ["n1", "n2", "n3"]);
+  assert.deepEqual(store.saved.notifications.map((entry) => entry.deleted ?? false), [false, true, true]);
+});
+
+test("POST notifications/mark-read updates read for every given id, in either direction", async () => {
+  const notifications = [
+    { id: "n1", sentAt: "x", recipients: [], content: "x", read: false },
+    { id: "n2", sentAt: "x", recipients: [], content: "x", read: true },
+  ];
+  const store = notificationsStore({ notifications });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const markRead = await handler(companyAdminEvent("POST", "/workspaces/me/notifications/mark-read", { ids: ["n1", "n2"], read: true }));
+  assert.equal(markRead.statusCode, 200);
+  assert.deepEqual(store.saved.notifications.map((entry) => entry.read), [true, true]);
+
+  const markUnread = await handler(companyAdminEvent("POST", "/workspaces/me/notifications/mark-read", { ids: ["n1"], read: false }));
+  assert.equal(markUnread.statusCode, 200);
+  assert.deepEqual(store.saved.notifications.map((entry) => [entry.id, entry.read]), [["n1", false], ["n2", true]]);
+});
+
+test("notification mutations (delete, mark-read, bulk actions) are admin-only, view is not", async () => {
   const store = {
     ...notificationsStore(),
     async getMembership() {
@@ -6263,12 +6492,16 @@ test("notifications are an admin-only resource", async () => {
   };
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
-  const event = authenticatedEvent("GET", "/workspaces/me/notifications");
-  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  const asNonAdmin = (method, path, body) => {
+    const event = authenticatedEvent(method, path, body);
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+    return event;
+  };
 
-  const response = await handler(event);
-
-  assert.equal(response.statusCode, 403);
+  assert.equal((await handler(asNonAdmin("DELETE", "/workspaces/me/notifications"))).statusCode, 403);
+  assert.equal((await handler(asNonAdmin("PATCH", "/workspaces/me/notifications/n1"))).statusCode, 403);
+  assert.equal((await handler(asNonAdmin("POST", "/workspaces/me/notifications/delete", { ids: ["n1"] }))).statusCode, 403);
+  assert.equal((await handler(asNonAdmin("POST", "/workspaces/me/notifications/mark-read", { ids: ["n1"], read: true }))).statusCode, 403);
 });
 
 function authenticatedEvent(method, path, body, queryStringParameters) {
