@@ -244,7 +244,10 @@ export function resolveGreeting(agent, profile) {
   if (configured) return configured;
   const businessName = text(profile?.businessName) || "the business";
   const receptionistName = text(agent?.configuration?.name) || text(agent?.name) || "the AI voice agent";
-  return `Thanks for calling ${businessName}. I'm ${receptionistName}. How can I help today?`;
+  const disclosure = agent?.configuration?.recordingDisclosure
+    ? " This call may be recorded for quality assurance."
+    : "";
+  return `Thanks for calling ${businessName}.${disclosure} We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, ${receptionistName}, to assist you while we are unable to do so. How can we help you today?`;
 }
 
 export function buildReceptionistPrompt(agent, profile) {
