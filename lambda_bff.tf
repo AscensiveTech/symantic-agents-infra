@@ -69,7 +69,7 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid    = "ManageCalls"
         Effect = "Allow"
-        Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+        Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
         Resource = [
           aws_dynamodb_table.control_plane["calls"].arn,
           "${aws_dynamodb_table.control_plane["calls"].arn}/index/*",
@@ -102,7 +102,7 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
       {
         Sid      = "ManageContacts"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
         Resource = aws_dynamodb_table.control_plane["contacts"].arn
       },
       {

@@ -178,15 +178,22 @@ test("resolveGreeting uses the configured greeting when set, otherwise builds on
   assert.equal(resolveGreeting(agent, profile), agent.configuration.greeting);
   assert.equal(
     resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "" } }, profile),
-    "Thanks for calling Arc Dental. I'm Maya. How can I help today?",
+    "Thanks for calling Arc Dental. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
   );
   assert.equal(
     resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "  " } }, { ...profile, businessName: "" }),
-    "Thanks for calling the business. I'm Maya. How can I help today?",
+    "Thanks for calling the business. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
   );
   assert.equal(
     resolveGreeting({ configuration: {} }, { businessName: "Rivertown Plumbing" }),
-    "Thanks for calling Rivertown Plumbing. I'm the AI voice agent. How can I help today?",
+    "Thanks for calling Rivertown Plumbing. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, the AI voice agent, to assist you while we are unable to do so. How can we help you today?",
+  );
+});
+
+test("resolveGreeting adds a short recording disclosure line when recordingDisclosure is on", () => {
+  assert.equal(
+    resolveGreeting({ configuration: { recordingDisclosure: true, name: "Maya" } }, { businessName: "Arc Dental" }),
+    "Thanks for calling Arc Dental. This call may be recorded for quality assurance. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
   );
 });
 
