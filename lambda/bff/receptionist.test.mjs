@@ -80,6 +80,21 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /\+17035550102/);
 });
 
+test("every prompt discloses the AI cannot call 911 itself and tells the caller to call it directly - with or without configured emergency routing", () => {
+  const withRouting = buildReceptionistPrompt(agent, profile);
+  assert.match(withRouting, /cannot call 911 or dispatch emergency services yourself/);
+  assert.match(withRouting, /tell the\s+caller to hang up and call 911/);
+  assert.match(withRouting, /Then also follow the emergency and escalation rules below\./);
+
+  const noRouting = {
+    ...agent,
+    configuration: { ...agent.configuration, emergencyRules: [], escalation: "" },
+  };
+  const withoutRouting = buildReceptionistPrompt(noRouting, profile);
+  assert.match(withoutRouting, /cannot call 911 or dispatch emergency services yourself/);
+  assert.match(withoutRouting, /Then take a message so the business knows the call came in\./);
+});
+
 test("Restrictions section is omitted entirely when the receptionist has none configured", () => {
   const noRestrictions = {
     ...agent,
