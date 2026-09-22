@@ -246,6 +246,9 @@ function pickProfile(value) {
     ...Object.fromEntries(Object.keys(PROFILE_FIELDS).map((field) => [field, value[field]])),
     businessName: sanitizeCompanyName(value.businessName),
     ...(isBusinessHours(value.businessHours) ? { businessHours: value.businessHours } : {}),
+    // Optional, so it stays out of PROFILE_FIELDS - requiring it there
+    // would reject a payload from any client that hasn't sent it yet.
+    ...(typeof value.mailingAddress === "string" ? { mailingAddress: value.mailingAddress } : {}),
   };
 }
 

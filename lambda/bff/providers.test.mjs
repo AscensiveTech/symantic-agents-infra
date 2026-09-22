@@ -432,10 +432,32 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
       llm_id: "llm-123",
     },
     voice_id: "retell-Cimo",
+    ambient_sound: null,
     agent_name: "Symantic agent-123 · Maya",
     webhook_events: ["call_started", "call_ended", "call_analyzed"],
   });
   assert.equal(calls[2][1].headers.Authorization, "Bearer retell-key");
+});
+
+test("Retell agent body passes a chosen ambient sound through to Retell verbatim", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (String(url).includes("/v2/list-agents")) return response([]);
+    if (String(url).endsWith("/create-retell-llm")) return response({ llm_id: "llm-123" }, 201);
+    return response({ agent_id: "retell-agent-123" }, 201);
+  };
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl });
+
+  await client.upsertAgent({
+    symanticAgentId: "agent-123",
+    agentName: "Maya",
+    greeting: "Thanks for calling.",
+    config: { prompt: "Compiled prompt", voice: "retell-Cimo", ambientSound: "coffee-shop" },
+  });
+
+  const agentCall = JSON.parse(calls[2][1].body);
+  assert.equal(agentCall.ambient_sound, "coffee-shop");
 });
 
 test("Retell imports a Telnyx DID and binds it to the synced agent", async () => {

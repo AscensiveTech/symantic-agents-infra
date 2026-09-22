@@ -75,6 +75,43 @@ test("PUT profile stores the authenticated workspace profile", async () => {
   ]);
 });
 
+test("PUT profile keeps an optional mailingAddress even though it's not in the required field list", async () => {
+  const profile = {
+    businessType: "dental",
+    businessName: "Arc Dental",
+    address: "123 Main Street",
+    mailingAddress: "PO Box 45",
+    timezone: "America/New_York",
+    phone: "(703) 555-0133",
+    description: "Family dental care",
+    hours: "Mon-Fri, 8:00 AM-5:00 PM",
+    faqs: [],
+    policies: "",
+    escalationContact: "",
+    ownerPhone: "",
+    fallbackPhone: "",
+    communicationStyle: "",
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async putProfile(_workspaceId, value) { return value; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler({
+    requestContext: {
+      authorizer: { jwt: { claims: { sub: "user-123" } } },
+      http: { method: "PUT", path: "/workspaces/me/profile" },
+    },
+    rawPath: "/workspaces/me/profile",
+    body: JSON.stringify(profile),
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).mailingAddress, "PO Box 45");
+});
+
 test("GET profile ensures the workspace and returns its profile", async () => {
   const calls = [];
   const profile = { businessName: "Arc Dental" };
