@@ -111,6 +111,56 @@ test("a second concurrent createBooking for the same agent/time slot is turned a
   assert.equal(locks.size, 0);
 });
 
+test("createBooking falls back to the agent's Booking Invite Email as the attendee when the caller's own email wasn't collected", async () => {
+  let providerInput;
+  const store = createStore({
+    getAgent: async () => ({
+      agentId: "agent-1",
+      configuration: { bookingInviteEmail: "bookings@tidytransformers.example" },
+    }),
+  });
+  const calendar = {
+    async getAvailability() {
+      return { available: true, busy: [] };
+    },
+    async createBooking(input) {
+      providerInput = input;
+      return { providerEventId: "google-event-1", provider: "google-calendar" };
+    },
+  };
+  const handler = toolHandler({ store, calendar });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody({ customer: { name: "Jordan Miles", phone: "+17035550123" } }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(providerInput.customer.email, "bookings@tidytransformers.example");
+});
+
+test("createBooking leaves the attendee email unset when neither the caller nor the agent has one on file", async () => {
+  let providerInput;
+  const calendar = {
+    async getAvailability() {
+      return { available: true, busy: [] };
+    },
+    async createBooking(input) {
+      providerInput = input;
+      return { providerEventId: "google-event-1", provider: "google-calendar" };
+    },
+  };
+  const handler = toolHandler({ calendar });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody({ customer: { name: "Jordan Miles", phone: "+17035550123" } }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(providerInput.customer.email, undefined);
+});
+
 test("createBooking resolves relative time in the workspace timezone and persists UTC", async () => {
   let persisted;
   let providerInput;

@@ -119,7 +119,7 @@ export async function handleCreateBooking(input, {
       service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service),
       description: stringOrUndefined(input.description),
       location: stringOrUndefined(input.location) || profile?.address || undefined,
-      customer: normalizeCustomer(input.customer),
+      customer: normalizeCustomer(input.customer, agent?.configuration?.bookingInviteEmail),
       callId: input.callId,
       idempotencyKey: input.idempotencyKey,
     });
@@ -141,7 +141,7 @@ export async function handleCreateBooking(input, {
     providerEventId: providerBooking.providerEventId,
     htmlLink: providerBooking.htmlLink,
     service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service) || "Appointment",
-    customer: normalizeCustomer(input.customer),
+    customer: normalizeCustomer(input.customer, agent?.configuration?.bookingInviteEmail),
     ...range,
     status: "confirmed",
     createdAt,
@@ -286,12 +286,19 @@ export async function handleCancelBooking(input, {
   return appointmentResponse(updated);
 }
 
-function normalizeCustomer(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+// The agent is instructed to never ask a caller for their own email, so
+// customer.email is almost always empty - fall back to the workspace's
+// configured Booking Invite Email (set on the agent when a calendar is
+// connected) so the provider still gets a real attendee/invite-from
+// address instead of no attendee at all.
+function normalizeCustomer(value, fallbackEmail) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { email: stringOrUndefined(fallbackEmail) };
+  }
   return {
     name: stringOrUndefined(value.name),
     phone: stringOrUndefined(value.phone),
-    email: stringOrUndefined(value.email),
+    email: stringOrUndefined(value.email) || stringOrUndefined(fallbackEmail),
   };
 }
 
