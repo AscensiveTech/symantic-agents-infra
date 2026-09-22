@@ -297,6 +297,10 @@ export function createRetellClient({
         llm_id: llmId,
       },
       voice_id: config.voice,
+      // Background track played under the call. Sent even when unset, as
+      // null, so clearing it on an existing agent actually removes it at
+      // Retell rather than leaving the previous track in place.
+      ambient_sound: config.ambientSound || null,
       agent_name: `Symantic ${symanticAgentId} · ${agentName}`,
       // Explicit rather than relying on Retell's account-level default -
       // call_started is what makes an "ongoing" row show up in Call History
