@@ -94,7 +94,7 @@ export function renderInviteEmail({ workspaceName, inviterName, url, ttlDays }) 
           <p style="margin:12px 0 0;font-size:13px;line-height:1.6;color:${MUTED};">This link expires in ${ttlDays} days. If the button doesn't work, paste this address into your browser:<br><span style="color:${INK};word-break:break-all;">${escapeHtml(url)}</span></p>
         </td></tr>
         <tr><td style="padding:16px 32px 24px;border-top:1px solid ${LINE};font-size:12px;line-height:1.6;color:${MUTED};">
-          If you weren't expecting this, you can ignore this email — nothing is connected unless you sign in.
+          If you weren't expecting this, you can ignore this email - nothing is connected unless you sign in.
         </td></tr>
       </table>
     </td></tr>
@@ -110,7 +110,7 @@ export function renderInviteEmail({ workspaceName, inviterName, url, ttlDays }) 
     "You'll sign in with Google or Microsoft directly. You will never be asked for your password here, and the only permissions requested are checking availability and creating appointments.",
     `This link expires in ${ttlDays} days.`,
     "",
-    "If you weren't expecting this, you can ignore this email — nothing is connected unless you sign in.",
+    "If you weren't expecting this, you can ignore this email - nothing is connected unless you sign in.",
   ].join("\n");
   return { subject, html, text };
 }

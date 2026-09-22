@@ -3626,7 +3626,7 @@ function defaultProposalTemplate(sections, now) {
 // exactly what to do to finish the removal.
 async function memberRemovalBlock(store, directory, workspaceId, target, actorUserId) {
   if (target.userId === actorUserId) {
-    return { status: 409, message: "You can't remove your own account — ask another admin to remove it." };
+    return { status: 409, message: "You can't remove your own account - ask another admin to remove it." };
   }
   const members = await store.listMemberships(workspaceId);
   const active = members.filter((m) => m.status !== "disabled");
