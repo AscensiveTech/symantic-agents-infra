@@ -947,6 +947,7 @@ test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared 
         phoneNumberId: "phone-agent-123",
         retellPhoneNumberId: "+17035550133",
         telnyxNumberId: "telnyx-num-1",
+        telnyxPhoneNumber: "+17035550199",
       };
     },
     async listCalls() {
@@ -995,6 +996,9 @@ test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared 
   assert.equal(body.callsHandledAtDeletion, 2);
   assert.ok(body.deletedAt);
   assert.equal(body.deletedByName, "user-123");
+  // Captured before the phone number record was deleted below - otherwise
+  // there'd be no trace of what number this agent used to have.
+  assert.equal(body.deletedPhoneNumber, "+17035550199");
 
   // Only the KB not referenced by another agent gets torn down.
   assert.deepEqual(
@@ -1010,6 +1014,36 @@ test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared 
   assert.deepEqual(providerCalls.filter(([name]) => name === "deletePhoneNumber"), [["deletePhoneNumber", "+17035550133"]]);
   assert.deepEqual(providerCalls.filter(([name]) => name === "releaseNumber"), [["releaseNumber", "telnyx-num-1"]]);
   assert.deepEqual(storeCalls.filter(([name]) => name === "deletePhoneNumberRecord"), [["deletePhoneNumberRecord", "phone-agent-123"]]);
+});
+
+test("DELETE agent leaves deletedPhoneNumber unset when the agent never had a phone number", async () => {
+  const agent = {
+    workspaceId: "user-123",
+    agentId: "agent-draft-1",
+    id: "agent-draft-1",
+    name: "Draft Agent",
+    status: "draft",
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getPhoneNumberForAgent() { return null; },
+    async listCalls() { return []; },
+    async listAgents() { return [agent]; },
+    async updateAgentRuntime(workspaceId, agentId, updates) {
+      return { ...agent, ...updates };
+    },
+  };
+  const providers = { retell: {}, telnyx: {} };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+
+  const response = await handler(companyAdminEvent("DELETE", "/workspaces/me/agents/agent-draft-1"));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.status, "deleted");
+  assert.equal(body.deletedPhoneNumber, undefined);
 });
 
 test("POST disable is refused for a non-admin", async () => {
@@ -2098,7 +2132,7 @@ test("PATCH contacts/{phoneNumber} accepts a 2-character name, allows AT&T-style
   assert.equal(tooLong.statusCode, 400);
 });
 
-test("PATCH contacts/{phoneNumber} upserts an optional extension, digits only up to 10, rejecting anything else", async () => {
+test("PATCH contacts/{phoneNumber} upserts an optional extension, digits only up to 5, rejecting anything else", async () => {
   let saved;
   const store = {
     async ensureWorkspace() {},
