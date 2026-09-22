@@ -404,6 +404,32 @@ test("POST agent succeeds when the only agent with that name was deleted", async
   assert.equal(created.length, 1);
 });
 
+test("POST agent accepts a 2-character name, rejects a disallowed character, and rejects a name over 80 characters", async () => {
+  const created = [];
+  const store = {
+    async ensureWorkspace() {},
+    async listAgents() { return []; },
+    async createAgent(workspaceId, agentId, agent) {
+      created.push(agent);
+      return agent;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const base = { id: "agent-new", role: "Phone operations", description: "Answers calls", status: "draft", capabilities: [] };
+
+  const shortName = await handler(authenticatedEvent("POST", "/workspaces/me/agents", { ...base, name: "Mo" }));
+  assert.equal(shortName.statusCode, 201);
+  assert.equal(created[0].name, "Mo");
+
+  const badChar = await handler(authenticatedEvent("POST", "/workspaces/me/agents", { ...base, id: "agent-new-2", name: "Maya \u{1F600}" }));
+  assert.equal(badChar.statusCode, 400);
+
+  const tooLong = await handler(authenticatedEvent("POST", "/workspaces/me/agents", { ...base, id: "agent-new-3", name: "A".repeat(81) }));
+  assert.equal(tooLong.statusCode, 400);
+});
+
 test("GET agent returns 404 when the workspace agent is missing", async () => {
   const store = {
     async ensureWorkspace() {},
@@ -2048,6 +2074,28 @@ test("PATCH contacts/{phoneNumber} upserts a name override, rejecting an invalid
     phoneNumber: "+17035550123",
     patch: { name: "Jordan Miles", companyName: "Acme Co", email: undefined, extension: undefined, updatedByName: "user-123", hidden: false },
   });
+});
+
+test("PATCH contacts/{phoneNumber} accepts a 2-character name, allows AT&T-style punctuation in companyName, and rejects a disallowed character or an over-length value", async () => {
+  const store = {
+    async ensureWorkspace() {},
+    async putContact(workspaceId, phoneNumber, patch) {
+      return { workspaceId, phoneNumber, ...patch, createdAt: "t1", updatedAt: "t2" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const shortName = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "Xu", companyName: "AT&T" }));
+  assert.equal(shortName.statusCode, 200);
+  assert.equal(JSON.parse(shortName.body).name, "Xu");
+  assert.equal(JSON.parse(shortName.body).companyName, "AT&T");
+
+  const badChar = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "<script>alert(1)</script>" }));
+  assert.equal(badChar.statusCode, 400);
+
+  const tooLong = await handler(authenticatedEvent("PATCH", "/workspaces/me/contacts/(703)%20555-0123", { name: "A".repeat(121) }));
+  assert.equal(tooLong.statusCode, 400);
 });
 
 test("PATCH contacts/{phoneNumber} upserts an optional extension, digits only up to 10, rejecting anything else", async () => {
@@ -4247,6 +4295,9 @@ test("maintenance notice PUT validates lengths and dates; clears on empty", asyn
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "x".repeat(121), body: "ok", startAt: start, endAt: end }))).statusCode, 400);
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "y".repeat(701), startAt: start, endAt: end }))).statusCode, 400);
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: "nonsense", endAt: end }))).statusCode, 400);
+  // An impossible calendar date (Feb 30) - Date() silently rolls this to
+  // March 2 rather than throwing, so a naive isNaN check would let it through.
+  assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: start, endAt: "2026-02-30T10:00:00.000Z" }))).statusCode, 400);
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: end, endAt: start }))).statusCode, 400);
   // start in the past
   assert.equal((await handler(superEvent("PUT", "/platform/system/notice", { title: "ok", body: "ok", startAt: new Date(Date.now() - 3600_000).toISOString(), endAt: end }))).statusCode, 400);
@@ -4457,7 +4508,7 @@ test("super administrators onboard a company with an isolated default template",
   assert.deepEqual(directoryCalls.map((call) => call[0]), ["create", "role"]);
 });
 
-test("company onboarding strips disallowed symbols from the name and caps it at 150 characters", async () => {
+test("company onboarding accepts allowed punctuation in the name unchanged, rejects disallowed characters, and rejects a name over 150 characters", async () => {
   let bundle;
   const store = {
     async getMembership(userId) {
@@ -4476,24 +4527,42 @@ test("company onboarding strips disallowed symbols from the name and caps it at 
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
 
-  const event = authenticatedEvent("POST", "/platform/companies", {
-    name: "  Smith & Sons — O'Brien's \"Best\" Co. 🎉  ".repeat(6),
+  const baseBody = {
     email: "billing@smithsons.example",
     adminEmail: "admin@smithsons.example",
     adminName: "Admin",
     temporaryPassword: "Temporary123!",
     tier: "basic",
     billingAnchorDate: "2099-01-01",
-  });
-  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  };
 
-  const response = await handler(event);
-  assert.equal(response.statusCode, 201);
-  // Em dash, curly/straight quotes, and emoji are stripped; apostrophe,
-  // ampersand, and period survive; the whole thing is capped at 150 chars.
-  assert.ok(bundle.workspace.name.length <= 150);
-  assert.ok(!/[—"🎉]/.test(bundle.workspace.name));
-  assert.match(bundle.workspace.name, /Smith & Sons\s+O'Brien's\s+Best\s+Co\./);
+  // Allowed punctuation (& . , ' - ( ) / # ! *) survives exactly as sent.
+  const okEvent = authenticatedEvent("POST", "/platform/companies", {
+    ...baseBody,
+    name: "Smith & Sons - O'Brien's Best Co.",
+  });
+  okEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const okResponse = await handler(okEvent);
+  assert.equal(okResponse.statusCode, 201);
+  assert.equal(bundle.workspace.name, "Smith & Sons - O'Brien's Best Co.");
+
+  // A disallowed character (emoji) is rejected outright, not silently stripped.
+  const badCharEvent = authenticatedEvent("POST", "/platform/companies", {
+    ...baseBody,
+    name: "Smith & Sons 🎉",
+  });
+  badCharEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const badCharResponse = await handler(badCharEvent);
+  assert.equal(badCharResponse.statusCode, 400);
+
+  // Over the 150-character limit is rejected, not truncated.
+  const tooLongEvent = authenticatedEvent("POST", "/platform/companies", {
+    ...baseBody,
+    name: "A".repeat(151),
+  });
+  tooLongEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const tooLongResponse = await handler(tooLongEvent);
+  assert.equal(tooLongResponse.statusCode, 400);
 });
 
 test("company onboarding requires an email, and a receptionist-only company can omit RapidProposal's section pickers", async () => {
@@ -4896,7 +4965,7 @@ test("company profile APIs read and update the signed-in workspace name", async 
   assert.equal(workspace.tier, "basic");
 });
 
-test("PATCH /workspaces/me/company strips disallowed symbols from the name", async () => {
+test("PATCH /workspaces/me/company accepts allowed punctuation unchanged and rejects a disallowed character", async () => {
   let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design", email: "billing@technovate.test", tier: "basic" };
   const store = {
     async getMembership(userId) {
@@ -4907,16 +4976,52 @@ test("PATCH /workspaces/me/company strips disallowed symbols from the name", asy
   };
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
-  const patchEvent = authenticatedEvent(
+
+  const okEvent = authenticatedEvent(
+    "PATCH",
+    "/workspaces/me/company",
+    { name: "Smith & Sons - O'Brien's Best Co." },
+  );
+  okEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const okResponse = await handler(okEvent);
+  assert.equal(okResponse.statusCode, 200);
+  assert.equal(workspace.name, "Smith & Sons - O'Brien's Best Co.");
+
+  // An em dash and curly quotes are not in the allowlist - rejected, not stripped.
+  const badEvent = authenticatedEvent(
     "PATCH",
     "/workspaces/me/company",
     { name: "Smith & Sons — O'Brien's \"Best\" Co." },
   );
-  patchEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  badEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const badResponse = await handler(badEvent);
+  assert.equal(badResponse.statusCode, 400);
+  // The earlier valid name is unchanged.
+  assert.equal(workspace.name, "Smith & Sons - O'Brien's Best Co.");
+});
 
-  const response = await handler(patchEvent);
-  assert.equal(response.statusCode, 200);
-  assert.equal(workspace.name, "Smith & Sons  O'Brien's Best Co.");
+test("PATCH /workspaces/me/company accepts a 2-character name and rejects one over 80 characters", async () => {
+  let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design", email: "billing@technovate.test", tier: "basic" };
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: workspace.workspaceId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return workspace; },
+    async putWorkspace(value) { workspace = value; return value; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const shortEvent = authenticatedEvent("PATCH", "/workspaces/me/company", { name: "Xu" });
+  shortEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const shortResponse = await handler(shortEvent);
+  assert.equal(shortResponse.statusCode, 200);
+  assert.equal(workspace.name, "Xu");
+
+  const longEvent = authenticatedEvent("PATCH", "/workspaces/me/company", { name: "A".repeat(81) });
+  longEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const longResponse = await handler(longEvent);
+  assert.equal(longResponse.statusCode, 400);
 });
 
 function knowledgeBaseTestStore(overrides = {}) {
@@ -5944,6 +6049,17 @@ test("a super admin logs a payment for a company and it shows up in that company
   const bad = authenticatedEvent("POST", "/platform/companies/user-123/proposal-payments", { paidAt: "nope", planLabel: "Pro", amount: 1, receivedBy: "x" });
   bad.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
   assert.equal((await handler(bad)).statusCode, 400);
+
+  // An impossible calendar date (Feb 30) - a naive isNaN(new Date(...)) check
+  // would let this through since Date() silently rolls it to March 2.
+  const impossibleDate = authenticatedEvent("POST", "/platform/companies/user-123/proposal-payments", { paidAt: "2026-02-30", planLabel: "Pro", amount: 1, receivedBy: "Ops" });
+  impossibleDate.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(impossibleDate)).statusCode, 400);
+
+  // A disallowed character in receivedBy (an identity-like field) is rejected.
+  const badReceivedBy = authenticatedEvent("POST", "/platform/companies/user-123/proposal-payments", { paidAt: "2026-09-10", planLabel: "Pro", amount: 1, receivedBy: "<script>" });
+  badReceivedBy.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(badReceivedBy)).statusCode, 400);
 
   const log = authenticatedEvent("POST", "/platform/companies/user-123/proposal-payments", {
     paidAt: "2026-09-10", planLabel: "Pro", amount: 79.67, receivedBy: "Ops", method: "Stripe", note: "first month prorated",

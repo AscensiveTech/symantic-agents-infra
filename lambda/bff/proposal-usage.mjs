@@ -416,18 +416,39 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
   return { tier: normalizedTier, planLabel, monthlyPrice, priceOverridden, upcoming, payments };
 }
 
+// A naive `!isNaN(new Date(paidAt))` check does not catch an impossible
+// calendar date - new Date("2026-02-30") silently rolls over to March 2
+// instead of throwing. Re-derive Y/M/D from a UTC Date built from the same
+// parts and confirm nothing rolled over.
+function isRealDateOnly(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value ?? "");
+  if (!match) return false;
+  const [, y, m, d] = match;
+  const check = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
+  return (
+    !Number.isNaN(check.getTime()) &&
+    check.getUTCFullYear() === Number(y) &&
+    check.getUTCMonth() === Number(m) - 1 &&
+    check.getUTCDate() === Number(d)
+  );
+}
+
+// Identity-like field (the staff member's name) - same allowlist as the
+// frontend's sanitizeIdentityName in lib/domain/validation.ts.
+const IDENTITY_NAME_INVALID_CHARS = /[^\p{L}\p{M}\p{N}\s&.,'()/#!*-]/u;
+
 // Validate a super-admin "log a payment" body. Returns a clean record (minus
 // server-set fields) or null.
 export function validProposalPayment(body) {
   if (!body || typeof body !== "object") return null;
   const paidAt = typeof body.paidAt === "string" ? body.paidAt.trim() : "";
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(paidAt) || Number.isNaN(new Date(paidAt).getTime())) return null;
+  if (!isRealDateOnly(paidAt)) return null;
   const planLabel = typeof body.planLabel === "string" ? body.planLabel.trim() : "";
   if (!planLabel || planLabel.length > 60) return null;
   const amount = money(body.amount);
   if (amount == null) return null;
   const receivedBy = typeof body.receivedBy === "string" ? body.receivedBy.trim() : "";
-  if (!receivedBy || receivedBy.length > 120) return null;
+  if (!receivedBy || receivedBy.length > 120 || IDENTITY_NAME_INVALID_CHARS.test(receivedBy)) return null;
   const method = typeof body.method === "string" ? body.method.trim() : "";
   if (method.length > 60) return null;
   const note = typeof body.note === "string" ? body.note.trim() : "";
