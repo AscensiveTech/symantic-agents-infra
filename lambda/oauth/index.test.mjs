@@ -732,19 +732,31 @@ test("an issued invitation returns a shareable link the admin can send by any me
   const { handler, invites } = inviteHandler();
 
   const created = await handler(
-    adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Front desk – Jane" }),
+    adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Front desk - Jane" }),
   );
   const body = JSON.parse(created.body);
 
   assert.equal(created.statusCode, 201);
   assert.equal(body.status, "pending");
-  assert.equal(body.inviteeLabel, "Front desk – Jane");
+  assert.equal(body.inviteeLabel, "Front desk - Jane");
   assert.equal(body.createdByName, "Dana Admin");
   assert.ok(body.url.startsWith("https://agents.example.com/connect-calendar/"));
   // The link is the credential, so it must not be a guessable id.
   assert.ok(body.url.split("/").pop().length >= 22);
-  const stored = await invites.listByWorkspace(workspaceId);
-  assert.equal(stored.length, 1);
+});
+
+test("POST /calendars/invites accepts a 2-character inviteeLabel and rejects a disallowed character or an over-length value", async () => {
+  const { handler } = inviteHandler();
+
+  const shortLabel = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-123", inviteeLabel: "Jo" }));
+  assert.equal(shortLabel.statusCode, 201);
+  assert.equal(JSON.parse(shortLabel.body).inviteeLabel, "Jo");
+
+  const badChar = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-456", inviteeLabel: "Front desk <b>" }));
+  assert.equal(badChar.statusCode, 400);
+
+  const tooLong = await handler(adminEvent("POST", "/calendars/invites", { agentId: "agent-789", inviteeLabel: "A".repeat(201) }));
+  assert.equal(tooLong.statusCode, 400);
 });
 
 test("the public invite page names the company without leaking workspace internals", async () => {

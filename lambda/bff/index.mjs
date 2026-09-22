@@ -61,6 +61,62 @@ function sanitizeCompanyName(raw) {
     : "";
 }
 
+// Reject-based counterpart to sanitizeCompanyName, for identity-like fields
+// (company name, contact name, team member name, agent name, appointment
+// type name, calendar-invite invitee name, ...) where a direct API call
+// should be told NO rather than have its input silently stripped/truncated.
+// Same allowlist as the frontend's sanitizeIdentityName/sanitizeCompanyName
+// in lib/domain/validation.ts - unicode letters/marks, digits, spaces, and
+// & . , ' - ( ) / # ! * - so control characters, < >, emoji, and other
+// punctuation are always rejected regardless of this allowlist.
+const IDENTITY_NAME_INVALID_CHARS = /[^\p{L}\p{M}\p{N}\s&.,'()/#!*-]/u;
+
+function identityNameCharsError(trimmed, max, label) {
+  if (trimmed.length > max) return `${label} must be ${max} characters or fewer`;
+  if (IDENTITY_NAME_INVALID_CHARS.test(trimmed)) {
+    return `${label} contains characters that aren't allowed`;
+  }
+  return null;
+}
+
+// For fields that must be present (company name on create, agent name, ...).
+// Never requires more than 1 character - many real names are legitimately
+// that short.
+function validateIdentityName(raw, { max, label = "This field" } = {}) {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  if (!trimmed) return { error: `${label} is required` };
+  const error = identityNameCharsError(trimmed, max, label);
+  return error ? { error } : { value: trimmed };
+}
+
+// For fields that may be cleared (contact name, a member's optional display
+// name, ...) - an empty value is fine, but anything provided still has to
+// pass the same length/character rules.
+function validateOptionalIdentityName(raw, { max, label = "This field" } = {}) {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  if (!trimmed) return { value: "" };
+  const error = identityNameCharsError(trimmed, max, label);
+  return error ? { error } : { value: trimmed };
+}
+
+// Client-supplied dates are only checked with regex + `new Date(...)` in a
+// few places, which is not enough: new Date("2026-02-30") silently rolls
+// over to March 2 instead of throwing, so a naive !isNaN(...) check lets an
+// impossible calendar date through. This re-derives Y/M/D from a UTC Date
+// built from the same parts and confirms nothing rolled over.
+const DATE_PREFIX_PATTERN = /^(\d{4})-(\d{2})-(\d{2})/;
+function isRealCalendarDatePrefix(value) {
+  const match = typeof value === "string" ? value.match(DATE_PREFIX_PATTERN) : null;
+  if (!match) return true; // no recognizable date prefix - let the caller's own format/NaN check handle it
+  const [, y, m, d] = match;
+  const check = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
+  return (
+    check.getUTCFullYear() === Number(y) &&
+    check.getUTCMonth() === Number(m) - 1 &&
+    check.getUTCDate() === Number(d)
+  );
+}
+
 const PROFILE_FIELDS = {
   businessType: "string",
   businessName: "string",
@@ -227,15 +283,22 @@ async function agentNameTaken(store, workspaceId, name, excludeAgentId) {
     String(existing.name ?? "").trim().toLowerCase() === target);
 }
 
+// AI Voice Agent name - identity-like label, mirrors the frontend's
+// sanitizeIdentityName(name, 80) in components/agent-wizard.tsx.
+const AGENT_NAME_MAX_LENGTH = 80;
+
 function pickAgent(value, routeAgentId) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const agentId = routeAgentId ?? value.id ?? value.agentId;
+  const nameValidation = typeof value.name === "string"
+    ? validateIdentityName(value.name, { max: AGENT_NAME_MAX_LENGTH, label: "Agent name" })
+    : { error: "Agent name is required" };
   if (
     typeof agentId !== "string" ||
     !AGENT_ID_PATTERN.test(agentId) ||
     (value.id !== undefined && value.id !== agentId) ||
     (value.agentId !== undefined && value.agentId !== agentId) ||
-    typeof value.name !== "string" ||
+    !nameValidation.value ||
     typeof value.role !== "string" ||
     typeof value.description !== "string" ||
     !CLIENT_SETTABLE_AGENT_STATUSES.has(value.status) ||
@@ -252,7 +315,7 @@ function pickAgent(value, routeAgentId) {
   }
   return {
     id: agentId,
-    name: value.name,
+    name: nameValidation.value,
     role: value.role,
     description: value.description,
     status: value.status,
@@ -1166,8 +1229,15 @@ export function createHandler({
 
         const body = readBody(event) ?? {};
         if (typeof body.name !== "string") return json(400, { message: "name is required" });
-        const name = body.name.trim().slice(0, 120);
-        const companyName = typeof body.companyName === "string" ? body.companyName.trim().slice(0, 120) : undefined;
+        const nameValidation = validateOptionalIdentityName(body.name, { max: 120, label: "Contact name" });
+        if (nameValidation.error) return json(400, { message: nameValidation.error });
+        const name = nameValidation.value;
+        let companyName;
+        if (typeof body.companyName === "string") {
+          const companyNameValidation = validateOptionalIdentityName(body.companyName, { max: 120, label: "Company name" });
+          if (companyNameValidation.error) return json(400, { message: companyNameValidation.error });
+          companyName = companyNameValidation.value;
+        }
         if (body.email !== undefined && body.email !== null && typeof body.email !== "string") {
           return json(400, { message: "email must be a string" });
         }
@@ -1664,7 +1734,9 @@ export function createHandler({
         if (typeof body?.callerName !== "string") {
           return json(400, { message: "callerName is required" });
         }
-        const callerName = body.callerName.trim().slice(0, 120);
+        const callerNameValidation = validateOptionalIdentityName(body.callerName, { max: 120, label: "Caller name" });
+        if (callerNameValidation.error) return json(400, { message: callerNameValidation.error });
+        const callerName = callerNameValidation.value;
         const existing = await store.getCall(workspaceId, callId);
         if (!existing) return json(404, { message: "Call not found" });
         // An empty string clears the manually-set name (e.g. the customer
@@ -1698,7 +1770,9 @@ export function createHandler({
         if (typeof body?.callerName !== "string") {
           return json(400, { message: "callerName is required" });
         }
-        const callerName = body.callerName.trim().slice(0, 120);
+        const callerNameValidation = validateOptionalIdentityName(body.callerName, { max: 120, label: "Caller name" });
+        if (callerNameValidation.error) return json(400, { message: callerNameValidation.error });
+        const callerName = callerNameValidation.value;
         const calls = (await store.listCalls(workspaceId))
           .filter((call) => call.callerNumber === phoneNumber);
 
@@ -2263,7 +2337,8 @@ async function handlePlatformCompanies(event, {
       const hasAnchor = body && Object.hasOwn(body, "billingAnchorDate");
       const hasCredit = body && Object.hasOwn(body, "billingCreditBalance");
       const hasDiscount = body && Object.hasOwn(body, "billingDiscount");
-      const name = sanitizeCompanyName(typeof body?.name === "string" ? body.name.trim() : "");
+      const nameValidation = hasName ? validateIdentityName(body?.name, { max: COMPANY_NAME_MAX_LENGTH, label: "Company name" }) : null;
+      const name = nameValidation?.value ?? "";
       const proposalPrice = body?.proposalPlanPriceOverride;
       const proposalPriceValid = proposalPrice === null || proposalPrice === ""
         || (typeof proposalPrice === "number" && Number.isFinite(proposalPrice) && proposalPrice >= 0);
@@ -2271,13 +2346,14 @@ async function handlePlatformCompanies(event, {
       const anchorValid = body?.billingAnchorDate === null || body?.billingAnchorDate === ""
         || (typeof body?.billingAnchorDate === "string"
           && /^\d{4}-\d{2}-\d{2}$/.test(body.billingAnchorDate)
-          && body.billingAnchorDate >= anchorTodayKey);
+          && body.billingAnchorDate >= anchorTodayKey
+          && isRealCalendarDatePrefix(body.billingAnchorDate));
       const creditValid = body?.billingCreditBalance === null || body?.billingCreditBalance === ""
         || (typeof body?.billingCreditBalance === "number" && Number.isFinite(body.billingCreditBalance) && body.billingCreditBalance >= 0);
       if (
         (!hasName && !hasTier && !hasPlan && !hasBlocklist && !hasMostAskedQuestions && !hasProposalPrice && !hasAnchor && !hasCredit && !hasEntitlements && !hasDiscount) ||
         (hasEntitlements && !isValidEntitlements(body.entitlements)) ||
-        (hasName && name.length < 2) ||
+        (hasName && !nameValidation.value) ||
         (hasTier && !COMPANY_TIERS.has(body?.tier)) ||
         (hasBlocklist && typeof body.callBlocklistEnabled !== "boolean") ||
         (hasMostAskedQuestions && typeof body.mostAskedQuestionsEnabled !== "boolean") ||
@@ -2474,15 +2550,16 @@ async function handlePlatformCompanies(event, {
       const hasRole = body && Object.hasOwn(body, "role");
       const hasName = body && Object.hasOwn(body, "name");
       const role = body?.role;
-      const name = typeof body?.name === "string" ? body.name.trim() : "";
+      const nameValidation = hasName ? validateIdentityName(body?.name, { max: 120, label: "Name" }) : null;
+      const name = nameValidation?.value ?? "";
       if (!hasRole && !hasName) {
         return json(400, { message: "Provide a role and/or a name to update." });
       }
       if (hasRole && !["company-admin", "quotation-builder"].includes(role)) {
         return json(400, { message: "Invalid workspace role" });
       }
-      if (hasName && (name.length < 1 || name.length > 120)) {
-        return json(400, { message: "Enter a name (1-120 characters)." });
+      if (hasName && !nameValidation.value) {
+        return json(400, { message: nameValidation.error ?? "Enter a name (1-120 characters)." });
       }
       const membership = await store.getMembership(target.userId);
       if (!membership || membership.workspaceId !== target.workspaceId) {
@@ -2538,7 +2615,8 @@ async function handlePlatformCompanies(event, {
   if (method !== "POST") return json(404, { message: "Not found" });
 
   const body = readBody(event);
-  const name = sanitizeCompanyName(typeof body?.name === "string" ? body.name.trim() : "");
+  const nameValidation = validateIdentityName(body?.name, { max: COMPANY_NAME_MAX_LENGTH, label: "Company name" });
+  const name = nameValidation.value ?? "";
   // The workspace's own company email - required from here on (see
   // handleCompanyProfile's PATCH, which never allows clearing it once set).
   // Distinct from adminEmail below, which only creates/identifies the Org
@@ -2548,7 +2626,8 @@ async function handlePlatformCompanies(event, {
   const adminEmail = typeof body?.adminEmail === "string"
     ? body.adminEmail.trim().toLowerCase()
     : "";
-  const adminName = typeof body?.adminName === "string" ? body.adminName.trim() : "";
+  const adminNameValidation = validateIdentityName(body?.adminName, { max: 120, label: "Admin name" });
+  const adminName = adminNameValidation.value ?? "";
   const website = typeof body?.website === "string" ? body.website.trim().slice(0, 200) : "";
   const officeAddress = typeof body?.officeAddress === "string" ? body.officeAddress.trim().slice(0, 240) : "";
   const temporaryPassword = body?.temporaryPassword;
@@ -2566,15 +2645,16 @@ async function handlePlatformCompanies(event, {
   // it later). Format YYYY-MM-DD.
   const billingAnchorDate = typeof body?.billingAnchorDate === "string" ? body.billingAnchorDate.trim() : "";
   const todayKey = new Date().toISOString().slice(0, 10);
-  const billingAnchorValid = /^\d{4}-\d{2}-\d{2}$/.test(billingAnchorDate) && billingAnchorDate >= todayKey;
+  const billingAnchorValid = /^\d{4}-\d{2}-\d{2}$/.test(billingAnchorDate)
+    && billingAnchorDate >= todayKey
+    && isRealCalendarDatePrefix(billingAnchorDate);
   if (
-    name.length < 2 ||
+    !nameValidation.value ||
     !email ||
     email.length > 320 ||
     !EMAIL_PATTERN.test(adminEmail) ||
     adminEmail.length > 320 ||
-    !adminName ||
-    adminName.length > 120 ||
+    !adminNameValidation.value ||
     typeof temporaryPassword !== "string" ||
     temporaryPassword.length < 12 ||
     !COMPANY_TIERS.has(tier) ||
@@ -3551,13 +3631,14 @@ async function assertSeatAvailable(store, workspaceId, tier) {
 // POST /platform/companies/{id}/users (super admin, any workspace).
 async function addWorkspaceMember({ store, directory, workspaceId, tier, actorUserId, body }) {
   const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
-  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  const nameValidation = validateOptionalIdentityName(body?.name, { max: 120, label: "Name" });
+  const name = nameValidation.value ?? "";
   const role = body?.role === "company-admin" ? "company-admin" : "quotation-builder";
   const temporaryPassword = body?.temporaryPassword;
   if (
     !EMAIL_PATTERN.test(email) ||
     email.length > 320 ||
-    name.length > 120 ||
+    nameValidation.error ||
     typeof temporaryPassword !== "string" ||
     temporaryPassword.length < 12
   ) {
@@ -3678,9 +3759,9 @@ async function handleWorkspaceUsers(event, {
 
     const patch = {};
     if (Object.hasOwn(body ?? {}, "name")) {
-      const name = typeof body.name === "string" ? body.name.trim() : "";
-      if (name.length < 1 || name.length > 120) return json(400, { message: "Enter a name (1-120 characters)." });
-      patch.name = name;
+      const nameValidation = validateIdentityName(body?.name, { max: 120, label: "Name" });
+      if (!nameValidation.value) return json(400, { message: nameValidation.error ?? "Enter a name (1-120 characters)." });
+      patch.name = nameValidation.value;
     }
     if (body?.tourCompleted === true) {
       patch.tourCompletedAt = self.tourCompletedAt ?? new Date().toISOString();
@@ -3744,15 +3825,16 @@ async function handleWorkspaceUsers(event, {
     const hasRole = body && Object.hasOwn(body, "role");
     const hasName = body && Object.hasOwn(body, "name");
     const role = body?.role;
-    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    const nameValidation = hasName ? validateIdentityName(body?.name, { max: 120, label: "Name" }) : null;
+    const name = nameValidation?.value ?? "";
     if (!hasRole && !hasName) {
       return json(400, { message: "Provide a role and/or a name to update." });
     }
     if (hasRole && !["company-admin", "quotation-builder"].includes(role)) {
       return json(400, { message: "Invalid workspace role" });
     }
-    if (hasName && (name.length < 1 || name.length > 120)) {
-      return json(400, { message: "Enter a name (1-120 characters)." });
+    if (hasName && !nameValidation.value) {
+      return json(400, { message: nameValidation.error ?? "Enter a name (1-120 characters)." });
     }
     const directory = await getUserDirectory();
     if (!actor.roles.includes("super-admin") && (
@@ -4111,8 +4193,12 @@ async function handleSystemNotice(event, { method, path, actor, store }) {
       const endAt = typeof body.endAt === "string" ? body.endAt : "";
       const start = new Date(startAt);
       const end = new Date(endAt);
-      if (Number.isNaN(start.getTime())) return json(400, { message: "Provide a valid start date and time." });
-      if (Number.isNaN(end.getTime())) return json(400, { message: "Provide a valid end date and time." });
+      if (Number.isNaN(start.getTime()) || !isRealCalendarDatePrefix(startAt)) {
+        return json(400, { message: "Provide a valid start date and time." });
+      }
+      if (Number.isNaN(end.getTime()) || !isRealCalendarDatePrefix(endAt)) {
+        return json(400, { message: "Provide a valid end date and time." });
+      }
       const nowMs = Date.now();
       const GRACE_MS = 5 * 60_000; // allow "starts now" despite request latency / clock skew
       const MAX_WINDOW_MS = 7 * 24 * 60 * 60_000;
@@ -4190,10 +4276,13 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
   }
   if (method === "PATCH") {
     const body = readBody(event);
-    const name = sanitizeCompanyName(typeof body?.name === "string" ? body.name.trim() : "");
-    if (name.length < 2) {
-      return json(400, { message: "Invalid company name" });
+    // Mirrors the 80-character limit on the "Company Name" field in
+    // components/company-profile-settings.tsx on the frontend.
+    const nameValidation = validateIdentityName(body?.name, { max: 80, label: "Company name" });
+    if (!nameValidation.value) {
+      return json(400, { message: nameValidation.error ?? "Invalid company name" });
     }
+    const name = nameValidation.value;
     // Company email is required from here on and, once set, can never be
     // cleared - a workspace admin PATCHing just the name (email omitted)
     // keeps whatever's already stored; explicitly sending a blank email is

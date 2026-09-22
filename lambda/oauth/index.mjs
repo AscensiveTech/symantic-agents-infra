@@ -1089,10 +1089,33 @@ function requireInviteId(value) {
   return value;
 }
 
+// Identity-like label ("who is this for?") - same allowlist as the
+// frontend's sanitizeIdentityName in lib/domain/validation.ts: unicode
+// letters/marks, digits, spaces, and & . , ' - ( ) / # ! * . Control
+// characters and < > are always rejected regardless of this allowlist.
+const INVITEE_LABEL_MAX_LENGTH = 200;
+const INVITEE_LABEL_INVALID_CHARS = /[^\p{L}\p{M}\p{N}\s&.,'()/#!*-]/u;
+
 function readInviteeLabel(body) {
   const raw = body?.inviteeLabel;
   if (typeof raw !== "string") return "";
-  return raw.trim().slice(0, 200);
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  if (trimmed.length > INVITEE_LABEL_MAX_LENGTH) {
+    throw new OAuthRequestError(
+      `Label must be ${INVITEE_LABEL_MAX_LENGTH} characters or fewer`,
+      400,
+      "invalid_invitee_label",
+    );
+  }
+  if (INVITEE_LABEL_INVALID_CHARS.test(trimmed)) {
+    throw new OAuthRequestError(
+      "Label contains characters that aren't allowed",
+      400,
+      "invalid_invitee_label",
+    );
+  }
+  return trimmed;
 }
 
 // Optional: absent or blank means "I'll share the link myself".
