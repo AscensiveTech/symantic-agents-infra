@@ -4289,7 +4289,10 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
     return json(200, {
       name: workspace.name || "",
       email: workspace.email || "",
-      address: workspace.companyAddress || "",
+      addressStreet: workspace.companyAddressStreet || "",
+      addressCity: workspace.companyAddressCity || "",
+      addressState: workspace.companyAddressState || "",
+      addressZip: workspace.companyAddressZip || "",
       phone: workspace.companyPhone || "",
       phoneExtension: workspace.companyPhoneExtension || "",
       ...companyLogoResponse(workspace, logoUrl),
@@ -4316,28 +4319,35 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
       }
       email = nextEmail;
     }
-    // Entirely optional, unlike email above - can be set, changed, or
-    // cleared back to blank freely.
-    const address = Object.hasOwn(body ?? {}, "address") && typeof body.address === "string"
-      ? body.address.trim().slice(0, 240)
-      : workspace.companyAddress || "";
-    const phone = Object.hasOwn(body ?? {}, "phone") && typeof body.phone === "string"
-      ? body.phone.trim().slice(0, 40)
-      : workspace.companyPhone || "";
-    const phoneExtension = Object.hasOwn(body ?? {}, "phoneExtension") && typeof body.phoneExtension === "string"
-      ? body.phoneExtension.trim().slice(0, 10)
-      : workspace.companyPhoneExtension || "";
+    // Entirely optional, unlike email above - each can be set, changed, or
+    // cleared back to blank freely. Mirrors the Street/City/State/ZIP split
+    // and length caps already used for Office Address at company onboarding
+    // (components/receptionist-client-companies.tsx).
+    function optionalField(key, max, fallback) {
+      return Object.hasOwn(body ?? {}, key) && typeof body[key] === "string"
+        ? body[key].trim().slice(0, max)
+        : fallback;
+    }
+    const addressStreet = optionalField("addressStreet", 120, workspace.companyAddressStreet || "");
+    const addressCity = optionalField("addressCity", 80, workspace.companyAddressCity || "");
+    const addressState = optionalField("addressState", 40, workspace.companyAddressState || "");
+    const addressZip = optionalField("addressZip", 16, workspace.companyAddressZip || "");
+    const phone = optionalField("phone", 40, workspace.companyPhone || "");
+    const phoneExtension = optionalField("phoneExtension", 10, workspace.companyPhoneExtension || "");
     await store.putWorkspace({
       ...workspace,
       name,
       email,
-      companyAddress: address,
+      companyAddressStreet: addressStreet,
+      companyAddressCity: addressCity,
+      companyAddressState: addressState,
+      companyAddressZip: addressZip,
       companyPhone: phone,
       companyPhoneExtension: phoneExtension,
       updatedAt: new Date().toISOString(),
       updatedBy: actor.userId,
     });
-    return json(200, { name, email, address, phone, phoneExtension });
+    return json(200, { name, email, addressStreet, addressCity, addressState, addressZip, phone, phoneExtension });
   }
   return json(404, { message: "Not found" });
 }

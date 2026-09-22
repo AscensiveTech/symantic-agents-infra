@@ -5084,11 +5084,15 @@ test("company profile APIs read and update the signed-in workspace name", async 
 
   assert.equal(getResponse.statusCode, 200);
   assert.deepEqual(JSON.parse(getResponse.body), {
-    name: "Technovate Design", email: "", address: "", phone: "", phoneExtension: "", logo: null,
+    name: "Technovate Design", email: "",
+    addressStreet: "", addressCity: "", addressState: "", addressZip: "",
+    phone: "", phoneExtension: "", logo: null,
   });
   assert.equal(patchResponse.statusCode, 200);
   assert.deepEqual(JSON.parse(patchResponse.body), {
-    name: "Technovate Group", email: "", address: "", phone: "", phoneExtension: "",
+    name: "Technovate Group", email: "",
+    addressStreet: "", addressCity: "", addressState: "", addressZip: "",
+    phone: "", phoneExtension: "",
   });
   assert.equal(workspace.name, "Technovate Group");
   assert.equal(workspace.tier, "basic");
@@ -5114,13 +5118,19 @@ test("PATCH /workspaces/me/company sets, changes, and clears the optional addres
 
   const setResponse = await patch({
     name: "Technovate Design",
-    address: "123 Main St, Springfield, IL 62701",
+    addressStreet: "123 Main St",
+    addressCity: "Springfield",
+    addressState: "IL",
+    addressZip: "62701",
     phone: "(217) 555-0100",
     phoneExtension: "204",
   });
   assert.equal(setResponse.statusCode, 200);
   const set = JSON.parse(setResponse.body);
-  assert.equal(set.address, "123 Main St, Springfield, IL 62701");
+  assert.equal(set.addressStreet, "123 Main St");
+  assert.equal(set.addressCity, "Springfield");
+  assert.equal(set.addressState, "IL");
+  assert.equal(set.addressZip, "62701");
   assert.equal(set.phone, "(217) 555-0100");
   assert.equal(set.phoneExtension, "204");
 
@@ -5128,13 +5138,17 @@ test("PATCH /workspaces/me/company sets, changes, and clears the optional addres
   // required, so an update that doesn't mention them must leave them as-is.
   const nameOnlyResponse = await patch({ name: "Technovate Group" });
   const nameOnly = JSON.parse(nameOnlyResponse.body);
-  assert.equal(nameOnly.address, "123 Main St, Springfield, IL 62701");
+  assert.equal(nameOnly.addressStreet, "123 Main St");
   assert.equal(nameOnly.phone, "(217) 555-0100");
 
   // Explicitly cleared - allowed, unlike email.
-  const clearResponse = await patch({ name: "Technovate Group", address: "", phone: "", phoneExtension: "" });
+  const clearResponse = await patch({
+    name: "Technovate Group",
+    addressStreet: "", addressCity: "", addressState: "", addressZip: "",
+    phone: "", phoneExtension: "",
+  });
   const cleared = JSON.parse(clearResponse.body);
-  assert.equal(cleared.address, "");
+  assert.equal(cleared.addressStreet, "");
   assert.equal(cleared.phone, "");
   assert.equal(cleared.phoneExtension, "");
 });
