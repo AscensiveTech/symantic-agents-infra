@@ -3,6 +3,7 @@ import {
   appointmentResponse,
   isConditionalFailure,
   providerIdempotencyIds,
+  slotLockId,
   stableId,
 } from "./records.mjs";
 import { resolveTimeRange } from "./time.mjs";
@@ -91,29 +92,42 @@ export async function handleCreateBooking(input, {
   // paddedProviderRange's own comment).
   const providerRange = appointmentType ? paddedProviderRange(range, appointmentType) : range;
 
-  const availability = await calendar.getAvailability({
-    workspaceId: input.workspaceId,
-    ...providerRange,
-  });
-  requireAvailable(availability);
+  // Holds this exact (agent, time range) slot for the whole recheck+book
+  // sequence below, so a second concurrent call for the same slot is
+  // turned away immediately instead of racing through to the calendar
+  // provider - which doesn't reject an overlapping event on its own,
+  // only a literal retry of the same event id.
+  const lockId = slotLockId(input.agentId, providerRange.startTimeUtc, providerRange.endTimeUtc);
+  const gotLock = await store.acquireSlotLock(input.workspaceId, lockId);
+  if (!gotLock) requireAvailable({ available: false });
+  let providerBooking;
+  try {
+    const availability = await calendar.getAvailability({
+      workspaceId: input.workspaceId,
+      ...providerRange,
+    });
+    requireAvailable(availability);
 
-  const providerIds = providerIdempotencyIds(
-    input.workspaceId,
-    input.idempotencyKey,
-  );
-  const providerBooking = await calendar.createBooking({
-    workspaceId: input.workspaceId,
-    ...providerRange,
-    ...providerIds,
-    service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service),
-    description: stringOrUndefined(input.description),
-    location: stringOrUndefined(input.location) || profile?.address || undefined,
-    customer: normalizeCustomer(input.customer),
-    callId: input.callId,
-    idempotencyKey: input.idempotencyKey,
-  });
-  if (!providerBooking?.providerEventId) {
-    throw new Error("Calendar provider did not return an event id");
+    const providerIds = providerIdempotencyIds(
+      input.workspaceId,
+      input.idempotencyKey,
+    );
+    providerBooking = await calendar.createBooking({
+      workspaceId: input.workspaceId,
+      ...providerRange,
+      ...providerIds,
+      service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service),
+      description: stringOrUndefined(input.description),
+      location: stringOrUndefined(input.location) || profile?.address || undefined,
+      customer: normalizeCustomer(input.customer),
+      callId: input.callId,
+      idempotencyKey: input.idempotencyKey,
+    });
+    if (!providerBooking?.providerEventId) {
+      throw new Error("Calendar provider did not return an event id");
+    }
+  } finally {
+    await store.releaseSlotLock(input.workspaceId, lockId);
   }
 
   const createdAt = new Date(now()).toISOString();
@@ -181,32 +195,42 @@ export async function handleRescheduleBooking(input, {
   const profile = await store.getBusinessProfile(input.workspaceId);
   const timezone = profile?.timezone || appointment.timezone || "UTC";
   const range = resolveTimeRange(input, timezone, now);
-  const availability = await calendar.getAvailability({
-    workspaceId: input.workspaceId,
-    providerEventId: appointment.providerEventId,
-    ...range,
-  });
-  requireAvailable(availability);
+  // Same race the create-booking path guards against - hold the target
+  // slot for the whole recheck+reschedule sequence so a second concurrent
+  // attempt at the same new time is turned away immediately.
+  const lockId = slotLockId(input.agentId ?? appointment.agentId, range.startTimeUtc, range.endTimeUtc);
+  const gotLock = await store.acquireSlotLock(input.workspaceId, lockId);
+  if (!gotLock) requireAvailable({ available: false });
   try {
-    await calendar.rescheduleBooking({
+    const availability = await calendar.getAvailability({
       workspaceId: input.workspaceId,
       providerEventId: appointment.providerEventId,
       ...range,
     });
-  } catch (error) {
-    if (!isAlreadyUpdatedError(error)) {
-      if (!isRecoverableRescheduleError(error)) throw error;
-      const recovered = await store.getAppointment(
-        input.workspaceId,
-        appointmentId,
-      );
-      if (
-        recovered?.lastRescheduleIdempotencyKey === input.idempotencyKey
-      ) {
-        return appointmentResponse(recovered);
+    requireAvailable(availability);
+    try {
+      await calendar.rescheduleBooking({
+        workspaceId: input.workspaceId,
+        providerEventId: appointment.providerEventId,
+        ...range,
+      });
+    } catch (error) {
+      if (!isAlreadyUpdatedError(error)) {
+        if (!isRecoverableRescheduleError(error)) throw error;
+        const recovered = await store.getAppointment(
+          input.workspaceId,
+          appointmentId,
+        );
+        if (
+          recovered?.lastRescheduleIdempotencyKey === input.idempotencyKey
+        ) {
+          return appointmentResponse(recovered);
+        }
+        throw error;
       }
-      throw error;
     }
+  } finally {
+    await store.releaseSlotLock(input.workspaceId, lockId);
   }
   const updated = await store.updateAppointment(
     input.workspaceId,

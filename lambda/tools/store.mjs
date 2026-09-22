@@ -92,6 +92,43 @@ export function createDynamoToolsStore(client, commands, tableNames) {
       );
     },
 
+    // A short-lived lock record in the same table as real appointments,
+    // keyed by a synthetic appointmentId (see slotLockId) that can never
+    // collide with a real one. Succeeds if nothing currently holds the
+    // lock, or if whatever's there has expired (covers a Lambda crashing
+    // between acquire and release, which would otherwise leave a slot
+    // permanently locked). Returns true/false rather than throwing, so
+    // callers can turn a lost race into a normal "not available" reply.
+    async acquireSlotLock(workspaceId, lockId, ttlMs = 30_000) {
+      requireTableName(tableNames.appointments);
+      const now = Date.now();
+      try {
+        await client.send(new commands.PutItemCommand({
+          TableName: tableNames.appointments,
+          Item: marshall({ workspaceId, appointmentId: lockId, expiresAtMs: now + ttlMs }),
+          ConditionExpression: "attribute_not_exists(appointmentId) OR expiresAtMs < :now",
+          ExpressionAttributeValues: marshall({ ":now": now }),
+        }));
+        return true;
+      } catch (error) {
+        if (error?.name === "ConditionalCheckFailedException") return false;
+        throw error;
+      }
+    },
+
+    async releaseSlotLock(workspaceId, lockId) {
+      requireTableName(tableNames.appointments);
+      try {
+        await client.send(new commands.DeleteItemCommand({
+          TableName: tableNames.appointments,
+          Key: marshall({ workspaceId, appointmentId: lockId }),
+        }));
+      } catch {
+        // Best-effort - a release that fails just means the lock rides
+        // out its own short TTL instead of being freed early.
+      }
+    },
+
     async getLead(workspaceId, leadId) {
       return getItem(client, commands, tableNames.leads, {
         workspaceId,
