@@ -2638,6 +2638,10 @@ async function handlePlatformCompanies(event, {
   const adminName = adminNameValidation.value ?? "";
   const website = typeof body?.website === "string" ? body.website.trim().slice(0, 200) : "";
   const officeAddress = typeof body?.officeAddress === "string" ? body.officeAddress.trim().slice(0, 240) : "";
+  // Entirely optional, free-form - no calls or SMS are sent to it, so
+  // there's no reason to enforce a phone format here.
+  const phone = typeof body?.phone === "string" ? body.phone.trim().slice(0, 40) : "";
+  const phoneExtension = typeof body?.phoneExtension === "string" ? body.phoneExtension.trim().slice(0, 10) : "";
   const temporaryPassword = body?.temporaryPassword;
   const tier = body?.tier ?? "basic";
   const hasEntitlements = body && Object.hasOwn(body, "entitlements");
@@ -2685,6 +2689,8 @@ async function handlePlatformCompanies(event, {
     ...(hasEntitlements ? { entitlements } : {}),
     ...(website ? { website } : {}),
     ...(officeAddress ? { officeAddress } : {}),
+    ...(phone ? { phone } : {}),
+    ...(phoneExtension ? { phoneExtension } : {}),
     allowedProposalSections: allowedSections,
     billingAnchorDate,
     createdAt: now,
@@ -2718,6 +2724,8 @@ async function handlePlatformCompanies(event, {
       email,
       website: website || undefined,
       officeAddress: officeAddress || undefined,
+      phone: phone || undefined,
+      phoneExtension: phoneExtension || undefined,
       createdAt: now,
       allowedProposalSections: allowedSections,
       entitlements: workspaceEntitlements(workspace),
@@ -3269,6 +3277,8 @@ async function platformCompanySummary(store, workspace) {
     email: workspace.email || "",
     website: workspace.website || "",
     officeAddress: workspace.officeAddress || "",
+    phone: workspace.phone || "",
+    phoneExtension: workspace.phoneExtension || "",
     createdAt: workspace.createdAt ?? null,
     allowedProposalSections: normalizeProposalSections(
       workspace.allowedProposalSections,
@@ -4279,6 +4289,9 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
     return json(200, {
       name: workspace.name || "",
       email: workspace.email || "",
+      address: workspace.companyAddress || "",
+      phone: workspace.companyPhone || "",
+      phoneExtension: workspace.companyPhoneExtension || "",
       ...companyLogoResponse(workspace, logoUrl),
     });
   }
@@ -4303,14 +4316,28 @@ async function handleCompanyProfile(event, { method, path, actor, store, getAsse
       }
       email = nextEmail;
     }
+    // Entirely optional, unlike email above - can be set, changed, or
+    // cleared back to blank freely.
+    const address = Object.hasOwn(body ?? {}, "address") && typeof body.address === "string"
+      ? body.address.trim().slice(0, 240)
+      : workspace.companyAddress || "";
+    const phone = Object.hasOwn(body ?? {}, "phone") && typeof body.phone === "string"
+      ? body.phone.trim().slice(0, 40)
+      : workspace.companyPhone || "";
+    const phoneExtension = Object.hasOwn(body ?? {}, "phoneExtension") && typeof body.phoneExtension === "string"
+      ? body.phoneExtension.trim().slice(0, 10)
+      : workspace.companyPhoneExtension || "";
     await store.putWorkspace({
       ...workspace,
       name,
       email,
+      companyAddress: address,
+      companyPhone: phone,
+      companyPhoneExtension: phoneExtension,
       updatedAt: new Date().toISOString(),
       updatedBy: actor.userId,
     });
-    return json(200, { name, email });
+    return json(200, { name, email, address, phone, phoneExtension });
   }
   return json(404, { message: "Not found" });
 }
