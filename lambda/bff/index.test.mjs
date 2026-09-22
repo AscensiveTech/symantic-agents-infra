@@ -4579,6 +4579,60 @@ test("super administrators onboard a company with an isolated default template",
   assert.deepEqual(directoryCalls.map((call) => call[0]), ["create", "role"]);
 });
 
+test("company onboarding keeps the optional office address, phone, and phone extension - and omits them when not given", async () => {
+  let bundle;
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: "workspace-platform", role: "company-admin", status: "active" };
+    },
+    async createWorkspaceBundle(value) { bundle = value; return value; },
+  };
+  const directory = {
+    async createUser() { return { userId: "id-1", username: "cognito-id-1" }; },
+    async setRole() {},
+    async deleteUser() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+
+  const withPhone = authenticatedEvent("POST", "/platform/companies", {
+    name: "Technovate Design",
+    email: "billing@technovate.design",
+    adminEmail: "admin@technovate.design",
+    adminName: "Admin",
+    temporaryPassword: "Temporary123!",
+    billingAnchorDate: "2099-01-01",
+    entitlements: { receptionist: true, rapidProposal: false },
+    officeAddress: "123 Main St, Springfield, IL 62701",
+    phone: "(217) 555-0100",
+    phoneExtension: "204",
+  });
+  withPhone.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"super-admin\"]";
+  const withPhoneResponse = await handler(withPhone);
+  const withPhoneBody = JSON.parse(withPhoneResponse.body);
+  assert.equal(withPhoneResponse.statusCode, 201);
+  assert.equal(withPhoneBody.phone, "(217) 555-0100");
+  assert.equal(withPhoneBody.phoneExtension, "204");
+  assert.equal(bundle.workspace.phone, "(217) 555-0100");
+  assert.equal(bundle.workspace.phoneExtension, "204");
+
+  const withoutPhone = authenticatedEvent("POST", "/platform/companies", {
+    name: "Northgate Studio",
+    email: "billing@northgate.design",
+    adminEmail: "admin@northgate.design",
+    adminName: "Admin",
+    temporaryPassword: "Temporary123!",
+    billingAnchorDate: "2099-01-01",
+    entitlements: { receptionist: true, rapidProposal: false },
+  });
+  withoutPhone.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"super-admin\"]";
+  const withoutPhoneResponse = await handler(withoutPhone);
+  const withoutPhoneBody = JSON.parse(withoutPhoneResponse.body);
+  assert.equal(withoutPhoneResponse.statusCode, 201);
+  assert.equal(withoutPhoneBody.phone, undefined);
+  assert.equal(bundle.workspace.phone, undefined);
+});
+
 test("company onboarding accepts allowed punctuation in the name unchanged, rejects disallowed characters, and rejects a name over 150 characters", async () => {
   let bundle;
   const store = {
@@ -5029,11 +5083,60 @@ test("company profile APIs read and update the signed-in workspace name", async 
   const patchResponse = await handler(patchEvent);
 
   assert.equal(getResponse.statusCode, 200);
-  assert.deepEqual(JSON.parse(getResponse.body), { name: "Technovate Design", email: "", logo: null });
+  assert.deepEqual(JSON.parse(getResponse.body), {
+    name: "Technovate Design", email: "", address: "", phone: "", phoneExtension: "", logo: null,
+  });
   assert.equal(patchResponse.statusCode, 200);
-  assert.deepEqual(JSON.parse(patchResponse.body), { name: "Technovate Group", email: "" });
+  assert.deepEqual(JSON.parse(patchResponse.body), {
+    name: "Technovate Group", email: "", address: "", phone: "", phoneExtension: "",
+  });
   assert.equal(workspace.name, "Technovate Group");
   assert.equal(workspace.tier, "basic");
+});
+
+test("PATCH /workspaces/me/company sets, changes, and clears the optional address and phone fields", async () => {
+  let workspace = { workspaceId: "workspace-technovate", name: "Technovate Design", email: "billing@technovate.test", tier: "basic" };
+  const store = {
+    async getMembership(userId) {
+      return { userId, workspaceId: workspace.workspaceId, role: "company-admin", status: "active" };
+    },
+    async getWorkspace() { return workspace; },
+    async putWorkspace(value) { workspace = value; return value; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  function patch(body) {
+    const event = authenticatedEvent("PATCH", "/workspaces/me/company", body);
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+    return handler(event);
+  }
+
+  const setResponse = await patch({
+    name: "Technovate Design",
+    address: "123 Main St, Springfield, IL 62701",
+    phone: "(217) 555-0100",
+    phoneExtension: "204",
+  });
+  assert.equal(setResponse.statusCode, 200);
+  const set = JSON.parse(setResponse.body);
+  assert.equal(set.address, "123 Main St, Springfield, IL 62701");
+  assert.equal(set.phone, "(217) 555-0100");
+  assert.equal(set.phoneExtension, "204");
+
+  // Omitted entirely on the next save - unlike email, these are never
+  // required, so an update that doesn't mention them must leave them as-is.
+  const nameOnlyResponse = await patch({ name: "Technovate Group" });
+  const nameOnly = JSON.parse(nameOnlyResponse.body);
+  assert.equal(nameOnly.address, "123 Main St, Springfield, IL 62701");
+  assert.equal(nameOnly.phone, "(217) 555-0100");
+
+  // Explicitly cleared - allowed, unlike email.
+  const clearResponse = await patch({ name: "Technovate Group", address: "", phone: "", phoneExtension: "" });
+  const cleared = JSON.parse(clearResponse.body);
+  assert.equal(cleared.address, "");
+  assert.equal(cleared.phone, "");
+  assert.equal(cleared.phoneExtension, "");
 });
 
 test("PATCH /workspaces/me/company accepts allowed punctuation unchanged and rejects a disallowed character", async () => {
