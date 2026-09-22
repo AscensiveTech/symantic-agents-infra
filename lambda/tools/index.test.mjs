@@ -63,6 +63,54 @@ test("duplicate createBooking returns the original appointment without a second 
   assert.equal(records.size, 1);
 });
 
+test("a second concurrent createBooking for the same agent/time slot is turned away instead of racing the provider", async () => {
+  const locks = new Set();
+  const providerCalls = [];
+  const store = createStore({
+    async acquireSlotLock(_workspaceId, lockId) {
+      if (locks.has(lockId)) return false;
+      locks.add(lockId);
+      return true;
+    },
+    async releaseSlotLock(_workspaceId, lockId) {
+      locks.delete(lockId);
+    },
+  });
+  const calendar = {
+    async getAvailability(input) {
+      providerCalls.push(["availability", input]);
+      return { available: true, busy: [] };
+    },
+    async createBooking(input) {
+      providerCalls.push(["create", input]);
+      return {
+        providerEventId: "google-event-1",
+        provider: "google-calendar",
+        htmlLink: "https://calendar.google.com/event/1",
+      };
+    },
+  };
+  const handler = toolHandler({ store, calendar });
+
+  // Two different calls (different idempotencyKey) for the exact same
+  // agent and time range - the second must never reach the provider at
+  // all, since acquireSlotLock is called before the availability recheck.
+  const [first, second] = await Promise.all([
+    handler(event("/retell/tools/calendar.createBooking", bookingBody({ idempotencyKey: "call-a" }))),
+    handler(event("/retell/tools/calendar.createBooking", bookingBody({ idempotencyKey: "call-b" }))),
+  ]);
+
+  const results = [first, second].map((response) => JSON.parse(response.body));
+  const succeeded = results.filter((body) => body.ok);
+  const rejected = results.filter((body) => !body.ok);
+  assert.equal(succeeded.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].code, "slot_unavailable");
+  assert.equal(providerCalls.filter(([name]) => name === "availability").length, 1);
+  assert.equal(providerCalls.filter(([name]) => name === "create").length, 1);
+  assert.equal(locks.size, 0);
+});
+
 test("createBooking resolves relative time in the workspace timezone and persists UTC", async () => {
   let persisted;
   let providerInput;
@@ -1164,6 +1212,10 @@ function createStore(overrides = {}) {
     async getAgent() {
       return null;
     },
+    async acquireSlotLock() {
+      return true;
+    },
+    async releaseSlotLock() {},
     ...overrides,
   };
 }
