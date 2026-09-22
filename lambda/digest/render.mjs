@@ -47,7 +47,7 @@ export function renderDigest({
   const body = count
     ? `Open Call History to see ${count === 1 ? "it" : "them"}.`
     : "There were no new calls since your last check.";
-  const preheader = count ? `${count} new ${plural} — ${body}` : body;
+  const preheader = count ? `${count} new ${plural} - ${body}` : body;
 
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(subject)}</title></head>
