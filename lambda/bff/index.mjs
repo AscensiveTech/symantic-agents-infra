@@ -1246,8 +1246,8 @@ export function createHandler({
           return json(400, { message: "email must be a valid email address" });
         }
         const extensionRaw = typeof body.extension === "string" ? body.extension.trim() : undefined;
-        if (extensionRaw && !/^\d{1,10}$/.test(extensionRaw)) {
-          return json(400, { message: "extension must be numeric, up to 10 digits" });
+        if (extensionRaw && !/^\d{1,5}$/.test(extensionRaw)) {
+          return json(400, { message: "extension must be numeric, up to 5 digits" });
         }
         const saved = await store.putContact(workspaceId, phoneNumber, {
           name: name || undefined,
@@ -2235,6 +2235,11 @@ export function createHandler({
             deletedAt,
             deletedByName: actorDisplayName(event, actor),
             callsHandledAtDeletion,
+            // Captured before deletePhoneNumberRecord ran above - once that
+            // record is gone there's no other trace of what number this
+            // agent used to have, so it has to be copied onto the agent
+            // record itself here or it's lost for good.
+            ...(phoneNumber?.telnyxPhoneNumber ? { deletedPhoneNumber: phoneNumber.telnyxPhoneNumber } : {}),
             updatedAt: deletedAt,
           });
           return json(200, toPublicAgent(updated));
