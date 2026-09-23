@@ -353,6 +353,26 @@ test("prompt includes configured holiday closures, contact emails, and service a
   assert.doesNotMatch(withNone, /check_service_area/);
 });
 
+test("a Cal.com agent's prompt lists its chosen event types instead of its own Appointment Types", () => {
+  const prompt = buildReceptionistPrompt({
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      connections: ["cal-com"],
+      calComEventTypes: [
+        { id: "101", name: "Estimate Visit", lengthInMinutes: 60 },
+        { id: "202", name: "Quick Call", lengthInMinutes: 15 },
+      ],
+      appointmentTypes: [{ id: "t1", name: "Stale Type", durationMin: 30, minimumLeadTimeMin: 60 }],
+    },
+  }, profile);
+
+  const typesSection = prompt.split("# APPOINTMENT TYPES")[1].split("\n\n")[0];
+  assert.match(typesSection, /- Estimate Visit \(1 hour\)/);
+  assert.match(typesSection, /- Quick Call \(15 minutes\)/);
+  assert.doesNotMatch(prompt, /Stale Type/);
+});
+
 test("prompt renders configured appointment types by name, duration, and lead time only - never the before/after buffers", () => {
   const withTypes = buildReceptionistPrompt({
     ...agent,

@@ -1133,3 +1133,159 @@ function authenticatedEvent(method, path, body, queryStringParameters) {
   };
   return value;
 }
+
+// --- Cal.com (API key) ------------------------------------------------------
+
+const calComEventTypes = [
+  { id: "101", name: "Estimate Visit", lengthInMinutes: 60 },
+  { id: "202", name: "Quick Call", lengthInMinutes: 15, teamName: "Field Team" },
+];
+
+function calComHandler({
+  connectionStore = createInMemoryConnectionStore(),
+  eventTypes = calComEventTypes,
+  keyError,
+  encrypted = [],
+} = {}) {
+  return createHandler({
+    getConnectionStore: async () => connectionStore,
+    getTokenCrypto: async () => ({
+      encryptToken: async (input) => {
+        encrypted.push(input);
+        return `enc:${input.token}`;
+      },
+      decryptToken: async ({ encryptedToken }) => encryptedToken.replace(/^enc:/, ""),
+    }),
+    getCalComClient: () => ({
+      async getProfile(apiKey) {
+        if (keyError) throw keyError;
+        return { email: apiKey ? "owner@example.com" : null, timeZone: "America/New_York" };
+      },
+      async listEventTypes() {
+        return eventTypes;
+      },
+    }),
+    now: () => 1_800_000_000_000,
+  });
+}
+
+test("connecting Cal.com stores the API key only encrypted and never returns it", async () => {
+  const connectionStore = createInMemoryConnectionStore();
+  const encrypted = [];
+  const handler = calComHandler({ connectionStore, encrypted });
+
+  const response = await handler(authenticatedEvent("POST", "/calendars/cal-com/api-key", {
+    agentId,
+    apiKey: "  cal_live_abc12345  ",
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.doesNotMatch(response.body, /cal_live_abc12345/);
+  const body = JSON.parse(response.body);
+  assert.equal(body.provider, "cal-com");
+  assert.equal(body.accountEmail, "owner@example.com");
+  assert.deepEqual(body.availableCalendars, calComEventTypes);
+  assert.deepEqual(body.selectedEventTypeIds, []);
+  assert.equal(body.selectedCalendarId, null);
+
+  assert.deepEqual(encrypted, [{ token: "cal_live_abc12345", workspaceId, agentId, provider: "cal-com" }]);
+  const stored = await connectionStore.get(workspaceId, agentId);
+  assert.equal(stored.encryptedApiKey, "enc:cal_live_abc12345");
+
+  const read = await handler(authenticatedEvent("GET", "/calendars/connection", undefined, { agentId }));
+  assert.doesNotMatch(read.body, /cal_live_abc12345|encryptedApiKey/);
+});
+
+test("a Cal.com account with a single event type is offered it automatically", async () => {
+  const handler = calComHandler({ eventTypes: [calComEventTypes[0]] });
+  const response = await handler(authenticatedEvent("POST", "/calendars/cal-com/api-key", { agentId, apiKey: "cal_live_abc12345" }));
+  const body = JSON.parse(response.body);
+  assert.deepEqual(body.selectedEventTypeIds, ["101"]);
+  assert.equal(body.selectedCalendarId, "101");
+});
+
+test("a rejected or malformed Cal.com key, or an account with no event types, stores nothing", async () => {
+  const { CalComKeyError } = await import("./cal-com.mjs");
+  for (const [options, apiKey, code] of [
+    [{}, "not-a-cal-key", "invalid_api_key"],
+    [{ keyError: new CalComKeyError("nope") }, "cal_live_revoked1", "invalid_api_key"],
+    [{ eventTypes: [] }, "cal_live_abc12345", "no_event_types"],
+  ]) {
+    const connectionStore = createInMemoryConnectionStore();
+    const handler = calComHandler({ ...options, connectionStore });
+    const response = await handler(authenticatedEvent("POST", "/calendars/cal-com/api-key", { agentId, apiKey }));
+    assert.equal(response.statusCode, 400, code);
+    assert.equal(JSON.parse(response.body).code, code);
+    assert.equal(await connectionStore.get(workspaceId, agentId), null);
+  }
+});
+
+test("choosing Cal.com event types validates them against the live account and caps the list", async () => {
+  const connectionStore = createInMemoryConnectionStore();
+  const handler = calComHandler({ connectionStore });
+  await handler(authenticatedEvent("POST", "/calendars/cal-com/api-key", { agentId, apiKey: "cal_live_abc12345" }));
+
+  const chosen = await handler(authenticatedEvent("POST", "/calendars/select", {
+    agentId,
+    provider: "cal-com",
+    selectedEventTypeIds: ["202", "101", "202"],
+  }));
+  assert.equal(chosen.statusCode, 200);
+  assert.deepEqual(JSON.parse(chosen.body).selectedEventTypeIds, ["202", "101"]);
+  assert.equal(JSON.parse(chosen.body).selectedCalendarId, "202");
+
+  const unknown = await handler(authenticatedEvent("POST", "/calendars/select", {
+    agentId,
+    provider: "cal-com",
+    selectedEventTypeIds: ["999"],
+  }));
+  assert.equal(unknown.statusCode, 400);
+  assert.equal(JSON.parse(unknown.body).code, "invalid_event_type");
+
+  const none = await handler(authenticatedEvent("POST", "/calendars/select", { agentId, provider: "cal-com", selectedEventTypeIds: [] }));
+  assert.equal(none.statusCode, 400);
+
+  const tooMany = await handler(authenticatedEvent("POST", "/calendars/select", {
+    agentId,
+    provider: "cal-com",
+    selectedEventTypeIds: Array.from({ length: 11 }, (_, i) => String(i)),
+  }));
+  assert.equal(tooMany.statusCode, 400);
+});
+
+test("the Cal.com account reader merges team event types, skips a team it can't read, and reports a rejected key", async () => {
+  const { CalComKeyError, createCalComAccountClient } = await import("./cal-com.mjs");
+  const reply = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const seen = [];
+  const client = createCalComAccountClient({
+    fetchImpl: async (url, options) => {
+      seen.push([String(url), options.headers["cal-api-version"]]);
+      const path = new URL(url).pathname;
+      if (path === "/v2/event-types") return reply({ data: [{ id: 101, title: "Estimate Visit", lengthInMinutes: 60 }] });
+      if (path === "/v2/teams") return reply({ data: [{ id: 7, name: "Field Team" }, { id: 8, name: "Locked Team" }] });
+      if (path === "/v2/teams/7/event-types") return reply({ data: [{ id: 202, title: "Round Robin Estimate", lengthInMinutes: 30 }, { id: 101, title: "Duplicate" }] });
+      return reply({ error: "forbidden" }, 500);
+    },
+  });
+
+  assert.deepEqual(await client.listEventTypes("cal_live_key"), [
+    { id: "101", name: "Estimate Visit", lengthInMinutes: 60 },
+    { id: "202", name: "Round Robin Estimate", lengthInMinutes: 30, teamName: "Field Team" },
+  ]);
+  assert.equal(seen[0][1], "2026-06-12");
+
+  const rejecting = createCalComAccountClient({ fetchImpl: async () => reply({ message: "Invalid API key" }, 401) });
+  await assert.rejects(rejecting.getProfile("cal_live_bad"), CalComKeyError);
+});
+
+test("disconnecting Cal.com removes the stored API key", async () => {
+  const connectionStore = createInMemoryConnectionStore();
+  const handler = calComHandler({ connectionStore });
+  await handler(authenticatedEvent("POST", "/calendars/cal-com/api-key", { agentId, apiKey: "cal_live_abc12345" }));
+
+  const response = await handler(authenticatedEvent("DELETE", "/calendars/connection", undefined, { agentId }));
+  assert.equal(response.statusCode, 200);
+  const stored = await connectionStore.get(workspaceId, agentId);
+  assert.equal(stored.connectionState, "disconnected");
+  assert.equal(stored.encryptedApiKey, undefined);
+});

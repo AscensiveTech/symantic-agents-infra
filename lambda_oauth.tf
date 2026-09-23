@@ -221,6 +221,7 @@ locals {
   oauth_authorized_routes = toset([
     "GET /oauth/{provider}/start",
     "POST /calendars/select",
+    "POST /calendars/cal-com/api-key",
     "GET /calendars/connection",
     "DELETE /calendars/connection",
     "POST /calendars/invites",

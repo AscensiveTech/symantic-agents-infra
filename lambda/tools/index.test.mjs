@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 
 import { createCalendarAdapter } from "./calendar/index.mjs";
+import { createCalComClient } from "./calendar/cal-com.mjs";
 import { createGoogleCalendarClient } from "./calendar/google.mjs";
 import { createMicrosoftCalendarClient } from "./calendar/microsoft.mjs";
 import { providerIdempotencyIds } from "./handlers/records.mjs";
@@ -1424,3 +1425,219 @@ function jsonResponse(body, status = 200) {
     headers: { "content-type": "application/json" },
   });
 }
+
+function calComConnection(overrides = {}) {
+  return {
+    workspaceId,
+    agentId: "agent-1",
+    provider: "cal-com",
+    encryptedApiKey: "encrypted-api-key",
+    selectedCalendarId: "101",
+    selectedEventTypeIds: ["101", "202"],
+    availableCalendars: [
+      { id: "101", name: "Estimate Visit", lengthInMinutes: 60 },
+      { id: "202", name: "Quick Call", lengthInMinutes: 15 },
+      { id: "303", name: "Not Offered", lengthInMinutes: 30 },
+    ],
+    calendarTimezone: "America/New_York",
+    connectionState: "connected",
+    ...overrides,
+  };
+}
+
+test("Cal.com client asks for slots on the chosen event type and books with the business's attendee email", async () => {
+  const requests = [];
+  const client = createCalComClient({
+    fetchImpl: async (url, options) => {
+      requests.push({ url: String(url), options });
+      if (String(url).includes("/slots")) {
+        return jsonResponse({ status: "success", data: { "2026-08-17": [{ start: "2026-08-17T18:00:00.000Z", end: "2026-08-17T19:00:00.000Z" }] } });
+      }
+      return jsonResponse({ status: "success", data: { uid: "booking-uid-1" } });
+    },
+  });
+
+  const availability = await client.getAvailability({
+    accessToken: "cal_live_key",
+    eventTypeId: "101",
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T19:00:00.000Z",
+  });
+  const booking = await client.createBooking({
+    accessToken: "cal_live_key",
+    eventTypeId: "101",
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    timezone: "America/New_York",
+    customer: { name: "Jordan Miles", phone: "+17035550123" },
+    attendeeEmail: "bookings@example.com",
+    callId,
+    idempotencyKey: "booking-1",
+  });
+
+  assert.equal(availability.available, true);
+  assert.equal(booking.providerEventId, "booking-uid-1");
+  const slotsUrl = new URL(requests[0].url);
+  assert.equal(slotsUrl.pathname, "/v2/slots");
+  assert.equal(slotsUrl.searchParams.get("eventTypeId"), "101");
+  assert.equal(requests[0].options.headers.authorization, "Bearer cal_live_key");
+  assert.equal(requests[0].options.headers["cal-api-version"], "2024-09-04");
+  assert.equal(requests[1].options.headers["cal-api-version"], "2026-02-25");
+  assert.deepEqual(JSON.parse(requests[1].options.body), {
+    start: "2026-08-17T18:00:00.000Z",
+    eventTypeId: 101,
+    attendee: { name: "Jordan Miles", email: "bookings@example.com", timeZone: "America/New_York", phoneNumber: "+17035550123" },
+    metadata: { symanticCallId: callId, symanticIdempotencyKey: "booking-1" },
+  });
+});
+
+test("Cal.com client reports a time as unavailable when no slot starts exactly then", async () => {
+  const client = createCalComClient({
+    fetchImpl: async () => jsonResponse({ data: { "2026-08-17": [{ start: "2026-08-17T19:00:00.000Z" }] } }),
+  });
+  const result = await client.getAvailability({
+    accessToken: "key",
+    eventTypeId: "101",
+    startTimeUtc: "2026-08-17T18:00:00.000Z",
+    endTimeUtc: "2026-08-17T19:00:00.000Z",
+  });
+  assert.equal(result.available, false);
+});
+
+test("Cal.com reschedule returns the new booking uid, and cancel treats a missing booking as done", async () => {
+  const client = createCalComClient({
+    fetchImpl: async (url) => String(url).endsWith("/cancel")
+      ? jsonResponse({ status: "error" }, 404)
+      : jsonResponse({ status: "success", data: { uid: "booking-uid-2" } }),
+  });
+  const moved = await client.rescheduleBooking({ accessToken: "key", providerEventId: "booking-uid-1", startTimeUtc: "2026-08-18T18:00:00.000Z" });
+  const cancelled = await client.cancelBooking({ accessToken: "key", providerEventId: "booking-uid-2" });
+  assert.equal(moved.providerEventId, "booking-uid-2");
+  assert.equal(cancelled.providerEventId, "booking-uid-2");
+});
+
+test("Cal.com adapter uses the decrypted API key, picks the event type by name, and never tries an OAuth refresh", async () => {
+  const seen = [];
+  let fetched = 0;
+  const adapter = createCalendarAdapter({
+    connectionStore: { async get() { return calComConnection(); } },
+    decryptToken: async ({ encryptedToken, provider }) => `${provider}:${encryptedToken}`,
+    getOAuthSecret: async () => { throw new Error("no OAuth secret for Cal.com"); },
+    fetchImpl: async () => { fetched += 1; return jsonResponse({}); },
+    providerClients: {
+      "cal-com": {
+        async getAvailability(input) {
+          seen.push({ key: input.accessToken, eventTypeId: input.eventTypeId });
+          return { available: true, busy: [] };
+        },
+      },
+    },
+  });
+
+  await adapter.getAvailability({ workspaceId, agentId: "agent-1", appointmentType: "quick call" });
+  await adapter.getAvailability({ workspaceId, agentId: "agent-1", appointmentType: "Something Else" });
+  const resolved = await adapter.resolveEventType({ workspaceId, agentId: "agent-1", appointmentType: "Quick Call" });
+
+  assert.deepEqual(seen, [
+    { key: "cal-com:encrypted-api-key", eventTypeId: "202" },
+    { key: "cal-com:encrypted-api-key", eventTypeId: "101" },
+  ]);
+  assert.deepEqual(resolved, { id: "202", name: "Quick Call", lengthInMinutes: 15 });
+  assert.equal(fetched, 0);
+});
+
+test("a revoked Cal.com API key marks the connection for reconnecting and the agent takes a message", async () => {
+  const marked = [];
+  const adapter = createCalendarAdapter({
+    connectionStore: {
+      async get() { return calComConnection(); },
+      async markReauthRequired(...args) { marked.push(args); },
+    },
+    decryptToken: async () => "cal_live_revoked",
+    providerClients: {
+      "cal-com": {
+        async getAvailability() {
+          const error = new Error("unauthorized");
+          error.statusCode = 401;
+          throw error;
+        },
+      },
+    },
+  });
+  const handler = toolHandler({ store: createStore(), calendar: adapter });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.getAvailability",
+    requiredBody({ agentId: "agent-1", startTime: "2026-08-17T14:00:00-04:00" }),
+  ));
+
+  assert.equal(JSON.parse(response.body).code, "calendar_reauth_required");
+  assert.deepEqual(marked, [[workspaceId, "agent-1", "invalid_api_key"]]);
+});
+
+test("booking through Cal.com uses the event type's length and name, ignores the agent's own Appointment Types, and stores the new uid after a reschedule", async () => {
+  const records = new Map();
+  const providerCalls = [];
+  const adapter = createCalendarAdapter({
+    connectionStore: { async get() { return calComConnection(); } },
+    decryptToken: async () => "cal_live_key",
+    providerClients: {
+      "cal-com": {
+        async getAvailability(input) {
+          providerCalls.push(["availability", input.eventTypeId, input.startTimeUtc, input.endTimeUtc]);
+          return { available: true, busy: [] };
+        },
+        async createBooking(input) {
+          providerCalls.push(["create", input.eventTypeId, input.attendeeEmail]);
+          return { provider: "cal-com", providerEventId: "booking-uid-1" };
+        },
+        async rescheduleBooking(input) {
+          providerCalls.push(["reschedule", input.eventTypeId, input.providerEventId]);
+          return { provider: "cal-com", providerEventId: "booking-uid-2" };
+        },
+      },
+    },
+  });
+  const store = createStore({
+    getAgent: async () => ({
+      agentId: "agent-1",
+      configuration: {
+        bookingInviteEmail: "bookings@example.com",
+        // Left over from before switching to Cal.com - must not pad the
+        // slot or enforce its own lead time.
+        appointmentTypes: [{ id: "t1", name: "Estimate Visit", durationMin: 15, minimumLeadTimeMin: 100000, blockBeforeMin: 30, blockAfterMin: 30 }],
+      },
+    }),
+    getAppointment: async (_workspaceId, appointmentId) => clone(records.get(appointmentId)),
+    putAppointment: async (record) => { records.set(record.appointmentId, clone(record)); return clone(record); },
+    updateAppointment: async (_workspaceId, appointmentId, updates) => {
+      const next = { ...records.get(appointmentId), ...updates };
+      records.set(appointmentId, next);
+      return clone(next);
+    },
+  });
+  const handler = toolHandler({ store, calendar: adapter });
+
+  const created = JSON.parse((await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody({ appointmentType: "Estimate Visit", endTime: undefined, service: undefined }),
+  ))).body);
+  assert.equal(created.ok, true);
+  const stored = records.get(created.appointmentId);
+  assert.equal(stored.service, "Estimate Visit");
+  assert.equal(stored.startTimeUtc, "2026-08-17T18:00:00.000Z");
+  assert.equal(stored.endTimeUtc, "2026-08-17T19:00:00.000Z");
+  assert.equal(stored.providerEventId, "booking-uid-1");
+
+  const moved = JSON.parse((await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({ agentId: "agent-1", idempotencyKey: "reschedule-1", appointmentId: created.appointmentId, startTime: "2026-08-18T14:00:00-04:00", durationMinutes: 60 }),
+  ))).body);
+  assert.equal(moved.ok, true);
+  assert.equal(records.get(created.appointmentId).providerEventId, "booking-uid-2");
+  assert.deepEqual(providerCalls, [
+    ["availability", "101", "2026-08-17T18:00:00.000Z", "2026-08-17T19:00:00.000Z"],
+    ["create", "101", "bookings@example.com"],
+    ["availability", "101", "2026-08-18T18:00:00.000Z", "2026-08-18T19:00:00.000Z"],
+    ["reschedule", "101", "booking-uid-1"],
+  ]);
+});

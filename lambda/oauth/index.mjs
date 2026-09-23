@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { CalComKeyError, createCalComAccountClient } from "./cal-com.mjs";
 import {
   describeSendFailure,
   getDefaultSender,
@@ -9,7 +10,13 @@ import {
 export const PROVIDER_LABELS = Object.freeze({
   "google-calendar": "Google Calendar",
   "microsoft-365-calendar": "Microsoft 365 Calendar",
+  "cal-com": "Cal.com",
 });
+
+// Cal.com connects with the customer's own API key, not OAuth, so it stays
+// out of PROVIDERS (which drives the OAuth start/callback/invite flows).
+const CAL_COM_PROVIDER = "cal-com";
+const MAX_SELECTED_EVENT_TYPES = 10;
 
 export const PROVIDERS = Object.freeze({
   "google-calendar": {
@@ -223,6 +230,7 @@ export function createInMemoryConnectionStore(initialRecords = []) {
         connectionState: "disconnected",
       };
       delete next.encryptedRefreshToken;
+      delete next.encryptedApiKey;
       records.set(key, next);
       return cloneRecord(next);
     },
@@ -490,6 +498,7 @@ export function createHandler(options = {}) {
     getOAuthSecret = getDefaultOAuthSecret,
     getTokenCrypto = getDefaultTokenCrypto,
     getProviderClient = (provider) => createProviderClient(provider),
+    getCalComClient = () => createCalComAccountClient(),
     redirectBaseUrl = process.env.OAUTH_REDIRECT_BASE_URL,
     appUrl = process.env.APP_URL,
     stateTtlSeconds = Number(process.env.OAUTH_STATE_TTL_SECONDS) ||
@@ -891,6 +900,104 @@ export function createHandler(options = {}) {
         const agentId = requireAgentId(event?.queryStringParameters?.agentId);
         const store = await getConnectionStore();
         return json(200, toPublicConnection(await store.disconnect(identity.workspaceId, agentId)));
+      }
+
+      if (path === "/calendars/cal-com/api-key" && method === "POST") {
+        const identity = await resolveIdentity(event, await getMembershipStore());
+        if (!identity) return json(401, { message: "Unauthorized" });
+        const body = readBody(event);
+        const agentId = requireAgentId(body?.agentId);
+        const apiKey = readCalComApiKey(body?.apiKey);
+        const { profile, eventTypes } = await readCalComAccount(getCalComClient(), apiKey);
+        const tokenCrypto = await getTokenCrypto();
+        // Stored only encrypted, under the same KMS key and per-agent
+        // encryption context as the Google/Microsoft refresh tokens. Never
+        // returned to the browser and never sent to Retell - only the tools
+        // Lambda decrypts it, at the moment it calls Cal.com.
+        const encryptedApiKey = await tokenCrypto.encryptToken({
+          token: apiKey,
+          workspaceId: identity.workspaceId,
+          agentId,
+          provider: CAL_COM_PROVIDER,
+        });
+        const store = await getConnectionStore();
+        const existing = await store.get(identity.workspaceId, agentId);
+        const connectedAtIso = new Date(now()).toISOString();
+        const selectedEventTypeIds = eventTypes.length === 1 ? [eventTypes[0].id] : [];
+        const connection = {
+          workspaceId: identity.workspaceId,
+          agentId,
+          provider: CAL_COM_PROVIDER,
+          accountEmail: profile.email,
+          selectedCalendarId: selectedEventTypeIds[0] ?? null,
+          selectedEventTypeIds,
+          calendarTimezone: profile.timeZone || "UTC",
+          availableCalendars: eventTypes,
+          encryptedApiKey,
+          scopes: [],
+          connectionState: "connected",
+          connectedAt: existing?.provider === CAL_COM_PROVIDER && existing.connectedAt
+            ? existing.connectedAt
+            : connectedAtIso,
+          lastSyncedAt: connectedAtIso,
+          updatedAt: connectedAtIso,
+        };
+        await store.save(connection);
+        return json(200, toPublicConnection(connection));
+      }
+
+      if (path === "/calendars/select" && method === "POST" && readBody(event)?.provider === CAL_COM_PROVIDER) {
+        const identity = await resolveIdentity(event, await getMembershipStore());
+        if (!identity) return json(401, { message: "Unauthorized" });
+        const body = readBody(event);
+        const agentId = requireAgentId(body?.agentId);
+        const requested = Array.isArray(body?.selectedEventTypeIds)
+          ? [...new Set(body.selectedEventTypeIds.map(String))]
+          : [];
+        if (requested.length === 0) {
+          throw new OAuthRequestError("Choose at least one event type to offer");
+        }
+        if (requested.length > MAX_SELECTED_EVENT_TYPES) {
+          throw new OAuthRequestError(`Choose at most ${MAX_SELECTED_EVENT_TYPES} event types`);
+        }
+        const store = await getConnectionStore();
+        const current = await store.get(identity.workspaceId, agentId);
+        if (
+          current?.provider !== CAL_COM_PROVIDER ||
+          current.connectionState !== "connected" ||
+          !current.encryptedApiKey
+        ) {
+          throw new OAuthRequestError("Cal.com is not connected", 409, "provider_not_connected");
+        }
+        // Re-read the account so event types added in Cal.com since
+        // connecting show up, and a removed one can't be selected.
+        const tokenCrypto = await getTokenCrypto();
+        const apiKey = await tokenCrypto.decryptToken({
+          encryptedToken: current.encryptedApiKey,
+          workspaceId: identity.workspaceId,
+          agentId,
+          provider: CAL_COM_PROVIDER,
+        });
+        const { eventTypes } = await readCalComAccount(getCalComClient(), apiKey);
+        const available = new Set(eventTypes.map(({ id }) => id));
+        if (requested.some((id) => !available.has(id))) {
+          throw new OAuthRequestError(
+            "That event type is no longer available in Cal.com",
+            400,
+            "invalid_event_type",
+          );
+        }
+        const updatedAtIso = new Date(now()).toISOString();
+        const connection = {
+          ...current,
+          selectedEventTypeIds: requested,
+          selectedCalendarId: requested[0],
+          availableCalendars: eventTypes,
+          lastSyncedAt: updatedAtIso,
+          updatedAt: updatedAtIso,
+        };
+        await store.save(connection);
+        return json(200, toPublicConnection(connection));
       }
 
       if (path === "/calendars/select" && method === "POST") {
@@ -1398,9 +1505,56 @@ function buildAppRedirect(appUrl, returnTo, parameters) {
 
 function toPublicConnection(connection) {
   if (!connection) return null;
-  const { encryptedRefreshToken: _encryptedRefreshToken, workspaceId: _workspaceId, ...value } =
-    connection;
+  const {
+    encryptedRefreshToken: _encryptedRefreshToken,
+    encryptedApiKey: _encryptedApiKey,
+    workspaceId: _workspaceId,
+    ...value
+  } = connection;
   return value;
+}
+
+function readCalComApiKey(value) {
+  const apiKey = typeof value === "string" ? value.trim() : "";
+  if (!/^cal_\S{8,200}$/.test(apiKey)) {
+    throw new OAuthRequestError(
+      "Enter a Cal.com API key - it starts with cal_",
+      400,
+      "invalid_api_key",
+    );
+  }
+  return apiKey;
+}
+
+async function readCalComAccount(client, apiKey) {
+  let profile;
+  let eventTypes;
+  try {
+    profile = await client.getProfile(apiKey);
+    eventTypes = await client.listEventTypes(apiKey);
+  } catch (error) {
+    if (error instanceof CalComKeyError) {
+      throw new OAuthRequestError(
+        "Cal.com didn't accept that API key. Check it was copied in full and hasn't been deleted or expired.",
+        400,
+        "invalid_api_key",
+      );
+    }
+    console.error("Cal.com account read failed", { name: error?.name, message: error?.message });
+    throw new OAuthRequestError(
+      "Couldn't reach Cal.com right now. Try again in a minute.",
+      502,
+      "cal_com_unavailable",
+    );
+  }
+  if (eventTypes.length === 0) {
+    throw new OAuthRequestError(
+      "This Cal.com account has no event types yet. Create one in Cal.com, then connect again.",
+      400,
+      "no_event_types",
+    );
+  }
+  return { profile, eventTypes };
 }
 
 function toPublicCalendar(calendar) {
@@ -1556,7 +1710,7 @@ export function createDynamoConnectionStore(client, commands, tableName) {
           Key: marshall({ workspaceId, agentId }),
           UpdateExpression:
             "SET selectedCalendarId = :none, connectionState = :disconnected " +
-            "REMOVE encryptedRefreshToken",
+            "REMOVE encryptedRefreshToken, encryptedApiKey",
           ConditionExpression: "attribute_exists(workspaceId)",
           ExpressionAttributeValues: marshall({
             ":none": null,

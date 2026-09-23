@@ -300,7 +300,12 @@ export function buildReceptionistPrompt(agent, profile) {
   const bookingInstruction = behavior.booking === true
     ? "Booking is enabled. Check availability before offering a time, and create a booking only after explicit caller confirmation."
     : "Booking is disabled. Do not promise or create appointments; take a message for office follow-up.";
-  const appointmentTypesLine = formatAppointmentTypes(behavior.appointmentTypes);
+  // A Cal.com agent books into the event types it chose there, which
+  // replace its own Appointment Types (Cal.com enforces notice and buffers).
+  const usesCalCom = Array.isArray(behavior.connections) && behavior.connections.includes("cal-com");
+  const appointmentTypesLine = usesCalCom
+    ? formatCalComEventTypes(behavior.calComEventTypes)
+    : formatAppointmentTypes(behavior.appointmentTypes);
   const allowCallTransfers = behavior.allowCallTransfers !== false;
   const emergencyRules = formatEmergencyRules(behavior.emergencyRules);
   const noTransferPhrasesLine = formatNoTransferPhrases(behavior.noTransferPhrases);
@@ -698,6 +703,16 @@ function formatAppointmentTypes(appointmentTypes) {
         : "";
       return `- ${text(type.name)} (${duration}${leadTime})`;
     })
+    .join("\n");
+}
+
+function formatCalComEventTypes(eventTypes) {
+  if (!Array.isArray(eventTypes) || !eventTypes.length) return "";
+  return eventTypes
+    .filter((eventType) => text(eventType?.name))
+    .map((eventType) => Number(eventType.lengthInMinutes) > 0
+      ? `- ${text(eventType.name)} (${formatMinutesLabel(eventType.lengthInMinutes)})`
+      : `- ${text(eventType.name)}`)
     .join("\n");
 }
 
