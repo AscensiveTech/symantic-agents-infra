@@ -1362,3 +1362,35 @@ function jsonResponse(body, status = 200) {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("booking reads relative times in the agent's own timezone, not the workspace's", async () => {
+  let persisted;
+  const store = createStore({
+    getBusinessProfile: async () => ({ timezone: "America/New_York", address: "1 Workspace Way" }),
+    getAgent: async () => ({
+      agentId: "agent-1",
+      configuration: { businessProfile: { timezone: "America/Chicago", address: "2 Branch Street" } },
+    }),
+    putAppointment: async (appointment) => { persisted = clone(appointment); return clone(appointment); },
+  });
+  let providerInput;
+  const calendar = {
+    async getAvailability() { return { available: true, busy: [] }; },
+    async createBooking(input) {
+      providerInput = input;
+      return { providerEventId: "event-branch", provider: "google-calendar" };
+    },
+  };
+  const handler = toolHandler({ store, calendar, now: () => new Date("2026-08-16T12:00:00.000Z") });
+
+  const response = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody({ startTime: "tomorrow at 2:00 PM", durationMinutes: 30, endTime: undefined, location: undefined }),
+  ));
+
+  assert.equal(response.statusCode, 200);
+  // 2:00 PM in Chicago (CDT, UTC-5), not New York.
+  assert.equal(persisted.startTimeUtc, "2026-08-17T19:00:00.000Z");
+  assert.equal(persisted.timezone, "America/Chicago");
+  assert.equal(providerInput.location, "2 Branch Street");
+});
