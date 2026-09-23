@@ -1234,6 +1234,68 @@ test("Microsoft cancelBooking treats a 404 response as success", async () => {
   assert.equal(result.providerEventId, "event-gone");
 });
 
+// Every other booking test injects a fake calendar that ignores which agent
+// it's called for, which is how handlers once shipped without passing
+// agentId at all - the real adapter looks the connection up by
+// {workspaceId, agentId}, so every live call failed. This runs the real
+// adapter end to end over a connection store that only answers for the
+// right agent.
+test("calendar tools reach the real adapter with the calling agent's own connection", async () => {
+  const lookups = [];
+  const providerCalls = [];
+  const calendar = createCalendarAdapter({
+    connectionStore: {
+      async get(lookupWorkspaceId, lookupAgentId) {
+        lookups.push([lookupWorkspaceId, lookupAgentId]);
+        if (lookupWorkspaceId !== workspaceId || lookupAgentId !== "agent-1") return null;
+        return {
+          workspaceId,
+          agentId: "agent-1",
+          provider: "google-calendar",
+          selectedCalendarId: "calendar-a",
+          calendarTimezone: "America/New_York",
+          encryptedRefreshToken: "encrypted-token",
+          tokenVersion: 1,
+          connectionState: "connected",
+        };
+      },
+    },
+    decryptToken: async () => "refresh-token",
+    encryptToken: async () => "encrypted-token",
+    getOAuthSecret: async () => ({ clientId: "client-id", clientSecret: "client-secret" }),
+    fetchImpl: async () => jsonResponse({ access_token: "access-token", expires_in: 3600 }),
+    providerClients: {
+      "google-calendar": {
+        async getAvailability(input) {
+          providerCalls.push(["availability", input.calendarId]);
+          return { available: true, busy: [] };
+        },
+        async createBooking(input) {
+          providerCalls.push(["create", input.calendarId]);
+          return { providerEventId: "google-event-1", provider: "google-calendar" };
+        },
+      },
+    },
+  });
+  const handler = toolHandler({ store: createStore(), calendar });
+
+  const availability = await handler(event(
+    "/retell/tools/calendar.getAvailability",
+    requiredBody({ agentId: "agent-1", startTime: "2026-08-17T14:00:00-04:00", durationMinutes: 30 }),
+  ));
+  const booking = await handler(event("/retell/tools/calendar.createBooking", bookingBody()));
+
+  assert.equal(JSON.parse(availability.body).ok, true);
+  assert.equal(JSON.parse(booking.body).ok, true);
+  assert.ok(lookups.length > 0);
+  assert.ok(lookups.every(([, lookupAgentId]) => lookupAgentId === "agent-1"));
+  assert.deepEqual(providerCalls, [
+    ["availability", "calendar-a"],
+    ["availability", "calendar-a"],
+    ["create", "calendar-a"],
+  ]);
+});
+
 test("provider idempotency ids satisfy Google and Microsoft formats", () => {
   const ids = providerIdempotencyIds(workspaceId, "booking-key");
 

@@ -104,6 +104,7 @@ export async function handleCreateBooking(input, {
   try {
     const availability = await calendar.getAvailability({
       workspaceId: input.workspaceId,
+      agentId: input.agentId,
       ...providerRange,
     });
     requireAvailable(availability);
@@ -114,6 +115,7 @@ export async function handleCreateBooking(input, {
     );
     providerBooking = await calendar.createBooking({
       workspaceId: input.workspaceId,
+      agentId: input.agentId,
       ...providerRange,
       ...providerIds,
       service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service),
@@ -211,6 +213,7 @@ export async function handleRescheduleBooking(input, {
   try {
     const availability = await calendar.getAvailability({
       workspaceId: input.workspaceId,
+      agentId: input.agentId,
       providerEventId: appointment.providerEventId,
       ...range,
     });
@@ -218,6 +221,7 @@ export async function handleRescheduleBooking(input, {
     try {
       await calendar.rescheduleBooking({
         workspaceId: input.workspaceId,
+        agentId: input.agentId,
         providerEventId: appointment.providerEventId,
         ...range,
       });
@@ -279,6 +283,7 @@ export async function handleCancelBooking(input, {
   }
   await calendar.cancelBooking({
     workspaceId: input.workspaceId,
+    agentId: input.agentId,
     providerEventId: appointment.providerEventId,
   });
   const updated = await store.updateAppointment(
