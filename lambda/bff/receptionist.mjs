@@ -303,7 +303,7 @@ export function buildReceptionistPrompt(agent, profile) {
   const appointmentTypesLine = formatAppointmentTypes(behavior.appointmentTypes);
   const allowCallTransfers = behavior.allowCallTransfers !== false;
   const emergencyRules = formatEmergencyRules(behavior.emergencyRules);
-  const noTransferPhrasesLine = formatNoTransferPhrases(behavior.noTransferPhrases);
+  const noTransferRulesLines = formatNoTransferRules(behavior.noTransferRules);
   const escalation = text(behavior.escalation);
   const exampleDialogues = text(behavior.exampleDialogues);
   const finalReminders = text(behavior.finalReminders);
@@ -402,8 +402,8 @@ export function buildReceptionistPrompt(agent, profile) {
       ? [emergencyRules, escalation].filter(Boolean).join("\n") ||
         "For a request to speak with a person, use the matching transfer_call tool. If transfer is unavailable, use message_take."
       : [
-        NO_TRANSFER_FIXED_LINE,
-        noTransferPhrasesLine ? `Example phrases a caller might use to ask for a person (not a strict match list, act on any request for a person the same way): ${noTransferPhrasesLine}` : "",
+        ...(noTransferRulesLines ? [noTransferRulesLines] : []),
+        `- For anything that doesn't match one of the responses above, ${NO_TRANSFER_FIXED_LINE}`,
       ].filter(Boolean).join("\n"),
     "",
     "# LIVE PERSON REQUESTS",
@@ -413,7 +413,8 @@ export function buildReceptionistPrompt(agent, profile) {
         + "tool from the rules above, or a configured escalation contact; otherwise let them "
         + "know everyone is currently unavailable and offer to take a message so the office "
         + "can follow up."
-      : `- If the caller asks for a specific person, a manager, or to speak with "someone", ${NO_TRANSFER_FIXED_LINE}`,
+      : "- If the caller asks for a specific person, a manager, or to speak with \"someone\", "
+        + "use the matching response in the rules above, or the fallback message if none match.",
     "",
     ...(spamScreeningEnabled(agent)
       ? [
@@ -740,9 +741,17 @@ const NO_TRANSFER_FIXED_LINE = "say: \"My apologies. Since no one is "
   + "available at the moment, please leave a message and I will ask the "
   + "team to call you as soon as they are available.\" Then take a message.";
 
-function formatNoTransferPhrases(phrases) {
-  if (!Array.isArray(phrases) || !phrases.length) return "";
-  return phrases.map(text).filter(Boolean).map((phrase) => `"${phrase}"`).join(", ");
+function formatNoTransferRules(rules) {
+  if (!Array.isArray(rules) || !rules.length) return "";
+  return rules.flatMap((rule) => {
+    const phrases = Array.isArray(rule?.phrases)
+      ? rule.phrases.map(text).filter(Boolean)
+      : [];
+    const message = text(rule?.message);
+    if (!phrases.length || !message) return [];
+    const phraseList = phrases.map((phrase) => `"${phrase}"`).join(", ");
+    return [`- If the caller mentions ${phraseList}: say "${message}" and take a message.`];
+  }).join("\n");
 }
 
 function text(value) {
