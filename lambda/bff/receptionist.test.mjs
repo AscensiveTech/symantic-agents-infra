@@ -80,19 +80,21 @@ test("prompt builder includes hours, FAQs, and emergency rules", () => {
   assert.match(prompt, /\+17035550102/);
 });
 
-test("every prompt discloses the AI cannot call 911 itself and tells the caller to call it directly - with or without configured emergency routing", () => {
+test("every prompt tells the caller to call 911 for a genuine emergency, with no claim about whether the AI can or cannot place that call itself - with or without configured emergency routing", () => {
   const withRouting = buildReceptionistPrompt(agent, profile);
-  assert.match(withRouting, /cannot call 911 or dispatch emergency services yourself/);
-  assert.match(withRouting, /tell the\s+caller to hang up and call 911/);
-  assert.match(withRouting, /Then also follow the emergency and escalation rules below\./);
+  assert.match(withRouting, /tell the caller to call 911/);
+  assert.doesNotMatch(withRouting, /cannot call 911/);
+  assert.doesNotMatch(withRouting, /dispatch emergency services/);
+  assert.match(withRouting, /Then take a message so the business knows the call came in/);
 
   const noRouting = {
     ...agent,
     configuration: { ...agent.configuration, emergencyRules: [], escalation: "" },
   };
   const withoutRouting = buildReceptionistPrompt(noRouting, profile);
-  assert.match(withoutRouting, /cannot call 911 or dispatch emergency services yourself/);
-  assert.match(withoutRouting, /Then take a message so the business knows the call came in\./);
+  assert.match(withoutRouting, /tell the caller to call 911/);
+  assert.doesNotMatch(withoutRouting, /cannot call 911/);
+  assert.match(withoutRouting, /Then take a message so the business knows the call came in/);
 });
 
 test("Restrictions section is omitted entirely when the receptionist has none configured", () => {
@@ -187,6 +189,64 @@ test("a 'decline' emergency rule's transferTarget never becomes a transfer_call 
   // its own 3 (escalationContact, ownerPhone, fallbackPhone).
   assert.ok(!config.transferNumbers.includes("+17035550102"));
   assert.equal(config.tools.filter(({ type }) => type === "transfer_call").length, 3);
+});
+
+test("allowCallTransfers: false means no transfer_call tool exists at all, even with rules, escalation, and owner/fallback numbers all configured", () => {
+  const noTransferAgent = {
+    ...agent,
+    configuration: { ...agent.configuration, allowCallTransfers: false },
+  };
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: noTransferAgent,
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.equal(config.tools.filter(({ type }) => type === "transfer_call").length, 0);
+  assert.deepEqual(config.transferNumbers, []);
+});
+
+test("the prompt's Talk To A Human and Live Person Requests sections give the fixed apology line when transfers are off, and never mention the transfer_call tool there", () => {
+  const noTransferAgent = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      allowCallTransfers: false,
+      noTransferPhrases: ["I want to talk to a human", "is anyone there"],
+    },
+  };
+  const prompt = buildReceptionistPrompt(noTransferAgent, profile);
+  const [, talkToHumanBody] = prompt.split("# TALK TO A HUMAN\n");
+  const [, livePersonBody] = prompt.split("# LIVE PERSON REQUESTS\n");
+  assert.match(talkToHumanBody, /My apologies\. Since no one is available/);
+  assert.match(talkToHumanBody, /"I want to talk to a human", "is anyone there"/);
+  assert.doesNotMatch(talkToHumanBody.split("\n\n")[0], /transfer_call/);
+  assert.match(livePersonBody, /My apologies\. Since no one is available/);
+
+  const withTransferAgent = { ...agent, configuration: { ...agent.configuration, allowCallTransfers: true } };
+  const withTransferPrompt = buildReceptionistPrompt(withTransferAgent, profile);
+  assert.doesNotMatch(withTransferPrompt, /My apologies\. Since no one is available/);
+});
+
+test("an extension is dialed as a DTMF pause after the transfer number", () => {
+  const withExtensionAgent = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      emergencyRules: [
+        { phrases: ["billing"], transferTarget: "+17035550102", extension: "204" },
+      ],
+    },
+  };
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: withExtensionAgent,
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.ok(config.transferNumbers.includes("+17035550102,,,204"));
 });
 
 test("resolveGreeting uses the configured greeting when set, otherwise builds one from the real business/receptionist name", () => {

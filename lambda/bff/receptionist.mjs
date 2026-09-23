@@ -271,7 +271,9 @@ export function buildReceptionistPrompt(agent, profile) {
     ? "Booking is enabled. Check availability before offering a time, and create a booking only after explicit caller confirmation."
     : "Booking is disabled. Do not promise or create appointments; take a message for office follow-up.";
   const appointmentTypesLine = formatAppointmentTypes(behavior.appointmentTypes);
+  const allowCallTransfers = behavior.allowCallTransfers !== false;
   const emergencyRules = formatEmergencyRules(behavior.emergencyRules);
+  const noTransferPhrasesLine = formatNoTransferPhrases(behavior.noTransferPhrases);
   const escalation = text(behavior.escalation);
   const exampleDialogues = text(behavior.exampleDialogues);
   const finalReminders = text(behavior.finalReminders);
@@ -295,13 +297,11 @@ export function buildReceptionistPrompt(agent, profile) {
       + "briefly, then keep helping with their call.",
     "5) Preserve the caller's meaning and collect only the minimum information required - "
       + "never interrogate or run a checklist.",
-    "6) For a genuine life-threatening emergency, first make clear you are an AI phone "
-      + "assistant and cannot call 911 or dispatch emergency services yourself - tell the "
-      + "caller to hang up and call 911 (or their local emergency number) right away. Say "
-      + "this immediately, before gathering any routine details."
-      + (emergencyRules || escalation
-        ? " Then also follow the emergency and escalation rules below."
-        : " Then take a message so the business knows the call came in."),
+    "6) For a genuine life-threatening emergency, tell the caller to call 911 (or their "
+      + "local emergency number) right away. Say this immediately, before gathering any "
+      + "routine details. Then take a message so the business knows the call came in - this "
+      + "is separate from a caller simply asking to talk to a person, which the rules below "
+      + "handle instead.",
     "",
     "# ONE THING AT A TIME",
     "- Never ask two questions in the same turn, and never open a new question while an "
@@ -362,16 +362,23 @@ export function buildReceptionistPrompt(agent, profile) {
     bookingInstruction,
     ...(appointmentTypesLine ? ["", "# APPOINTMENT TYPES", appointmentTypesLine] : []),
     "",
-    "# EMERGENCY & ESCALATION",
-    [emergencyRules, escalation].filter(Boolean).join("\n") ||
-      "For emergencies or requests for a person, use the matching transfer_call tool. If transfer is unavailable, use message_take.",
+    "# TALK TO A HUMAN",
+    allowCallTransfers
+      ? [emergencyRules, escalation].filter(Boolean).join("\n") ||
+        "For a request to speak with a person, use the matching transfer_call tool. If transfer is unavailable, use message_take."
+      : [
+        NO_TRANSFER_FIXED_LINE,
+        noTransferPhrasesLine ? `Example phrases a caller might use to ask for a person (not a strict match list, act on any request for a person the same way): ${noTransferPhrasesLine}` : "",
+      ].filter(Boolean).join("\n"),
     "",
     "# LIVE PERSON REQUESTS",
-    "- If the caller asks for a specific person, a manager, or to speak with \"someone\", "
-      + "don't guess or state who does or doesn't work here. Use the matching transfer_call "
-      + "tool for a genuine emergency or a configured escalation contact; otherwise let them "
-      + "know everyone is currently unavailable and offer to take a message so the office "
-      + "can follow up.",
+    allowCallTransfers
+      ? "- If the caller asks for a specific person, a manager, or to speak with \"someone\", "
+        + "don't guess or state who does or doesn't work here. Use the matching transfer_call "
+        + "tool from the rules above, or a configured escalation contact; otherwise let them "
+        + "know everyone is currently unavailable and offer to take a message so the office "
+        + "can follow up."
+      : `- If the caller asks for a specific person, a manager, or to speak with "someone", ${NO_TRANSFER_FIXED_LINE}`,
     "",
     ...(spamScreeningEnabled(agent)
       ? [
@@ -530,7 +537,26 @@ function toRetellTool(definition, {
   };
 }
 
+// Appends a configured extension to an already-validated E.164 number, as
+// three commas (a DTMF pause) followed by the extension digits - Retell's
+// own documented example for dialing an extension after a transfer
+// connects: "+44203XXXXXXX,,,2000"
+// (community.retellai.com/t/dynamic-extension-dialing/2641). Retell's
+// docs also describe a separate dedicated "Extension Number" field in
+// their dashboard UI, but its exact API field name isn't confirmed here -
+// this comma-pause form is the one with a documented working example, so
+// it's what's implemented.
+function withExtension(number, extension) {
+  const digits = text(extension).replace(/\D/g, "").slice(0, 6);
+  return digits ? `${number},,,${digits}` : number;
+}
+
+// If allowCallTransfers is explicitly false, this agent must never be
+// able to transfer a call under any circumstance - returning no tools at
+// all here (rather than relying on a prompt instruction the model could
+// ignore) is what makes that an actual guarantee, not just a suggestion.
 function buildTransferTools(agent, profile) {
+  if (agent?.configuration?.allowCallTransfers === false) return [];
   const rules = Array.isArray(agent?.configuration?.emergencyRules)
     ? agent.configuration.emergencyRules
     : [];
@@ -539,7 +565,9 @@ function buildTransferTools(agent, profile) {
       // A "decline" rule only speaks its configured message - see
       // formatEmergencyRules above - so its transferTarget (often a stale
       // leftover from when the rule was previously set to "transfer") must
-      // never turn into a real transfer_call tool.
+      // never turn into a real transfer_call tool. Legacy - the UI no
+      // longer offers this, but an already-stored decline rule keeps
+      // behaving exactly as before.
       if (rule?.action === "decline") return [];
       const number = toE164(rule?.transferTarget);
       if (!number) return [];
@@ -547,10 +575,10 @@ function buildTransferTools(agent, profile) {
         ? rule.phrases.map(text).filter(Boolean)
         : [];
       return [{
-        number,
+        number: withExtension(number, rule?.extension),
         description: phrases.length
           ? `Warm transfer when the caller mentions ${phrases.join(", ")}.`
-          : "Warm transfer for this configured emergency rule.",
+          : "Warm transfer for this configured call transfer rule.",
       }];
     }),
     ...[
@@ -666,6 +694,18 @@ function formatEmergencyRules(rules) {
       `- If the caller mentions ${phraseList}: transfer to ${target}.`,
     ];
   }).join("\n");
+}
+
+// Matches the exact wording the frontend seeds into Role Instructions
+// (NO_TRANSFER_ROLE_INSTRUCTIONS_ADDENDUM, lib/mock-data/data.ts) - kept
+// as one literal string here too so the two can't quietly drift apart.
+const NO_TRANSFER_FIXED_LINE = "say: \"My apologies. Since no one is "
+  + "available at the moment, please leave a message and I will ask the "
+  + "team to call you as soon as they are available.\" Then take a message.";
+
+function formatNoTransferPhrases(phrases) {
+  if (!Array.isArray(phrases) || !phrases.length) return "";
+  return phrases.map(text).filter(Boolean).map((phrase) => `"${phrase}"`).join(", ");
 }
 
 function text(value) {
