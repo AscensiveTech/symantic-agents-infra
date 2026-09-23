@@ -119,7 +119,14 @@ export async function handleCreateBooking(input, {
       service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service),
       description: stringOrUndefined(input.description),
       location: stringOrUndefined(input.location) || profile?.address || undefined,
-      customer: normalizeCustomer(input.customer, agent?.configuration?.bookingInviteEmail),
+      // No live invite-sending yet (deferred, per product decision) - the
+      // provider must never see an email on this customer object, or
+      // Google (sendUpdates=all) / Microsoft Graph's own default
+      // attendee-notify behavior will actually send someone a calendar
+      // invite. The stored appointment record below keeps the full
+      // customer info (email included) for the business's own
+      // reference - only what reaches the provider is stripped.
+      customer: { ...normalizeCustomer(input.customer, agent?.configuration?.bookingInviteEmail), email: undefined },
       callId: input.callId,
       idempotencyKey: input.idempotencyKey,
     });

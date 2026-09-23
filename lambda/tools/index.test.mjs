@@ -111,13 +111,15 @@ test("a second concurrent createBooking for the same agent/time slot is turned a
   assert.equal(locks.size, 0);
 });
 
-test("createBooking falls back to the agent's Booking Invite Email as the attendee when the caller's own email wasn't collected", async () => {
+test("createBooking never sends an email to the calendar provider - not the caller's own, not the Booking Invite Email fallback - but both still reach the stored appointment record", async () => {
   let providerInput;
+  let stored;
   const store = createStore({
     getAgent: async () => ({
       agentId: "agent-1",
       configuration: { bookingInviteEmail: "bookings@tidytransformers.example" },
     }),
+    putAppointment: async (record) => { stored = record; return clone(record); },
   });
   const calendar = {
     async getAvailability() {
@@ -130,13 +132,28 @@ test("createBooking falls back to the agent's Booking Invite Email as the attend
   };
   const handler = toolHandler({ store, calendar });
 
-  const response = await handler(event(
+  // Case 1: caller gave no email - falls back to Booking Invite Email
+  // for internal records, but the provider must still see nothing.
+  const fallbackResponse = await handler(event(
     "/retell/tools/calendar.createBooking",
     bookingBody({ customer: { name: "Jordan Miles", phone: "+17035550123" } }),
   ));
+  assert.equal(fallbackResponse.statusCode, 200);
+  assert.equal(providerInput.customer.email, undefined);
+  assert.equal(stored.customer.email, "bookings@tidytransformers.example");
 
-  assert.equal(response.statusCode, 200);
-  assert.equal(providerInput.customer.email, "bookings@tidytransformers.example");
+  // Case 2: caller gave their own email - same rule applies to it too,
+  // no live invite-sending to anyone yet, caller included.
+  const callerEmailResponse = await handler(event(
+    "/retell/tools/calendar.createBooking",
+    bookingBody({
+      idempotencyKey: "idempotency-key-2",
+      customer: { name: "Jordan Miles", phone: "+17035550123", email: "jordan@example.com" },
+    }),
+  ));
+  assert.equal(callerEmailResponse.statusCode, 200);
+  assert.equal(providerInput.customer.email, undefined);
+  assert.equal(stored.customer.email, "jordan@example.com");
 });
 
 test("createBooking leaves the attendee email unset when neither the caller nor the agent has one on file", async () => {
