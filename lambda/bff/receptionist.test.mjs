@@ -323,12 +323,14 @@ test("prompt prefers structured business hours (with split intervals) and carrie
   assert.match(fallback, /Mon-Fri, 8:00 AM-5:00 PM/);
 });
 
-test("prompt includes configured holiday closures, contact emails, and service area coverage", () => {
+test("prompt includes configured holidays, contact emails, and service area coverage", () => {
   const withAll = buildReceptionistPrompt(agent, {
     ...profile,
+    holidaysEnabled: true,
     holidays: [
       { id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true },
-      { id: "h2", name: "Not Closed", date: "2026-12-01", closed: false },
+      { id: "h2", name: "Christmas Eve", date: "2026-12-24", closed: false, hours: "9 AM-1 PM" },
+      { id: "h3", name: "Labor Day", date: "2026-09-07", closed: true, disabled: true },
     ],
     contactEmails: [
       { label: "Billing / AR", email: "billing@example.com" },
@@ -337,8 +339,8 @@ test("prompt includes configured holiday closures, contact emails, and service a
     serviceAreas: ["Maryland", "Washington D.C."],
   });
 
-  assert.match(withAll, /Holiday closures: Thanksgiving \(2026-11-26\)/);
-  assert.doesNotMatch(withAll, /Not Closed/);
+  assert.match(withAll, /- Holidays: Thanksgiving \(2026-11-26\): closed, Christmas Eve \(2026-12-24\): open 9 AM-1 PM$/m);
+  assert.doesNotMatch(withAll, /Labor Day/);
   assert.match(withAll, /# CONTACT EMAILS/);
   assert.match(withAll, /Billing \/ AR: billing@example\.com/);
   assert.match(withAll, /- info@example\.com/);
@@ -347,10 +349,19 @@ test("prompt includes configured holiday closures, contact emails, and service a
   assert.match(withAll, /call check_service_area with it before deciding anything yourself/);
 
   const withNone = buildReceptionistPrompt(agent, profile);
-  assert.doesNotMatch(withNone, /Holiday closures:/);
+  assert.doesNotMatch(withNone, /- Holidays:/);
   assert.doesNotMatch(withNone, /# CONTACT EMAILS/);
   assert.doesNotMatch(withNone, /# SERVICE AREA/);
   assert.doesNotMatch(withNone, /check_service_area/);
+});
+
+test("holidays never reach the prompt while the holidays toggle is off or was never set, even if a list is saved", () => {
+  const holidays = [{ id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true }];
+  for (const holidaysEnabled of [false, undefined]) {
+    const prompt = buildReceptionistPrompt(agent, { ...profile, holidays, holidaysEnabled });
+    assert.doesNotMatch(prompt, /- Holidays:/);
+    assert.doesNotMatch(prompt, /Thanksgiving/);
+  }
 });
 
 test("prompt renders configured appointment types by name, duration, and lead time only - never the before/after buffers", () => {

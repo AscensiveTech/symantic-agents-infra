@@ -294,7 +294,7 @@ export function buildReceptionistPrompt(agent, profile) {
   const hoursLine = isBusinessHours(profile?.businessHours)
     ? formatBusinessHours(profile.businessHours)
     : (text(profile?.hours) || "Not provided");
-  const holidaysLine = formatHolidayClosures(profile?.holidays);
+  const holidaysLine = formatHolidays(profile);
   const contactEmailsLine = formatContactEmails(profile?.contactEmails);
   const serviceAreaLine = formatServiceAreas(profile?.serviceAreas);
   const bookingInstruction = behavior.booking === true
@@ -346,7 +346,7 @@ export function buildReceptionistPrompt(agent, profile) {
     `- Address: ${text(profile?.address) || "Not provided"}`,
     `- Timezone: ${text(profile?.timezone) || "UTC"}`,
     `- Hours: ${hoursLine}`,
-    ...(holidaysLine ? [`- Holiday closures: ${holidaysLine}`] : []),
+    ...(holidaysLine ? [`- Holidays: ${holidaysLine}`] : []),
     "- Current local time at the start of this call: {{currentTime}} ({{timezone}}). "
       + "Treat this as the authoritative clock when the caller asks whether you are open right now.",
     ...(contactEmailsLine ? ["", "# CONTACT EMAILS", contactEmailsLine] : []),
@@ -659,11 +659,19 @@ export function resolveConfiguredVoiceId(configuration, resolveVoiceId) {
   return resolveVoiceId(configuration?.voice);
 }
 
-function formatHolidayClosures(holidays) {
-  if (!Array.isArray(holidays) || !holidays.length) return "";
-  return holidays
-    .filter((holiday) => holiday?.closed && text(holiday?.name) && text(holiday?.date))
-    .map((holiday) => `${text(holiday.name)} (${text(holiday.date)})`)
+// Off (or never set) means the business keeps its normal hours on every
+// holiday, so the agent gets no holiday line at all. Removed entries are
+// suggestions the owner didn't add, never real closures.
+function formatHolidays(profile) {
+  if (profile?.holidaysEnabled !== true || !Array.isArray(profile?.holidays)) return "";
+  return profile.holidays
+    .filter((holiday) => !holiday?.disabled && text(holiday?.name) && text(holiday?.date))
+    .map((holiday) => {
+      const label = `${text(holiday.name)} (${text(holiday.date)})`;
+      if (holiday.closed) return `${label}: closed`;
+      const hours = text(holiday.hours);
+      return hours ? `${label}: open ${hours}` : `${label}: open, normal hours`;
+    })
     .join(", ");
 }
 
