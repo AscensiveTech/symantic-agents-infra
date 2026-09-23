@@ -11,6 +11,7 @@ import {
 import { ToolRequestError } from "./handlers/errors.mjs";
 import { handleLeadCapture } from "./handlers/lead.mjs";
 import { handleMessageTake } from "./handlers/message.mjs";
+import { handleServiceArea } from "./handlers/service-area.mjs";
 import { handleTransfer } from "./handlers/transfer.mjs";
 import { createDynamoToolsStore } from "./store.mjs";
 
@@ -23,6 +24,7 @@ const ROUTES = new Set([
   "/retell/tools/lead.capture",
   "/retell/tools/message.take",
   "/retell/tools/call.transfer",
+  "/retell/tools/service-area.check",
 ]);
 
 export function verifyRetellSignature(
@@ -131,6 +133,8 @@ export function createHandler({
         result = await handleMessageTake(input, context);
       } else if (path === "/retell/tools/call.transfer") {
         result = await handleTransfer(input, context);
+      } else if (path === "/retell/tools/service-area.check") {
+        result = await handleServiceArea(input);
       } else {
         const calendar = await getCalendar();
         const calendarContext = { ...context, calendar };

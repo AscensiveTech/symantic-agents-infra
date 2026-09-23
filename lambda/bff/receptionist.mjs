@@ -235,6 +235,36 @@ const CORE_TOOLS = [
   },
 ];
 
+// Only built (and only registered as a tool) when the business has
+// actually configured a service area - the whole list travels with the
+// tool definition itself as a `const` property, the same way
+// toRetellTool() already bakes workspaceId/agentId/callId in as consts.
+// No database access at call time: zero added latency, zero added
+// infra, pure string comparison in the handler. Editing the list already
+// requires a republish to reach a live agent, same as every other
+// configuration field.
+function buildServiceAreaTool(profile) {
+  const serviceAreas = Array.isArray(profile?.serviceAreas)
+    ? profile.serviceAreas.map(text).filter(Boolean)
+    : [];
+  if (!serviceAreas.length) return null;
+  return {
+    name: "check_service_area",
+    path: "/retell/tools/service-area.check",
+    description:
+      "Check whether a location the caller mentioned is in the published service area list - call this "
+      + "before relying on your own judgment, whenever a caller states a city, region, or ZIP code.",
+    properties: {
+      location: {
+        type: "string",
+        description: "The city, region, or ZIP code the caller mentioned.",
+      },
+      serviceAreas: { type: "string", const: JSON.stringify(serviceAreas) },
+    },
+    required: ["location", "serviceAreas"],
+  };
+}
+
 // The greeting the receptionist speaks first. Uses the configured Custom
 // Greeting Message when the customer has set one; otherwise builds one from
 // the real business/receptionist name rather than ever sending a blank or
@@ -325,6 +355,11 @@ export function buildReceptionistPrompt(agent, profile) {
         "",
         "# SERVICE AREA",
         `Published coverage: ${serviceAreaLine}`,
+        "- The moment a caller states a city, region, or ZIP code, call check_service_area with it "
+          + "before deciding anything yourself. If it comes back matched, say the location is within "
+          + "the service area and the team will confirm the exact address. If it comes back "
+          + "unmatched, fall back to your own judgment using the rules below - an unmatched result "
+          + "isn't a refusal, just means nothing on the list was an exact/near-exact hit.",
         "- If a caller's location matches or is near one of these areas, say it's likely within the "
           + "service area and that the team will confirm the exact address.",
         "- If it's outside these areas, don't refuse - say it's outside the generally published "
@@ -423,9 +458,11 @@ export function buildReceptionistConfig({
   if (!text(voiceId)) throw new Error("Retell voice id is required");
 
   const bookingEnabled = agent?.configuration?.booking === true;
-  const definitions = bookingEnabled
-    ? [...CALENDAR_TOOLS, ...CORE_TOOLS]
-    : CORE_TOOLS;
+  const serviceAreaTool = buildServiceAreaTool(profile);
+  const definitions = [
+    ...(bookingEnabled ? [...CALENDAR_TOOLS, ...CORE_TOOLS] : CORE_TOOLS),
+    ...(serviceAreaTool ? [serviceAreaTool] : []),
+  ];
   const transferDefinitions = buildTransferTools(agent, profile);
   const callHandling = resolveCallHandling(agent);
   return {

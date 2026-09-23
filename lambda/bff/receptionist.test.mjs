@@ -284,11 +284,13 @@ test("prompt includes configured holiday closures, contact emails, and service a
   assert.match(withAll, /- info@example\.com/);
   assert.match(withAll, /# SERVICE AREA/);
   assert.match(withAll, /Published coverage: Maryland, Washington D\.C\./);
+  assert.match(withAll, /call check_service_area with it before deciding anything yourself/);
 
   const withNone = buildReceptionistPrompt(agent, profile);
   assert.doesNotMatch(withNone, /Holiday closures:/);
   assert.doesNotMatch(withNone, /# CONTACT EMAILS/);
   assert.doesNotMatch(withNone, /# SERVICE AREA/);
+  assert.doesNotMatch(withNone, /check_service_area/);
 });
 
 test("prompt renders configured appointment types by name, duration, and lead time only - never the before/after buffers", () => {
@@ -433,6 +435,33 @@ test("receptionist config exposes lookup tools, invocation-safe functions, and n
     type: "warm_transfer",
     show_transferee_as_caller: false,
   });
+});
+
+test("check_service_area tool is omitted when no service area is configured, and included with the list baked in as a const when it is", () => {
+  const withoutAreas = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent,
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.ok(!withoutAreas.tools.some(({ name }) => name === "check_service_area"));
+
+  const withAreas = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent,
+    profile: { ...profile, serviceAreas: ["Arlington, VA", "Alexandria, VA"] },
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  const serviceAreaTool = withAreas.tools.find(({ name }) => name === "check_service_area");
+  assert.ok(serviceAreaTool);
+  assert.equal(serviceAreaTool.url, "https://api.example.com/retell/tools/service-area.check");
+  assert.equal(
+    serviceAreaTool.parameters.properties.serviceAreas.const,
+    JSON.stringify(["Arlington, VA", "Alexandria, VA"]),
+  );
+  assert.ok(serviceAreaTool.parameters.required.includes("location"));
 });
 
 test("booking-disabled agents omit calendar tools", () => {

@@ -586,6 +586,7 @@ test("every tool rejects a missing workspaceId, callId, or idempotencyKey", asyn
     "/retell/tools/lead.capture",
     "/retell/tools/message.take",
     "/retell/tools/call.transfer",
+    "/retell/tools/service-area.check",
   ];
 
   for (const path of paths) {
@@ -761,6 +762,27 @@ test("lead.capture and message.take return their original records for duplicate 
   assert.equal(messages.size, 1);
   assert.equal(JSON.parse(leadA.body).message, "We will notify the office.");
   assert.equal(JSON.parse(messageA.body).message, "We will notify the office.");
+});
+
+test("service-area.check is reachable through the signed dispatcher and needs no store access", async () => {
+  const handler = toolHandler({
+    // No store methods this route could plausibly call are stubbed - any
+    // store access at all would throw and fail this test.
+    store: {},
+  });
+  const body = requiredBody({
+    location: "Arlington, VA",
+    serviceAreas: JSON.stringify(["Arlington, VA", "Alexandria, VA"]),
+  });
+
+  const response = await handler(event("/retell/tools/service-area.check", body));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    ok: true,
+    matched: true,
+    message: "That location is within our published service area.",
+  });
 });
 
 test("call.transfer matches emergencyRules phrases to a transfer target", async () => {
