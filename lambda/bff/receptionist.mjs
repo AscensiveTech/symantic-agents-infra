@@ -415,7 +415,7 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
       : []),
     "",
     "# APPROVED CALLER INTENTS",
-    intents || "Use the approved FAQs and take a message for anything else.",
+    intents || "Help with anything covered by the business information and knowledge base, and take a message for anything else.",
     "",
     "# ROLE AND APPROACH",
     text(behavior.roleInstructions) || text(agent?.description) || "Answer only from the approved business information below.",
@@ -452,7 +452,7 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
     allowCallTransfers
       ? "- If the caller asks for a specific person, a manager, or to speak with \"someone\", "
         + "don't guess or state who does or doesn't work here. Use the matching transfer_call "
-        + "tool from the rules above, or a configured escalation contact; otherwise let them "
+        + "tool from the rules above; otherwise let them "
         + "know everyone is currently unavailable and offer to take a message so the office "
         + "can follow up."
       : `- If the caller asks for a specific person, a manager, or to speak with "someone", ${NO_TRANSFER_FIXED_LINE}`,
