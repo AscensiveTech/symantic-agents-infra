@@ -506,7 +506,27 @@ export function buildReceptionistConfig({
         : {}),
     },
     allowedInboundCountries: resolveAllowedInboundCountries(agent),
+    // Read by the Retell provider as ambient_sound. It was never set here,
+    // so every agent went out with no background track whatever was chosen.
+    ambientSound: resolveAmbientSound(agent),
   };
+}
+
+// Retell's fixed list - mirrored in the frontend's lib/domain/ambient-sound.ts.
+// Anything else (a stale or hand-edited value) sends no sound rather than
+// being rejected by Retell at publish time.
+const AMBIENT_SOUNDS = new Set([
+  "coffee-shop",
+  "convention-hall",
+  "summer-outdoor",
+  "mountain-outdoor",
+  "static-noise",
+  "call-center",
+]);
+
+export function resolveAmbientSound(agent) {
+  const value = text(agent?.configuration?.ambientSound);
+  return AMBIENT_SOUNDS.has(value) ? value : null;
 }
 
 const SUPPORTED_LANGUAGES = new Set(["en-US", "es-419"]);

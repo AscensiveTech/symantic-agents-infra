@@ -6,6 +6,7 @@ import {
   buildReceptionistConfig,
   buildReceptionistPrompt,
   resolveAllowedInboundCountries,
+  resolveAmbientSound,
   resolveCallHandling,
   resolveConfiguredVoiceId,
   resolveGreeting,
@@ -270,6 +271,20 @@ test("resolveGreeting adds a short recording disclosure line when recordingDiscl
     resolveGreeting({ configuration: { recordingDisclosure: true, name: "Maya" } }, { businessName: "Arc Dental" }),
     "Thanks for calling Arc Dental. This call may be recorded for quality assurance. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
   );
+});
+
+test("the agent's chosen ambient sound reaches the Retell config, and an unknown one sends none", () => {
+  const build = (ambientSound) => buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: { ...agent, configuration: { ...agent.configuration, ambientSound } },
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.equal(build("coffee-shop").ambientSound, "coffee-shop");
+  assert.equal(build("").ambientSound, null);
+  assert.equal(build("rainforest").ambientSound, null);
+  assert.equal(resolveAmbientSound({ configuration: {} }), null);
 });
 
 test("resolveCallHandling applies defaults and clamps to the Retell range", () => {
