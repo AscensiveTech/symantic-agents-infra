@@ -1005,7 +1005,7 @@ test("DELETE agent is refused for a non-admin", async () => {
   assert.equal(response.statusCode, 403);
 });
 
-test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared knowledge base items, and records a history summary", async () => {
+test("DELETE agent tears down the Retell agent/LLM and the Telnyx number, only unassigns its Library items, and records a history summary", async () => {
   const providerCalls = [];
   const storeCalls = [];
   const agent = {
@@ -1082,15 +1082,12 @@ test("DELETE agent tears down the Retell agent/LLM, the Telnyx number, unshared 
   // there'd be no trace of what number this agent used to have.
   assert.equal(body.deletedPhoneNumber, "+17035550199");
 
-  // Only the KB not referenced by another agent gets torn down.
-  assert.deepEqual(
-    providerCalls.filter(([name]) => name === "deleteKnowledgeBase"),
-    [["deleteKnowledgeBase", "retell-kb-solo"]],
-  );
-  assert.deepEqual(
-    storeCalls.filter(([name]) => name === "deleteKnowledgeBaseRecord"),
-    [["deleteKnowledgeBaseRecord", "kb-solo"]],
-  );
+  // The Library is shared: nothing is deleted from it, even an item only
+  // this agent used - the agent is just unassigned from its items.
+  assert.deepEqual(providerCalls.filter(([name]) => name === "deleteKnowledgeBase"), []);
+  assert.deepEqual(storeCalls.filter(([name]) => name === "deleteKnowledgeBaseRecord"), []);
+  const deletion = storeCalls.find(([name]) => name === "updateAgentRuntime")[2];
+  assert.deepEqual(deletion.configuration.knowledgeBaseIds, []);
 
   assert.deepEqual(providerCalls.filter(([name]) => name === "deleteAgentAndLlm"), [["deleteAgentAndLlm", "retell-agent-1"]]);
   assert.deepEqual(providerCalls.filter(([name]) => name === "deletePhoneNumber"), [["deletePhoneNumber", "+17035550133"]]);
@@ -1571,6 +1568,86 @@ test("retell-status: never flags drafts or agents that aren't live, and a Retell
     (await retellStatus({ readError: new Error("Retell timeout") })).body,
     { editedInRetell: false, changedFields: [], unavailable: true },
   );
+});
+
+test("GET knowledge-bases never counts a deleted agent as assigned (older deleted agents still list their items)", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [["kb-1", { knowledgeBaseId: "kb-1", kind: "file", name: "Website", sourceLabel: "site.docx" }]],
+    agents: [
+      { id: "agent-live", name: "Samantha- CWR Inc", status: "active", configuration: { knowledgeBaseIds: ["kb-1"] } },
+      { id: "agent-gone", name: "Old Agent", status: "deleted", configuration: { knowledgeBaseIds: ["kb-1"] } },
+    ],
+  });
+  store.listKnowledgeBases = async () => [...store.knowledgeBases.values()];
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const event = authenticatedEvent("GET", "/workspaces/me/knowledge-bases");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const response = await handler(event);
+
+  assert.deepEqual(JSON.parse(response.body)[0].assignedAgents, [{ id: "agent-live", name: "Samantha- CWR Inc" }]);
+});
+
+test("knowledge file downloads: stored keys are signed directly; older items are matched once by name and upload time, then remembered", async () => {
+  const { knowledgeBaseDownloads } = await loadBff();
+  const signer = { async createDownloadUrl(workspaceId, key) { return `https://s3.example/${workspaceId}/${key}`; } };
+  const updates = [];
+  const store = { async updateKnowledgeBase(workspaceId, knowledgeBaseId, patch) { updates.push([knowledgeBaseId, patch]); } };
+
+  const stored = await knowledgeBaseDownloads({
+    store, workspaceId: "ws", signer,
+    record: { knowledgeBaseId: "kb-1", fileKeys: ["knowledge-base/uuid-1/site.docx"] },
+    listObjects: async () => { throw new Error("no listing needed when the key is stored"); },
+  });
+  assert.deepEqual(stored, [{ name: "site.docx", url: "https://s3.example/ws/knowledge-base/uuid-1/site.docx" }]);
+
+  const createdAt = "2026-09-17T20:25:40.900Z";
+  const at = (iso) => Date.parse(iso);
+  const legacy = await knowledgeBaseDownloads({
+    store, workspaceId: "ws", signer,
+    record: { knowledgeBaseId: "kb-2", sourceLabel: "site.docx", createdAt },
+    listObjects: async () => [
+      // Same file uploaded again for another item the day before - not this one.
+      { key: "workspaces/ws/knowledge-base/older/site.docx", lastModified: at("2026-09-16T22:27:02Z") },
+      { key: "workspaces/ws/knowledge-base/right/site.docx", lastModified: at("2026-09-17T20:25:41Z") },
+      { key: "workspaces/ws/knowledge-base/other/ar.docx", lastModified: at("2026-09-17T20:25:41Z") },
+    ],
+  });
+  assert.deepEqual(legacy.map((file) => file.url), ["https://s3.example/ws/knowledge-base/right/site.docx"]);
+  assert.deepEqual(updates, [["kb-2", { fileKeys: ["knowledge-base/right/site.docx"] }]]);
+
+  const missing = await knowledgeBaseDownloads({
+    store, workspaceId: "ws", signer,
+    record: { knowledgeBaseId: "kb-3", sourceLabel: "gone.pdf", createdAt },
+    listObjects: async () => [],
+  });
+  assert.deepEqual(missing, []);
+});
+
+test("GET knowledge-bases/{id}/download only serves uploaded files, and 404s an unknown item", async () => {
+  const store = knowledgeBaseTestStore({
+    knowledgeBases: [
+      ["kb-text", { knowledgeBaseId: "kb-text", kind: "text", name: "Policy", sourceText: "..." }],
+      ["kb-file", { knowledgeBaseId: "kb-file", kind: "file", name: "Site", sourceLabel: "site.docx", fileKeys: ["knowledge-base/u/site.docx"] }],
+    ],
+  });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getKnowledgeSigner: async () => ({ async createDownloadUrl(workspaceId, key) { return `https://s3.example/${key}`; } }),
+  });
+
+  const get = (path) => {
+    const event = authenticatedEvent("GET", path);
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+    return handler(event);
+  };
+  const file = await get("/workspaces/me/knowledge-bases/kb-file/download");
+  assert.equal(file.statusCode, 200);
+  assert.deepEqual(JSON.parse(file.body), { files: [{ name: "site.docx", url: "https://s3.example/knowledge-base/u/site.docx" }] });
+  assert.equal((await get("/workspaces/me/knowledge-bases/kb-text/download")).statusCode, 400);
+  assert.equal((await get("/workspaces/me/knowledge-bases/kb-nope/download")).statusCode, 404);
 });
 
 test("GET calls lists workspace calls without exposing Retell identifiers", async () => {

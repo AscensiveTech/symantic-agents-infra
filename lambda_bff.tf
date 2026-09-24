@@ -209,6 +209,17 @@ resource "aws_iam_role_policy" "bff_dynamodb" {
         Action   = ["s3:GetObject", "s3:PutObject"]
         Resource = "${aws_s3_bucket.knowledge_assets.arn}/*"
       },
+      {
+        # Only used to find the original upload of Library items created
+        # before their file key was stored, for Download.
+        Sid      = "ListKnowledgeAssets"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.knowledge_assets.arn
+        Condition = {
+          StringLike = { "s3:prefix" = ["workspaces/*"] }
+        }
+      },
     ]
   })
 }

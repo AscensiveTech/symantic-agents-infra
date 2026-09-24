@@ -1037,6 +1037,25 @@ export function createHandler({
         }
       }
 
+      // Short-lived links to a file item's original upload, for the
+      // Library's detail pop-up. Read-only.
+      const knowledgeDownloadMatch = path.match(/^\/workspaces\/me\/knowledge-bases\/([^/]+)\/download$/);
+      if (knowledgeDownloadMatch && method === "GET") {
+        await store.ensureWorkspace(workspaceId);
+        const knowledgeBaseId = decodeURIComponent(knowledgeDownloadMatch[1]);
+        const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
+        if (!record) return json(404, { message: "Knowledge base item not found" });
+        if (record.kind !== "file") return json(400, { message: "Only uploaded files can be downloaded" });
+        const files = await knowledgeBaseDownloads({
+          store,
+          workspaceId,
+          record: { ...record, knowledgeBaseId },
+          signer: await getKnowledgeSigner(),
+        });
+        if (!files.length) return json(404, { message: "The original file for this item couldn't be found" });
+        return json(200, { files });
+      }
+
       const knowledgeBaseTarget = path.match(/^\/workspaces\/me\/knowledge-bases\/(.+)$/)?.[1];
       if (knowledgeBaseTarget && method === "PATCH") {
         await store.ensureWorkspace(workspaceId);
@@ -2265,23 +2284,11 @@ export function createHandler({
         // agent's history reflects what actually happened, not demo output.
         const callsHandledAtDeletion = calls.filter((call) => call.agentId === agentId && call.demoSeed !== true).length;
 
-        const knowledgeBaseIds = Array.isArray(agent?.configuration?.knowledgeBaseIds)
-          ? agent.configuration.knowledgeBaseIds
-          : [];
+        // The Library is shared: deleting an agent only unassigns its items
+        // (knowledgeBaseIds is cleared on the deleted record below), and
+        // every item stays in the Library for the other agents.
+        void otherAgents;
         const providers = await getProviders();
-        for (const knowledgeBaseId of knowledgeBaseIds) {
-          const stillUsed = otherAgents.some((other) =>
-            other.id !== agentId &&
-            Array.isArray(other?.configuration?.knowledgeBaseIds) &&
-            other.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
-          if (stillUsed) continue;
-          const record = await store.getKnowledgeBase(workspaceId, knowledgeBaseId);
-          if (!record) continue;
-          if (record.retellKnowledgeBaseId) {
-            await providers.retell.deleteKnowledgeBase(record.retellKnowledgeBaseId).catch(() => {});
-          }
-          await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
-        }
 
         if (agent.retellAgentId) {
           await providers.retell.deleteAgentAndLlm(agent.retellAgentId).catch(() => {});
@@ -2301,6 +2308,7 @@ export function createHandler({
           const updated = await store.updateAgentRuntime(workspaceId, agentId, {
             status: "deleted",
             deletedAt,
+            configuration: { ...(agent.configuration ?? {}), knowledgeBaseIds: [] },
             deletedByName: actorDisplayName(event, actor),
             callsHandledAtDeletion,
             // Captured before deletePhoneNumberRecord ran above - once that
@@ -6111,8 +6119,60 @@ async function buildRetellKnowledgeBase({ providers, getKnowledgeSigner, workspa
 // which agents then reference by id (Retell natively allows the same
 // knowledge_base_id on more than one agent, so no per-agent copy is needed).
 function toPublicKnowledgeBase(record) {
-  const { workspaceId: _workspaceId, ...rest } = record;
+  const { workspaceId: _workspaceId, fileKeys: _fileKeys, ...rest } = record;
   return rest;
+}
+
+let knowledgeListPromise;
+// Download links for a file item's original upload(s). Items created
+// before fileKeys was stored are matched once by file name and upload
+// time (uploads land a moment before the item is created), and the keys
+// are then saved so the lookup never has to run again.
+export async function knowledgeBaseDownloads({ store, workspaceId, record, signer, listObjects = listKnowledgeObjects }) {
+  let keys = Array.isArray(record.fileKeys) ? record.fileKeys : [];
+  if (!keys.length) {
+    const names = String(record.sourceLabel ?? "").split(", ").filter(Boolean);
+    const createdAt = Date.parse(record.createdAt ?? "") || 0;
+    const objects = await listObjects(workspaceId);
+    const prefix = `workspaces/${workspaceId}/`;
+    keys = names.flatMap((name) => {
+      const best = objects
+        .filter((object) => object.key.endsWith(`/${name}`) && object.lastModified <= createdAt + 60_000)
+        .sort((a, b) => Math.abs(createdAt - a.lastModified) - Math.abs(createdAt - b.lastModified))[0];
+      return best && Math.abs(createdAt - best.lastModified) <= 15 * 60_000 ? [best.key.slice(prefix.length)] : [];
+    });
+    if (keys.length) {
+      await store.updateKnowledgeBase(workspaceId, record.knowledgeBaseId, { fileKeys: keys }).catch((error) => {
+        console.error("Unable to remember a knowledge file's key", { knowledgeBaseId: record.knowledgeBaseId, error });
+      });
+    }
+  }
+  return Promise.all(keys.map(async (key) => ({
+    name: key.split("/").pop(),
+    url: await signer.createDownloadUrl(workspaceId, key),
+  })));
+}
+
+async function listKnowledgeObjects(workspaceId) {
+  const bucket = process.env.KNOWLEDGE_ASSETS_BUCKET;
+  if (!bucket) return [];
+  knowledgeListPromise ??= import("@aws-sdk/client-s3").then((m) => ({
+    client: new m.S3Client({ region: process.env.AWS_REGION }),
+    ListObjectsV2Command: m.ListObjectsV2Command,
+  }));
+  const { client, ListObjectsV2Command } = await knowledgeListPromise;
+  const objects = [];
+  let ContinuationToken;
+  do {
+    const res = await client.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: `workspaces/${workspaceId}/knowledge-base/`,
+      ...(ContinuationToken ? { ContinuationToken } : {}),
+    }));
+    for (const object of res.Contents ?? []) objects.push({ key: object.Key, lastModified: new Date(object.LastModified).getTime() });
+    ContinuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (ContinuationToken && objects.length < 5000);
+  return objects;
 }
 
 async function listKnowledgeBasesWithAssignments(store, workspaceId) {
@@ -6123,7 +6183,8 @@ async function listKnowledgeBasesWithAssignments(store, workspaceId) {
   return items.map((item) => ({
     ...toPublicKnowledgeBase(item),
     assignedAgents: agents
-      .filter((agent) => Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
+      .filter((agent) => agent?.status !== "deleted" &&
+        Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
         agent.configuration.knowledgeBaseIds.includes(item.knowledgeBaseId))
       .map((agent) => ({ id: agent.id, name: agent.name })),
   }));
@@ -6223,6 +6284,8 @@ async function createKnowledgeBaseItem(store, providers, getKnowledgeSigner, wor
     name,
     kind: url ? "url" : fileMetadata.length ? "file" : "text",
     sourceLabel: url || fileMetadata.map((file) => file.name).join(", ") || "Pasted text",
+    // Where each uploaded file lives in the knowledge bucket, for Download.
+    ...(fileMetadata.length ? { fileKeys: fileMetadata.map((file) => file.key) } : {}),
     ...(sizeBytes !== undefined ? { sizeBytes } : {}),
     ...(created ? { retellKnowledgeBaseId: created.knowledgeBaseId } : {}),
     enableAutoRefresh,
@@ -6329,6 +6392,7 @@ async function updateKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
 
   const agents = await store.listAgents(workspaceId);
   const assignedTo = agents.filter((agent) =>
+    agent?.status !== "deleted" &&
     Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
     agent.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
 
@@ -6386,6 +6450,7 @@ async function deleteKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
 
   const agents = await store.listAgents(workspaceId);
   const assignedTo = agents.filter((agent) =>
+    agent?.status !== "deleted" &&
     Array.isArray(agent?.configuration?.knowledgeBaseIds) &&
     agent.configuration.knowledgeBaseIds.includes(knowledgeBaseId));
 
