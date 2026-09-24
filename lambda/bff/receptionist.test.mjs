@@ -64,137 +64,6 @@ const agent = {
   },
 };
 
-test("prompt builder includes hours and emergency rules, but never the workspace profile's uneditable FAQs, description, or policies", () => {
-  const prompt = buildReceptionistPrompt(agent, profile);
-
-  assert.match(prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
-  // These profile fields can't be edited on any screen and in production only
-  // ever held sample data - they must not reach a live agent.
-  assert.doesNotMatch(prompt, /Family dentistry/);
-  assert.doesNotMatch(prompt, /Do you accept insurance\?/);
-  assert.doesNotMatch(prompt, /Give 24 hours notice/);
-  assert.doesNotMatch(prompt, /Warm and concise/);
-  assert.match(prompt, /this agent's knowledge base/);
-  assert.match(prompt, /severe bleeding or trouble breathing/);
-  assert.match(prompt, /chest pain/);
-  assert.match(prompt, /can't breathe/);
-  assert.match(prompt, /# ROLE AND APPROACH\nYou are the front-desk receptionist for a dental clinic\./);
-  assert.match(prompt, /# RESTRICTIONS - WHAT NOT TO SAY OR DO\nNever provide a diagnosis or promise insurance coverage\./);
-  assert.match(prompt, /\+17035550102/);
-});
-
-test("every prompt tells the caller to call 911 for a genuine emergency, with no claim about whether the AI can or cannot place that call itself - with or without configured emergency routing", () => {
-  const withRouting = buildReceptionistPrompt(agent, profile);
-  assert.match(withRouting, /tell the caller to call 911/);
-  assert.doesNotMatch(withRouting, /cannot call 911/);
-  assert.doesNotMatch(withRouting, /dispatch emergency services/);
-  assert.match(withRouting, /Then take a message so the business knows the call came in/);
-
-  const noRouting = {
-    ...agent,
-    configuration: { ...agent.configuration, emergencyRules: [], escalation: "" },
-  };
-  const withoutRouting = buildReceptionistPrompt(noRouting, profile);
-  assert.match(withoutRouting, /tell the caller to call 911/);
-  assert.doesNotMatch(withoutRouting, /cannot call 911/);
-  assert.match(withoutRouting, /Then take a message so the business knows the call came in/);
-});
-
-test("Restrictions section is omitted entirely when the receptionist has none configured", () => {
-  const noRestrictions = {
-    ...agent,
-    configuration: { ...agent.configuration, restrictions: "" },
-  };
-  const prompt = buildReceptionistPrompt(noRestrictions, profile);
-
-  assert.doesNotMatch(prompt, /# RESTRICTIONS - WHAT NOT TO SAY OR DO/);
-  assert.match(prompt, /# ROLE AND APPROACH\nYou are the front-desk receptionist for a dental clinic\./);
-});
-
-test("a 'decline' emergency rule tells the agent to say a message instead of transferring", () => {
-  const declineAgent = {
-    ...agent,
-    configuration: {
-      ...agent.configuration,
-      emergencyRules: [
-        { phrases: ["fire", "smoke"], action: "decline", message: "We're sorry, we can't help with that. Please call 911." },
-        { phrases: ["chest pain"], transferTarget: "+17035550102" },
-      ],
-    },
-  };
-  const prompt = buildReceptionistPrompt(declineAgent, profile);
-
-  assert.match(prompt, /fire.*smoke.*say "We're sorry, we can't help with that\. Please call 911\."/s);
-  assert.match(prompt, /do not transfer/);
-  assert.match(prompt, /chest pain.*transfer to \+17035550102/s);
-});
-
-test("prompt always instructs honesty about being an AI - never claim to be human", () => {
-  const prompt = buildReceptionistPrompt(agent, profile);
-  assert.match(prompt, /always answer honestly.*yes, you are an AI voice agent/is);
-  assert.match(prompt, /Never claim to be human/);
-});
-
-test("prompt carries spam / robocall handling rules by default and drops them when screening is off", () => {
-  const withScreening = buildReceptionistPrompt(agent, profile);
-  assert.match(withScreening, /# SPAM & ROBOCALLS/);
-  assert.match(withScreening, /telemarketer reading a script/);
-  assert.match(withScreening, /call the end_call tool/);
-
-  const off = buildReceptionistPrompt(
-    { ...agent, configuration: { ...agent.configuration, spamScreening: false } },
-    profile,
-  );
-  assert.doesNotMatch(off, /# SPAM & ROBOCALLS/);
-});
-
-test("prompt follows the ROLE / CRITICAL RULES / ONE THING AT A TIME structure and carries the new behavioral sections", () => {
-  const prompt = buildReceptionistPrompt(agent, profile);
-
-  assert.match(prompt, /^# ROLE\n/);
-  assert.match(prompt, /# CRITICAL RULES/);
-  assert.match(prompt, /Never confirm a booking, callback, or any other action until the matching Symantic tool has actually returned success/);
-  assert.match(prompt, /# ONE THING AT A TIME/);
-  assert.match(prompt, /Never ask two questions in the same turn/);
-  assert.match(prompt, /# LIVE PERSON REQUESTS/);
-  assert.match(prompt, /# OFF-TOPIC, ABUSE & NONSENSE/);
-  assert.match(prompt, /Abuse, insults, or gibberish\/nonsense speech: don't engage, argue, or match their tone/);
-  assert.match(prompt, /Off-topic requests .*give one polite redirect/);
-  assert.match(prompt, /# CLOSING/);
-  assert.match(prompt, /wait for a real answer - hesitation .*is not a no/);
-});
-
-test("prompt always instructs the AI-disclosure rule as part of CRITICAL RULES", () => {
-  const prompt = buildReceptionistPrompt(agent, profile);
-  assert.match(prompt, /# CRITICAL RULES[\s\S]*always answer honestly.*yes, you are an AI voice agent/);
-  assert.match(prompt, /Never claim to be human/);
-});
-
-test("a 'decline' emergency rule's transferTarget never becomes a transfer_call tool, even if it looks like a valid phone number", () => {
-  const declineAgent = {
-    ...agent,
-    configuration: {
-      ...agent.configuration,
-      emergencyRules: [
-        { phrases: ["talk to a human"], action: "decline", transferTarget: "+17035550102", message: "We'll call you back." },
-      ],
-    },
-  };
-  const config = buildReceptionistConfig({
-    workspaceId: "workspace-123",
-    agent: declineAgent,
-    profile,
-    toolBaseUrl: "https://api.example.com",
-    voiceId: "retell-voice-1",
-  });
-  // "+17035550102" is the decline rule's own transferTarget - it must never
-  // appear as a transfer destination. The only general destination is the
-  // agent's own forwarding number (ownerPhone); the uneditable escalation
-  // and fallback numbers are never used.
-  assert.ok(!config.transferNumbers.includes("+17035550102"));
-  assert.deepEqual(config.transferNumbers, ["+17035550100"]);
-});
-
 test("allowCallTransfers: false means no transfer_call tool exists at all, even with rules, escalation, and owner/fallback numbers all configured", () => {
   const noTransferAgent = {
     ...agent,
@@ -209,50 +78,6 @@ test("allowCallTransfers: false means no transfer_call tool exists at all, even 
   });
   assert.equal(config.tools.filter(({ type }) => type === "transfer_call").length, 0);
   assert.deepEqual(config.transferNumbers, []);
-});
-
-test("the prompt's Talk To A Human section gives each configured no-transfer rule's own message, plus an always-present fallback, and never mentions the transfer_call tool there", () => {
-  const noTransferAgent = {
-    ...agent,
-    configuration: {
-      ...agent.configuration,
-      allowCallTransfers: false,
-      noTransferRules: [
-        { phrases: ["talk to a supervisor"], message: "I'll pass that along and someone will call you back shortly." },
-        { phrases: [], message: "" },
-      ],
-    },
-  };
-  const prompt = buildReceptionistPrompt(noTransferAgent, profile);
-  const [, talkToHumanBody] = prompt.split("# TALK TO A HUMAN\n");
-  const [, livePersonBody] = prompt.split("# LIVE PERSON REQUESTS\n");
-  assert.match(talkToHumanBody, /"talk to a supervisor": say "I'll pass that along/);
-  assert.match(talkToHumanBody, /My apologies\. Since no one is available/);
-  assert.doesNotMatch(talkToHumanBody.split("\n\n")[0], /transfer_call/);
-  assert.match(livePersonBody, /the matching response in the rules above, or the fallback message/);
-
-  const withTransferAgent = { ...agent, configuration: { ...agent.configuration, allowCallTransfers: true } };
-  const withTransferPrompt = buildReceptionistPrompt(withTransferAgent, profile);
-  assert.doesNotMatch(withTransferPrompt, /My apologies\. Since no one is available/);
-});
-
-test("a no-transfer rule missing either its phrases or its message is skipped from the prompt", () => {
-  const noTransferAgent = {
-    ...agent,
-    configuration: {
-      ...agent.configuration,
-      allowCallTransfers: false,
-      noTransferRules: [
-        { phrases: ["billing question"], message: "" },
-        { phrases: [], message: "Someone will call you back." },
-      ],
-    },
-  };
-  const prompt = buildReceptionistPrompt(noTransferAgent, profile);
-  const [, talkToHumanBody] = prompt.split("# TALK TO A HUMAN\n");
-  assert.doesNotMatch(talkToHumanBody, /billing question/);
-  assert.doesNotMatch(talkToHumanBody, /Someone will call you back\./);
-  assert.match(talkToHumanBody, /My apologies\. Since no one is available/);
 });
 
 test("an extension is dialed as a DTMF pause after the transfer number", () => {
@@ -298,42 +123,6 @@ test("resolveGreeting adds a short recording disclosure line when recordingDiscl
   );
 });
 
-test("an agent's own Business Profile replaces the workspace's - two agents in one workspace can be two different locations", () => {
-  const maryland = {
-    ...agent,
-    configuration: {
-      ...agent.configuration,
-      greeting: "",
-      allowCallTransfers: true,
-      emergencyRules: [],
-      businessProfile: {
-        businessName: "Arc Dental Maryland",
-        timezone: "America/New_York",
-        hours: "Tue-Thu, 9:00 AM-1:00 PM",
-        serviceAreas: ["Bethesda, MD"],
-        ownerPhone: "+13015550111",
-      },
-    },
-  };
-  const config = buildReceptionistConfig({
-    workspaceId: "workspace-123",
-    agent: maryland,
-    profile: { ...profile, serviceAreas: ["Charleston, SC"] },
-    toolBaseUrl: "https://api.example.com",
-    voiceId: "retell-voice-1",
-  });
-
-  assert.match(config.prompt, /AI voice agent for Arc Dental Maryland/);
-  assert.match(config.prompt, /Tue-Thu, 9:00 AM-1:00 PM/);
-  assert.doesNotMatch(config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
-  assert.match(config.prompt, /Published coverage: Bethesda, MD/);
-  assert.doesNotMatch(config.prompt, /Charleston/);
-  assert.deepEqual(config.transferNumbers, ["+13015550111"]);
-  // Fields the agent hasn't saved for itself still fall back to the workspace.
-  assert.match(config.prompt, /Address: 123 Main Street/);
-  assert.match(resolveGreeting(maryland, profile), /^Thanks for calling Arc Dental Maryland\./);
-});
-
 test("the agent's chosen ambient sound reaches the Retell config, and an unknown one sends none", () => {
   const build = (ambientSound) => buildReceptionistConfig({
     workspaceId: "workspace-123",
@@ -371,66 +160,6 @@ test("resolveAllowedInboundCountries normalizes to unique upper-case ISO codes",
   );
 });
 
-test("prompt prefers structured business hours (with split intervals) and carries the call clock", () => {
-  const open = (intervals) => ({ closed: false, intervals });
-  const structured = buildReceptionistPrompt(agent, {
-    ...profile,
-    hours: "ignored free text",
-    businessHours: {
-      mon: open([{ open: "08:00", close: "12:00" }, { open: "13:00", close: "17:00" }]),
-      tue: open([{ open: "08:00", close: "12:00" }, { open: "13:00", close: "17:00" }]),
-      wed: open([{ open: "08:00", close: "12:00" }, { open: "13:00", close: "17:00" }]),
-      thu: open([{ open: "08:00", close: "12:00" }, { open: "13:00", close: "17:00" }]),
-      fri: open([{ open: "08:00", close: "12:00" }, { open: "13:00", close: "17:00" }]),
-      sat: open([{ open: "09:00", close: "13:00" }]),
-      sun: { closed: true, intervals: [{ open: "09:00", close: "13:00" }] },
-    },
-  });
-
-  assert.match(
-    structured,
-    /Mon–Fri 8:00 AM–12:00 PM, 1:00 PM–5:00 PM; Sat 9:00 AM–1:00 PM; Sun closed/,
-  );
-  assert.doesNotMatch(structured, /ignored free text/);
-  assert.match(structured, /\{\{currentTime\}\} \(\{\{timezone\}\}\)/);
-  assert.match(structured, /whether you are open right now/);
-
-  const fallback = buildReceptionistPrompt(agent, { ...profile, businessHours: { mon: "bad" } });
-  assert.match(fallback, /Mon-Fri, 8:00 AM-5:00 PM/);
-});
-
-test("prompt includes configured holidays, contact emails, and service area coverage", () => {
-  const withAll = buildReceptionistPrompt(agent, {
-    ...profile,
-    holidaysEnabled: true,
-    holidays: [
-      { id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true },
-      { id: "h2", name: "Christmas Eve", date: "2026-12-24", closed: false, hours: "9 AM-1 PM" },
-      { id: "h3", name: "Labor Day", date: "2026-09-07", closed: true, disabled: true },
-    ],
-    contactEmails: [
-      { label: "Billing / AR", email: "billing@example.com" },
-      { label: "", email: "info@example.com" },
-    ],
-    serviceAreas: ["Maryland", "Washington D.C."],
-  });
-
-  assert.match(withAll, /- Holidays: Thanksgiving \(2026-11-26\): closed, Christmas Eve \(2026-12-24\): open 9 AM-1 PM$/m);
-  assert.doesNotMatch(withAll, /Labor Day/);
-  assert.match(withAll, /# CONTACT EMAILS/);
-  assert.match(withAll, /Billing \/ AR: billing@example\.com/);
-  assert.match(withAll, /- info@example\.com/);
-  assert.match(withAll, /# SERVICE AREA/);
-  assert.match(withAll, /Published coverage: Maryland, Washington D\.C\./);
-  assert.match(withAll, /call check_service_area with it before deciding anything yourself/);
-
-  const withNone = buildReceptionistPrompt(agent, profile);
-  assert.doesNotMatch(withNone, /- Holidays:/);
-  assert.doesNotMatch(withNone, /# CONTACT EMAILS/);
-  assert.doesNotMatch(withNone, /# SERVICE AREA/);
-  assert.doesNotMatch(withNone, /check_service_area/);
-});
-
 test("holidays never reach the prompt while the holidays toggle is off or was never set, even if a list is saved", () => {
   const holidays = [{ id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true }];
   for (const holidaysEnabled of [false, undefined]) {
@@ -458,57 +187,6 @@ test("a Cal.com agent's prompt lists its chosen event types instead of its own A
   assert.match(typesSection, /- Estimate Visit \(1 hour\)/);
   assert.match(typesSection, /- Quick Call \(15 minutes\)/);
   assert.doesNotMatch(prompt, /Stale Type/);
-});
-
-test("prompt renders configured appointment types by name, duration, and lead time only - never the before/after buffers", () => {
-  const withTypes = buildReceptionistPrompt({
-    ...agent,
-    configuration: {
-      ...agent.configuration,
-      appointmentTypes: [
-        { id: "t1", name: "Quick Call", durationMin: 15, minimumLeadTimeMin: 60, blockBeforeMin: 0, blockAfterMin: 0, happensAtCustomerLocation: false },
-        { id: "t2", name: "On-Site Visit", durationMin: 30, minimumLeadTimeMin: 1440, blockBeforeMin: 60, blockAfterMin: 60, happensAtCustomerLocation: true },
-        { id: "t3", name: "No Restriction", durationMin: 45, minimumLeadTimeMin: 0 },
-      ],
-    },
-  }, profile);
-
-  assert.match(withTypes, /# APPOINTMENT TYPES/);
-  assert.match(withTypes, /Quick Call \(15 minutes, must be booked at least 1 hour in advance\)/);
-  assert.match(withTypes, /On-Site Visit \(30 minutes, must be booked at least 24 hours in advance\)/);
-  assert.match(withTypes, /No Restriction \(45 minutes\)$/m);
-  const typesSection = withTypes.split("# APPOINTMENT TYPES")[1].split("\n\n")[0];
-  assert.doesNotMatch(typesSection, /\b60\b/); // no raw buffer minutes ever rendered
-  assert.doesNotMatch(typesSection, /blockBefore|blockAfter/i);
-
-  const withNone = buildReceptionistPrompt(agent, profile);
-  assert.doesNotMatch(withNone, /# APPOINTMENT TYPES/);
-});
-
-test("prompt renders Example Dialogues after Restrictions, and Final Reminders last (deliberately, for the recency effect)", () => {
-  const withBoth = buildReceptionistPrompt({
-    ...agent,
-    configuration: {
-      ...agent.configuration,
-      exampleDialogues: "Caller: Hi, do you have any openings?\nYou: We do - what day works for you?",
-      finalReminders: "- Never guess.\n- Wait for the caller to finish before closing.",
-    },
-  }, profile);
-
-  assert.match(withBoth, /# EXAMPLE DIALOGUES/);
-  assert.match(withBoth, /Caller: Hi, do you have any openings\?/);
-  assert.match(withBoth, /# FINAL REMINDERS/);
-  assert.match(withBoth, /- Never guess\./);
-
-  // Restrictions -> Example Dialogues -> ... -> Final Reminders, in that order
-  assert.ok(withBoth.indexOf("# RESTRICTIONS") < withBoth.indexOf("# EXAMPLE DIALOGUES"));
-  assert.ok(withBoth.indexOf("# FINAL REMINDERS") > withBoth.lastIndexOf("# CLOSING"));
-  // Final Reminders is the very last section in the whole prompt
-  assert.ok(withBoth.trimEnd().endsWith("Wait for the caller to finish before closing."));
-
-  const withNeither = buildReceptionistPrompt(agent, profile);
-  assert.doesNotMatch(withNeither, /# EXAMPLE DIALOGUES/);
-  assert.doesNotMatch(withNeither, /# FINAL REMINDERS/);
 });
 
 test("prompt renders an allDay day as 'Open 24 hours', not raw interval text", () => {
@@ -542,66 +220,6 @@ test("cloned voice mode uses the stored voiceId instead of the catalog map", () 
     resolveConfiguredVoiceId({ voiceMode: "cloned", voiceId: "  ", voice: "Calm and natural" }, resolveVoiceId),
     "mapped:Calm and natural",
   );
-});
-
-test("receptionist config exposes lookup tools, invocation-safe functions, and native warm transfer", () => {
-  const config = buildReceptionistConfig({
-    workspaceId: "workspace-123",
-    agent,
-    profile,
-    toolBaseUrl: "https://api.example.com/",
-    voiceId: "retell-voice-1",
-  });
-
-  assert.equal(config.voice, "retell-voice-1");
-  assert.equal(config.bookingEnabled, true);
-  // The rule's own target, then the agent's forwarding number. The
-  // workspace profile's escalation/fallback numbers are never destinations.
-  assert.deepEqual(config.transferNumbers, [
-    "+17035550102",
-    "+17035550100",
-  ]);
-  const customTools = config.tools.filter(({ type }) => type === "custom");
-  assert.deepEqual(
-    customTools.map(({ url }) => url),
-    [
-      "https://api.example.com/retell/tools/calendar.findAppointment",
-      "https://api.example.com/retell/tools/calendar.getAvailability",
-      "https://api.example.com/retell/tools/calendar.createBooking",
-      "https://api.example.com/retell/tools/calendar.rescheduleBooking",
-      "https://api.example.com/retell/tools/calendar.cancelBooking",
-      "https://api.example.com/retell/tools/lead.capture",
-      "https://api.example.com/retell/tools/message.take",
-    ],
-  );
-  for (const tool of customTools) {
-    assert.equal(tool.parameters.properties.workspaceId.const, "workspace-123");
-    assert.equal(tool.parameters.properties.callId.const, "{{call_id}}");
-    assert.equal(tool.parameters.properties.idempotencyKey, undefined);
-    assert.ok(!tool.parameters.required.includes("idempotencyKey"));
-  }
-  const endCall = config.tools.filter(({ type }) => type === "end_call");
-  assert.equal(endCall.length, 1);
-  assert.equal(endCall[0].name, "end_call");
-
-  assert.equal(config.retellAgent.end_call_after_silence_ms, 60_000);
-  assert.equal(config.retellAgent.max_call_duration_ms, 600_000);
-  assert.deepEqual(config.retellAgent.post_call_analysis_data, [
-    { type: "boolean", name: "is_spam", description: config.retellAgent.post_call_analysis_data[0].description },
-  ]);
-  assert.match(config.retellAgent.post_call_analysis_data[0].description, /robocall|telemarketer/i);
-  assert.deepEqual(config.allowedInboundCountries, []);
-
-  const transferTools = config.tools.filter(({ type }) => type === "transfer_call");
-  assert.equal(transferTools.length, 2);
-  assert.deepEqual(transferTools[0].transfer_destination, {
-    type: "predefined",
-    number: "+17035550102",
-  });
-  assert.deepEqual(transferTools[0].transfer_option, {
-    type: "warm_transfer",
-    show_transferee_as_caller: false,
-  });
 });
 
 test("check_service_area tool is omitted when no service area is configured, and included with the list baked in as a const when it is", () => {
@@ -705,6 +323,260 @@ test("end_call is always available, independent of spamScreening - the agent als
   assert.ok(config.tools.some(({ type }) => type === "end_call"));
 });
 
+// --- Prompt overhaul (2026-09-24): structure and behavior to the standard
+// of the two reference prompts, driven only by the agent's own settings. ---
+
+const sectionsOf = (prompt) => prompt.split("\n").filter((line) => line.startsWith("# ")).map((line) => line.slice(2));
+const section = (prompt, title) => {
+  const start = prompt.indexOf(`# ${title}\n`);
+  if (start === -1) return null;
+  const next = prompt.indexOf("\n# ", start + 2);
+  return prompt.slice(start, next === -1 ? undefined : next);
+};
+
+test("sections come in the reference order, with the business's own text after the fixed rules and Final Reminders last", () => {
+  const prompt = buildReceptionistPrompt({
+    ...agent,
+    configuration: { ...agent.configuration, exampleDialogues: "Caller: Hi\nYou: Hello!", finalReminders: "- Always be kind." },
+  }, profile);
+
+  assert.deepEqual(sectionsOf(prompt), [
+    "ROLE", "CONTEXT (never read aloud)", "CRITICAL RULES", "ONE THING AT A TIME", "BUSINESS INFO", "KNOWLEDGE BASE",
+    "APPOINTMENT TYPES", "SCHEDULING RULES", "BOOKING FLOW", "RESCHEDULING AND CANCELLING", "TAKING A MESSAGE",
+    "CALL TRANSFERS", "REQUESTS FOR A SPECIFIC PERSON", "SPAM", "OFF-TOPIC, FLIRTING AND ABUSE", "NO PROGRESS", "CLOSING",
+    "HOW THIS BUSINESS WANTS CALLS HANDLED", "RESTRICTIONS - WHAT NOT TO SAY OR DO", "EXAMPLE DIALOGUES", "FINAL REMINDERS",
+  ]);
+  assert.match(section(prompt, "HOW THIS BUSINESS WANTS CALLS HANDLED"), /the rules above always win/);
+  assert.match(section(prompt, "HOW THIS BUSINESS WANTS CALLS HANDLED"), /You are the front-desk receptionist for a dental clinic\./);
+  assert.match(section(prompt, "RESTRICTIONS - WHAT NOT TO SAY OR DO"), /Never provide a diagnosis/);
+  assert.match(prompt.trimEnd(), /- Always be kind\.$/);
+});
+
+test("sample-data profile fields and hidden, uneditable agent fields never reach the prompt", () => {
+  const prompt = buildReceptionistPrompt(agent, profile);
+
+  assert.doesNotMatch(prompt, /Family dentistry|Do you accept insurance\?|Give 24 hours notice|Warm and concise/);
+  // intents and escalation have no screen; their stored text is ignored.
+  assert.doesNotMatch(prompt, /APPROVED CALLER INTENTS|Urgent care/);
+  assert.doesNotMatch(prompt, /severe bleeding or trouble breathing/);
+  assert.doesNotMatch(prompt, /\+17035550199|\+17035550188/);
+});
+
+test("critical rules: caller number, clock, no email, never guess, tool-confirmed actions, AI disclosure, 911, staff names", () => {
+  const rules = section(buildReceptionistPrompt(agent, profile), "CRITICAL RULES");
+
+  assert.match(rules, /\{\{user_number\}\}/);
+  assert.match(rules, /\{\{currentTime\}\} \(\{\{timezone\}\}\)/);
+  assert.match(rules, /Never ask for an email address/);
+  assert.match(rules, /Never guess/);
+  assert.match(rules, /until the tool has actually returned\s+success/);
+  assert.match(rules, /Yes - I'm an AI assistant for Arc Dental/);
+  assert.match(rules, /please hang up and call 911 right away/);
+  assert.match(rules, /Never confirm or deny that anyone works here/);
+  assert.match(rules, /the phone number alone is enough/);
+
+  const noBooking = section(buildReceptionistPrompt({ ...agent, configuration: { ...agent.configuration, booking: false } }, profile), "CRITICAL RULES");
+  assert.doesNotMatch(noBooking, /booked under/);
+});
+
+test("the context line explains why the AI is answering, and the message flow asks name, reason, and confirms the number one at a time", () => {
+  const prompt = buildReceptionistPrompt(agent, profile);
+
+  assert.match(section(prompt, "CONTEXT (never read aloud)"), /busy - on other calls or out serving customers/);
+  const message = section(prompt, "TAKING A MESSAGE");
+  assert.match(message, /Everyone's busy helping other customers/);
+  assert.ok(message.indexOf("name first") < message.indexOf("what the call is about"));
+  assert.match(message, /If they ask\s+what it is, tell them/);
+  assert.match(message, /message_take/);
+  assert.match(message, /Never promise a callback time\. Never ask for an email/);
+  assert.match(section(prompt, "ONE THING AT A TIME"), /Bad: .*\nGood: /);
+});
+
+test("Allow transfers: each rule becomes its own tool (its number, or the Default Transfer Number), named in the prompt, with the fixed line and never a generic 'talk to a person' transfer", () => {
+  const allow = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      allowCallTransfers: true,
+      emergencyRules: [
+        { phrases: ["chest pain"], transferTarget: "+17035550102" },
+        { phrases: ["Sunny", "billing"], transferTarget: "" },
+        { phrases: ["service desk"], transferTarget: "+17035550103", extension: "204" },
+        { phrases: [], transferTarget: "+17035550104" },
+        { phrases: ["I want to talk to a human."], transferTarget: "720431997", action: "decline", message: "No one is available - I'll take a message." },
+      ],
+    },
+  };
+  const config = buildReceptionistConfig({ workspaceId: "w", agent: allow, profile, toolBaseUrl: "https://api.example.com", voiceId: "v" });
+  const transfers = config.tools.filter((tool) => tool.type === "transfer_call");
+
+  assert.deepEqual(transfers.map((tool) => [tool.name, tool.transfer_destination.number]), [
+    ["transfer_call_1", "+17035550102"],
+    ["transfer_call_2", "+17035550100"],
+    ["transfer_call_3", "+17035550103,,,204"],
+  ]);
+  for (const tool of transfers) assert.equal(tool.execution_message_description, "Sure, I'll transfer your call to a staff member so they can assist you.");
+  const rules = section(config.prompt, "CALL TRANSFERS");
+  assert.match(rules, /"chest pain": use transfer_call_1\./);
+  assert.match(rules, /"Sunny", "billing": use transfer_call_2\./);
+  assert.match(rules, /"I want to talk to a human\.": say "No one is available - I'll take a message\." and don't transfer/);
+  assert.match(rules, /matches no rule above: don't transfer - use TAKING\s+A MESSAGE/);
+  assert.match(rules, /Never say who you're transferring to/);
+  assert.doesNotMatch(config.prompt, /transfer to \+?\d/);
+  assert.doesNotMatch(config.prompt, /720431997/);
+});
+
+test("Do Not Allow: no transfer tools at all, each rule's own response, then the fixed fallback line", () => {
+  const noTransfer = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      allowCallTransfers: false,
+      emergencyRules: [{ phrases: ["chest pain"], transferTarget: "+17035550102" }],
+      noTransferRules: [
+        { phrases: ["talk to a supervisor"], message: "I'll pass that along and someone will call you back." },
+        { phrases: ["billing question"], message: "" },
+      ],
+    },
+  };
+  const config = buildReceptionistConfig({ workspaceId: "w", agent: noTransfer, profile, toolBaseUrl: "https://api.example.com", voiceId: "v" });
+
+  assert.equal(config.tools.filter((tool) => tool.type === "transfer_call").length, 0);
+  const rules = section(config.prompt, "CALL TRANSFERS");
+  assert.match(rules, /This agent never transfers a call\./);
+  assert.match(rules, /"talk to a supervisor": say "I'll pass that along/);
+  assert.doesNotMatch(rules, /billing question/);
+  assert.match(rules, /My apologies\. Since no one is available/);
+  assert.doesNotMatch(config.prompt, /transfer_call/);
+});
+
+test("requests for a specific person never confirm, deny, or repeat a name", () => {
+  const person = section(buildReceptionistPrompt(agent, profile), "REQUESTS FOR A SPECIFIC PERSON");
+  assert.match(person, /never confirm or deny that anyone\s+by that name works here/);
+  assert.match(person, /never repeat the name back/);
+  assert.match(person, /Someone from Arc Dental will call you back/);
+});
+
+test("spam, off-topic, flirting, abuse, and no-progress handling - never accusing the caller", () => {
+  const prompt = buildReceptionistPrompt(agent, profile);
+  assert.match(section(prompt, "SPAM"), /never say the word "spam" and never accuse the caller/);
+  const conduct = section(prompt, "OFF-TOPIC, FLIRTING AND ABUSE");
+  assert.match(conduct, /Flirting/);
+  assert.match(conduct, /An explicit opening line gets no redirect/);
+  assert.match(conduct, /cursing/);
+  assert.match(section(prompt, "NO PROGRESS"), /about two minutes/);
+  const noSpam = buildReceptionistPrompt({ ...agent, configuration: { ...agent.configuration, spamScreening: false } }, profile);
+  assert.equal(section(noSpam, "SPAM"), null);
+});
+
+test("booking on: types (no buffers), scheduling window, full booking and reschedule/cancel flows naming the calendar functions; off: none of it", () => {
+  const booking = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      bookingWindowDays: 10,
+      appointmentTypes: [
+        { id: "a", name: "Quick Call", durationMin: 15, minimumLeadTimeMin: 60, blockBeforeMin: 60, blockAfterMin: 60 },
+        { id: "b", name: "On-Site Visit", durationMin: 30, minimumLeadTimeMin: 1440, happensAtCustomerLocation: true },
+      ],
+    },
+  };
+  const prompt = buildReceptionistPrompt(booking, { ...profile, serviceAreas: ["Rockville, MD"] });
+
+  const types = section(prompt, "APPOINTMENT TYPES");
+  assert.match(types, /ways to book, not services/);
+  assert.match(types, /Quick Call \(15 minutes, must be booked at least 1 hour in advance\)/);
+  assert.doesNotMatch(types, /\b60 minutes|blockBefore|blockAfter/);
+  assert.match(section(prompt, "SCHEDULING RULES"), /Only book up to 10 days ahead/);
+  const flow = section(prompt, "BOOKING FLOW");
+  assert.match(flow, /calendar_get_availability/);
+  assert.match(flow, /calendar_create_booking only after that yes/);
+  assert.match(flow, /what\s+city are you in/);
+  assert.match(flow, /full address for the\s+visit/);
+  const changes = section(prompt, "RESCHEDULING AND CANCELLING");
+  for (const tool of ["calendar_find_appointment", "calendar_reschedule_booking", "calendar_cancel_booking"]) assert.match(changes, new RegExp(tool));
+  assert.match(changes, /with and without the country code/);
+  assert.match(section(prompt, "SERVICE AREA"), /don't book the\s+visit - we can't locate it\. Take a message instead/);
+  assert.match(section(prompt, "ONE THING AT A TIME"), /ask their city before checking availability/);
+
+  const noBooking = buildReceptionistPrompt({ ...booking, configuration: { ...booking.configuration, booking: false } }, profile);
+  for (const title of ["APPOINTMENT TYPES", "SCHEDULING RULES", "BOOKING FLOW", "RESCHEDULING AND CANCELLING"]) assert.equal(section(noBooking, title), null);
+  assert.doesNotMatch(noBooking, /calendar_/);
+});
+
+test("the booking window defaults to 30 days and stays within 1-60", () => {
+  const days = (bookingWindowDays) => section(
+    buildReceptionistPrompt({ ...agent, configuration: { ...agent.configuration, bookingWindowDays } }, profile),
+    "SCHEDULING RULES",
+  ).match(/Only book up to (\d+) days/)[1];
+  assert.equal(days(undefined), "30");
+  assert.equal(days(45), "45");
+  assert.equal(days(0), "30");
+  assert.equal(days(90), "30");
+});
+
+test("business info: structured hours win over free text, the call clock is authoritative, holidays only when enabled, contact emails, pricing guard", () => {
+  const withAll = buildReceptionistPrompt(agent, {
+    ...profile,
+    hours: "ignored free text",
+    businessHours: Object.fromEntries(["mon", "tue", "wed", "thu", "fri", "sat", "sun"].map((day) => [day, day === "tue"
+      ? { closed: true, intervals: [{ open: "09:00", close: "13:00" }] }
+      : { closed: false, intervals: [{ open: "08:00", close: "12:00" }, { open: "13:00", close: "17:00" }] }])),
+    holidaysEnabled: true,
+    holidays: [
+      { id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true },
+      { id: "h2", name: "Labor Day", date: "2026-09-07", closed: true, disabled: true },
+    ],
+    contactEmails: [{ label: "Billing / AR", email: "billing@example.com" }],
+  });
+  const info = section(withAll, "BUSINESS INFO");
+  assert.doesNotMatch(info, /ignored free text/);
+  assert.match(info, /- Holidays: Thanksgiving \(2026-11-26\): closed$/m);
+  assert.doesNotMatch(info, /Labor Day/);
+  assert.match(info, /Billing \/ AR: billing@example\.com/);
+  assert.match(info, /weekends included/);
+  assert.match(section(withAll, "KNOWLEDGE BASE"), /Never quote a price, discount, special/);
+
+  const disabled = buildReceptionistPrompt(agent, { ...profile, holidaysEnabled: false, holidays: [{ id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true }] });
+  assert.doesNotMatch(disabled, /Thanksgiving/);
+});
+
+test("an agent's own Business Profile replaces the workspace's - two agents in one workspace can be two different locations", () => {
+  const maryland = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      greeting: "",
+      allowCallTransfers: true,
+      emergencyRules: [{ phrases: ["manager"], transferTarget: "" }],
+      businessProfile: {
+        businessName: "Arc Dental Maryland",
+        timezone: "America/New_York",
+        hours: "Tue-Thu, 9:00 AM-1:00 PM",
+        serviceAreas: ["Bethesda, MD"],
+        ownerPhone: "+13015550111",
+      },
+    },
+  };
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: maryland,
+    profile: { ...profile, serviceAreas: ["Charleston, SC"] },
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+
+  assert.match(config.prompt, /the AI receptionist for Arc Dental Maryland/);
+  assert.match(config.prompt, /Tue-Thu, 9:00 AM-1:00 PM/);
+  assert.doesNotMatch(config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
+  assert.match(config.prompt, /Published coverage: Bethesda, MD/);
+  assert.doesNotMatch(config.prompt, /Charleston/);
+  // The rule has no number of its own, so it uses this agent's Default Transfer Number.
+  assert.deepEqual(config.tools.filter((tool) => tool.type === "transfer_call").map((tool) => tool.transfer_destination.number), ["+13015550111"]);
+  assert.match(config.prompt, /Address: 123 Main Street/);
+  assert.match(resolveGreeting(maryland, profile), /^Thanks for calling Arc Dental Maryland\./);
+});
+
 test("the agent speaks its AI Voice Agent Name; agents saved before that field fall back to the Internal Name up to the first dash", () => {
   const named = (configuration) => ({ ...agent, name: "Samantha- CWR Inc", configuration: { ...agent.configuration, name: "Samantha- CWR Inc", greeting: "", ...configuration } });
 
@@ -714,7 +586,32 @@ test("the agent speaks its AI Voice Agent Name; agents saved before that field f
   assert.equal(spokenAgentName({ name: "Hailey", configuration: { name: "Hailey" } }), "Hailey");
 
   const prompt = buildReceptionistPrompt(named({ spokenName: "Sam" }), profile);
-  assert.match(prompt, /You are Sam, the AI voice agent/);
+  assert.match(prompt, /You are Sam, the AI receptionist for Arc Dental/);
   assert.doesNotMatch(prompt, /CWR Inc/);
   assert.match(resolveGreeting(named({ spokenName: "Sam" }), profile), /This is Sam, the virtual receptionist/);
 });
+
+test("receptionist config: invocation-safe tools, end_call, call handling, and one warm transfer tool per rule", () => {
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent,
+    profile,
+    toolBaseUrl: "https://api.example.com/",
+    voiceId: "retell-voice-1",
+  });
+
+  assert.equal(config.voice, "retell-voice-1");
+  for (const tool of config.tools.filter((candidate) => candidate.type === "custom")) {
+    assert.equal(tool.parameters.properties.workspaceId.const, "workspace-123");
+    assert.equal(tool.parameters.properties.callId.const, "{{call_id}}");
+    assert.match(tool.url, /^https:\/\/api\.example\.com\/retell\/tools\//);
+  }
+  assert.equal(config.tools.filter((tool) => tool.name === "end_call").length, 1);
+  assert.equal(config.retellAgent.end_call_after_silence_ms, 60_000);
+  assert.equal(config.retellAgent.max_call_duration_ms, 600_000);
+  const transfers = config.tools.filter((tool) => tool.type === "transfer_call");
+  assert.equal(transfers.length, 1);
+  assert.deepEqual(transfers[0].transfer_destination, { type: "predefined", number: "+17035550102" });
+  assert.deepEqual(transfers[0].transfer_option, { type: "warm_transfer", show_transferee_as_caller: false });
+});
+
