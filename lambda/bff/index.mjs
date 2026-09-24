@@ -1884,9 +1884,9 @@ export function createHandler({
         const launchIssue = launchReadinessIssue(agent, effectiveProfile(agent, profile), calendar);
         if (launchIssue) return json(409, { message: launchIssue });
         const providers = await getProviders();
-        // Retell-only - no phone number touched here. Attaching one is a
-        // fully separate action, any time after this, from the Agents
-        // roster (see the attach-phone-number route below).
+        // Always publish to Retell, unconditionally - re-activating an
+        // agent that already has a retellAgentId must still push whatever
+        // changed since the last publish, exactly as before.
         const synced = await syncRetellAgent({
           workspaceId,
           agentId: agentAction.agentId,
@@ -1896,6 +1896,25 @@ export function createHandler({
           providers,
           getKnowledgeSigner,
           toolBaseUrl,
+        });
+        // The customer clicking "Create AI Voice Agent" (the final wizard
+        // step) means the whole thing done - Retell agent published AND a
+        // real phone number provisioned at Telnyx, not deferred to a
+        // separate "Attach a Phone Number" click. Pass the just-resolved
+        // retellAgentId through so syncPhoneNumber's own "no retellAgentId
+        // yet" shortcut doesn't publish to Retell a second time; it still
+        // reuses a number already attached to this agent (e.g. from an
+        // earlier Test call) rather than ordering a second one.
+        const phoneResult = await syncPhoneNumber({
+          workspaceId,
+          agentId: agentAction.agentId,
+          agent: { ...agent, retellAgentId: synced.retellAgentId },
+          profile,
+          store,
+          providers,
+          getKnowledgeSigner,
+          toolBaseUrl,
+          phoneStatus: "active",
         });
         const activatedAt = new Date().toISOString();
         let updatedAgent;
@@ -1917,10 +1936,9 @@ export function createHandler({
           }
           throw error;
         }
-        const existingPhone = await store.getPhoneNumberForAgent(workspaceId, agentAction.agentId);
         return json(200, {
           agent: toPublicAgent(updatedAgent),
-          phoneNumber: existingPhone ? toPublicPhoneNumber(existingPhone) : null,
+          phoneNumber: toPublicPhoneNumber(phoneResult.phoneNumber),
         });
       }
 

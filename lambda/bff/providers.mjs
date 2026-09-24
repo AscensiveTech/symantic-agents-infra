@@ -101,11 +101,22 @@ export function createTelnyxClient({
   // column can't do this - every number intentionally shares one SIP
   // connection - but Telnyx's per-number "tags" field is built for exactly
   // this). Cosmetic only: a failure here must never fail provisioning.
-  // Conservative cap and character set until Telnyx's real tag limit is
-  // confirmed from the logging below - letters/digits/spaces and a small
-  // set of punctuation a business name might legitimately contain.
+  // Telnyx's real rule (confirmed from a rejected tag's own error message,
+  // 2026-09-24: "only letters, numbers, dashes and underscores are
+  // allowed") is stricter than what this used to allow - spaces included.
+  // Since the caller always joins "{businessName} - {agentName}" with
+  // spaces, every previous tag attempt for a real (space-containing) name
+  // silently failed - this was never caught because the PATCH failure is
+  // deliberately best-effort. Runs of anything else collapse to one dash
+  // instead of being dropped, so "CWR Solutions - Desert Bloom" still
+  // reads as "CWR-Solutions-Desert-Bloom" rather than losing the words
+  // entirely.
   function sanitizeTelnyxTag(value) {
-    return value.replace(/[^\p{L}\p{N}\s'&.,-]/gu, "").trim().slice(0, 50);
+    return value
+      .normalize("NFKD").replace(/\p{Diacritic}/gu, "")
+      .replace(/[^\p{L}\p{N}_]+/gu, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 50);
   }
 
   async function tagNumber(telnyxNumberId, agentName, businessName) {
