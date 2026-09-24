@@ -41,6 +41,8 @@ export function createGoogleCalendarClient({
       endTimeUtc,
       timezone,
       service,
+      title,
+      reminderMinutes,
       description,
       location,
       customer,
@@ -51,7 +53,10 @@ export function createGoogleCalendarClient({
         "/events?sendUpdates=all";
       const event = {
         id: providerId,
-        summary: service || "Appointment",
+        summary: title || service || "Appointment",
+        ...(Number.isInteger(reminderMinutes)
+          ? { reminders: { useDefault: false, overrides: [{ method: "popup", minutes: reminderMinutes }] } }
+          : {}),
         description: description || undefined,
         location: location || undefined,
         start: { dateTime: startTimeUtc, timeZone: timezone },
@@ -93,6 +98,7 @@ export function createGoogleCalendarClient({
       startTimeUtc,
       endTimeUtc,
       timezone,
+      title,
     }) {
       const result = await requestJson(
         fetchImpl,
@@ -102,6 +108,7 @@ export function createGoogleCalendarClient({
           method: "PATCH",
           accessToken,
           body: {
+            ...(title ? { summary: title } : {}),
             start: { dateTime: startTimeUtc, timeZone: timezone },
             end: { dateTime: endTimeUtc, timeZone: timezone },
           },

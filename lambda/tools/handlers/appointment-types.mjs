@@ -32,6 +32,51 @@ export function enforceMinimumLeadTime(appointmentType, startTimeUtc, now) {
   }
 }
 
+// How far ahead this agent may book ("Book Up To (Days Ahead)" on the
+// Calendar & Booking step): 1-60 days, 30 when never set. Mirrors
+// resolveBookingWindowDays in lambda/bff/receptionist.mjs.
+export function resolveBookingWindowDays(agent) {
+  const raw = Math.round(Number(agent?.configuration?.bookingWindowDays));
+  return Number.isFinite(raw) && raw >= 1 && raw <= 60 ? raw : 30;
+}
+
+// Enforced here, not only in the prompt - a time past the window is
+// never reported as available or booked, whatever the model asks for.
+export function enforceBookingWindow(agent, startTimeUtc, now) {
+  const days = resolveBookingWindowDays(agent);
+  const startMs = Date.parse(startTimeUtc);
+  if (Number.isFinite(startMs) && startMs > Number(now()) + days * 86_400_000) {
+    throw new ToolRequestError(
+      `That's too far out - appointments can only be scheduled up to ${days} days ahead.`,
+      { statusCode: 409, code: "beyond_booking_window" },
+    );
+  }
+}
+
+// The per-agent invite options: the start time at the front of the
+// calendar title ("2:00 PM - Estimate Visit - Anthony"), and a reminder
+// N minutes before (unset = the calendar's own default).
+export function inviteOptions(agent, { startTimeUtc, timezone, service, customerName }) {
+  const config = agent?.configuration ?? {};
+  const reminder = Math.round(Number(config.inviteReminderMinutes));
+  const parts = [service || "Appointment", customerName].filter(Boolean);
+  let title;
+  if (config.inviteStartTimeInTitle === true) {
+    const time = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone: timezone || "UTC" })
+      .format(new Date(startTimeUtc));
+    title = [time, ...parts].join(" - ");
+  } else if (customerName) {
+    title = parts.join(" - ");
+  }
+  return {
+    ...(title ? { title } : {}),
+    ...(config.inviteReminderMinutes !== undefined && config.inviteReminderMinutes !== null && config.inviteReminderMinutes !== ""
+      && Number.isFinite(reminder) && reminder >= 0 && reminder <= 1440
+      ? { reminderMinutes: reminder }
+      : {}),
+  };
+}
+
 // The Before/After buffers pad the real calendar block (travel/setup time)
 // but are never spoken to the caller - only the provider-facing calendar
 // call (getAvailability/createBooking) ever sees the padded range; the

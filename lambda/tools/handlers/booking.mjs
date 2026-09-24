@@ -7,7 +7,7 @@ import {
   stableId,
 } from "./records.mjs";
 import { resolveTimeRange } from "./time.mjs";
-import { enforceMinimumLeadTime, paddedProviderRange, resolveAppointmentType } from "./appointment-types.mjs";
+import { enforceBookingWindow, enforceMinimumLeadTime, inviteOptions, paddedProviderRange, resolveAppointmentType } from "./appointment-types.mjs";
 import { effectiveProfile } from "./profile.mjs";
 
 export async function handleFindAppointment(input, { store }) {
@@ -99,6 +99,7 @@ export async function handleCreateBooking(input, {
     now,
   );
   if (appointmentType) enforceMinimumLeadTime(appointmentType, range.startTimeUtc, now);
+  enforceBookingWindow(agent, range.startTimeUtc, now);
   // Before/After buffers only ever reach the provider-facing calls below -
   // the appointment record keeps the unpadded, spoken range (see
   // paddedProviderRange's own comment).
@@ -133,6 +134,12 @@ export async function handleCreateBooking(input, {
       ...providerRange,
       ...providerIds,
       service: serviceName,
+      ...inviteOptions(agent, {
+        startTimeUtc: range.startTimeUtc,
+        timezone,
+        service: serviceName,
+        customerName: stringOrUndefined(input.customer?.name),
+      }),
       description: stringOrUndefined(input.description),
       location: stringOrUndefined(input.location) || profile?.address || undefined,
       // No live invite-sending yet (deferred, per product decision) - the
@@ -222,6 +229,7 @@ export async function handleRescheduleBooking(input, {
   const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
   const timezone = profile?.timezone || appointment.timezone || "UTC";
   const range = resolveTimeRange(input, timezone, now);
+  enforceBookingWindow(agent, range.startTimeUtc, now);
   let providerEventId = appointment.providerEventId;
   // Same race the create-booking path guards against - hold the target
   // slot for the whole recheck+reschedule sequence so a second concurrent
@@ -245,6 +253,12 @@ export async function handleRescheduleBooking(input, {
         appointmentType: appointment.service,
         providerEventId: appointment.providerEventId,
         ...range,
+        ...inviteOptions(agent, {
+          startTimeUtc: range.startTimeUtc,
+          timezone,
+          service: appointment.service,
+          customerName: appointment.customer?.name,
+        }),
       });
       // Cal.com issues a new booking id on every reschedule; Google and
       // Microsoft keep the same one.

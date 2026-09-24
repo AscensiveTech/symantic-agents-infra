@@ -1673,3 +1673,69 @@ test("booking through Cal.com uses the event type's length and name, ignores the
     ["reschedule", "101", "booking-uid-1"],
   ]);
 });
+
+test("the booking window is enforced by the tools: a date past it is never reported available or booked", async () => {
+  const store = createStore({
+    async getAgent() { return { agentId: "agent-1", configuration: { bookingWindowDays: 10 } }; },
+  });
+  let providerCalls = 0;
+  const calendar = {
+    async getAvailability() { providerCalls += 1; return { available: true, busy: [] }; },
+    async createBooking() { providerCalls += 1; return { providerEventId: "e1", provider: "google-calendar" }; },
+  };
+  const handler = toolHandler({ store, calendar, now: () => new Date("2026-08-16T12:00:00.000Z") });
+
+  const farCheck = await handler(event("/retell/tools/calendar.getAvailability", requiredBody({
+    agentId: "agent-1", startTime: "2026-09-10T14:00:00-04:00", durationMinutes: 30,
+  })));
+  const farBook = await handler(event("/retell/tools/calendar.createBooking", bookingBody({
+    startTime: "2026-09-10T14:00:00-04:00", endTime: "2026-09-10T14:30:00-04:00",
+  })));
+
+  // Calendar tools answer 200 with ok:false so the agent can tell the caller why.
+  for (const response of [farCheck, farBook]) {
+    assert.equal(response.statusCode, 200);
+    const body = JSON.parse(response.body);
+    assert.equal(body.ok, false);
+    assert.equal(body.code, "beyond_booking_window");
+    assert.match(body.message, /up to 10 days ahead/);
+  }
+  assert.equal(providerCalls, 0);
+
+  const near = await handler(event("/retell/tools/calendar.createBooking", bookingBody()));
+  assert.notEqual(JSON.parse(near.body).ok, false);
+});
+
+test("invite options: start time in the title and a custom reminder reach Google and Microsoft; unset options change nothing", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options) => {
+    requests.push({ url: String(url), body: options?.body ? JSON.parse(options.body) : undefined });
+    return jsonResponse({ id: "evt-1", start: { dateTime: "2026-08-17T18:00:00Z" }, end: { dateTime: "2026-08-17T18:30:00Z" } });
+  };
+  const booking = {
+    accessToken: "t", calendarId: "cal", providerId: "p1",
+    startTimeUtc: "2026-08-17T18:00:00.000Z", endTimeUtc: "2026-08-17T18:30:00.000Z", timezone: "America/New_York",
+    service: "Estimate Visit", customer: { name: "Anthony" },
+  };
+  const { inviteOptions } = await import("./handlers/appointment-types.mjs");
+  const options = inviteOptions(
+    { configuration: { inviteStartTimeInTitle: true, inviteReminderMinutes: 3 } },
+    { startTimeUtc: booking.startTimeUtc, timezone: booking.timezone, service: "Estimate Visit", customerName: "Anthony" },
+  );
+  assert.deepEqual(options, { title: "2:00 PM - Estimate Visit - Anthony", reminderMinutes: 3 });
+
+  await createGoogleCalendarClient({ fetchImpl }).createBooking({ ...booking, ...options });
+  await createMicrosoftCalendarClient({ fetchImpl }).createBooking({ ...booking, ...options });
+  const [google, microsoft] = requests;
+  assert.equal(google.body.summary, "2:00 PM - Estimate Visit - Anthony");
+  assert.deepEqual(google.body.reminders, { useDefault: false, overrides: [{ method: "popup", minutes: 3 }] });
+  assert.equal(microsoft.body.subject, "2:00 PM - Estimate Visit - Anthony");
+  assert.equal(microsoft.body.isReminderOn, true);
+  assert.equal(microsoft.body.reminderMinutesBeforeStart, 3);
+
+  // Nothing set: no reminder override, and the title is the service plus the caller's name.
+  assert.deepEqual(
+    inviteOptions({ configuration: {} }, { startTimeUtc: booking.startTimeUtc, timezone: booking.timezone, service: "Estimate Visit", customerName: "Anthony" }),
+    { title: "Estimate Visit - Anthony" },
+  );
+});
