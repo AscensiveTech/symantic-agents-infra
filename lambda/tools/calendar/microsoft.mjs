@@ -41,6 +41,8 @@ export function createMicrosoftCalendarClient({
       endTimeUtc,
       timezone,
       service,
+      title,
+      reminderMinutes,
       description,
       location,
       customer,
@@ -52,7 +54,10 @@ export function createMicrosoftCalendarClient({
           method: "POST",
           accessToken,
           body: {
-            subject: service || "Appointment",
+            subject: title || service || "Appointment",
+            ...(Number.isInteger(reminderMinutes)
+              ? { isReminderOn: true, reminderMinutesBeforeStart: reminderMinutes }
+              : {}),
             body: description
               ? { contentType: "text", content: description }
               : undefined,
@@ -100,6 +105,7 @@ export function createMicrosoftCalendarClient({
       startTimeUtc,
       endTimeUtc,
       timezone,
+      title,
     }) {
       const result = await requestJson(
         fetchImpl,
@@ -108,6 +114,7 @@ export function createMicrosoftCalendarClient({
           method: "PATCH",
           accessToken,
           body: {
+            ...(title ? { subject: title } : {}),
             start: graphDateTime(startTimeUtc),
             end: graphDateTime(endTimeUtc),
           },
