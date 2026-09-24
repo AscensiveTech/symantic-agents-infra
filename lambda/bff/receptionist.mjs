@@ -316,12 +316,24 @@ export function effectiveProfile(agent, workspaceProfile) {
   return merged;
 }
 
+// What the agent calls itself on calls - the AI Voice Agent Name. Agents
+// saved before that field existed use their Internal Name up to the first
+// dash ("Samantha- CWR Inc" -> "Samantha"), mirroring the wizard's
+// defaultSpokenName. The Internal Name itself is admin-only: it labels the
+// agent in Retell and the number in Telnyx, and is never spoken.
+export function spokenAgentName(agent) {
+  const saved = agent?.configuration?.spokenName;
+  if (typeof saved === "string" && saved.trim()) return saved.trim();
+  const internal = text(agent?.configuration?.name) || text(agent?.name);
+  return internal.split("-")[0].trim() || internal || "the AI voice agent";
+}
+
 export function resolveGreeting(agent, workspaceProfile) {
   const profile = effectiveProfile(agent, workspaceProfile);
   const configured = text(agent?.configuration?.greeting);
   if (configured) return configured;
   const businessName = text(profile?.businessName) || "the business";
-  const receptionistName = text(agent?.configuration?.name) || text(agent?.name) || "the AI voice agent";
+  const receptionistName = spokenAgentName(agent);
   const disclosure = agent?.configuration?.recordingDisclosure
     ? " This call may be recorded for quality assurance."
     : "";
@@ -332,7 +344,7 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
   const profile = effectiveProfile(agent, workspaceProfile);
   const behavior = agent?.configuration ?? {};
   const businessName = text(profile?.businessName) || "the business";
-  const receptionistName = text(behavior.name) || text(agent?.name) || "the AI voice agent";
+  const receptionistName = spokenAgentName(agent);
   const tone = text(behavior.tone) || "clear, professional";
   const faqs = "- Answer from the business information above and this agent's knowledge base. "
     + "If something isn't covered there, take a message instead of guessing.";

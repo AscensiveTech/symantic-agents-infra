@@ -248,6 +248,14 @@ export function createTelnyxClient({
       );
     },
 
+    // Re-tags an existing number after the agent's Internal Name or
+    // business name changes, so Telnyx's number list keeps matching the
+    // right client. Best-effort, like the tag at purchase.
+    async retagNumber({ telnyxNumberId, agentName, businessName }) {
+      if (!telnyxNumberId) return;
+      await tagNumber(telnyxNumberId, agentName, businessName);
+    },
+
     // Releases a number back to Telnyx (stops recurring per-number
     // billing) - used when an agent is permanently deleted, never on
     // disable.

@@ -2184,6 +2184,7 @@ export function createHandler({
             let retellSync;
             try {
               const profile = await store.getProfile(workspaceId);
+              await retagNumberIfRenamed({ store, providers: await getProviders(), workspaceId, agentId, before: existing, after: updatedAgent, profile });
               const providers = await getProviders();
               const synced = await syncRetellAgent({
                 workspaceId,
@@ -5891,6 +5892,26 @@ export async function syncRetellAgent({
 // The phone-only half: provisions (or reuses) a Telnyx number and imports
 // it into Retell against this agent. Callable any time after the agent
 // exists - a minute later or five days later - not tied to activation.
+// The Telnyx tag is "{business name} - {Internal Name}" and is only set
+// when a number is bought, so a rename on Save Changes re-tags it. Never
+// blocks the save.
+export async function retagNumberIfRenamed({ store, providers, workspaceId, agentId, before, after, profile }) {
+  const label = (agent) => ({
+    agentName: agent?.configuration?.name ?? agent?.name,
+    businessName: effectiveProfile(agent, profile)?.businessName,
+  });
+  const previous = label(before);
+  const next = label(after);
+  if (previous.agentName === next.agentName && previous.businessName === next.businessName) return;
+  try {
+    const phoneNumber = await store.getPhoneNumberForAgent?.(workspaceId, agentId);
+    if (!phoneNumber?.telnyxNumberId || typeof providers.telnyx?.retagNumber !== "function") return;
+    await providers.telnyx.retagNumber({ telnyxNumberId: phoneNumber.telnyxNumberId, ...next });
+  } catch (error) {
+    console.error("Failed to re-tag the Telnyx number after a rename", { agentId, error });
+  }
+}
+
 // Compares what's live in Retell with what the app last published. An
 // agent published before fingerprints were stored has no baseline yet, so
 // its live prompt and greeting are compared with what the app would send
@@ -5949,8 +5970,10 @@ export async function syncPhoneNumber({
       agentId,
       preferredPhone: agent?.configuration?.phone ?? profile.phone,
       desiredPhone: agent?.configuration?.desiredPhoneNumber,
+      // The Internal Name (never the spoken name) and this agent's own
+      // business name, so Telnyx's list shows which client owns the number.
       agentName: agent?.configuration?.name ?? agent?.name,
-      businessName: profile?.businessName,
+      businessName: effectiveProfile(agent, profile)?.businessName,
     });
     phoneNumber = {
       workspaceId,

@@ -13,6 +13,7 @@ import {
   resolveLanguage,
   resolvePauseBeforeSpeakingMs,
   resolveStartSpeaker,
+  spokenAgentName,
 } from "./receptionist.mjs";
 
 const profile = {
@@ -702,4 +703,18 @@ test("end_call is always available, independent of spamScreening - the agent als
     voiceId: "retell-voice-1",
   });
   assert.ok(config.tools.some(({ type }) => type === "end_call"));
+});
+
+test("the agent speaks its AI Voice Agent Name; agents saved before that field fall back to the Internal Name up to the first dash", () => {
+  const named = (configuration) => ({ ...agent, name: "Samantha- CWR Inc", configuration: { ...agent.configuration, name: "Samantha- CWR Inc", greeting: "", ...configuration } });
+
+  assert.equal(spokenAgentName(named({})), "Samantha");
+  assert.equal(spokenAgentName(named({ spokenName: "Sam" })), "Sam");
+  assert.equal(spokenAgentName(named({ spokenName: "   " })), "Samantha");
+  assert.equal(spokenAgentName({ name: "Hailey", configuration: { name: "Hailey" } }), "Hailey");
+
+  const prompt = buildReceptionistPrompt(named({ spokenName: "Sam" }), profile);
+  assert.match(prompt, /You are Sam, the AI voice agent/);
+  assert.doesNotMatch(prompt, /CWR Inc/);
+  assert.match(resolveGreeting(named({ spokenName: "Sam" }), profile), /This is Sam, the virtual receptionist/);
 });
