@@ -1573,6 +1573,47 @@ test("retell-status: never flags drafts or agents that aren't live, and a Retell
   );
 });
 
+test("Retell's agent name and the Telnyx tag carry the Internal Name, never the spoken name; a rename re-tags the number", async () => {
+  const { retagNumberIfRenamed, syncRetellAgent } = await loadBff();
+  const agent = {
+    ...receptionistAgent(),
+    status: "active",
+    name: "Samantha- CWR Inc",
+    configuration: { ...receptionistAgent().configuration, name: "Samantha- CWR Inc", spokenName: "Sam" },
+  };
+  const upserts = [];
+  await syncRetellAgent({
+    workspaceId: "user-123",
+    agentId: "agent-123",
+    agent,
+    profile: receptionistProfile(),
+    store: { async updateAgentRuntime() {}, async listKnowledgeBases() { return []; }, async getKnowledgeBase() { return null; } },
+    providers: {
+      retell: { async upsertAgent(input) { upserts.push(input); return { retellAgentId: "r1", publishedVersion: 1, fingerprints: {} }; } },
+      resolveVoiceId: (voice) => voice || "voice-1",
+    },
+    getKnowledgeSigner: async () => null,
+    toolBaseUrl: "https://api.example.com",
+  });
+  assert.equal(upserts[0].agentName, "Samantha- CWR Inc");
+  assert.match(upserts[0].config.prompt, /You are Sam,/);
+
+  const retags = [];
+  const store = { async getPhoneNumberForAgent() { return { telnyxNumberId: "tn-1" }; } };
+  const providers = { telnyx: { async retagNumber(input) { retags.push(input); } } };
+  const renamed = { ...agent, configuration: { ...agent.configuration, name: "Samantha - CWR Solutions" } };
+  await retagNumberIfRenamed({ store, providers, workspaceId: "user-123", agentId: "agent-123", before: agent, after: agent, profile: receptionistProfile() });
+  assert.equal(retags.length, 0, "no rename, no re-tag");
+  await retagNumberIfRenamed({ store, providers, workspaceId: "user-123", agentId: "agent-123", before: agent, after: renamed, profile: receptionistProfile() });
+  assert.equal(retags.length, 1);
+  assert.equal(retags[0].telnyxNumberId, "tn-1");
+  assert.equal(retags[0].agentName, "Samantha - CWR Solutions");
+  assert.equal(retags[0].businessName, receptionistProfile().businessName);
+  const spokenOnly = { ...agent, configuration: { ...agent.configuration, spokenName: "Samantha" } };
+  await retagNumberIfRenamed({ store, providers, workspaceId: "user-123", agentId: "agent-123", before: agent, after: spokenOnly, profile: receptionistProfile() });
+  assert.equal(retags.length, 1, "changing only the spoken name never touches Telnyx");
+});
+
 test("GET calls lists workspace calls without exposing Retell identifiers", async () => {
   const calls = [{
     workspaceId: "user-123",

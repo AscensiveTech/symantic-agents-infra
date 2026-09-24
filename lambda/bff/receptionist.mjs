@@ -316,12 +316,24 @@ export function effectiveProfile(agent, workspaceProfile) {
   return merged;
 }
 
+// What the agent calls itself on calls - the AI Voice Agent Name. Agents
+// saved before that field existed use their Internal Name up to the first
+// dash ("Samantha- CWR Inc" -> "Samantha"), mirroring the wizard's
+// defaultSpokenName. The Internal Name itself is admin-only: it labels the
+// agent in Retell and the number in Telnyx, and is never spoken.
+export function spokenAgentName(agent) {
+  const saved = agent?.configuration?.spokenName;
+  if (typeof saved === "string" && saved.trim()) return saved.trim();
+  const internal = text(agent?.configuration?.name) || text(agent?.name);
+  return internal.split("-")[0].trim() || internal || "the AI voice agent";
+}
+
 export function resolveGreeting(agent, workspaceProfile) {
   const profile = effectiveProfile(agent, workspaceProfile);
   const configured = text(agent?.configuration?.greeting);
   if (configured) return configured;
   const businessName = text(profile?.businessName) || "the business";
-  const receptionistName = text(agent?.configuration?.name) || text(agent?.name) || "the AI voice agent";
+  const receptionistName = spokenAgentName(agent);
   const disclosure = agent?.configuration?.recordingDisclosure
     ? " This call may be recorded for quality assurance."
     : "";
@@ -332,170 +344,319 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
   const profile = effectiveProfile(agent, workspaceProfile);
   const behavior = agent?.configuration ?? {};
   const businessName = text(profile?.businessName) || "the business";
-  const receptionistName = text(behavior.name) || text(agent?.name) || "the AI voice agent";
-  const tone = text(behavior.tone) || "clear, professional";
-  const faqs = "- Answer from the business information above and this agent's knowledge base. "
-    + "If something isn't covered there, take a message instead of guessing.";
-  const intents = list(behavior.intents);
+  const receptionistName = spokenAgentName(agent);
+  const tone = (text(behavior.tone) || "clear and professional").replace(/^./, (letter) => letter.toLowerCase());
   const hoursLine = isBusinessHours(profile?.businessHours)
     ? formatBusinessHours(profile.businessHours)
     : (text(profile?.hours) || "Not provided");
   const holidaysLine = formatHolidays(profile);
   const contactEmailsLine = formatContactEmails(profile?.contactEmails);
   const serviceAreaLine = formatServiceAreas(profile?.serviceAreas);
-  const bookingInstruction = behavior.booking === true
-    ? "Booking is enabled. Check availability before offering a time, and create a booking only after explicit caller confirmation."
-    : "Booking is disabled. Do not promise or create appointments; take a message for office follow-up.";
-  // A Cal.com agent books into the event types it chose there, which
-  // replace its own Appointment Types (Cal.com enforces notice and buffers).
+  const booking = behavior.booking === true;
   const usesCalCom = Array.isArray(behavior.connections) && behavior.connections.includes("cal-com");
   const appointmentTypesLine = usesCalCom
     ? formatCalComEventTypes(behavior.calComEventTypes)
     : formatAppointmentTypes(behavior.appointmentTypes);
+  const hasOnSiteTypes = !usesCalCom && Array.isArray(behavior.appointmentTypes)
+    && behavior.appointmentTypes.some((type) => type?.happensAtCustomerLocation === true);
+  const bookingWindowDays = resolveBookingWindowDays(agent);
   const allowCallTransfers = behavior.allowCallTransfers !== false;
-  const emergencyRules = formatEmergencyRules(behavior.emergencyRules);
+  const transferRules = transferRuleTools(agent, profile);
+  const declineRules = formatDeclineRules(behavior.emergencyRules);
   const noTransferRulesLines = formatNoTransferRules(behavior.noTransferRules);
-  const escalation = text(behavior.escalation);
+  const roleInstructions = text(behavior.roleInstructions);
+  const restrictions = text(behavior.restrictions);
   const exampleDialogues = text(behavior.exampleDialogues);
   const finalReminders = text(behavior.finalReminders);
+  const whatYouDo = [
+    "answer questions about the business and its services",
+    "take messages for the team",
+    ...(booking ? ["book, reschedule, and cancel appointments"] : []),
+    ...(allowCallTransfers && transferRules.length ? ["transfer callers when one of the business's transfer rules applies"] : []),
+  ];
+  const listJoin = (items) => (items.length > 1 ? `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}` : items[0]);
 
-  return [
-    "# ROLE",
-    `You are ${receptionistName}, the AI voice agent for ${businessName}. `
-      + `Speak in a ${tone} style. Answer questions and take messages or bookings - calm, `
-      + "helpful, and honest.",
-    "",
-    "# CRITICAL RULES",
-    "1) Never invent business facts, prices, availability, medical advice, or policy - "
-      + "answer only from the approved information below. If you don't know, take a message.",
-    "2) Never confirm a booking, callback, or any other action until the matching Symantic "
-      + "tool has actually returned success - state the exact result the tool gives back. "
-      + "Never fabricate a confirmation.",
-    "3) If a tool fails, say so briefly and offer to take a message or try again. Never "
-      + "pretend it worked.",
-    "4) If asked whether you are an AI, a bot, or a real person, always answer honestly - "
-      + "yes, you are an AI voice agent. Never claim to be human. Say so plainly and "
-      + "briefly, then keep helping with their call.",
-    "5) Preserve the caller's meaning and collect only the minimum information required - "
-      + "never interrogate or run a checklist.",
-    "6) For a genuine life-threatening emergency, tell the caller to call 911 (or their "
-      + "local emergency number) right away. Say this immediately, before gathering any "
-      + "routine details. Then take a message so the business knows the call came in - this "
-      + "is separate from a caller simply asking to talk to a person, which the rules below "
-      + "handle instead.",
-    "",
-    "# ONE THING AT A TIME",
-    "- Never ask two questions in the same turn, and never open a new question while an "
-      + "earlier one is unanswered.",
-    "- If the caller asks about something specific, resolve that first before asking "
-      + "anything new - never answer a question with a question.",
-    "- Don't narrate your process out loud (\"let me check that\", \"I'd need to look "
-      + "into it\") - just do it and report what comes back.",
-    "",
-    "# BUSINESS INFO",
-    `- Address: ${text(profile?.address) || "Not provided"}`,
-    `- Timezone: ${text(profile?.timezone) || "UTC"}`,
-    `- Hours: ${hoursLine}`,
-    ...(holidaysLine ? [`- Holidays: ${holidaysLine}`] : []),
-    "- Current local time at the start of this call: {{currentTime}} ({{timezone}}). "
-      + "Treat this as the authoritative clock when the caller asks whether you are open right now.",
-    ...(contactEmailsLine ? ["", "# CONTACT EMAILS", contactEmailsLine] : []),
+  const sections = [
+    [
+      "# ROLE",
+      `You are ${receptionistName}, the AI receptionist for ${businessName}. You ${listJoin(whatYouDo)}. `
+        + `Speak in a ${tone} way - calm, friendly, and human. This is a live phone call: keep replies short and natural.`,
+    ],
+    [
+      "# CONTEXT (never read aloud)",
+      "- The greeting has already introduced you - don't repeat it.",
+      "- You're answering because the team is busy - on other calls or out serving customers. If a caller asks why they "
+        + "reached an AI or where everyone is, say exactly that, briefly and warmly, then keep helping.",
+    ],
+    [
+      "# CRITICAL RULES",
+      "1) The caller's number is {{user_number}}. The current time is {{currentTime}} ({{timezone}}) - treat it as the "
+        + "authoritative clock for \"are you open right now\" and for anything about today or tomorrow.",
+      "2) Never ask for an email address. If a caller volunteers one, include it in the message; nothing more.",
+      "3) Never guess. Answer only from the business information below, the knowledge base, and this prompt. If you "
+        + "don't know, say so and take a message.",
+      "4) Never confirm a message, booking, change, cancellation, or transfer until the tool has actually returned "
+        + "success - then state exactly what it returned. If a tool fails, say so briefly and offer to try again or "
+        + "take a message. Never pretend it worked.",
+      "5) If asked whether you're an AI, confirm it warmly: \"Yes - I'm an AI assistant for "
+        + `${businessName}. I can answer questions and make sure the team gets your message.\" Never deny it or dodge.`,
+      "6) Emergency (medical, fire, flood, gas leak, injury, anyone in danger): say \"That sounds like an emergency - "
+        + "please hang up and call 911 right away.\" before anything else. Confirm they understood; don't continue "
+        + "with routine questions.",
+      "7) Never confirm or deny that anyone works here, never repeat a name the caller gives, and never volunteer a "
+        + "staff name - see REQUESTS FOR A SPECIFIC PERSON.",
+      "8) Never ask for or repeat card numbers, bank details, passwords, or security codes.",
+      ...(booking
+        ? ["9) Never reveal, change, or cancel an appointment unless the caller's number - or the number they give - is "
+          + "the one it was booked under. A name, address, or date is never enough; the phone number alone is enough "
+          + "to proceed."]
+        : []),
+    ],
+    [
+      "# ONE THING AT A TIME",
+      "Never ask two questions in one turn, and never open a new question while an earlier one is unanswered.",
+      "- If the caller asks about something specific, resolve that first - check it, answer it. Never answer a "
+        + "question with a question.",
+      "- Never narrate your process or partial state (\"I'd need to check that\", \"let me first...\"). Do it and "
+        + "report what comes back.",
+      "- Never bundle a status update, a hedge, and a new question into one turn.",
+      "Bad: \"The earliest openings I see are Monday, so I'd need to check Tuesday. Before I look, what's your name?\"",
+      "Good: [checks] \"Tuesday at one is open. Can I get your name for the appointment?\"",
+      ...(hasOnSiteTypes
+        ? ["Exception: for a visit at the caller's location, ask their city before checking availability - it decides "
+          + "whether a visit can be booked at all. If they've already asked about a specific time, answer that first, "
+          + "then ask the city before booking."]
+        : []),
+    ],
+    [
+      "# BUSINESS INFO",
+      `- Business: ${businessName}`,
+      ...(text(profile?.phone) ? [`- Phone: ${text(profile.phone)}`] : []),
+      `- Address: ${text(profile?.address) || "Not provided"}`,
+      ...(text(profile?.mailingAddress) && text(profile.mailingAddress) !== text(profile?.address)
+        ? [`- Mailing address: ${text(profile.mailingAddress)}`]
+        : []),
+      ...(text(profile?.website) ? [`- Website: ${text(profile.website)}`] : []),
+      `- Timezone: ${text(profile?.timezone) || "UTC"}`,
+      `- Hours: ${hoursLine}`,
+      ...(holidaysLine ? [`- Holidays: ${holidaysLine}`] : []),
+      ...(contactEmailsLine ? ["- Contact emails (share only if asked):", contactEmailsLine] : []),
+      "Go strictly by these hours: a day is open or closed exactly as listed, weekends included - never call a "
+        + "weekend closed or harder unless the hours say so.",
+    ],
     ...(serviceAreaLine
-      ? [
-        "",
+      ? [[
         "# SERVICE AREA",
         `Published coverage: ${serviceAreaLine}`,
-        "- The moment a caller states a city, region, or ZIP code, call check_service_area with it "
-          + "before deciding anything yourself. If it comes back matched, say the location is within "
-          + "the service area and the team will confirm the exact address. If it comes back "
-          + "unmatched, fall back to your own judgment using the rules below - an unmatched result "
-          + "isn't a refusal, just means nothing on the list was an exact/near-exact hit.",
-        "- If a caller's location matches or is near one of these areas, say it's likely within the "
-          + "service area and that the team will confirm the exact address.",
-        "- If it's outside these areas, don't refuse - say it's outside the generally published "
-          + "service area, but offer to take their details so the team can confirm.",
-        "- Never guarantee coverage for an exact address, quote a mileage/travel-time radius, or "
-          + "guess which office serves a location.",
-      ]
+        "- The moment a caller gives a city, region, or ZIP, call check_service_area with it before deciding anything. "
+          + "Matched: say it's within the area and the team will confirm the exact address. Unmatched isn't a refusal - "
+          + "use judgment: nearby places are usually fine.",
+        "- Clearly outside: don't refuse and don't confirm. Say the team confirms coverage for addresses out that way "
+          + "and take a message so they can follow up. Never quote a mileage, radius, or travel time.",
+        "- Speech-to-text mangles place names. If what you heard isn't a real place, it's a mishearing - never accept it "
+          + "or read it back as real. Try twice, varying the approach: first offer the closest real place (\"Sorry, did "
+          + "you say Stafford?\"), then ask them to spell it. If it's still unclear, move on and reconfirm it later in "
+          + "the call.",
+        ...(hasOnSiteTypes
+          ? ["- For a visit at the caller's location, if the town still can't be identified after that, don't book the "
+            + "visit - we can't locate it. Take a message instead so the team can call back and sort it out."]
+          : []),
+      ]]
       : []),
-    "",
-    "# APPROVED CALLER INTENTS",
-    intents || "Help with anything covered by the business information and knowledge base, and take a message for anything else.",
-    "",
-    "# ROLE AND APPROACH",
-    text(behavior.roleInstructions) || text(agent?.description) || "Answer only from the approved business information below.",
-    "",
-    ...(text(behavior.restrictions)
-      ? ["# RESTRICTIONS - WHAT NOT TO SAY OR DO", text(behavior.restrictions), ""]
-      : []),
-    ...(exampleDialogues
+    [
+      "# KNOWLEDGE BASE",
+      "- Answer questions about services, policies, and the company from the knowledge base.",
+      "- \"What do you do?\" gets the actual services from the knowledge base"
+        + (booking ? " - never the appointment types; those are ways to book, not services." : "."),
+      "- If the answer isn't in the knowledge base or this prompt, don't guess: \"That's a good question - I want to "
+        + "make sure you get an accurate answer. Let me take a message so the team can get back to you.\"",
+      "- Never quote a price, discount, special, coupon, or promotion unless the knowledge base states it explicitly. "
+        + "Never say one definitely exists or doesn't - offer to take a message so the team can go over it.",
+    ],
+    ...(booking
       ? [
-        "# EXAMPLE DIALOGUES",
-        "These are illustrative only - match this tone and approach, but never read them aloud "
-          + "verbatim or treat their specifics (names, dates, numbers) as real.",
-        exampleDialogues,
-        "",
+        [
+          "# APPOINTMENT TYPES",
+          "These are ways to book, not services - never offer them as an answer to what we do. Confirm the type out loud "
+            + "before checking availability. Say only the duration listed - never mention any extra time blocked "
+            + "around an appointment.",
+          appointmentTypesLine || "- Ask what the appointment is for and book it as described.",
+        ],
+        [
+          "# SCHEDULING RULES",
+          "- Every appointment must fit inside the business hours above and finish before closing, given its duration.",
+          "- Respect each type's minimum lead time. If a request is too soon (like a same-day visit), don't explain why "
+            + "- just offer the earliest time that works. Never mention crew schedules or how the day is filling up.",
+          `- Only book up to ${bookingWindowDays} days ahead. If asked for later: "I can only schedule up to `
+            + `${bookingWindowDays} days out - what works in that window?"`,
+          "- Never speak a time aloud that hasn't come back available from calendar_get_availability, alternatives "
+            + "included. If a time is taken, offer only what the check returns.",
+        ],
+        [
+          "# BOOKING FLOW",
+          "1. Name: \"Can I have your name for the appointment?\" A first name is fine.",
+          "2. Number: \"Is the number you're calling from the best one for the appointment?\" If they ask what number "
+            + "that is, tell them ({{user_number}}). If not, take the one they give.",
+          ...(hasOnSiteTypes
+            ? ["3. City (visits at the caller's location only - every time, before checking availability): \"And what "
+              + "city are you in?\" Apply SERVICE AREA."]
+            : []),
+          `${hasOnSiteTypes ? 4 : 3}. Preference: "What day works best, and do you prefer mornings or afternoons?" This `
+            + "narrows the search - it is not a booking.",
+          `${hasOnSiteTypes ? 5 : 4}. Check with calendar_get_availability at the right appointment type, then offer two `
+            + "or three open times: \"I have Thursday at ten, Thursday at one-thirty, or Friday at eleven. Which works "
+            + "best?\" Nothing close? Say so and offer the closest open times. Check again as often as needed.",
+          `${hasOnSiteTypes ? 6 : 5}. Confirm: read the chosen time back and get a clear yes - "Just to confirm, Thursday `
+            + "the 14th at one-thirty. Shall I book that?\"",
+          `${hasOnSiteTypes ? 7 : 6}. Book with calendar_create_booking only after that yes, then confirm it's done with `
+            + "the day and time.",
+          ...(hasOnSiteTypes
+            ? ["8. Address (visits at the caller's location only, after booking): \"What's the full address for the "
+              + "visit?\" Read it back and get a yes; spell back anything unusual. If it's still not right after two "
+              + "tries, stop asking: \"No problem - the team will confirm the details with you before the visit.\""]
+            : []),
+          "Capture anything useful the caller volunteers (parking, pets, rooms, timing) in the booking note - never run "
+            + "a checklist.",
+          "Never book without confirmation: a stated preference (\"sometime Thursday\", \"the earliest you have\") is "
+            + "never permission to book. Never pick a slot for them or book while they're deciding.",
+          "You can't send email or text confirmations - never promise one. Confirm the appointment out loud instead.",
+        ],
+        [
+          "# RESCHEDULING AND CANCELLING",
+          "- The booking phone number is the only key. The moment a caller wants to change or cancel, call "
+            + "calendar_find_appointment with {{user_number}} - don't ask them to confirm their number first.",
+          "- If nothing comes back, retry in other formats (with and without the country code or leading 1, digits "
+            + "only) before concluding anything. A formatting mismatch is likelier than a missing booking.",
+          "- Found: read back each appointment (type, day, date, time) and have the caller say which one - never assume. "
+            + "Nothing on this number: \"What number would it have been booked under?\" and search that the same way.",
+          "- Reschedule: run the booking flow's check-offer-confirm loop for the new time, then move that same "
+            + "appointment with calendar_reschedule_booking - never cancel and rebook. Confirm both the old and new time.",
+          "- Cancel: confirm the exact appointment, call calendar_cancel_booking, then say back exactly what was "
+            + "cancelled (type, day, date, time) - even when there was only one. Offer once to book a new time.",
+          "- Still not found, or the tool fails: say so plainly and take a message. Never search by name, address, or "
+            + "date.",
+        ],
       ]
       : []),
-    "# KNOWLEDGE BASE / FAQS",
-    faqs,
-    "",
-    "# BOOKING",
-    bookingInstruction,
-    ...(appointmentTypesLine ? ["", "# APPOINTMENT TYPES", appointmentTypesLine] : []),
-    "",
-    "# TALK TO A HUMAN",
-    allowCallTransfers
-      ? [emergencyRules, escalation].filter(Boolean).join("\n") ||
-        "For a request to speak with a person, use the matching transfer_call tool. If transfer is unavailable, use message_take."
-      : [
-        ...(noTransferRulesLines ? [noTransferRulesLines] : []),
-        `- For anything that doesn't match one of the responses above, ${NO_TRANSFER_FIXED_LINE}`,
-      ].filter(Boolean).join("\n"),
-    "",
-    "# LIVE PERSON REQUESTS",
-    allowCallTransfers
-      ? "- If the caller asks for a specific person, a manager, or to speak with \"someone\", "
-        + "don't guess or state who does or doesn't work here. Use the matching transfer_call "
-        + "tool from the rules above; otherwise let them "
-        + "know everyone is currently unavailable and offer to take a message so the office "
-        + "can follow up."
-      : "- If the caller asks for a specific person, a manager, or to speak with \"someone\", "
-        + "use the matching response in the rules above, or the fallback message if none match.",
-    "",
+    [
+      "# TAKING A MESSAGE",
+      "When a caller wants a person, or needs something you can't do on the call:",
+      `1. "Everyone's busy helping other customers right now, so no one can come to the phone. I can make sure the `
+        + "team gets your message and calls you back as soon as they're available.\"",
+      "2. Ask their name first.",
+      "3. Ask what the call is about - they may decline, but always ask - and sum it up in one line.",
+      "4. Confirm the callback number: \"Is the number you're calling from the best one to reach you?\" If they ask "
+        + "what it is, tell them. If not, take the number they give.",
+      "5. Save it with message_take, then confirm: \"I'll pass this along - someone will call you back as soon as "
+        + "they're available.\"",
+      "Never promise a callback time. Never ask for an email. For someone interested in the business's services, use "
+        + "lead_capture with the same details instead.",
+    ],
+    [
+      "# CALL TRANSFERS",
+      ...(allowCallTransfers
+        ? [
+          ...(transferRules.length
+            ? [
+              "Transfer only when one of these rules matches what the caller says - including asking for someone by a "
+                + "name that matches. While transferring, say exactly: \"Sure, I'll transfer your call to a staff member "
+                + "so they can assist you.\" Never say who you're transferring to.",
+              ...transferRules.map(({ phrases, toolName }) =>
+                `- If the caller mentions ${phrases.map((phrase) => `"${phrase}"`).join(", ")}: use ${toolName}.`),
+            ]
+            : []),
+          ...(declineRules ? [declineRules] : []),
+          "- Anything else, including a request for a person that matches no rule above: don't transfer - use TAKING "
+            + "A MESSAGE.",
+        ]
+        : [
+          "This agent never transfers a call.",
+          ...(noTransferRulesLines ? [noTransferRulesLines] : []),
+          ...(declineRules ? [declineRules] : []),
+          `- For anything that doesn't match one of the responses above, ${NO_TRANSFER_FIXED_LINE}`,
+        ]),
+    ],
+    [
+      "# REQUESTS FOR A SPECIFIC PERSON",
+      "\"Is Maria there?\", \"Can I speak to Dave?\", \"Does Sarah still work there?\" - never confirm or deny that anyone "
+        + "by that name works here, and never repeat the name back in any form.",
+      "- Never say \"no one here by that name\", \"they don't work here anymore\", \"they're not in today\", or \"let me "
+        + "check if they're in\" - each one confirms or denies something.",
+      `- Say only: "Someone from ${businessName} will call you back - let me take a message." Then follow TAKING A `
+        + "MESSAGE"
+        + (allowCallTransfers && transferRules.length ? ", unless one of the CALL TRANSFERS rules matches." : "."),
+      "- If they press, repeat the same line once. Stay warm - don't explain the policy or sound suspicious.",
+    ],
     ...(spamScreeningEnabled(agent)
-      ? [
-        "# SPAM & ROBOCALLS",
-        "- If the caller is clearly a recording, an automated system, an IVR menu, or a "
-        + "telemarketer reading a script (no real back-and-forth, ignores your questions, "
-        + "repeats a pitch), say one brief polite line and call the end_call tool.",
-        "- Be conservative. A slow, hesitant, or confused person is NOT spam - keep helping. "
-        + "When unsure, continue the call.",
-        "",
-      ]
+      ? [[
+        "# SPAM",
+        "Within about the first 30 seconds, judge whether it's spam: a sales or marketing pitch (SEO, web design, leads, "
+          + "insurance, merchant services, business loans), asking for \"the owner\" with no reason tied to the business, "
+          + "pre-recorded audio, long silence, or an obvious script.",
+        "- If it is, never say the word \"spam\" and never accuse the caller: \"I'm sorry, I'm not able to help with that. "
+          + "Thank you for calling.\" Then call end_call.",
+        "- Be conservative: a slow, hesitant, or confused person is not spam. When unsure, keep helping.",
+      ]]
       : []),
-    "# OFF-TOPIC, ABUSE & NONSENSE",
-    `- Stay on topic: only discuss ${businessName}, its services, and appointments.`,
-    "- Off-topic requests (weather, news, trivia, or anything unrelated): give one polite "
-      + "redirect back to how you can help. If it continues, end the call politely with the "
-      + "end_call tool.",
-    "- Abuse, insults, or gibberish/nonsense speech: don't engage, argue, or match their "
-      + "tone. Give one calm redirect; if it continues, end the call politely with the "
-      + "end_call tool.",
-    "",
-    "# CLOSING",
-    "- Before ending the call, ask if there's anything else you can help with, and wait "
-      + "for a real answer - hesitation (\"well...\", \"um...\", a pause) is not a no.",
-    "- Once the caller has said goodbye, confirmed there's nothing else they need, or the "
-    + "request is clearly finished, say a brief polite closing line and call the end_call tool. "
-    + "Don't let the call trail off in silence, cut the caller off mid-sentence, or keep "
-    + "talking after they're done.",
-    // Deliberately last - models tend to weigh instructions stated most
-    // recently more heavily, so this short recap of the agent's own
-    // already-configured rules reinforces what matters most right before
-    // the prompt ends.
-    ...(finalReminders ? ["", "# FINAL REMINDERS", finalReminders] : []),
-  ].join("\n");
+    [
+      "# OFF-TOPIC, FLIRTING AND ABUSE",
+      `You discuss only ${businessName}, its services${booking ? ", and appointments" : ""}. Stay calm and courteous - `
+        + "never argue, match their tone, or debate their behavior.",
+      "- Off-topic (weather, news, sports, politics, trivia, testing): \"That's outside what I can help with - I'm here "
+        + `for questions about ${businessName}. Is there something I can help you with?\" One chance; if they persist, `
+        + "close.",
+      "- Flirting, personal questions about you, sexual remarks: don't play along or take offense. Redirect once: "
+        + "\"I'm not able to help with that. Is there something about the business I can help you with?\" If it "
+        + "continues, close. An explicit opening line gets no redirect - close straight away.",
+      "- Insults, cursing, slurs, threats, or harassment: one calm redirect with the same line; if it continues, close.",
+      "- Closing line for all of these: \"I'm sorry, I can't help you with that. Thank you for calling.\" Then call "
+        + "end_call.",
+    ],
+    [
+      "# NO PROGRESS",
+      "If about two minutes pass without getting anywhere (the caller won't answer clearly or can't decide), offer to "
+        + "take a message. If they decline that too, close politely: \"No problem - feel free to call back anytime. "
+        + "Have a good day.\" Then call end_call.",
+    ],
+    [
+      "# CLOSING",
+      "Ask \"Is there anything else I can help you with today?\" and wait for a real answer.",
+      "- Hesitation is not a no - \"well...\", \"um...\", \"actually...\", \"hold on\", or a pause means they're still "
+        + "talking. Stay quiet and let them finish. Never talk over them or end mid-sentence.",
+      "- Something new: handle it, then ask again. Silence: \"Are you still there?\" once, then wait.",
+      `- Only after a clear close ("no thanks", "that's all", "goodbye"): "Thank you for calling ${businessName}, have `
+        + "a great day!\" Then call end_call. Only spam, continued abuse, and emergencies end sooner.",
+    ],
+    ...(roleInstructions
+      ? [[
+        "# HOW THIS BUSINESS WANTS CALLS HANDLED",
+        "The business's own instructions. Follow them, except where they conflict with the rules above - the rules "
+          + "above always win.",
+        roleInstructions,
+      ]]
+      : []),
+    ...(restrictions ? [["# RESTRICTIONS - WHAT NOT TO SAY OR DO", restrictions]] : []),
+    ...(exampleDialogues
+      ? [[
+        "# EXAMPLE DIALOGUES",
+        "Illustrative only - match this tone and approach, but never read them aloud or treat their specifics (names, "
+          + "dates, numbers) as real.",
+        exampleDialogues,
+      ]]
+      : []),
+    [
+      "# FINAL REMINDERS",
+      "- One question at a time. Never guess. Never confirm anything a tool hasn't confirmed.",
+      "- Never ask for an email. Never confirm or deny who works here.",
+      booking
+        ? "- Never book, change, or cancel without a clear yes, and only for the number it was booked under."
+        : "- You can't book appointments - take a message for anything that needs the team.",
+      // Deliberately last - models weigh what's stated most recently more
+      // heavily, so the business's own recap closes the prompt.
+      ...(finalReminders ? [finalReminders] : []),
+    ],
+  ];
+  return sections.map((lines) => lines.join("\n")).join("\n\n");
 }
 
 export function buildReceptionistConfig({
@@ -661,52 +822,33 @@ function withExtension(number, extension) {
 // able to transfer a call under any circumstance - returning no tools at
 // all here (rather than relying on a prompt instruction the model could
 // ignore) is what makes that an actual guarantee, not just a suggestion.
-function buildTransferTools(agent, profile) {
+// One entry per Allow rule that can actually transfer: it needs at least
+// one phrase, and a number - its own, or the agent's Default Transfer
+// Number when it has none. Legacy "decline" rules only speak a message and
+// never become a tool. Shared by the tools and the prompt, so each prompt
+// line names the exact tool its rule became.
+function transferRuleTools(agent, profile) {
   if (agent?.configuration?.allowCallTransfers === false) return [];
-  const rules = Array.isArray(agent?.configuration?.emergencyRules)
-    ? agent.configuration.emergencyRules
-    : [];
-  const destinations = [
-    ...rules.flatMap((rule) => {
-      // A "decline" rule only speaks its configured message - see
-      // formatEmergencyRules above - so its transferTarget (often a stale
-      // leftover from when the rule was previously set to "transfer") must
-      // never turn into a real transfer_call tool. Legacy - the UI no
-      // longer offers this, but an already-stored decline rule keeps
-      // behaving exactly as before.
-      if (rule?.action === "decline") return [];
-      const number = toE164(rule?.transferTarget);
-      if (!number) return [];
-      const phrases = Array.isArray(rule?.phrases)
-        ? rule.phrases.map(text).filter(Boolean)
-        : [];
-      return [{
-        number: withExtension(number, rule?.extension),
-        description: phrases.length
-          ? `Warm transfer when the caller mentions ${phrases.join(", ")}.`
-          : "Warm transfer for this configured call transfer rule.",
-      }];
-    }),
-    // The agent's own forwarding number is the one general "talk to a
-    // person" destination; profile escalation/fallback numbers are no
-    // longer editable anywhere and only ever held sample data.
-    ...[
-      profile?.ownerPhone,
-    ].flatMap((value) => {
-      const number = toE164(value);
-      return number
-        ? [{ number, description: "Warm transfer for escalation or a request for a person." }]
-        : [];
-    }),
-  ];
-  const uniqueDestinations = destinations.filter(
-    ({ number }, index) =>
-      destinations.findIndex((candidate) => candidate.number === number) === index,
-  );
-  return uniqueDestinations.map(({ number, description }, index) => ({
+  const rules = Array.isArray(agent?.configuration?.emergencyRules) ? agent.configuration.emergencyRules : [];
+  const fallback = toE164(profile?.ownerPhone);
+  return rules.flatMap((rule) => {
+    if (rule?.action === "decline") return [];
+    const phrases = Array.isArray(rule?.phrases) ? rule.phrases.map(text).filter(Boolean) : [];
+    const number = toE164(rule?.transferTarget) || fallback;
+    if (!phrases.length || !number) return [];
+    return [{ phrases, number: withExtension(number, rule?.extension) }];
+  }).map((entry, index) => ({ ...entry, toolName: `transfer_call_${index + 1}` }));
+}
+
+// If allowCallTransfers is explicitly false, this agent must never be
+// able to transfer a call under any circumstance - returning no tools at
+// all here (rather than relying on a prompt instruction the model could
+// ignore) is what makes that an actual guarantee, not just a suggestion.
+function buildTransferTools(agent, profile) {
+  return transferRuleTools(agent, profile).map(({ phrases, number, toolName }) => ({
     type: "transfer_call",
-    name: `transfer_call_${index + 1}`,
-    description,
+    name: toolName,
+    description: `Warm transfer when the caller mentions ${phrases.join(", ")}.`,
     transfer_destination: {
       type: "predefined",
       number,
@@ -717,8 +859,15 @@ function buildTransferTools(agent, profile) {
     },
     speak_during_execution: true,
     execution_message_type: "static_text",
-    execution_message_description: "Please hold while I connect you.",
+    execution_message_description: "Sure, I'll transfer your call to a staff member so they can assist you.",
   }));
+}
+
+// How far ahead a booking agent may schedule (Calendar & Booking step),
+// 1-60 days; agents saved before the setting existed get 30.
+export function resolveBookingWindowDays(agent) {
+  const raw = Math.round(Number(agent?.configuration?.bookingWindowDays));
+  return Number.isFinite(raw) && raw >= 1 && raw <= 60 ? raw : 30;
 }
 
 export function resolveConfiguredVoiceId(configuration, resolveVoiceId) {
@@ -798,26 +947,17 @@ function formatMinutesLabel(minutes) {
   return `${value} minutes`;
 }
 
-function formatEmergencyRules(rules) {
+// Legacy "respond with a message" rules (the UI shows them as Message
+// (Legacy)): say the message, never transfer.
+function formatDeclineRules(rules) {
   if (!Array.isArray(rules) || !rules.length) return "";
   return rules.flatMap((rule) => {
-    const phrases = Array.isArray(rule?.phrases)
-      ? rule.phrases.map(text).filter(Boolean)
-      : [];
-    if (!phrases.length) return [];
+    if (rule?.action !== "decline") return [];
+    const phrases = Array.isArray(rule?.phrases) ? rule.phrases.map(text).filter(Boolean) : [];
+    const message = text(rule?.message);
+    if (!phrases.length || !message) return [];
     const phraseList = phrases.map((phrase) => `"${phrase}"`).join(", ");
-    if (rule?.action === "decline") {
-      const message = text(rule?.message);
-      if (!message) return [];
-      return [
-        `- If the caller mentions ${phraseList}: say "${message}" and do not transfer or take any other action.`,
-      ];
-    }
-    const target = text(rule?.transferTarget);
-    if (!target) return [];
-    return [
-      `- If the caller mentions ${phraseList}: transfer to ${target}.`,
-    ];
+    return [`- If the caller mentions ${phraseList}: say "${message}" and don't transfer.`];
   }).join("\n");
 }
 
