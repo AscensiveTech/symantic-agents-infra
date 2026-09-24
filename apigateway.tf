@@ -52,6 +52,7 @@ locals {
     "POST /workspaces/me/knowledge-bases",
     "PATCH /workspaces/me/knowledge-bases/{knowledgeBaseId}",
     "DELETE /workspaces/me/knowledge-bases/{knowledgeBaseId}",
+    "GET /workspaces/me/knowledge-bases/{knowledgeBaseId}/download",
     "POST /workspaces/me/knowledge-assets/upload-url",
     "GET /workspaces/me/most-asked-questions",
     "POST /workspaces/me/most-asked-questions",
