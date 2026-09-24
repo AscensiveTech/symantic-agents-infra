@@ -249,7 +249,51 @@ function pickProfile(value) {
     // Optional, so it stays out of PROFILE_FIELDS - requiring it there
     // would reject a payload from any client that hasn't sent it yet.
     ...(typeof value.mailingAddress === "string" ? { mailingAddress: value.mailingAddress } : {}),
+    // Optional for the same reason. These were once dropped here entirely,
+    // so no live agent ever received them - keep each shape-checked rather
+    // than passed through raw.
+    ...(Array.isArray(value.holidays) ? { holidays: pickHolidays(value.holidays) } : {}),
+    ...(typeof value.holidaysEnabled === "boolean" ? { holidaysEnabled: value.holidaysEnabled } : {}),
+    ...(Array.isArray(value.contactEmails) ? { contactEmails: pickContactEmails(value.contactEmails) } : {}),
+    ...(Array.isArray(value.serviceAreas) ? { serviceAreas: pickServiceAreas(value.serviceAreas) } : {}),
   };
+}
+
+const MAX_HOLIDAYS = 50;
+const MAX_CONTACT_EMAILS = 20;
+const MAX_SERVICE_AREAS = 200;
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function boundedString(candidate, maxLength) {
+  return typeof candidate === "string" ? candidate.slice(0, maxLength) : "";
+}
+
+function pickHolidays(holidays) {
+  return holidays
+    .filter((item) => item && typeof item === "object" && typeof item.id === "string")
+    .slice(0, MAX_HOLIDAYS)
+    .map((item) => ({
+      id: boundedString(item.id, 128),
+      name: boundedString(item.name, 80),
+      date: typeof item.date === "string" && ISO_DATE_PATTERN.test(item.date) ? item.date : "",
+      closed: item.closed === true,
+      ...(typeof item.hours === "string" && item.hours ? { hours: boundedString(item.hours, 80) } : {}),
+      ...(item.disabled === true ? { disabled: true } : {}),
+    }));
+}
+
+function pickContactEmails(contactEmails) {
+  return contactEmails
+    .filter((item) => item && typeof item === "object" && typeof item.email === "string")
+    .slice(0, MAX_CONTACT_EMAILS)
+    .map((item) => ({ label: boundedString(item.label, 80), email: boundedString(item.email, 320) }));
+}
+
+function pickServiceAreas(serviceAreas) {
+  return serviceAreas
+    .filter((item) => typeof item === "string" && item.trim())
+    .slice(0, MAX_SERVICE_AREAS)
+    .map((item) => item.trim().slice(0, 120));
 }
 
 

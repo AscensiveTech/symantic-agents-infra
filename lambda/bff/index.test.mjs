@@ -112,6 +112,51 @@ test("PUT profile keeps an optional mailingAddress even though it's not in the r
   assert.equal(JSON.parse(response.body).mailingAddress, "PO Box 45");
 });
 
+test("PUT profile keeps holidays, the holidays toggle, contact emails, and service areas - shape-checked", async () => {
+  let saved;
+  const store = {
+    async ensureWorkspace() {},
+    async putProfile(_workspaceId, value) { saved = value; return value; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/profile", {
+    businessType: "dental",
+    businessName: "Arc Dental",
+    address: "123 Main Street",
+    timezone: "America/New_York",
+    phone: "(703) 555-0133",
+    description: "Family dental care",
+    hours: "Mon-Fri, 8:00 AM-5:00 PM",
+    faqs: [],
+    policies: "",
+    escalationContact: "",
+    ownerPhone: "",
+    fallbackPhone: "",
+    communicationStyle: "",
+    holidaysEnabled: true,
+    holidays: [
+      { id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true },
+      { id: "h2", name: "Christmas Eve", date: "2026-12-24", closed: false, hours: "9 AM-1 PM" },
+      { id: "h3", name: "Labor Day", date: "2026-09-07", closed: true, disabled: true, extra: "dropped" },
+      { name: "no id - dropped" },
+    ],
+    contactEmails: [{ label: "Billing", email: "billing@example.com" }, { label: "no email" }],
+    serviceAreas: [" Arlington, VA ", "", 42],
+  }));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(saved.holidaysEnabled, true);
+  assert.deepEqual(saved.holidays, [
+    { id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true },
+    { id: "h2", name: "Christmas Eve", date: "2026-12-24", closed: false, hours: "9 AM-1 PM" },
+    { id: "h3", name: "Labor Day", date: "2026-09-07", closed: true, disabled: true },
+  ]);
+  assert.deepEqual(saved.contactEmails, [{ label: "Billing", email: "billing@example.com" }]);
+  assert.deepEqual(saved.serviceAreas, ["Arlington, VA"]);
+});
+
 test("GET profile ensures the workspace and returns its profile", async () => {
   const calls = [];
   const profile = { businessName: "Arc Dental" };
