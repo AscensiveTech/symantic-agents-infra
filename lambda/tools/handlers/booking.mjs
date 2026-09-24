@@ -75,14 +75,25 @@ export async function handleCreateBooking(input, {
   const agent = await store.getAgent(input.workspaceId, input.agentId);
   const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
   const timezone = profile?.timezone || "UTC";
-  const appointmentType = resolveAppointmentType(agent, input.appointmentType);
+  // A Cal.com agent's event types replace its own Appointment Types -
+  // Cal.com enforces its own notice and buffers, so neither is applied here.
+  const calComEventType = await calendar.resolveEventType?.({
+    workspaceId: input.workspaceId,
+    agentId: input.agentId,
+    appointmentType: input.appointmentType,
+  });
+  const appointmentType = calComEventType ? undefined : resolveAppointmentType(agent, input.appointmentType);
+  const serviceName = stringOrUndefined(calComEventType?.name) ||
+    stringOrUndefined(appointmentType?.name) ||
+    stringOrUndefined(input.service);
 
   // When a configured type matches, its Duration is authoritative - the
   // agent isn't meant to override how long a "Quick Call" or "On-Site
   // Visit" runs on a per-call basis.
+  const typedDuration = calComEventType?.lengthInMinutes ?? appointmentType?.durationMin;
   const range = resolveTimeRange(
-    appointmentType
-      ? { ...input, durationMinutes: appointmentType.durationMin, endTime: undefined }
+    typedDuration
+      ? { ...input, durationMinutes: typedDuration, endTime: undefined }
       : input,
     timezone,
     now,
@@ -106,6 +117,7 @@ export async function handleCreateBooking(input, {
     const availability = await calendar.getAvailability({
       workspaceId: input.workspaceId,
       agentId: input.agentId,
+      appointmentType: input.appointmentType,
       ...providerRange,
     });
     requireAvailable(availability);
@@ -117,9 +129,10 @@ export async function handleCreateBooking(input, {
     providerBooking = await calendar.createBooking({
       workspaceId: input.workspaceId,
       agentId: input.agentId,
+      appointmentType: input.appointmentType,
       ...providerRange,
       ...providerIds,
-      service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service),
+      service: serviceName,
       description: stringOrUndefined(input.description),
       location: stringOrUndefined(input.location) || profile?.address || undefined,
       // No live invite-sending yet (deferred, per product decision) - the
@@ -130,6 +143,9 @@ export async function handleCreateBooking(input, {
       // customer info (email included) for the business's own
       // reference - only what reaches the provider is stripped.
       customer: { ...normalizeCustomer(input.customer, agent?.configuration?.bookingInviteEmail), email: undefined },
+      // Only Cal.com reads this: it requires an attendee email on every
+      // booking, and gets the business's own address - never the caller's.
+      attendeeEmail: stringOrUndefined(agent?.configuration?.bookingInviteEmail),
       callId: input.callId,
       idempotencyKey: input.idempotencyKey,
     });
@@ -150,7 +166,7 @@ export async function handleCreateBooking(input, {
     provider: providerBooking.provider,
     providerEventId: providerBooking.providerEventId,
     htmlLink: providerBooking.htmlLink,
-    service: stringOrUndefined(appointmentType?.name) || stringOrUndefined(input.service) || "Appointment",
+    service: serviceName || "Appointment",
     customer: normalizeCustomer(input.customer, agent?.configuration?.bookingInviteEmail),
     ...range,
     status: "confirmed",
@@ -206,6 +222,7 @@ export async function handleRescheduleBooking(input, {
   const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
   const timezone = profile?.timezone || appointment.timezone || "UTC";
   const range = resolveTimeRange(input, timezone, now);
+  let providerEventId = appointment.providerEventId;
   // Same race the create-booking path guards against - hold the target
   // slot for the whole recheck+reschedule sequence so a second concurrent
   // attempt at the same new time is turned away immediately.
@@ -216,17 +233,22 @@ export async function handleRescheduleBooking(input, {
     const availability = await calendar.getAvailability({
       workspaceId: input.workspaceId,
       agentId: input.agentId,
+      appointmentType: appointment.service,
       providerEventId: appointment.providerEventId,
       ...range,
     });
     requireAvailable(availability);
     try {
-      await calendar.rescheduleBooking({
+      const moved = await calendar.rescheduleBooking({
         workspaceId: input.workspaceId,
         agentId: input.agentId,
+        appointmentType: appointment.service,
         providerEventId: appointment.providerEventId,
         ...range,
       });
+      // Cal.com issues a new booking id on every reschedule; Google and
+      // Microsoft keep the same one.
+      providerEventId = moved?.providerEventId || providerEventId;
     } catch (error) {
       if (!isAlreadyUpdatedError(error)) {
         if (!isRecoverableRescheduleError(error)) throw error;
@@ -250,6 +272,7 @@ export async function handleRescheduleBooking(input, {
     appointmentId,
     {
       ...range,
+      providerEventId,
       status: "rescheduled",
       lastRescheduleIdempotencyKey: input.idempotencyKey,
       updatedAt: new Date(now()).toISOString(),

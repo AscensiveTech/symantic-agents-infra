@@ -1,3 +1,4 @@
+import { createCalComClient } from "./cal-com.mjs";
 import { createGoogleCalendarClient } from "./google.mjs";
 import { createMicrosoftCalendarClient } from "./microsoft.mjs";
 
@@ -42,6 +43,7 @@ export function createCalendarAdapter({
       createGoogleCalendarClient({ fetchImpl }),
     "microsoft-365-calendar": providerClients["microsoft-365-calendar"] ??
       createMicrosoftCalendarClient({ fetchImpl }),
+    "cal-com": providerClients["cal-com"] ?? createCalComClient({ fetchImpl }),
   };
   const accessTokenCache = new Map();
   const refreshPromises = new Map();
@@ -50,6 +52,7 @@ export function createCalendarAdapter({
   async function invoke(operation, input) {
     const connection = await connectionStore.get(input.workspaceId, input.agentId);
     requireUsableConnection(connection);
+    if (connection.provider === "cal-com") return invokeCalCom(operation, input, connection);
     const client = clients[connection.provider];
     if (!client?.[operation]) {
       throw calendarError(
@@ -82,6 +85,34 @@ export function createCalendarAdapter({
       if (error?.statusCode !== 401) throw error;
       await markReauthRequired(connection.workspaceId, connection.agentId, "repeated_401");
       throw new CalendarReauthRequiredError("repeated_401");
+    }
+  }
+
+  // Cal.com connects with the customer's own API key rather than OAuth, so
+  // there's no token to refresh: a 401 means the key was revoked or
+  // deleted, and the only fix is reconnecting with a new one.
+  async function invokeCalCom(operation, input, connection) {
+    if (typeof decryptToken !== "function") {
+      throw new Error("Calendar token decryption is not configured");
+    }
+    const apiKey = await decryptToken({
+      encryptedToken: connection.encryptedApiKey,
+      workspaceId: connection.workspaceId,
+      agentId: connection.agentId,
+      provider: connection.provider,
+    });
+    const eventType = selectCalComEventType(connection, input.appointmentType);
+    try {
+      return await clients["cal-com"][operation]({
+        ...input,
+        accessToken: apiKey,
+        eventTypeId: eventType?.id,
+        timezone: input.timezone || connection.calendarTimezone || "UTC",
+      });
+    } catch (error) {
+      if (error?.statusCode !== 401) throw error;
+      await markReauthRequired(connection.workspaceId, connection.agentId, "invalid_api_key");
+      throw new CalendarReauthRequiredError("invalid_api_key");
     }
   }
 
@@ -264,6 +295,15 @@ export function createCalendarAdapter({
   }
 
   return {
+    // Null unless this agent books through Cal.com. When it does, the
+    // matched event type's own length and name replace the agent's
+    // Appointment Types - Cal.com enforces its own buffers and notice.
+    async resolveEventType(input) {
+      const connection = await connectionStore.get(input.workspaceId, input.agentId);
+      if (connection?.provider !== "cal-com") return null;
+      requireUsableConnection(connection);
+      return selectCalComEventType(connection, input.appointmentType);
+    },
     getAvailability: (input) => invoke("getAvailability", input),
     createBooking: (input) => invoke("createBooking", input),
     rescheduleBooking: (input) => invoke("rescheduleBooking", input),
@@ -283,6 +323,27 @@ function credentialFingerprint(connection) {
   ].join("\0");
 }
 
+// The caller's requested appointment type is matched by name
+// (case-insensitive) against the event types the business chose to offer.
+// With no match, the first chosen one is used - so a business offering a
+// single event type never depends on the agent naming it exactly.
+function selectCalComEventType(connection, requestedName) {
+  const chosen = new Set((connection.selectedEventTypeIds ?? []).map(String));
+  const offered = (connection.availableCalendars ?? [])
+    .filter((eventType) => chosen.has(String(eventType?.id)));
+  if (!offered.length) return null;
+  const wanted = typeof requestedName === "string" ? requestedName.trim().toLowerCase() : "";
+  const match = wanted
+    ? offered.find((eventType) => String(eventType.name ?? "").trim().toLowerCase() === wanted)
+    : undefined;
+  const eventType = match ?? offered[0];
+  return {
+    id: String(eventType.id),
+    name: eventType.name,
+    lengthInMinutes: Number(eventType.lengthInMinutes) || undefined,
+  };
+}
+
 function requireUsableConnection(connection) {
   if (
     !connection ||
@@ -291,10 +352,13 @@ function requireUsableConnection(connection) {
   ) {
     throw new CalendarReauthRequiredError("connection_unavailable");
   }
+  const credential = connection.provider === "cal-com"
+    ? connection.encryptedApiKey
+    : connection.encryptedRefreshToken;
   if (
     connection.connectionState !== "connected" ||
     !connection.selectedCalendarId ||
-    !connection.encryptedRefreshToken
+    !credential
   ) {
     throw calendarError(
       "Calendar is not connected",

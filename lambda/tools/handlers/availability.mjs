@@ -10,10 +10,18 @@ export async function handleAvailability(input, {
   const agent = await store.getAgent(input.workspaceId, input.agentId);
   const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
   const timezone = profile?.timezone || "UTC";
-  const appointmentType = resolveAppointmentType(agent, input.appointmentType);
+  // A Cal.com agent's event types replace its own Appointment Types -
+  // Cal.com enforces its own notice and buffers, so neither is applied here.
+  const calComEventType = await calendar.resolveEventType?.({
+    workspaceId: input.workspaceId,
+    agentId: input.agentId,
+    appointmentType: input.appointmentType,
+  });
+  const appointmentType = calComEventType ? undefined : resolveAppointmentType(agent, input.appointmentType);
+  const typedDuration = calComEventType?.lengthInMinutes ?? appointmentType?.durationMin;
   const range = resolveTimeRange(
-    appointmentType
-      ? { ...input, durationMinutes: appointmentType.durationMin, endTime: undefined }
+    typedDuration
+      ? { ...input, durationMinutes: typedDuration, endTime: undefined }
       : input,
     timezone,
     now,
@@ -26,6 +34,7 @@ export async function handleAvailability(input, {
   const result = await calendar.getAvailability({
     workspaceId: input.workspaceId,
     agentId: input.agentId,
+    appointmentType: input.appointmentType,
     ...providerRange,
   });
   return {
