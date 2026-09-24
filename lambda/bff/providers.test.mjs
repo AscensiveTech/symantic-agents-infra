@@ -5,7 +5,6 @@ import {
   createAnthropicClient,
   createRetellClient,
   createTelnyxClient,
-  promptHash,
   resolveRetellVoiceId,
 } from "./providers.mjs";
 import { createFakeRetell } from "./test-support/fake-retell.mjs";
@@ -399,8 +398,8 @@ test("Retell upsert creates an LLM and voice agent with compiled config, then pu
     config,
   });
 
-  assert.equal(result.published, true);
-  assert.equal(result.promptSource, "app");
+  assert.ok(Number.isInteger(result.publishedVersion));
+  assert.ok(result.fingerprints["llm.general_prompt"]);
   const [list, createLlm, createAgent, versions, publish] = fake.requests;
   assert.equal(list.path, "/v2/list-agents");
   assert.deepEqual(list.body, {
@@ -560,7 +559,7 @@ test("Retell upsert reuses a Symantic-named agent instead of creating another", 
   });
 
   assert.equal(result.retellAgentId, agentId);
-  assert.equal(result.published, true);
+  assert.ok(Number.isInteger(result.publishedVersion));
   assert.equal(fake.requests[0].path, "/v2/list-agents");
   assert.ok(!fake.requests.some((request) => request.path === "/create-agent"));
 });
@@ -604,10 +603,9 @@ test("Retell upsert updates and publishes an agent the app created that was neve
     agentName: "Maya",
     greeting: "Hello.",
     config: { prompt: "Updated prompt", tools: [], voice: "retell-Cimo" },
-    lastPushedPromptHash: promptHash("Old prompt"),
   });
 
-  assert.equal(result.published, true);
+  assert.ok(Number.isInteger(result.publishedVersion));
   assert.equal(result.publishedVersion, 0);
   const live = fake.answering("+17035550177");
   assert.equal(live.binding, "latest_published");

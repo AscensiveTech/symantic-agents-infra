@@ -3,29 +3,12 @@ import { createHash } from "node:crypto";
 const TELNYX_BASE_URL = "https://api.telnyx.com/v2";
 const RETELL_BASE_URL = "https://api.retellai.com";
 
-// Retell LLM fields the app always writes. Everything else on the LLM
-// (model, temperature, states, ...) belongs to whoever edits the agent in
-// the Retell dashboard, and a save never overwrites it.
-const APP_LLM_FIELDS = ["general_tools", "knowledge_base_ids"];
-// Written only while the app owns the prompt (promptSource "app").
-const APP_PROMPT_LLM_FIELDS = ["general_prompt", "begin_message", "start_speaker"];
 // Bookkeeping Retell stamps on every version - never compared or copied.
 const RETELL_VERSION_FIELDS = new Set([
   "agent_id", "llm_id", "version", "is_published", "base_version",
   "version_title", "version_description", "assigned_tags",
   "last_modification_timestamp", "response_engine", "llm_websocket_url",
 ]);
-// Tool names the app generates. A tool added by hand in Retell with any
-// other name survives an app save.
-const APP_TOOL_NAME = /^(end_call|lead_capture|message_take|check_service_area|calendar_[a-z_]+|transfer_call_\d+)$/;
-
-export function promptHash(prompt) {
-  return createHash("sha256").update(String(prompt ?? ""), "utf8").digest("hex");
-}
-
-function sameValue(left, right) {
-  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
-}
 
 // Key order differs between Retell responses, so compare with sorted keys.
 function canonical(value) {
@@ -36,22 +19,29 @@ function canonical(value) {
   return value ?? null;
 }
 
-// Fields (other than the app's own) where Retell's draft differs from what
-// callers currently hear - edits someone made in the Retell dashboard and
-// hasn't published yet.
-function unpublishedRetellEdits({ draftAgent, publishedAgent, draftLlm, publishedLlm, appAgentFields, appLlmFields }) {
-  const edits = [];
-  const collect = (scope, draft, published, owned) => {
-    for (const field of new Set([...Object.keys(draft ?? {}), ...Object.keys(published ?? {})])) {
-      if (RETELL_VERSION_FIELDS.has(field) || owned.has(field)) continue;
-      if (!sameValue(draft?.[field], published?.[field])) {
-        edits.push({ scope, field, published: published?.[field] ?? null, draft: draft?.[field] ?? null });
-      }
+const sameValue = (left, right) => JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+
+// One hash per field of a published agent and its LLM ("agent.voice_id",
+// "llm.general_prompt", ...). Stored after every app publish, then compared
+// with what's live to spot edits someone made directly in Retell - purely
+// informational, the next app push replaces them anyway.
+export function retellFingerprints(agent, llm) {
+  const prints = {};
+  const add = (scope, object) => {
+    for (const [field, value] of Object.entries(object ?? {})) {
+      if (RETELL_VERSION_FIELDS.has(field)) continue;
+      prints[`${scope}.${field}`] = createHash("sha256").update(JSON.stringify(canonical(value)), "utf8").digest("hex");
     }
   };
-  collect("agent", draftAgent, publishedAgent, appAgentFields);
-  collect("llm", draftLlm, publishedLlm, appLlmFields);
-  return edits;
+  add("agent", agent);
+  add("llm", llm);
+  return prints;
+}
+
+export function changedRetellFields(stored, live) {
+  return [...new Set([...Object.keys(stored ?? {}), ...Object.keys(live ?? {})])]
+    .filter((field) => stored?.[field] !== live?.[field])
+    .sort();
 }
 
 export class ProviderRequestError extends Error {
@@ -395,26 +385,30 @@ export function createRetellClient({
     }
   }
 
-  // The app's tools replace the app-generated ones already on the LLM;
-  // anything added by hand in Retell is kept.
-  function mergeTools(existingTools, appTools) {
-    const handAdded = (Array.isArray(existingTools) ? existingTools : [])
-      .filter((tool) => !APP_TOOL_NAME.test(String(tool?.name ?? "")));
-    return [...(appTools ?? []), ...handAdded];
+  // The live published version and its LLM - what callers hear right now.
+  async function readLivePublished(agentId) {
+    const versions = await listAgentVersions(agentId);
+    const live = versions.find((version) => version.is_published);
+    if (!live) return null;
+    const agent = await getAgentVersion(agentId, live.version);
+    const llm = agent?.response_engine?.llm_id
+      ? await getLlmVersion(agent.response_engine.llm_id, agent.response_engine.version)
+      : null;
+    return { version: live.version, agent, llm };
   }
 
-  async function syncVersionedAgent({
-    agentId,
-    llmId: fallbackLlmId,
-    symanticAgentId,
-    agentName,
-    greeting,
-    config,
-    promptSource,
-    lastPushedPromptHash,
-    overwriteRetellPrompt,
-    retellEditsDecision,
-  }) {
+  // Every push from the app goes through here. Sync is one-way: whatever
+  // the app sends replaces what's in Retell. Retell only lets the latest
+  // draft be edited, so this works on a draft (created from the live
+  // version when there isn't one), then publishes it and makes sure the
+  // agent's numbers follow "latest_published".
+  //
+  // Edits someone made in the Retell dashboard but never published are
+  // discarded: any field the app doesn't send is reset to its live value
+  // before publishing, so an app save never makes half-finished dashboard
+  // work go live. response_engine is never sent - Retell rejects it once
+  // an agent has versions.
+  async function publishFromApp(agentId, { llmPatch, agentPatch, fallbackLlmId }) {
     const versions = await listAgentVersions(agentId);
     const livePublished = versions.find((version) => version.is_published);
     let draftVersion = versions[0] && !versions[0].is_published ? versions[0].version : null;
@@ -431,117 +425,54 @@ export function createRetellClient({
 
     const draftAgent = await getAgentVersion(agentId, draftVersion);
     const llmId = draftAgent?.response_engine?.llm_id ?? fallbackLlmId;
-    const draftLlm = await getLlmVersion(llmId, draftAgent?.response_engine?.version);
-    const publishedAgent = livePublished ? await getAgentVersion(agentId, livePublished.version) : null;
-    const publishedLlm = publishedAgent
-      ? await getLlmVersion(publishedAgent?.response_engine?.llm_id ?? llmId, publishedAgent?.response_engine?.version)
-      : null;
-
-    let owner = promptSource === "retell" && !overwriteRetellPrompt ? "retell" : "app";
-    if (owner === "app" && !overwriteRetellPrompt) {
-      const livePrompt = (publishedLlm ?? draftLlm)?.general_prompt;
-      if (typeof livePrompt === "string" && livePrompt !== config.prompt) {
-        const liveHash = promptHash(livePrompt);
-        // With no record of what the app last pushed (agents synced before
-        // this was tracked), any difference is treated as a hand edit.
-        if (!lastPushedPromptHash || liveHash !== lastPushedPromptHash) owner = "retell";
-      }
-    }
-
-    const llmPatch = {
-      general_tools: mergeTools(draftLlm?.general_tools, config.tools),
-      knowledge_base_ids: config.knowledgeBaseIds ?? [],
-      ...(owner === "app"
-        ? {
-          general_prompt: config.prompt,
-          begin_message: greeting,
-          start_speaker: config.startSpeaker === "user" ? "user" : "agent",
-        }
-        : {}),
-    };
-    const { response_engine: _engine, ...agentPatch } = agentBody({ llmId, symanticAgentId, agentName, config });
-
-    const pendingRetellEdits = publishedAgent
-      ? unpublishedRetellEdits({
-        draftAgent,
-        publishedAgent,
-        draftLlm,
-        publishedLlm,
-        appAgentFields: new Set(Object.keys(agentPatch)),
-        appLlmFields: new Set([...APP_LLM_FIELDS, ...(owner === "app" ? APP_PROMPT_LLM_FIELDS : [])]),
-      })
-      : [];
-    if (retellEditsDecision === "discard") {
-      for (const edit of pendingRetellEdits) {
-        (edit.scope === "agent" ? agentPatch : llmPatch)[edit.field] = edit.published;
-      }
-    }
-
     const llmVersion = draftAgent?.response_engine?.version;
-    await retellRequest(`/update-retell-llm/${encodeURIComponent(llmId)}${Number.isInteger(llmVersion) ? `?version=${llmVersion}` : ""}`, {
-      method: "PATCH",
-      body: llmPatch,
-    });
-    await retellRequest(agentPath("update-agent", agentId, `?version=${draftVersion}`), {
-      method: "PATCH",
-      body: agentPatch,
-    });
+    const draftLlm = await getLlmVersion(llmId, llmVersion);
+    const agentUpdate = { ...agentPatch };
+    const llmUpdate = { ...llmPatch };
+    if (livePublished) {
+      const liveAgent = await getAgentVersion(agentId, livePublished.version);
+      const liveLlm = await getLlmVersion(liveAgent?.response_engine?.llm_id ?? llmId, liveAgent?.response_engine?.version);
+      const resetUnpublished = (draft, live, update) => {
+        for (const [field, value] of Object.entries(live ?? {})) {
+          if (RETELL_VERSION_FIELDS.has(field) || field in update) continue;
+          if (!sameValue(draft?.[field], value)) update[field] = value;
+        }
+      };
+      resetUnpublished(draftAgent, liveAgent, agentUpdate);
+      resetUnpublished(draftLlm, liveLlm, llmUpdate);
+    }
 
-    const result = {
-      retellAgentId: agentId,
-      promptSource: owner,
-      ...(owner === "app" ? { pushedPromptHash: promptHash(config.prompt) } : {}),
-    };
-    if (pendingRetellEdits.length && retellEditsDecision !== "include" && retellEditsDecision !== "discard") {
-      return { ...result, published: false, pendingRetellEdits };
-    }
-    const publishedVersion = await publishVersion(agentId, draftVersion);
-    await followLatestPublished(agentId);
-    return { ...result, published: true, publishedVersion };
-  }
-
-  // Knowledge base edits reach a live agent the same way a save does: on a
-  // draft, then published. Never publishes someone's unfinished dashboard
-  // edits along the way - that agent is reported as not updated instead,
-  // and its next Save Changes asks the customer what to do with them.
-  async function pushKnowledgeBaseIds(agentId, knowledgeBaseIds) {
-    const versions = await listAgentVersions(agentId);
-    const livePublished = versions.find((version) => version.is_published);
-    let draftVersion = versions[0] && !versions[0].is_published ? versions[0].version : null;
-    if (draftVersion !== null && livePublished) {
-      const [draftAgent, publishedAgent] = await Promise.all([
-        getAgentVersion(agentId, draftVersion),
-        getAgentVersion(agentId, livePublished.version),
-      ]);
-      const [draftLlm, publishedLlm] = await Promise.all([
-        getLlmVersion(draftAgent.response_engine.llm_id, draftAgent.response_engine.version),
-        getLlmVersion(publishedAgent.response_engine.llm_id, publishedAgent.response_engine.version),
-      ]);
-      const edits = unpublishedRetellEdits({
-        draftAgent, publishedAgent, draftLlm, publishedLlm,
-        appAgentFields: new Set(), appLlmFields: new Set(["knowledge_base_ids"]),
+    if (Object.keys(llmUpdate).length) {
+      await retellRequest(`/update-retell-llm/${encodeURIComponent(llmId)}${Number.isInteger(llmVersion) ? `?version=${llmVersion}` : ""}`, {
+        method: "PATCH",
+        body: llmUpdate,
       });
-      if (edits.length) {
-        throw new ProviderRequestError("Retell", "Retell has unpublished edits for this agent - open it and click Save Changes to choose what to do with them.", {
-          details: { pendingRetellEdits: edits.map(({ scope, field }) => `${scope}.${field}`) },
-        });
-      }
     }
-    if (draftVersion === null) {
-      const created = await retellRequest(agentPath("create-agent-version", agentId), {
-        method: "POST",
-        body: { base_version: livePublished?.version ?? 0 },
+    if (Object.keys(agentUpdate).length) {
+      await retellRequest(agentPath("update-agent", agentId, `?version=${draftVersion}`), {
+        method: "PATCH",
+        body: agentUpdate,
       });
-      draftVersion = created.version;
     }
-    const draftAgent = await getAgentVersion(agentId, draftVersion);
-    const llmVersion = draftAgent.response_engine.version;
-    await retellRequest(`/update-retell-llm/${encodeURIComponent(draftAgent.response_engine.llm_id)}${Number.isInteger(llmVersion) ? `?version=${llmVersion}` : ""}`, {
-      method: "PATCH",
-      body: { knowledge_base_ids: knowledgeBaseIds ?? [] },
-    });
     await publishVersion(agentId, draftVersion);
     await followLatestPublished(agentId);
+    const live = await readLivePublished(agentId);
+    return { publishedVersion: draftVersion, fingerprints: retellFingerprints(live?.agent, live?.llm) };
+  }
+
+  function appLlmPatch({ greeting, config }) {
+    return {
+      start_speaker: config.startSpeaker === "user" ? "user" : "agent",
+      begin_message: greeting,
+      general_prompt: config.prompt,
+      general_tools: config.tools,
+      knowledge_base_ids: config.knowledgeBaseIds ?? [],
+    };
+  }
+
+  // Knowledge base edits reach a live agent the same way a save does.
+  function pushKnowledgeBaseIds(agentId, knowledgeBaseIds) {
+    return publishFromApp(agentId, { llmPatch: { knowledge_base_ids: knowledgeBaseIds ?? [] }, agentPatch: {} });
   }
 
   return {
@@ -589,33 +520,15 @@ export function createRetellClient({
 
 
     // Pushes the app's settings to Retell and publishes them, so callers
-    // hear the change right away. Retell keeps published versions
-    // read-only and only lets the latest draft be edited, so this always
-    // works on a draft (creating one from the live version if needed) and
-    // then publishes it.
-    //
-    // promptSource "retell" means the prompt, greeting and model are
-    // maintained by hand in the Retell dashboard: the save still pushes
-    // tools, knowledge bases, voice and call handling, but never the
-    // prompt. A prompt edited in Retell since the app last pushed one also
-    // switches the agent to "retell" (reported back as promptSource), so a
-    // save can never silently wipe a hand-written prompt. Pass
-    // overwriteRetellPrompt to replace it on purpose.
-    //
-    // If Retell's draft holds edits nobody has published yet, the save
-    // stops before publishing and returns them as pendingRetellEdits;
-    // retellEditsDecision "include" publishes them with the app's
-    // changes, "discard" resets them to the live values first.
+    // hear the change right away (see publishFromApp). Returns the live
+    // version's fingerprints for the "Manually Edited by Admin in Retell"
+    // check.
     async upsertAgent({
       retellAgentId,
       symanticAgentId,
       agentName,
       greeting,
       config,
-      promptSource = "app",
-      lastPushedPromptHash,
-      overwriteRetellPrompt = false,
-      retellEditsDecision,
     }) {
       let existing = null;
       let resolvedId = typeof retellAgentId === "string" && retellAgentId
@@ -651,20 +564,16 @@ export function createRetellClient({
           });
           const publishedVersion = await publishLatestDraft(resolvedId);
           await followLatestPublished(resolvedId);
-          return { retellAgentId: resolvedId, published: true, publishedVersion, promptSource, pushedPromptHash: promptHash(config.prompt) };
+          const live = await readLivePublished(resolvedId);
+          return { retellAgentId: resolvedId, publishedVersion, fingerprints: retellFingerprints(live?.agent, live?.llm) };
         }
-        return syncVersionedAgent({
-          agentId: resolvedId,
-          llmId: existingLlmId,
-          symanticAgentId,
-          agentName,
-          greeting,
-          config,
-          promptSource,
-          lastPushedPromptHash,
-          overwriteRetellPrompt,
-          retellEditsDecision,
+        const { response_engine: _engine, ...agentPatch } = agentBody({ llmId: existingLlmId, symanticAgentId, agentName, config });
+        const published = await publishFromApp(resolvedId, {
+          llmPatch: appLlmPatch({ greeting, config }),
+          agentPatch,
+          fallbackLlmId: existingLlmId,
         });
+        return { retellAgentId: resolvedId, ...published };
       }
 
       const llmId = await createLlm({ greeting, config });
@@ -681,14 +590,13 @@ export function createRetellClient({
       // Publish right away so the phone number can follow
       // "latest_published" from the very first call.
       const publishedVersion = await publishLatestDraft(createdId);
-      return {
-        retellAgentId: createdId,
-        published: true,
-        publishedVersion,
-        promptSource: "app",
-        pushedPromptHash: promptHash(config.prompt),
-      };
+      const live = await readLivePublished(createdId);
+      return { retellAgentId: createdId, publishedVersion, fingerprints: retellFingerprints(live?.agent, live?.llm) };
     },
+
+    // What callers hear right now, for the "Manually Edited by Admin in
+    // Retell" check. Read-only. Null if nothing is published.
+    readLivePublished,
 
     async importPhoneNumber({
       phoneNumber,

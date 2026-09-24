@@ -1494,79 +1494,83 @@ test("Save Changes on a live agent still saves when Retell rejects the update, b
   });
 });
 
-test("Save Changes reports a live publish, and records who owns the prompt and the hash of what the app pushed", async () => {
+test("Save Changes reports a live publish and stores the published version's fingerprints as the new baseline", async () => {
   const { body, runtimeUpdates, retellCalls } = await saveLiveAgent({
     async upsertAgent() {
-      return { retellAgentId: "retell-agent-123", published: true, publishedVersion: 4, promptSource: "app", pushedPromptHash: "hash-1" };
+      return { retellAgentId: "retell-agent-123", publishedVersion: 4, fingerprints: { "llm.general_prompt": "h1" } };
     },
-    existingOverrides: { promptSource: "app", retellPromptHash: "hash-0" },
+    query: { promptSource: "retell", retellEdits: "include" },
   });
 
-  assert.equal(retellCalls[0].promptSource, "app");
-  assert.equal(retellCalls[0].lastPushedPromptHash, "hash-0");
-  assert.equal(retellCalls[0].overwriteRetellPrompt, false);
-  assert.deepEqual(runtimeUpdates.at(-1), { retellAgentId: "retell-agent-123", promptSource: "app", retellPromptHash: "hash-1" });
-  assert.deepEqual(body.retellSync, { status: "live", promptSource: "app", publishedVersion: 4 });
+  // One-way: nothing the caller of the route sends changes what's pushed.
+  assert.equal("promptSource" in retellCalls[0], false);
+  assert.equal("retellEditsDecision" in retellCalls[0], false);
+  assert.deepEqual(runtimeUpdates.at(-1), { retellAgentId: "retell-agent-123", retellFingerprints: { "llm.general_prompt": "h1" } });
+  assert.deepEqual(body.retellSync, { status: "live", publishedVersion: 4 });
 });
 
-test("Save Changes on an agent whose prompt is hand-written in Retell keeps promptSource retell and the old app hash", async () => {
-  const { body, runtimeUpdates } = await saveLiveAgent({
-    async upsertAgent() {
-      return { retellAgentId: "retell-agent-123", published: true, publishedVersion: 3, promptSource: "retell" };
+// The retell-status route against an in-memory store and Retell.
+async function retellStatus({ agentOverrides = {}, live, readError } = {}) {
+  const agent = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123", ...agentOverrides };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getProfile() { return receptionistProfile(); },
+  };
+  const providers = {
+    retell: {
+      async readLivePublished(retellAgentId) {
+        assert.equal(retellAgentId, "retell-agent-123");
+        if (readError) throw readError;
+        return live;
+      },
     },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+  const response = await handler(authenticatedEvent("GET", "/workspaces/me/agents/agent-123/retell-status"));
+  return { statusCode: response.statusCode, body: JSON.parse(response.body) };
+}
+
+test("retell-status: nothing flagged when what's live matches the fingerprints stored at the last app publish", async () => {
+  const { retellFingerprints } = await import("./providers.mjs");
+  const live = { version: 3, agent: { voice_id: "v1" }, llm: { general_prompt: "P", model: "gpt-5" } };
+  const { statusCode, body } = await retellStatus({
+    agentOverrides: { retellFingerprints: retellFingerprints(live.agent, live.llm) },
+    live,
   });
 
-  assert.equal(runtimeUpdates.at(-1).promptSource, "retell");
-  assert.equal("retellPromptHash" in runtimeUpdates.at(-1), false);
-  assert.equal(body.retellSync.promptSource, "retell");
-  assert.equal(body.promptSource, "retell");
+  assert.equal(statusCode, 200);
+  assert.deepEqual(body, { editedInRetell: false, changedFields: [] });
 });
 
-test("Save Changes returns Retell's unpublished dashboard edits for the customer to decide on, and passes the decision through on the retry", async () => {
-  const pending = [{ scope: "llm", field: "model", published: "gpt-5.6-terra", draft: "gpt-5" }];
-  const first = await saveLiveAgent({
-    async upsertAgent() {
-      return { retellAgentId: "retell-agent-123", published: false, promptSource: "retell", pendingRetellEdits: pending };
-    },
-  });
-  assert.deepEqual(first.body.retellSync, {
-    status: "needs_decision",
-    promptSource: "retell",
-    pendingRetellEdits: [{ scope: "llm", field: "model", live: "gpt-5.6-terra", draft: "gpt-5" }],
+test("retell-status: a field edited and published in Retell since the last app publish is flagged by name", async () => {
+  const { retellFingerprints } = await import("./providers.mjs");
+  const published = { agent: { voice_id: "v1" }, llm: { general_prompt: "P", model: "gpt-5" } };
+  const { body } = await retellStatus({
+    agentOverrides: { retellFingerprints: retellFingerprints(published.agent, published.llm) },
+    live: { version: 4, agent: { voice_id: "v1" }, llm: { general_prompt: "P edited by hand", model: "gpt-5.6-terra" } },
   });
 
-  const retry = await saveLiveAgent({
-    async upsertAgent() {
-      return { retellAgentId: "retell-agent-123", published: true, publishedVersion: 3, promptSource: "retell" };
-    },
-    query: { retellEdits: "discard" },
-  });
-  assert.equal(retry.retellCalls[0].retellEditsDecision, "discard");
-  assert.equal(retry.body.retellSync.status, "live");
+  assert.deepEqual(body, { editedInRetell: true, changedFields: ["llm.general_prompt", "llm.model"] });
 });
 
-test("Save Changes with promptSource=app takes the prompt back from Retell on purpose; promptSource=retell hands it over", async () => {
-  const takeBack = await saveLiveAgent({
-    async upsertAgent() { return { retellAgentId: "retell-agent-123", published: true, promptSource: "app", pushedPromptHash: "h" }; },
-    query: { promptSource: "app" },
-    existingOverrides: { promptSource: "retell" },
+test("retell-status: an agent published before fingerprints existed is compared with what the app would send now", async () => {
+  const { body } = await retellStatus({
+    live: { version: 1, agent: {}, llm: { general_prompt: "# ROLE\nA 33,000-character prompt written by hand.", begin_message: "Thanks for calling C W R." } },
   });
-  assert.equal(takeBack.retellCalls[0].promptSource, "app");
-  assert.equal(takeBack.retellCalls[0].overwriteRetellPrompt, true);
 
-  const handOver = await saveLiveAgent({
-    async upsertAgent() { return { retellAgentId: "retell-agent-123", published: true, promptSource: "retell" }; },
-    query: { promptSource: "retell" },
-  });
-  assert.equal(handOver.retellCalls[0].promptSource, "retell");
-  assert.equal(handOver.retellCalls[0].overwriteRetellPrompt, false);
+  assert.equal(body.editedInRetell, true);
+  assert.deepEqual(body.changedFields, ["llm.general_prompt", "llm.begin_message"]);
+});
 
-  const junk = await saveLiveAgent({
-    async upsertAgent() { return { retellAgentId: "retell-agent-123", published: true, promptSource: "app" }; },
-    query: { promptSource: "anything", retellEdits: "yolo" },
-  });
-  assert.equal(junk.retellCalls[0].promptSource, "app");
-  assert.equal(junk.retellCalls[0].retellEditsDecision, undefined);
+test("retell-status: never flags drafts or agents that aren't live, and a Retell outage just hides the label", async () => {
+  assert.deepEqual((await retellStatus({ agentOverrides: { status: "draft" } })).body, { editedInRetell: false, changedFields: [] });
+  assert.deepEqual((await retellStatus({ agentOverrides: { retellAgentId: undefined } })).body, { editedInRetell: false, changedFields: [] });
+  assert.deepEqual(
+    (await retellStatus({ readError: new Error("Retell timeout") })).body,
+    { editedInRetell: false, changedFields: [], unavailable: true },
+  );
 });
 
 test("GET calls lists workspace calls without exposing Retell identifiers", async () => {

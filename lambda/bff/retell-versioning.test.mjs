@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createRetellClient, promptHash } from "./providers.mjs";
+import { changedRetellFields, createRetellClient, retellFingerprints } from "./providers.mjs";
 import { createFakeRetell } from "./test-support/fake-retell.mjs";
 
 const HAND_PROMPT = "# ROLE\nHand-written in the Retell dashboard.\n# ACCOUNTS RECEIVABLE\n...";
@@ -24,8 +24,8 @@ function appConfig(overrides = {}) {
 }
 
 // Samantha as found in production on 2026-09-24: v0 and v1 published, the
-// phone pinned to v1, and a draft v2 whose model someone changed in the
-// dashboard without publishing.
+// phone pinned to v1, a hand-written prompt, and a draft v2 whose model
+// someone changed in the dashboard without publishing.
 function seedSamantha(fake, { draft = true } = {}) {
   const llm = {
     general_prompt: HAND_PROMPT,
@@ -65,45 +65,57 @@ function save(fake, agentId, overrides = {}) {
   });
 }
 
+// What an admin does by hand in the Retell dashboard: new draft from the
+// live version, edit it, publish.
+async function dashboardEditAndPublish(fake, agentId, edit) {
+  const live = fake.versions(agentId).filter((version) => version.is_published).at(-1);
+  await fake.fetchImpl(`https://api.retellai.com/create-agent-version/${agentId}`, {
+    method: "POST",
+    body: JSON.stringify({ base_version: live.version }),
+  });
+  fake.dashboardEditDraft(agentId, edit);
+  fake.dashboardPublishLatest(agentId);
+}
+
 test("a save never sends response_engine to an agent that already has published versions (the Sep 17 production failure)", async () => {
   const fake = createFakeRetell();
   const { agentId } = seedSamantha(fake, { draft: false });
 
-  const result = await save(fake, agentId, { promptSource: "retell" });
+  const result = await save(fake, agentId);
 
-  assert.equal(result.published, true);
+  assert.ok(Number.isInteger(result.publishedVersion));
   const agentUpdates = fake.requests.filter((request) => request.path.startsWith("/update-agent/"));
   assert.ok(agentUpdates.length > 0);
   for (const update of agentUpdates) assert.equal(update.body.response_engine, undefined);
 });
 
-test("a hand-written Retell prompt is kept: the agent switches to promptSource retell and only app-owned fields change", async () => {
+test("sync is one-way: the app's prompt, greeting, tools and knowledge bases replace everything that was in Retell", async () => {
   const fake = createFakeRetell();
   const { agentId } = seedSamantha(fake, { draft: false });
 
-  // No record of what the app last pushed, and the live prompt isn't the
-  // app's - exactly Samantha's case.
-  const result = await save(fake, agentId);
+  await save(fake, agentId);
 
-  assert.equal(result.promptSource, "retell");
-  assert.equal(result.pushedPromptHash, undefined);
   const live = fake.answering(PHONE);
-  assert.equal(live.llm.general_prompt, HAND_PROMPT);
-  assert.equal(live.llm.begin_message, "Thanks for calling C W R.");
-  assert.equal(live.llm.model, "gpt-5.6-terra");
+  assert.equal(live.llm.general_prompt, APP_PROMPT);
+  assert.equal(live.llm.begin_message, "Thanks for calling CWR Solutions.");
+  assert.deepEqual(live.llm.general_tools.map((tool) => tool.name), ["end_call", "message_take", "transfer_call_1"]);
+  assert.doesNotMatch(JSON.stringify(live.llm.general_tools), /555010[29]/);
   assert.deepEqual(live.llm.knowledge_base_ids, ["kb-app"]);
+  // A field the app doesn't manage stays at its live value.
+  assert.equal(live.llm.model, "gpt-5.6-terra");
 });
 
-test("the app's transfer tools replace the old ones (dropping the fake 555 numbers) while a tool added by hand in Retell survives", async () => {
+test("unpublished dashboard edits are discarded silently: the save starts from the live version, so the draft's model change never goes live", async () => {
   const fake = createFakeRetell();
-  const { agentId } = seedSamantha(fake, { draft: false });
+  const { agentId } = seedSamantha(fake);
 
-  await save(fake, agentId, { promptSource: "retell" });
+  const result = await save(fake, agentId);
 
-  const names = fake.answering(PHONE).llm.general_tools.map((tool) => tool.name);
-  assert.deepEqual(names.sort(), ["end_call", "lookup_invoice", "message_take", "transfer_call_1"]);
-  const numbers = JSON.stringify(fake.answering(PHONE).llm.general_tools);
-  assert.doesNotMatch(numbers, /555010[29]/);
+  assert.equal(result.publishedVersion, 2);
+  const live = fake.answering(PHONE);
+  assert.equal(live.agent.version, 2);
+  assert.equal(live.llm.model, "gpt-5.6-terra");
+  assert.equal(live.llm.general_prompt, APP_PROMPT);
 });
 
 test("the phone stops being pinned to one version: after a save it follows latest_published and callers hear the save", async () => {
@@ -111,115 +123,86 @@ test("the phone stops being pinned to one version: after a save it follows lates
   const { agentId } = seedSamantha(fake, { draft: false });
   assert.equal(fake.answering(PHONE).agent.version, 1);
 
-  const result = await save(fake, agentId, { promptSource: "retell" });
+  const result = await save(fake, agentId);
 
   const live = fake.answering(PHONE);
   assert.equal(live.binding, "latest_published");
   assert.equal(live.agent.version, result.publishedVersion);
-  assert.ok(result.publishedVersion > 1);
 });
 
-test("unpublished dashboard edits stop the save before publishing and are reported, so nothing half-finished goes live silently", async () => {
-  const fake = createFakeRetell();
-  const { agentId } = seedSamantha(fake);
-
-  const result = await save(fake, agentId, { promptSource: "retell" });
-
-  assert.equal(result.published, false);
-  assert.deepEqual(result.pendingRetellEdits.map((edit) => `${edit.scope}.${edit.field}`), ["llm.model"]);
-  assert.equal(result.pendingRetellEdits[0].published, "gpt-5.6-terra");
-  assert.equal(result.pendingRetellEdits[0].draft, "gpt-5");
-  // Callers still hear v1, untouched.
-  assert.equal(fake.answering(PHONE).agent.version, 1);
-  assert.equal(fake.answering(PHONE).llm.model, "gpt-5.6-terra");
-});
-
-test("choosing Discard resets the dashboard's unpublished edits to the live values, then publishes the app's changes", async () => {
-  const fake = createFakeRetell();
-  const { agentId } = seedSamantha(fake);
-
-  const result = await save(fake, agentId, { promptSource: "retell", retellEditsDecision: "discard" });
-
-  assert.equal(result.published, true);
-  const live = fake.answering(PHONE);
-  assert.equal(live.agent.version, 2);
-  assert.equal(live.llm.model, "gpt-5.6-terra");
-  assert.equal(live.llm.general_prompt, HAND_PROMPT);
-  assert.deepEqual(live.llm.knowledge_base_ids, ["kb-app"]);
-});
-
-test("choosing Include publishes the dashboard's unpublished edits together with the app's changes", async () => {
-  const fake = createFakeRetell();
-  const { agentId } = seedSamantha(fake);
-
-  await save(fake, agentId, { promptSource: "retell", retellEditsDecision: "include" });
-
-  assert.equal(fake.answering(PHONE).llm.model, "gpt-5");
-});
-
-test("an app-owned prompt is pushed and published, and the pushed hash is returned for the next save's edit check", async () => {
+test("a dashboard publish after an app save goes live too, since the number follows latest_published", async () => {
   const fake = createFakeRetell();
   const { agentId } = seedSamantha(fake, { draft: false });
-  const first = await save(fake, agentId, { overwriteRetellPrompt: true });
-  assert.equal(first.promptSource, "app");
-  assert.equal(first.pushedPromptHash, promptHash(APP_PROMPT));
-  assert.equal(fake.answering(PHONE).llm.general_prompt, APP_PROMPT);
+  await save(fake, agentId);
 
-  const second = await save(fake, agentId, {
-    lastPushedPromptHash: first.pushedPromptHash,
-    config: appConfig({ prompt: "# ROLE\nGenerated again, with new hours." }),
-  });
+  await dashboardEditAndPublish(fake, agentId, { llm: { general_prompt: "# ROLE\nEdited by hand in Retell." } });
 
-  assert.equal(second.promptSource, "app");
-  assert.equal(second.published, true);
-  assert.equal(fake.answering(PHONE).llm.general_prompt, "# ROLE\nGenerated again, with new hours.");
-});
-
-test("a prompt edited and published in the Retell dashboard after the app's last push switches the agent to promptSource retell instead of being overwritten", async () => {
-  const fake = createFakeRetell();
-  const { agentId } = seedSamantha(fake, { draft: false });
-  const first = await save(fake, agentId, { overwriteRetellPrompt: true });
-
-  // Someone edits in the dashboard (e.g. while the app is down) and publishes.
-  const versions = fake.versions(agentId);
-  assert.ok(versions.at(-1).is_published);
-  // Dashboard flow: new draft from live, edit, publish.
-  await fake.fetchImpl(`https://api.retellai.com/create-agent-version/${agentId}`, {
-    method: "POST",
-    body: JSON.stringify({ base_version: versions.at(-1).version }),
-  });
-  fake.dashboardEditDraft(agentId, { llm: { general_prompt: "# ROLE\nEdited by hand in Retell." } });
-  fake.dashboardPublishLatest(agentId);
-  assert.equal(fake.answering(PHONE).llm.general_prompt, "# ROLE\nEdited by hand in Retell.");
-
-  const second = await save(fake, agentId, { lastPushedPromptHash: first.pushedPromptHash });
-
-  assert.equal(second.promptSource, "retell");
   assert.equal(fake.answering(PHONE).llm.general_prompt, "# ROLE\nEdited by hand in Retell.");
 });
 
-test("overwriteRetellPrompt replaces a hand-written prompt on purpose", async () => {
+test("the next app save replaces a prompt someone edited and published in Retell", async () => {
   const fake = createFakeRetell();
   const { agentId } = seedSamantha(fake, { draft: false });
+  await save(fake, agentId);
+  await dashboardEditAndPublish(fake, agentId, { llm: { general_prompt: "# ROLE\nEdited by hand in Retell." } });
 
-  const result = await save(fake, agentId, { promptSource: "retell", overwriteRetellPrompt: true });
+  await save(fake, agentId, { config: appConfig({ prompt: "# ROLE\nSaved again from the app." }) });
 
-  assert.equal(result.promptSource, "app");
-  assert.equal(fake.answering(PHONE).llm.general_prompt, APP_PROMPT);
+  assert.equal(fake.answering(PHONE).llm.general_prompt, "# ROLE\nSaved again from the app.");
 });
 
 test("saving twice in a row works: each save makes a new draft from the live version and publishes it", async () => {
   const fake = createFakeRetell();
   const { agentId } = seedSamantha(fake, { draft: false });
 
-  const first = await save(fake, agentId, { promptSource: "retell" });
-  const second = await save(fake, agentId, { promptSource: "retell", config: appConfig({ ambientSound: "" }) });
+  const first = await save(fake, agentId);
+  const second = await save(fake, agentId, { config: appConfig({ ambientSound: "" }) });
 
   assert.equal(second.publishedVersion, first.publishedVersion + 1);
   assert.equal(fake.answering(PHONE).agent.ambient_sound, null);
 });
 
-test("a new agent is published at creation and its imported number follows latest_published", async () => {
+test("fingerprints: unchanged right after an app save, a dashboard edit is reported by field, and the next save resets the baseline", async () => {
+  const fake = createFakeRetell();
+  const { agentId } = seedSamantha(fake, { draft: false });
+  const retell = client(fake);
+  const saved = await save(fake, agentId);
+
+  const afterSave = await retell.readLivePublished(agentId);
+  assert.deepEqual(changedRetellFields(saved.fingerprints, retellFingerprints(afterSave.agent, afterSave.llm)), []);
+
+  await dashboardEditAndPublish(fake, agentId, {
+    agent: { voice_id: "11labs-Adrian" },
+    llm: { general_prompt: "# ROLE\nEdited by hand in Retell.", model: "gpt-5" },
+  });
+  const afterEdit = await retell.readLivePublished(agentId);
+  assert.deepEqual(
+    changedRetellFields(saved.fingerprints, retellFingerprints(afterEdit.agent, afterEdit.llm)),
+    ["agent.voice_id", "llm.general_prompt", "llm.model"],
+  );
+
+  const resaved = await save(fake, agentId);
+  const afterResave = await retell.readLivePublished(agentId);
+  assert.deepEqual(changedRetellFields(resaved.fingerprints, retellFingerprints(afterResave.agent, afterResave.llm)), []);
+});
+
+test("an unpublished dashboard draft doesn't count as a manual edit - callers don't hear it", async () => {
+  const fake = createFakeRetell();
+  const { agentId } = seedSamantha(fake, { draft: false });
+  const retell = client(fake);
+  const saved = await save(fake, agentId);
+
+  await fake.fetchImpl(`https://api.retellai.com/create-agent-version/${agentId}`, {
+    method: "POST",
+    body: JSON.stringify({ base_version: saved.publishedVersion }),
+  });
+  fake.dashboardEditDraft(agentId, { llm: { general_prompt: "# ROLE\nNot published." } });
+
+  const live = await retell.readLivePublished(agentId);
+  assert.deepEqual(changedRetellFields(saved.fingerprints, retellFingerprints(live.agent, live.llm)), []);
+});
+
+test("a new agent is published at creation, its imported number follows latest_published, and the next save goes live", async () => {
   const fake = createFakeRetell();
   const retell = createRetellClient({ apiKey: "retell-key", fetchImpl: fake.fetchImpl, terminationUri: "sip.telnyx.com" });
 
@@ -231,45 +214,41 @@ test("a new agent is published at creation and its imported number follows lates
   });
   await retell.importPhoneNumber({ phoneNumber: "+15550001111", retellAgentId: created.retellAgentId });
 
-  assert.equal(created.published, true);
-  assert.equal(created.promptSource, "app");
+  assert.equal(created.publishedVersion, 0);
+  assert.ok(created.fingerprints["llm.general_prompt"]);
   const live = fake.answering("+15550001111");
   assert.equal(live.binding, "latest_published");
   assert.equal(live.llm.general_prompt, APP_PROMPT);
 
-  // And the very next save goes live too - no pinned version, no engine error.
-  const saved = await retell.upsertAgent({
+  await retell.upsertAgent({
     retellAgentId: created.retellAgentId,
     symanticAgentId: "agent-new",
     agentName: "Nova",
     greeting: "Hello.",
     config: appConfig({ prompt: "# ROLE\nSecond save." }),
-    lastPushedPromptHash: created.pushedPromptHash,
   });
-  assert.equal(saved.published, true);
   assert.equal(fake.answering("+15550001111").llm.general_prompt, "# ROLE\nSecond save.");
 });
 
-test("a knowledge base edit reaches callers on a versioned agent: pushed to a draft and published, the number following latest_published", async () => {
+test("a knowledge base edit reaches callers on a versioned agent, and returns fresh fingerprints", async () => {
   const fake = createFakeRetell();
   const { agentId } = seedSamantha(fake, { draft: false });
+
+  const published = await client(fake).pushKnowledgeBaseIds(agentId, ["kb-new"]);
+
+  const live = fake.answering(PHONE);
+  assert.deepEqual(live.llm.knowledge_base_ids, ["kb-new"]);
+  assert.equal(live.binding, "latest_published");
+  assert.ok(published.fingerprints["llm.knowledge_base_ids"]);
+});
+
+test("a knowledge base edit also discards unpublished dashboard edits instead of publishing them", async () => {
+  const fake = createFakeRetell();
+  const { agentId } = seedSamantha(fake);
 
   await client(fake).pushKnowledgeBaseIds(agentId, ["kb-new"]);
 
   const live = fake.answering(PHONE);
   assert.deepEqual(live.llm.knowledge_base_ids, ["kb-new"]);
-  assert.equal(live.binding, "latest_published");
-  assert.equal(live.llm.general_prompt, HAND_PROMPT);
-});
-
-test("a knowledge base edit refuses to publish someone's unfinished dashboard edits, and leaves the live version untouched", async () => {
-  const fake = createFakeRetell();
-  const { agentId } = seedSamantha(fake);
-
-  await assert.rejects(
-    client(fake).pushKnowledgeBaseIds(agentId, ["kb-new"]),
-    /unpublished edits/,
-  );
-  assert.equal(fake.answering(PHONE).agent.version, 1);
-  assert.deepEqual(fake.answering(PHONE).llm.knowledge_base_ids, ["kb-1", "kb-2"]);
+  assert.equal(live.llm.model, "gpt-5.6-terra");
 });
