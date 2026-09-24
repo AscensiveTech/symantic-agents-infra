@@ -6,6 +6,7 @@ import {
   buildReceptionistConfig,
   buildReceptionistPrompt,
   resolveAllowedInboundCountries,
+  resolveAmbientSound,
   resolveCallHandling,
   resolveConfiguredVoiceId,
   resolveGreeting,
@@ -330,6 +331,20 @@ test("an agent's own Business Profile replaces the workspace's - two agents in o
   // Fields the agent hasn't saved for itself still fall back to the workspace.
   assert.match(config.prompt, /Address: 123 Main Street/);
   assert.match(resolveGreeting(maryland, profile), /^Thanks for calling Arc Dental Maryland\./);
+});
+
+test("the agent's chosen ambient sound reaches the Retell config, and an unknown one sends none", () => {
+  const build = (ambientSound) => buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: { ...agent, configuration: { ...agent.configuration, ambientSound } },
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.equal(build("coffee-shop").ambientSound, "coffee-shop");
+  assert.equal(build("").ambientSound, null);
+  assert.equal(build("rainforest").ambientSound, null);
+  assert.equal(resolveAmbientSound({ configuration: {} }), null);
 });
 
 test("resolveCallHandling applies defaults and clamps to the Retell range", () => {
