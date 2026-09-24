@@ -24,6 +24,7 @@ export async function handleAvailability(input, {
   const providerRange = appointmentType ? paddedProviderRange(range, appointmentType) : range;
   const result = await calendar.getAvailability({
     workspaceId: input.workspaceId,
+    agentId: input.agentId,
     ...providerRange,
   });
   return {
