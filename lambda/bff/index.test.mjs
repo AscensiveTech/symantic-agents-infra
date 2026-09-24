@@ -6547,13 +6547,16 @@ test("PATCH /platform/companies/{id} re-anchors billing and stores a credit bala
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => store });
 
+  // The anchor must be today or later, so it's relative to the run date -
+  // a fixed date here made this test start failing on its own on Sep 17.
+  const anchor = new Date(Date.now() + 10 * 86_400_000).toISOString().slice(0, 10);
   const patch = authenticatedEvent("PATCH", "/platform/companies/user-123", {
-    tier: "repository", billingAnchorDate: "2026-09-16", billingCreditBalance: 10.5,
+    tier: "repository", billingAnchorDate: anchor, billingCreditBalance: 10.5,
   });
   patch.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
   assert.equal((await handler(patch)).statusCode, 200);
   assert.equal(saved[0].tier, "repository");
-  assert.equal(saved[0].billingAnchorDate, "2026-09-16");
+  assert.equal(saved[0].billingAnchorDate, anchor);
   assert.equal(saved[0].billingCreditBalance, 10.5);
 
   // clearing the credit

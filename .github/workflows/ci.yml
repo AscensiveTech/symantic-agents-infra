@@ -1,0 +1,42 @@
+name: CI
+
+# Runs on every push and pull request. Before this existed, the Lambda
+# tests only ran when someone remembered to run them locally, so a broken
+# or time-bombed test could sit unnoticed for days. Read-only: no AWS
+# access, and no Terraform plan or apply.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lambda-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lambda: [bff, tools, oauth, postcall, digest, kb-refresh, most-asked-refresh]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: node --test (lambda/${{ matrix.lambda }})
+        working-directory: lambda/${{ matrix.lambda }}
+        run: node --test
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+      - name: Format check
+        run: terraform fmt -check -recursive
+      - name: Validate (no backend, no AWS)
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate

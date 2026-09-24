@@ -158,8 +158,8 @@ resource "aws_lambda_function" "most_asked_refresh" {
 }
 
 resource "aws_cloudwatch_event_rule" "most_asked_refresh_daily" {
-  name        = "${local.name_prefix}-most-asked-refresh-daily"
-  description = "Runs the Most Asked Questions auto-refresh trigger-day check once a day at 09:00 UTC (late night across every continental US timezone)."
+  name                = "${local.name_prefix}-most-asked-refresh-daily"
+  description         = "Runs the Most Asked Questions auto-refresh trigger-day check once a day at 09:00 UTC (late night across every continental US timezone)."
   schedule_expression = "cron(0 9 * * ? *)"
 }
 
