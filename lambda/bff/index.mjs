@@ -2179,10 +2179,12 @@ export function createHandler({
             await recordAgentPlanChange(store, workspaceId, agent.name, nextPlan, actor.userId);
           }
           if (wasActive || reactivating) {
+            const query = event?.queryStringParameters ?? {};
+            let retellSync;
             try {
               const profile = await store.getProfile(workspaceId);
               const providers = await getProviders();
-              await syncRetellAgent({
+              const synced = await syncRetellAgent({
                 workspaceId,
                 agentId,
                 agent: updatedAgent,
@@ -2191,13 +2193,26 @@ export function createHandler({
                 providers,
                 getKnowledgeSigner,
                 toolBaseUrl,
+                retellEditsDecision: ["include", "discard"].includes(query.retellEdits) ? query.retellEdits : undefined,
+                promptSourceChoice: ["app", "retell"].includes(query.promptSource) ? query.promptSource : undefined,
               });
+              retellSync = synced.retellSync;
             } catch (syncError) {
-              // The edit is already saved either way - a Retell hiccup here
-              // shouldn't block the save, just leaves the live agent one
-              // sync behind until the next successful save or activation.
+              // The edit is saved either way, so the save still succeeds -
+              // but the app is told the change isn't live, instead of this
+              // only reaching the logs (which is how Samantha's saves failed
+              // unnoticed from Sep 17 to Sep 24, 2026).
               console.error("Failed to resync an active agent to Retell after edit", syncError);
+              retellSync = {
+                status: "failed",
+                message: syncError?.details?.message ?? syncError?.message ?? "Retell didn't accept the update.",
+              };
             }
+            return json(200, {
+              ...updatedAgent,
+              ...(retellSync.promptSource ? { promptSource: retellSync.promptSource } : {}),
+              retellSync,
+            });
           }
           return json(200, updatedAgent);
         } catch (error) {
@@ -5822,6 +5837,8 @@ export async function syncRetellAgent({
   providers,
   getKnowledgeSigner,
   toolBaseUrl,
+  retellEditsDecision,
+  promptSourceChoice,
 }) {
   const voiceId = resolveConfiguredVoiceId(
     agent?.configuration,
@@ -5842,20 +5859,55 @@ export async function syncRetellAgent({
     providers,
     getKnowledgeSigner,
   });
+  // promptSourceChoice is the customer flipping "Prompt Managed in
+  // Retell": "retell" hands the prompt to the dashboard, "app" takes it
+  // back and overwrites whatever is in Retell.
   const synced = await providers.retell.upsertAgent({
     retellAgentId: agent.retellAgentId,
     symanticAgentId: agentId,
     agentName: agent?.configuration?.name ?? agent.name,
     greeting: resolveGreeting(agent, profile),
     config,
+    promptSource: promptSourceChoice ?? agent.promptSource ?? "app",
+    lastPushedPromptHash: agent.retellPromptHash,
+    overwriteRetellPrompt: promptSourceChoice === "app",
+    retellEditsDecision,
   });
   try {
-    await store.updateAgentRuntime(workspaceId, agentId, { retellAgentId: synced.retellAgentId });
+    await store.updateAgentRuntime(workspaceId, agentId, {
+      retellAgentId: synced.retellAgentId,
+      ...(synced.promptSource ? { promptSource: synced.promptSource } : {}),
+      // Only when the app actually pushed its prompt - otherwise the hash
+      // of the last app push stays, so a later Retell edit is still spotted.
+      ...(synced.pushedPromptHash ? { retellPromptHash: synced.pushedPromptHash } : {}),
+    });
   } catch (error) {
     if (isConditionalCheckFailed(error)) throw error;
-    console.error("Failed to persist retellAgentId after Retell upsert", error);
+    console.error("Failed to persist Retell sync state after upsert", error);
   }
-  return { retellAgentId: synced.retellAgentId, config };
+  return {
+    retellAgentId: synced.retellAgentId,
+    config,
+    retellSync: retellSyncStatus(synced),
+  };
+}
+
+// What the Save Changes response tells the app about Retell: whether the
+// change is live, and if not, what's needed from the customer.
+export function retellSyncStatus(synced) {
+  if (synced?.published === false) {
+    return {
+      status: "needs_decision",
+      promptSource: synced.promptSource,
+      pendingRetellEdits: (synced.pendingRetellEdits ?? []).map((edit) => ({
+        scope: edit.scope,
+        field: edit.field,
+        live: edit.published,
+        draft: edit.draft,
+      })),
+    };
+  }
+  return { status: "live", promptSource: synced?.promptSource ?? "app", publishedVersion: synced?.publishedVersion ?? null };
 }
 
 // The phone-only half: provisions (or reuses) a Telnyx number and imports
@@ -6277,12 +6329,11 @@ async function updateKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
   const failedFor = [];
   await Promise.all(assignedTo.map(async (agent) => {
     try {
-      const llmId = await providers.retell.getAgentLlmId(agent.retellAgentId);
-      if (!llmId) throw new Error("Agent has no live Retell agent yet");
+      if (!agent.retellAgentId) throw new Error("Agent has no live Retell agent yet");
       const knowledgeBaseIds = (await Promise.all(
         (agent.configuration.knowledgeBaseIds ?? []).map((id) => store.getKnowledgeBase(workspaceId, id)),
       )).filter((item) => item?.retellKnowledgeBaseId).map((item) => item.retellKnowledgeBaseId);
-      await providers.retell.updateLlmKnowledgeBaseIds(llmId, knowledgeBaseIds);
+      await providers.retell.pushKnowledgeBaseIds(agent.retellAgentId, knowledgeBaseIds);
       pushedTo.push({ id: agent.id, name: agent.name });
     } catch (error) {
       console.error("Unable to push knowledge base edit to agent", { agentId: agent.id, error });
@@ -6324,13 +6375,10 @@ async function deleteKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
       const nextIds = (agent.configuration.knowledgeBaseIds ?? []).filter((id) => id !== knowledgeBaseId);
       await store.putAgent(workspaceId, agent.id, { ...agent, configuration: { ...agent.configuration, knowledgeBaseIds: nextIds } });
       if (agent.retellAgentId) {
-        const llmId = await providers.retell.getAgentLlmId(agent.retellAgentId);
-        if (llmId) {
-          const remainingRetellIds = (await Promise.all(
-            nextIds.map((id) => store.getKnowledgeBase(workspaceId, id)),
-          )).filter((item) => item?.retellKnowledgeBaseId).map((item) => item.retellKnowledgeBaseId);
-          await providers.retell.updateLlmKnowledgeBaseIds(llmId, remainingRetellIds);
-        }
+        const remainingRetellIds = (await Promise.all(
+          nextIds.map((id) => store.getKnowledgeBase(workspaceId, id)),
+        )).filter((item) => item?.retellKnowledgeBaseId).map((item) => item.retellKnowledgeBaseId);
+        await providers.retell.pushKnowledgeBaseIds(agent.retellAgentId, remainingRetellIds);
       }
       unassignedFrom.push({ id: agent.id, name: agent.name });
     } catch (error) {
@@ -6651,6 +6699,7 @@ function toPublicAgent(item) {
     agentId,
     retellAgentId: _retellAgentId,
     retellLlmId: _retellLlmId,
+    retellPromptHash: _retellPromptHash,
     retellKnowledgeBaseId: _retellKnowledgeBaseId,
     retellKnowledgeBaseFingerprint: _retellKnowledgeBaseFingerprint,
     telnyxNumberId: _telnyxNumberId,

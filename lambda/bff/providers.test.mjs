@@ -5,8 +5,10 @@ import {
   createAnthropicClient,
   createRetellClient,
   createTelnyxClient,
+  promptHash,
   resolveRetellVoiceId,
 } from "./providers.mjs";
+import { createFakeRetell } from "./test-support/fake-retell.mjs";
 
 function response(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -379,22 +381,9 @@ test("Telnyx searchAvailableNumbers rejects a malformed area code", async () => 
   );
 });
 
-test("Retell upsert creates an LLM and voice agent with compiled config", async () => {
-  const calls = [];
-  const fetchImpl = async (url, init = {}) => {
-    calls.push([String(url), init]);
-    if (String(url).includes("/v2/list-agents")) {
-      return response([]);
-    }
-    if (String(url).endsWith("/create-retell-llm")) {
-      return response({ llm_id: "llm-123" }, 201);
-    }
-    return response({ agent_id: "retell-agent-123" }, 201);
-  };
-  const client = createRetellClient({
-    apiKey: "retell-key",
-    fetchImpl,
-  });
+test("Retell upsert creates an LLM and voice agent with compiled config, then publishes it", async () => {
+  const fake = createFakeRetell();
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl: fake.fetchImpl });
   const config = {
     prompt: "Compiled prompt",
     tools: [{ type: "custom", name: "lead_capture" }],
@@ -410,33 +399,32 @@ test("Retell upsert creates an LLM and voice agent with compiled config", async 
     config,
   });
 
-  assert.deepEqual(result, {
-    retellAgentId: "retell-agent-123",
-  });
-  assert.equal(calls[0][0], "https://api.retellai.com/v2/list-agents?limit=1000");
-  assert.deepEqual(JSON.parse(calls[0][1].body), {
+  assert.equal(result.published, true);
+  assert.equal(result.promptSource, "app");
+  const [list, createLlm, createAgent, versions, publish] = fake.requests;
+  assert.equal(list.path, "/v2/list-agents");
+  assert.deepEqual(list.body, {
     filter_criteria: { channel: { type: "string", op: "eq", value: "voice" } },
   });
-  assert.equal(calls[1][0], "https://api.retellai.com/create-retell-llm");
-  assert.deepEqual(JSON.parse(calls[1][1].body), {
+  assert.equal(createLlm.path, "/create-retell-llm");
+  assert.deepEqual(createLlm.body, {
     start_speaker: "agent",
     begin_message: "Thanks for calling.",
     general_prompt: "Compiled prompt",
     general_tools: config.tools,
     knowledge_base_ids: [],
   });
-  assert.equal(calls[2][0], "https://api.retellai.com/create-agent");
-  assert.deepEqual(JSON.parse(calls[2][1].body), {
-    response_engine: {
-      type: "retell-llm",
-      llm_id: "llm-123",
-    },
+  assert.equal(createAgent.path, "/create-agent");
+  assert.deepEqual(createAgent.body, {
+    response_engine: { type: "retell-llm", llm_id: "llm_1" },
     voice_id: "retell-Cimo",
     ambient_sound: null,
     agent_name: "Symantic agent-123 · Maya",
     webhook_events: ["call_started", "call_ended", "call_analyzed"],
   });
-  assert.equal(calls[2][1].headers.Authorization, "Bearer retell-key");
+  assert.equal(versions.path, `/list-agent-versions/${result.retellAgentId}`);
+  assert.equal(publish.path, `/publish-agent-version/${result.retellAgentId}`);
+  assert.deepEqual(publish.body, { version: 0, version_title: "Saved from Symantic" });
 });
 
 test("Retell agent body passes a chosen ambient sound through to Retell verbatim", async () => {
@@ -494,8 +482,8 @@ test("Retell imports a Telnyx DID and binds it to the synced agent", async () =>
     sip_trunk_auth_username: "telnyx-user",
     sip_trunk_auth_password: "telnyx-password",
     transport: "TCP",
-    inbound_agents: [{ agent_id: "retell-agent-123", weight: 1 }],
-    outbound_agents: [{ agent_id: "retell-agent-123", weight: 1 }],
+    inbound_agents: [{ agent_id: "retell-agent-123", agent_version: "latest_published", weight: 1 }],
+    outbound_agents: [{ agent_id: "retell-agent-123", agent_version: "latest_published", weight: 1 }],
     nickname: "Symantic workspace-123 agent-123",
     inbound_webhook_url: "https://api.example.com/retell/inbound-lookup",
   });
@@ -556,150 +544,75 @@ test("Retell creates a knowledge base with a URL source and auto-refresh enabled
 });
 
 test("Retell upsert reuses a Symantic-named agent instead of creating another", async () => {
-  const calls = [];
-  const fetchImpl = async (url, init = {}) => {
-    calls.push([String(url), init]);
-    if (String(url).includes("/v2/list-agents")) {
-      return response([{
-        agent_id: "retell-existing",
-        agent_name: "Symantic agent-123 · Maya",
-        response_engine: {
-          type: "retell-llm",
-          llm_id: "llm-existing",
-        },
-      }]);
-    }
-    return response({ ok: true });
-  };
-  const client = createRetellClient({
-    apiKey: "retell-key",
-    fetchImpl,
-  });
+  const fake = createFakeRetell();
+  const { agentId } = fake.seedAgent({ versions: [{
+    published: true,
+    agent: { agent_name: "Symantic agent-123 · Maya" },
+    llm: { general_prompt: "Updated prompt" },
+  }] });
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl: fake.fetchImpl });
 
   const result = await client.upsertAgent({
     symanticAgentId: "agent-123",
     agentName: "Maya",
     greeting: "Hello.",
-    config: {
-      prompt: "Updated prompt",
-      tools: [],
-      voice: "retell-Cimo",
-    },
+    config: { prompt: "Updated prompt", tools: [], voice: "retell-Cimo" },
   });
 
-  assert.deepEqual(result, {
-    retellAgentId: "retell-existing",
-  });
-  assert.equal(calls[0][0], "https://api.retellai.com/v2/list-agents?limit=1000");
-  assert.equal(
-    calls[1][0],
-    "https://api.retellai.com/update-retell-llm/llm-existing",
-  );
-  assert.equal(
-    calls[2][0],
-    "https://api.retellai.com/update-agent/retell-existing",
-  );
-  assert.ok(!calls.some(([url]) => url.endsWith("/create-agent")));
+  assert.equal(result.retellAgentId, agentId);
+  assert.equal(result.published, true);
+  assert.equal(fake.requests[0].path, "/v2/list-agents");
+  assert.ok(!fake.requests.some((request) => request.path === "/create-agent"));
 });
 
 test("Retell upsert looks up by Symantic name after a stored agent id 404s", async () => {
-  const calls = [];
-  const fetchImpl = async (url, init = {}) => {
-    calls.push([String(url), init]);
-    if (String(url).includes("/get-agent/")) {
-      return response({ message: "not found" }, 404);
-    }
-    if (String(url).includes("/v2/list-agents")) {
-      return response({
-        agents: [{
-          agent_id: "retell-recovered",
-          agent_name: "Symantic agent-123 · Maya",
-          response_engine: {
-            type: "retell-llm",
-            llm_id: "llm-recovered",
-          },
-        }],
-      });
-    }
-    return response({ ok: true });
-  };
-  const client = createRetellClient({
-    apiKey: "retell-key",
-    fetchImpl,
-  });
+  const fake = createFakeRetell();
+  const { agentId } = fake.seedAgent({ versions: [{
+    published: true,
+    agent: { agent_name: "Symantic agent-123 · Maya" },
+    llm: { general_prompt: "Updated prompt" },
+  }] });
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl: fake.fetchImpl });
 
   const result = await client.upsertAgent({
     retellAgentId: "retell-stale",
     symanticAgentId: "agent-123",
     agentName: "Maya",
     greeting: "Hello.",
-    config: {
-      prompt: "Updated prompt",
-      tools: [],
-      voice: "retell-Cimo",
-    },
+    config: { prompt: "Updated prompt", tools: [], voice: "retell-Cimo" },
   });
 
-  assert.deepEqual(result, {
-    retellAgentId: "retell-recovered",
-  });
-  assert.equal(
-    calls[0][0],
-    "https://api.retellai.com/get-agent/retell-stale",
-  );
-  assert.equal(calls[1][0], "https://api.retellai.com/v2/list-agents?limit=1000");
-  assert.ok(!calls.some(([url]) => url.endsWith("/create-agent")));
+  assert.equal(result.retellAgentId, agentId);
+  assert.equal(fake.requests[0].path, "/get-agent/retell-stale");
+  assert.equal(fake.requests[1].path, "/v2/list-agents");
+  assert.ok(!fake.requests.some((request) => request.path === "/create-agent"));
 });
 
-test("Retell upsert updates the existing LLM and agent", async () => {
-  const calls = [];
-  const fetchImpl = async (url, init = {}) => {
-    calls.push([String(url), init]);
-    if (init.method === "GET") {
-      return response({
-        agent_id: "retell-agent-123",
-        response_engine: {
-          type: "retell-llm",
-          llm_id: "llm-existing",
-        },
-      });
-    }
-    return response({ ok: true });
-  };
-  const client = createRetellClient({
-    apiKey: "retell-key",
-    fetchImpl,
-  });
+test("Retell upsert updates and publishes an agent the app created that was never published, and repoints its number", async () => {
+  const fake = createFakeRetell();
+  const { agentId } = fake.seedAgent({ versions: [{
+    published: false,
+    agent: { agent_name: "Symantic agent-123 · Maya" },
+    llm: { general_prompt: "Old prompt" },
+  }] });
+  fake.seedPhone("+17035550177", agentId);
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl: fake.fetchImpl });
 
   const result = await client.upsertAgent({
-    retellAgentId: "retell-agent-123",
+    retellAgentId: agentId,
     symanticAgentId: "agent-123",
     agentName: "Maya",
     greeting: "Hello.",
-    config: {
-      prompt: "Updated prompt",
-      tools: [],
-      voice: "retell-Cimo",
-    },
+    config: { prompt: "Updated prompt", tools: [], voice: "retell-Cimo" },
+    lastPushedPromptHash: promptHash("Old prompt"),
   });
 
-  assert.deepEqual(result, {
-    retellAgentId: "retell-agent-123",
-  });
-  assert.equal(
-    calls[0][0],
-    "https://api.retellai.com/get-agent/retell-agent-123",
-  );
-  assert.equal(
-    calls[1][0],
-    "https://api.retellai.com/update-retell-llm/llm-existing",
-  );
-  assert.equal(
-    calls[2][0],
-    "https://api.retellai.com/update-agent/retell-agent-123",
-  );
-  assert.equal(calls[1][1].method, "PATCH");
-  assert.equal(calls[2][1].method, "PATCH");
+  assert.equal(result.published, true);
+  assert.equal(result.publishedVersion, 0);
+  const live = fake.answering("+17035550177");
+  assert.equal(live.binding, "latest_published");
+  assert.equal(live.llm.general_prompt, "Updated prompt");
+  assert.equal(live.agent.voice_id, "retell-Cimo");
 });
 
 test("Retell test call sends provider IDs only in the provider request", async () => {

@@ -1440,6 +1440,135 @@ test("PUT agent keeps an already-active agent active and pushes the edit to Rete
   assert.match(retellCalls[0].config.prompt, /Updated answering restrictions/);
 });
 
+// Shared set-up for Save Changes on a live agent: a store that keeps what
+// the route writes, and a Retell whose upsert the test controls.
+async function saveLiveAgent({ upsertAgent, query, existingOverrides = {} }) {
+  const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123", ...existingOverrides };
+  let record = existing;
+  const runtimeUpdates = [];
+  const retellCalls = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return record; },
+    async getProfile() { return receptionistProfile(); },
+    async putAgent(_workspaceId, _agentId, agent) { record = { ...record, ...agent }; return record; },
+    async updateAgentRuntime(_workspaceId, _agentId, updates) {
+      runtimeUpdates.push(updates);
+      record = { ...record, ...Object.fromEntries(Object.entries(updates).filter(([, value]) => value !== undefined)) };
+      return record;
+    },
+  };
+  const providers = {
+    retell: {
+      async upsertAgent(input) {
+        retellCalls.push(input);
+        return upsertAgent(input);
+      },
+    },
+    resolveVoiceId(requestedVoice) { return requestedVoice; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => providers,
+    toolBaseUrl: "https://api.example.com",
+  });
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", existing, query));
+  return { response, body: JSON.parse(response.body), runtimeUpdates, retellCalls, record: () => record };
+}
+
+test("Save Changes on a live agent still saves when Retell rejects the update, but tells the app it isn't live (no more silent failures)", async () => {
+  const { response, body, record } = await saveLiveAgent({
+    async upsertAgent() {
+      throw Object.assign(new Error("Retell request failed"), {
+        details: { message: "Cannot update response engine after agent versions have been created" },
+      });
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(record().status, "active");
+  assert.deepEqual(body.retellSync, {
+    status: "failed",
+    message: "Cannot update response engine after agent versions have been created",
+  });
+});
+
+test("Save Changes reports a live publish, and records who owns the prompt and the hash of what the app pushed", async () => {
+  const { body, runtimeUpdates, retellCalls } = await saveLiveAgent({
+    async upsertAgent() {
+      return { retellAgentId: "retell-agent-123", published: true, publishedVersion: 4, promptSource: "app", pushedPromptHash: "hash-1" };
+    },
+    existingOverrides: { promptSource: "app", retellPromptHash: "hash-0" },
+  });
+
+  assert.equal(retellCalls[0].promptSource, "app");
+  assert.equal(retellCalls[0].lastPushedPromptHash, "hash-0");
+  assert.equal(retellCalls[0].overwriteRetellPrompt, false);
+  assert.deepEqual(runtimeUpdates.at(-1), { retellAgentId: "retell-agent-123", promptSource: "app", retellPromptHash: "hash-1" });
+  assert.deepEqual(body.retellSync, { status: "live", promptSource: "app", publishedVersion: 4 });
+});
+
+test("Save Changes on an agent whose prompt is hand-written in Retell keeps promptSource retell and the old app hash", async () => {
+  const { body, runtimeUpdates } = await saveLiveAgent({
+    async upsertAgent() {
+      return { retellAgentId: "retell-agent-123", published: true, publishedVersion: 3, promptSource: "retell" };
+    },
+  });
+
+  assert.equal(runtimeUpdates.at(-1).promptSource, "retell");
+  assert.equal("retellPromptHash" in runtimeUpdates.at(-1), false);
+  assert.equal(body.retellSync.promptSource, "retell");
+  assert.equal(body.promptSource, "retell");
+});
+
+test("Save Changes returns Retell's unpublished dashboard edits for the customer to decide on, and passes the decision through on the retry", async () => {
+  const pending = [{ scope: "llm", field: "model", published: "gpt-5.6-terra", draft: "gpt-5" }];
+  const first = await saveLiveAgent({
+    async upsertAgent() {
+      return { retellAgentId: "retell-agent-123", published: false, promptSource: "retell", pendingRetellEdits: pending };
+    },
+  });
+  assert.deepEqual(first.body.retellSync, {
+    status: "needs_decision",
+    promptSource: "retell",
+    pendingRetellEdits: [{ scope: "llm", field: "model", live: "gpt-5.6-terra", draft: "gpt-5" }],
+  });
+
+  const retry = await saveLiveAgent({
+    async upsertAgent() {
+      return { retellAgentId: "retell-agent-123", published: true, publishedVersion: 3, promptSource: "retell" };
+    },
+    query: { retellEdits: "discard" },
+  });
+  assert.equal(retry.retellCalls[0].retellEditsDecision, "discard");
+  assert.equal(retry.body.retellSync.status, "live");
+});
+
+test("Save Changes with promptSource=app takes the prompt back from Retell on purpose; promptSource=retell hands it over", async () => {
+  const takeBack = await saveLiveAgent({
+    async upsertAgent() { return { retellAgentId: "retell-agent-123", published: true, promptSource: "app", pushedPromptHash: "h" }; },
+    query: { promptSource: "app" },
+    existingOverrides: { promptSource: "retell" },
+  });
+  assert.equal(takeBack.retellCalls[0].promptSource, "app");
+  assert.equal(takeBack.retellCalls[0].overwriteRetellPrompt, true);
+
+  const handOver = await saveLiveAgent({
+    async upsertAgent() { return { retellAgentId: "retell-agent-123", published: true, promptSource: "retell" }; },
+    query: { promptSource: "retell" },
+  });
+  assert.equal(handOver.retellCalls[0].promptSource, "retell");
+  assert.equal(handOver.retellCalls[0].overwriteRetellPrompt, false);
+
+  const junk = await saveLiveAgent({
+    async upsertAgent() { return { retellAgentId: "retell-agent-123", published: true, promptSource: "app" }; },
+    query: { promptSource: "anything", retellEdits: "yolo" },
+  });
+  assert.equal(junk.retellCalls[0].promptSource, "app");
+  assert.equal(junk.retellCalls[0].retellEditsDecision, undefined);
+});
+
 test("GET calls lists workspace calls without exposing Retell identifiers", async () => {
   const calls = [{
     workspaceId: "user-123",
@@ -5384,8 +5513,7 @@ test("PATCH knowledge-bases/{id} re-scrapes a website under a new Retell id and 
         return { knowledgeBaseId: "retell-kb-new" };
       },
       async deleteKnowledgeBase(id) { deleted.push(id); },
-      async getAgentLlmId() { return "llm-1"; },
-      async updateLlmKnowledgeBaseIds() {},
+      async pushKnowledgeBaseIds() {},
     },
   };
   const { createHandler } = await loadBff();
@@ -5450,11 +5578,8 @@ test("PATCH knowledge-bases/{id} re-uploads the text to Retell under a new id an
         return { knowledgeBaseId: "retell-kb-new" };
       },
       async deleteKnowledgeBase(id) { deleted.push(id); },
-      async getAgentLlmId(retellAgentId) {
-        return retellAgentId === "retell-agent-1" ? "llm-1" : null;
-      },
-      async updateLlmKnowledgeBaseIds(llmId, ids) {
-        pushedIds.push([llmId, ids]);
+      async pushKnowledgeBaseIds(retellAgentId, ids) {
+        pushedIds.push([retellAgentId, ids]);
       },
     },
   };
@@ -5475,7 +5600,7 @@ test("PATCH knowledge-bases/{id} re-uploads the text to Retell under a new id an
   assert.deepEqual(body.pushedTo, [{ id: "agent-1", name: "Maya" }]);
   assert.deepEqual(body.failedFor, []);
   assert.equal(pushedIds.length, 1);
-  assert.equal(pushedIds[0][0], "llm-1");
+  assert.equal(pushedIds[0][0], "retell-agent-1");
   assert.deepEqual(new Set(pushedIds[0][1]), new Set(["retell-kb-new", "retell-kb-2"]));
 });
 
@@ -5490,8 +5615,7 @@ test("PATCH knowledge-bases/{id} reports per-agent push failures without blockin
     retell: {
       async createKnowledgeBase() { return { knowledgeBaseId: "retell-kb-new" }; },
       async deleteKnowledgeBase() {},
-      async getAgentLlmId() { return null; },
-      async updateLlmKnowledgeBaseIds() { throw new Error("should not be called without an llmId"); },
+      async pushKnowledgeBaseIds() { throw new Error("should not be called for an agent with no Retell agent"); },
     },
   };
   const { createHandler } = await loadBff();
@@ -5628,8 +5752,7 @@ test("DELETE knowledge-bases/{id} auto-unassigns from every agent, pushes the ch
   const providers = {
     retell: {
       async deleteKnowledgeBase(id) { deleted.push(id); },
-      async getAgentLlmId() { return "llm-1"; },
-      async updateLlmKnowledgeBaseIds(llmId, ids) { pushedIds.push([llmId, ids]); },
+      async pushKnowledgeBaseIds(retellAgentId, ids) { pushedIds.push([retellAgentId, ids]); },
     },
   };
   const { createHandler } = await loadBff();
@@ -5647,7 +5770,8 @@ test("DELETE knowledge-bases/{id} auto-unassigns from every agent, pushes the ch
   assert.equal(store.agents[0].configuration.knowledgeBaseIds.includes("kb-1"), false);
   assert.equal(store.knowledgeBases.has("kb-1"), false);
   assert.equal(pushedIds.length, 1);
-  assert.equal(pushedIds[0][0], "llm-1");
+  assert.equal(pushedIds[0][0], "retell-agent-1");
+  assert.deepEqual(pushedIds[0][1], []);
 });
 
 test("DELETE knowledge-bases/{id} leaves the record intact when Retell won't confirm the deletion", async () => {
