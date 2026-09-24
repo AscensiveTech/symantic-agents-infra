@@ -1,8 +1,11 @@
+import { effectiveProfile } from "./profile.mjs";
+
 export async function handleTransfer(input, { store }) {
-  const [agent, profile] = await Promise.all([
+  const [agent, workspaceProfile] = await Promise.all([
     store.getAgent(input.workspaceId, stringOrUndefined(input.agentId)),
     store.getBusinessProfile(input.workspaceId),
   ]);
+  const profile = effectiveProfile(agent, workspaceProfile);
   const configuration = agent?.configuration ?? {};
   const reason = stringOrUndefined(input.reason) || "";
   const matchedEmergency = matchEmergencyRule(configuration.emergencyRules, reason);
@@ -25,9 +28,7 @@ export async function handleTransfer(input, { store }) {
     ];
   const transferTarget = [
     ...policyCandidates,
-    profile?.escalationContact,
     profile?.ownerPhone,
-    profile?.fallbackPhone,
   ].map(extractPhone).find(Boolean);
 
   if (!transferTarget) {

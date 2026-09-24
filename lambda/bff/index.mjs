@@ -7,7 +7,7 @@ import {
   ProviderRequestError,
   resolveRetellVoiceId,
 } from "./providers.mjs";
-import { buildReceptionistConfig, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
+import { buildReceptionistConfig, effectiveProfile, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
@@ -1860,7 +1860,7 @@ export function createHandler({
             typeof store.getCalendarConnection === "function"
           ? await store.getCalendarConnection(workspaceId, agentAction.agentId)
           : null;
-        const launchIssue = launchReadinessIssue(agent, profile, calendar);
+        const launchIssue = launchReadinessIssue(agent, effectiveProfile(agent, profile), calendar);
         if (launchIssue) return json(409, { message: launchIssue });
         const providers = await getProviders();
         // Retell-only - no phone number touched here. Attaching one is a
@@ -2036,8 +2036,7 @@ export function createHandler({
           retellAgentId: runtime.retellAgentId,
           workspaceId,
           agentId: agentAction.agentId,
-          currentTime: formatCurrentTime(profile.timezone),
-          timezone: typeof profile.timezone === "string" ? profile.timezone : "UTC",
+          ...agentClock(effectiveProfile(agent, profile)),
         });
         return json(202, {
           ...call,
@@ -5544,8 +5543,7 @@ async function handleInboundLookup(event, {
       dynamic_variables: {
         workspaceId: phoneNumber.workspaceId,
         agentId: phoneNumber.agentId,
-        currentTime: formatCurrentTime(profile.timezone),
-        timezone: typeof profile.timezone === "string" ? profile.timezone : "UTC",
+        ...agentClock(effectiveProfile(agent, profile)),
       },
       metadata: {
         workspaceId: phoneNumber.workspaceId,
@@ -6353,6 +6351,13 @@ async function deleteKnowledgeBaseItem(store, providers, workspaceId, knowledgeB
 
   await store.deleteKnowledgeBaseRecord(workspaceId, knowledgeBaseId);
   return { ok: true, unassignedFrom, failedToUnassign };
+}
+
+// The local time a call starts at, in the answering agent's own timezone -
+// two agents in one workspace can serve locations in different timezones.
+function agentClock(profile) {
+  const timezone = typeof profile?.timezone === "string" && profile.timezone ? profile.timezone : "UTC";
+  return { currentTime: formatCurrentTime(timezone), timezone };
 }
 
 function launchReadinessIssue(agent, profile, calendar) {

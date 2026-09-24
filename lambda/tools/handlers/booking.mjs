@@ -8,6 +8,7 @@ import {
 } from "./records.mjs";
 import { resolveTimeRange } from "./time.mjs";
 import { enforceMinimumLeadTime, paddedProviderRange, resolveAppointmentType } from "./appointment-types.mjs";
+import { effectiveProfile } from "./profile.mjs";
 
 export async function handleFindAppointment(input, { store }) {
   const callerPhone = normalizePhone(
@@ -71,9 +72,9 @@ export async function handleCreateBooking(input, {
   );
   if (existing) return appointmentResponse(existing);
 
-  const profile = await store.getBusinessProfile(input.workspaceId);
-  const timezone = profile?.timezone || "UTC";
   const agent = await store.getAgent(input.workspaceId, input.agentId);
+  const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
+  const timezone = profile?.timezone || "UTC";
   const appointmentType = resolveAppointmentType(agent, input.appointmentType);
 
   // When a configured type matches, its Duration is authoritative - the
@@ -201,7 +202,8 @@ export async function handleRescheduleBooking(input, {
     });
   }
 
-  const profile = await store.getBusinessProfile(input.workspaceId);
+  const agent = await store.getAgent(input.workspaceId, input.agentId ?? appointment.agentId);
+  const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
   const timezone = profile?.timezone || appointment.timezone || "UTC";
   const range = resolveTimeRange(input, timezone, now);
   // Same race the create-booking path guards against - hold the target

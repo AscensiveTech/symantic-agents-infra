@@ -62,16 +62,17 @@ const agent = {
   },
 };
 
-test("prompt builder includes hours, FAQs, and emergency rules", () => {
+test("prompt builder includes hours and emergency rules, but never the workspace profile's uneditable FAQs, description, or policies", () => {
   const prompt = buildReceptionistPrompt(agent, profile);
 
   assert.match(prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
-  assert.match(prompt, /- Services and business overview: Family dentistry/);
-  assert.doesNotMatch(prompt, /^- Description:/m);
-  assert.doesNotMatch(prompt, /^- Services:/m);
-  assert.match(prompt, /Do you accept insurance\?/);
-  assert.match(prompt, /Yes, most PPO plans\./);
-  assert.match(prompt, /Do you see children\?/);
+  // These profile fields can't be edited on any screen and in production only
+  // ever held sample data - they must not reach a live agent.
+  assert.doesNotMatch(prompt, /Family dentistry/);
+  assert.doesNotMatch(prompt, /Do you accept insurance\?/);
+  assert.doesNotMatch(prompt, /Give 24 hours notice/);
+  assert.doesNotMatch(prompt, /Warm and concise/);
+  assert.match(prompt, /this agent's knowledge base/);
   assert.match(prompt, /severe bleeding or trouble breathing/);
   assert.match(prompt, /chest pain/);
   assert.match(prompt, /can't breathe/);
@@ -185,10 +186,11 @@ test("a 'decline' emergency rule's transferTarget never becomes a transfer_call 
     voiceId: "retell-voice-1",
   });
   // "+17035550102" is the decline rule's own transferTarget - it must never
-  // appear as a transfer destination. profile still legitimately contributes
-  // its own 3 (escalationContact, ownerPhone, fallbackPhone).
+  // appear as a transfer destination. The only general destination is the
+  // agent's own forwarding number (ownerPhone); the uneditable escalation
+  // and fallback numbers are never used.
   assert.ok(!config.transferNumbers.includes("+17035550102"));
-  assert.equal(config.tools.filter(({ type }) => type === "transfer_call").length, 3);
+  assert.deepEqual(config.transferNumbers, ["+17035550100"]);
 });
 
 test("allowCallTransfers: false means no transfer_call tool exists at all, even with rules, escalation, and owner/fallback numbers all configured", () => {
@@ -253,23 +255,59 @@ test("resolveGreeting uses the configured greeting when set, otherwise builds on
   assert.equal(resolveGreeting(agent, profile), agent.configuration.greeting);
   assert.equal(
     resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "" } }, profile),
-    "Thanks for calling Arc Dental. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
+    "Thanks for calling Arc Dental. This is Maya, the virtual receptionist. How can I help you today?",
   );
   assert.equal(
     resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "  " } }, { ...profile, businessName: "" }),
-    "Thanks for calling the business. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
+    "Thanks for calling the business. This is Maya, the virtual receptionist. How can I help you today?",
   );
   assert.equal(
     resolveGreeting({ configuration: {} }, { businessName: "Rivertown Plumbing" }),
-    "Thanks for calling Rivertown Plumbing. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, the AI voice agent, to assist you while we are unable to do so. How can we help you today?",
+    "Thanks for calling Rivertown Plumbing. This is the AI voice agent, the virtual receptionist. How can I help you today?",
   );
 });
 
 test("resolveGreeting adds a short recording disclosure line when recordingDisclosure is on", () => {
   assert.equal(
     resolveGreeting({ configuration: { recordingDisclosure: true, name: "Maya" } }, { businessName: "Arc Dental" }),
-    "Thanks for calling Arc Dental. This call may be recorded for quality assurance. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
+    "Thanks for calling Arc Dental. This call may be recorded for quality assurance. This is Maya, the virtual receptionist. How can I help you today?",
   );
+});
+
+test("an agent's own Business Profile replaces the workspace's - two agents in one workspace can be two different locations", () => {
+  const maryland = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      greeting: "",
+      allowCallTransfers: true,
+      emergencyRules: [],
+      businessProfile: {
+        businessName: "Arc Dental Maryland",
+        timezone: "America/New_York",
+        hours: "Tue-Thu, 9:00 AM-1:00 PM",
+        serviceAreas: ["Bethesda, MD"],
+        ownerPhone: "+13015550111",
+      },
+    },
+  };
+  const config = buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: maryland,
+    profile: { ...profile, serviceAreas: ["Charleston, SC"] },
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+
+  assert.match(config.prompt, /AI voice agent for Arc Dental Maryland/);
+  assert.match(config.prompt, /Tue-Thu, 9:00 AM-1:00 PM/);
+  assert.doesNotMatch(config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
+  assert.match(config.prompt, /Published coverage: Bethesda, MD/);
+  assert.doesNotMatch(config.prompt, /Charleston/);
+  assert.deepEqual(config.transferNumbers, ["+13015550111"]);
+  // Fields the agent hasn't saved for itself still fall back to the workspace.
+  assert.match(config.prompt, /Address: 123 Main Street/);
+  assert.match(resolveGreeting(maryland, profile), /^Thanks for calling Arc Dental Maryland\./);
 });
 
 test("resolveCallHandling applies defaults and clamps to the Retell range", () => {
@@ -459,11 +497,11 @@ test("receptionist config exposes lookup tools, invocation-safe functions, and n
 
   assert.equal(config.voice, "retell-voice-1");
   assert.equal(config.bookingEnabled, true);
+  // The rule's own target, then the agent's forwarding number. The
+  // workspace profile's escalation/fallback numbers are never destinations.
   assert.deepEqual(config.transferNumbers, [
     "+17035550102",
-    "+17035550199",
     "+17035550100",
-    "+17035550188",
   ]);
   const customTools = config.tools.filter(({ type }) => type === "custom");
   assert.deepEqual(
@@ -497,7 +535,7 @@ test("receptionist config exposes lookup tools, invocation-safe functions, and n
   assert.deepEqual(config.allowedInboundCountries, []);
 
   const transferTools = config.tools.filter(({ type }) => type === "transfer_call");
-  assert.equal(transferTools.length, 4);
+  assert.equal(transferTools.length, 2);
   assert.deepEqual(transferTools[0].transfer_destination, {
     type: "predefined",
     number: "+17035550102",

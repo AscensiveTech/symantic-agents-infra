@@ -1,14 +1,15 @@
 import { resolveTimeRange } from "./time.mjs";
 import { enforceMinimumLeadTime, paddedProviderRange, resolveAppointmentType } from "./appointment-types.mjs";
+import { effectiveProfile } from "./profile.mjs";
 
 export async function handleAvailability(input, {
   store,
   calendar,
   now,
 }) {
-  const profile = await store.getBusinessProfile(input.workspaceId);
-  const timezone = profile?.timezone || "UTC";
   const agent = await store.getAgent(input.workspaceId, input.agentId);
+  const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
+  const timezone = profile?.timezone || "UTC";
   const appointmentType = resolveAppointmentType(agent, input.appointmentType);
   const range = resolveTimeRange(
     appointmentType

@@ -269,7 +269,55 @@ function buildServiceAreaTool(profile) {
 // Greeting Message when the customer has set one; otherwise builds one from
 // the real business/receptionist name rather than ever sending a blank or
 // placeholder greeting live.
-export function resolveGreeting(agent, profile) {
+// Every field on an agent's Business Profile step belongs to that agent
+// alone - two agents in one workspace can be two different locations with
+// different hours, timezone, service area, and forwarding number. Values an
+// agent hasn't saved for itself yet (agents created before this existed)
+// fall back to the workspace profile until its next Save Changes.
+export const AGENT_PROFILE_FIELDS = Object.freeze([
+  "businessName",
+  "phone",
+  "address",
+  "mailingAddress",
+  "website",
+  "timezone",
+  "contactEmails",
+  "serviceAreas",
+  "businessHours",
+  "hours",
+  "holidays",
+  "holidaysEnabled",
+  "ownerPhone",
+]);
+
+// Workspace profile fields no screen can edit any more. Existing workspaces
+// still carry sample-data values in them (a dental practice description,
+// dental FAQs, a policy, and fake 555 escalation/fallback numbers), so they
+// must never reach a live agent's instructions or transfer destinations.
+const UNEDITABLE_PROFILE_FIELDS = Object.freeze([
+  "description",
+  "faqs",
+  "policies",
+  "escalationContact",
+  "fallbackPhone",
+  "communicationStyle",
+  "businessType",
+]);
+
+export function effectiveProfile(agent, workspaceProfile) {
+  const merged = { ...(workspaceProfile ?? {}) };
+  for (const field of UNEDITABLE_PROFILE_FIELDS) delete merged[field];
+  const own = agent?.configuration?.businessProfile;
+  if (own && typeof own === "object") {
+    for (const field of AGENT_PROFILE_FIELDS) {
+      if (own[field] !== undefined) merged[field] = own[field];
+    }
+  }
+  return merged;
+}
+
+export function resolveGreeting(agent, workspaceProfile) {
+  const profile = effectiveProfile(agent, workspaceProfile);
   const configured = text(agent?.configuration?.greeting);
   if (configured) return configured;
   const businessName = text(profile?.businessName) || "the business";
@@ -277,19 +325,17 @@ export function resolveGreeting(agent, profile) {
   const disclosure = agent?.configuration?.recordingDisclosure
     ? " This call may be recorded for quality assurance."
     : "";
-  return `Thanks for calling ${businessName}.${disclosure} We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, ${receptionistName}, to assist you while we are unable to do so. How can we help you today?`;
+  return `Thanks for calling ${businessName}.${disclosure} This is ${receptionistName}, the virtual receptionist. How can I help you today?`;
 }
 
-export function buildReceptionistPrompt(agent, profile) {
+export function buildReceptionistPrompt(agent, workspaceProfile) {
+  const profile = effectiveProfile(agent, workspaceProfile);
   const behavior = agent?.configuration ?? {};
   const businessName = text(profile?.businessName) || "the business";
   const receptionistName = text(behavior.name) || text(agent?.name) || "the AI voice agent";
-  const tone = text(behavior.tone) || text(profile?.communicationStyle) || "clear, professional";
-  const faqs = Array.isArray(profile?.faqs) && profile.faqs.length
-    ? profile.faqs
-      .map(({ question, answer }) => `- Q: ${question}\n  A: ${answer}`)
-      .join("\n")
-    : "- No approved FAQs are configured. Take a message instead of guessing.";
+  const tone = text(behavior.tone) || "clear, professional";
+  const faqs = "- Answer from the business information above and this agent's knowledge base. "
+    + "If something isn't covered there, take a message instead of guessing.";
   const intents = list(behavior.intents);
   const hoursLine = isBusinessHours(profile?.businessHours)
     ? formatBusinessHours(profile.businessHours)
@@ -342,7 +388,6 @@ export function buildReceptionistPrompt(agent, profile) {
       + "into it\") - just do it and report what comes back.",
     "",
     "# BUSINESS INFO",
-    `- Services and business overview: ${text(profile?.description) || "Not provided"}`,
     `- Address: ${text(profile?.address) || "Not provided"}`,
     `- Timezone: ${text(profile?.timezone) || "UTC"}`,
     `- Hours: ${hoursLine}`,
@@ -370,7 +415,7 @@ export function buildReceptionistPrompt(agent, profile) {
       : []),
     "",
     "# APPROVED CALLER INTENTS",
-    intents || "Use the approved FAQs and take a message for anything else.",
+    intents || "Help with anything covered by the business information and knowledge base, and take a message for anything else.",
     "",
     "# ROLE AND APPROACH",
     text(behavior.roleInstructions) || text(agent?.description) || "Answer only from the approved business information below.",
@@ -387,9 +432,6 @@ export function buildReceptionistPrompt(agent, profile) {
         "",
       ]
       : []),
-    "# POLICIES",
-    text(profile?.policies) || "No additional policies are configured.",
-    "",
     "# KNOWLEDGE BASE / FAQS",
     faqs,
     "",
@@ -410,7 +452,7 @@ export function buildReceptionistPrompt(agent, profile) {
     allowCallTransfers
       ? "- If the caller asks for a specific person, a manager, or to speak with \"someone\", "
         + "don't guess or state who does or doesn't work here. Use the matching transfer_call "
-        + "tool from the rules above, or a configured escalation contact; otherwise let them "
+        + "tool from the rules above; otherwise let them "
         + "know everyone is currently unavailable and offer to take a message so the office "
         + "can follow up."
       : `- If the caller asks for a specific person, a manager, or to speak with "someone", ${NO_TRANSFER_FIXED_LINE}`,
@@ -453,10 +495,11 @@ export function buildReceptionistPrompt(agent, profile) {
 export function buildReceptionistConfig({
   workspaceId,
   agent,
-  profile,
+  profile: workspaceProfile,
   toolBaseUrl,
   voiceId,
 }) {
+  const profile = effectiveProfile(agent, workspaceProfile);
   const agentId = text(agent?.id) || text(agent?.agentId);
   if (!text(workspaceId) || !agentId) {
     throw new Error("workspaceId and Symantic agent id are required");
@@ -618,10 +661,11 @@ function buildTransferTools(agent, profile) {
           : "Warm transfer for this configured call transfer rule.",
       }];
     }),
+    // The agent's own forwarding number is the one general "talk to a
+    // person" destination; profile escalation/fallback numbers are no
+    // longer editable anywhere and only ever held sample data.
     ...[
-      profile?.escalationContact,
       profile?.ownerPhone,
-      profile?.fallbackPhone,
     ].flatMap((value) => {
       const number = toE164(value);
       return number
