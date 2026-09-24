@@ -209,26 +209,48 @@ test("allowCallTransfers: false means no transfer_call tool exists at all, even 
   assert.deepEqual(config.transferNumbers, []);
 });
 
-test("the prompt's Talk To A Human and Live Person Requests sections give the fixed apology line when transfers are off, and never mention the transfer_call tool there", () => {
+test("the prompt's Talk To A Human section gives each configured no-transfer rule's own message, plus an always-present fallback, and never mentions the transfer_call tool there", () => {
   const noTransferAgent = {
     ...agent,
     configuration: {
       ...agent.configuration,
       allowCallTransfers: false,
-      noTransferPhrases: ["I want to talk to a human", "is anyone there"],
+      noTransferRules: [
+        { phrases: ["talk to a supervisor"], message: "I'll pass that along and someone will call you back shortly." },
+        { phrases: [], message: "" },
+      ],
     },
   };
   const prompt = buildReceptionistPrompt(noTransferAgent, profile);
   const [, talkToHumanBody] = prompt.split("# TALK TO A HUMAN\n");
   const [, livePersonBody] = prompt.split("# LIVE PERSON REQUESTS\n");
+  assert.match(talkToHumanBody, /"talk to a supervisor": say "I'll pass that along/);
   assert.match(talkToHumanBody, /My apologies\. Since no one is available/);
-  assert.match(talkToHumanBody, /"I want to talk to a human", "is anyone there"/);
   assert.doesNotMatch(talkToHumanBody.split("\n\n")[0], /transfer_call/);
-  assert.match(livePersonBody, /My apologies\. Since no one is available/);
+  assert.match(livePersonBody, /the matching response in the rules above, or the fallback message/);
 
   const withTransferAgent = { ...agent, configuration: { ...agent.configuration, allowCallTransfers: true } };
   const withTransferPrompt = buildReceptionistPrompt(withTransferAgent, profile);
   assert.doesNotMatch(withTransferPrompt, /My apologies\. Since no one is available/);
+});
+
+test("a no-transfer rule missing either its phrases or its message is skipped from the prompt", () => {
+  const noTransferAgent = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      allowCallTransfers: false,
+      noTransferRules: [
+        { phrases: ["billing question"], message: "" },
+        { phrases: [], message: "Someone will call you back." },
+      ],
+    },
+  };
+  const prompt = buildReceptionistPrompt(noTransferAgent, profile);
+  const [, talkToHumanBody] = prompt.split("# TALK TO A HUMAN\n");
+  assert.doesNotMatch(talkToHumanBody, /billing question/);
+  assert.doesNotMatch(talkToHumanBody, /Someone will call you back\./);
+  assert.match(talkToHumanBody, /My apologies\. Since no one is available/);
 });
 
 test("an extension is dialed as a DTMF pause after the transfer number", () => {
