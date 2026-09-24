@@ -2620,11 +2620,12 @@ test("Dynamo agent updates preserve provider foreign keys", async () => {
   ));
 });
 
-test("POST activate syncs Retell only - no phone number is touched", async () => {
+test("POST activate publishes to Retell AND provisions a real Telnyx phone number - 'Create AI Voice Agent' means the whole thing done, not deferred to a separate Attach step", async () => {
   const events = [];
   const agent = receptionistAgent();
   agent.configuration.knowledgeBaseText = "Appointments require 24 hours notice for cancellation.";
   const profile = receptionistProfile();
+  let putPhoneNumberRecord;
   const store = {
     async ensureWorkspace() {},
     async getAgent(workspaceId, agentId) {
@@ -2646,6 +2647,10 @@ test("POST activate syncs Retell only - no phone number is touched", async () =>
       events.push(["getPhoneNumberForAgent"]);
       return null;
     },
+    async putPhoneNumber(record) {
+      events.push(["putPhoneNumber", record]);
+      putPhoneNumberRecord = record;
+    },
     async updateAgentRuntime(workspaceId, agentId, updates) {
       events.push(["updateAgentRuntime", workspaceId, agentId, updates]);
       return { ...agent, ...updates };
@@ -2664,7 +2669,7 @@ test("POST activate syncs Retell only - no phone number is touched", async () =>
     telnyx: {
       async ensureNumber(input) {
         events.push(["telnyx", input]);
-        throw new Error("activate must never provision a phone number");
+        return { telnyxNumberId: "telnyx-number-123", telnyxPhoneNumber: "+17035550199", telnyxOrderId: "order-123" };
       },
     },
     retell: {
@@ -2678,7 +2683,7 @@ test("POST activate syncs Retell only - no phone number is touched", async () =>
       },
       async importPhoneNumber(input) {
         events.push(["importPhoneNumber", input]);
-        throw new Error("activate must never import a phone number");
+        return { retellPhoneNumberId: "+17035550199" };
       },
     },
     resolveVoiceId(requestedVoice) {
@@ -2703,8 +2708,11 @@ test("POST activate syncs Retell only - no phone number is touched", async () =>
   assert.equal(body.agent.id, "agent-123");
   assert.equal(body.agent.status, "active");
   assert.equal(body.agent.everPublished, true);
-  assert.equal(body.phoneNumber, null);
-  assert.ok(!events.some(([name]) => name === "telnyx" || name === "importPhoneNumber"));
+  assert.equal(body.phoneNumber.phoneNumber, "+17035550199");
+  const telnyxInput = events.find(([name]) => name === "telnyx")[1];
+  assert.equal(telnyxInput.agentId, "agent-123");
+  assert.ok(events.some(([name]) => name === "importPhoneNumber"));
+  assert.equal(putPhoneNumberRecord.status, "active");
   const retellInput = events.find(([name]) => name === "retell")[1];
   assert.equal(retellInput.symanticAgentId, "agent-123");
   assert.match(retellInput.config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
@@ -2722,6 +2730,52 @@ test("POST activate syncs Retell only - no phone number is touched", async () =>
   assert.ok(retellInput.config.tools.filter(({ type }) => type === "custom").every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")
   ));
+});
+
+test("POST activate reuses an already-attached phone number (e.g. from an earlier Test call) instead of ordering a second one", async () => {
+  const events = [];
+  const agent = receptionistAgent();
+  const profile = receptionistProfile();
+  const existingPhone = {
+    workspaceId: "user-123",
+    phoneNumberId: "phone-agent-123",
+    agentId: "agent-123",
+    telnyxNumberId: "telnyx-number-existing",
+    telnyxPhoneNumber: "+17035550177",
+    retellPhoneNumberId: "+17035550177",
+    status: "draft",
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getProfile() { return profile; },
+    async getCalendarConnection() {
+      return { provider: "google-calendar", selectedCalendarId: "primary", connectionState: "connected" };
+    },
+    async getPhoneNumberForAgent() { return existingPhone; },
+    async putPhoneNumber(record) { events.push(["putPhoneNumber", record]); },
+    async updateAgentRuntime(workspaceId, agentId, updates) { return { ...agent, ...updates }; },
+    async putAgent() {},
+    async listKnowledgeBases() { return []; },
+  };
+  const providers = {
+    telnyx: {
+      async ensureNumber() { events.push(["telnyx"]); throw new Error("must not order a second number"); },
+    },
+    retell: {
+      async upsertAgent() { return { retellAgentId: "retell-agent-123" }; },
+      async importPhoneNumber() { events.push(["importPhoneNumber"]); throw new Error("already imported - must not import twice"); },
+    },
+    resolveVoiceId: (voice) => voice,
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers, toolBaseUrl: "https://api.example.com" });
+
+  const response = await handler(authenticatedEvent("POST", "/workspaces/me/agents/agent-123/activate"));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).phoneNumber.phoneNumber, "+17035550177");
+  assert.ok(!events.some(([name]) => name === "telnyx" || name === "importPhoneNumber"));
 });
 
 test("POST activate ignores an invalid transferTarget left over on a 'decline' emergency rule", async () => {
@@ -2749,6 +2803,7 @@ test("POST activate ignores an invalid transferTarget left over on a 'decline' e
       return { provider: "google-calendar", selectedCalendarId: "primary", connectionState: "connected" };
     },
     async getPhoneNumberForAgent() { return null; },
+    async putPhoneNumber() {},
     async updateAgentRuntime(workspaceId, agentId, updates) {
       return { ...agent, ...updates };
     },
@@ -2761,7 +2816,7 @@ test("POST activate ignores an invalid transferTarget left over on a 'decline' e
     },
   };
   const providers = {
-    telnyx: { async ensureNumber() { throw new Error("must not provision a number"); } },
+    telnyx: { async ensureNumber() { return { telnyxNumberId: "t1", telnyxPhoneNumber: "+17035550188" }; } },
     retell: {
       async createKnowledgeBase() { return { knowledgeBaseId: "knowledge-base-123", status: "in_progress" }; },
       async upsertAgent(input) {
@@ -2770,7 +2825,7 @@ test("POST activate ignores an invalid transferTarget left over on a 'decline' e
         assert.ok(!input.config.transferNumbers.includes("720431997"));
         return { retellAgentId: "retell-agent-123" };
       },
-      async importPhoneNumber() { throw new Error("must not import a number"); },
+      async importPhoneNumber() { return { retellPhoneNumberId: "+17035550188" }; },
     },
     resolveVoiceId() { return "retell-Cimo"; },
   };
@@ -2893,12 +2948,16 @@ test("POST activate no longer requires a successful test - an untested current c
       return { provider: "google-calendar", selectedCalendarId: "primary", connectionState: "connected" };
     },
     async getPhoneNumberForAgent() { return null; },
+    async putPhoneNumber() {},
     async updateAgentRuntime(workspaceId, agentId, updates) { return { ...agent, ...updates }; },
     async putAgent(workspaceId, agentId, nextAgent) { Object.assign(agent, nextAgent); return nextAgent; },
   };
   const providers = {
-    telnyx: { async ensureNumber() { throw new Error("activate must never provision a phone number"); } },
-    retell: { async upsertAgent() { return { retellAgentId: "retell-agent-123" }; } },
+    telnyx: { async ensureNumber() { return { telnyxNumberId: "t1", telnyxPhoneNumber: "+17035550188" }; } },
+    retell: {
+      async upsertAgent() { return { retellAgentId: "retell-agent-123" }; },
+      async importPhoneNumber() { return { retellPhoneNumberId: "+17035550188" }; },
+    },
     resolveVoiceId(requestedVoice) { return requestedVoice || "retell-Cimo"; },
   };
   const { createHandler } = await loadBff();

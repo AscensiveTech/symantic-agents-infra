@@ -121,7 +121,10 @@ test("Telnyx provisioning tags the new number with the agent's Receptionist Name
   assert.equal(calls.length, 5);
   assert.equal(calls[4][0], "https://api.telnyx.com/v2/phone_numbers/telnyx-number-real-123");
   assert.equal(calls[4][1].method, "PATCH");
-  assert.deepEqual(JSON.parse(calls[4][1].body), { tags: ["Alpine Shadows - Acme"] });
+  // Telnyx's own rule is letters/numbers/dashes/underscores only - spaces
+  // (including the " - " join separator) collapse to a single dash rather
+  // than being sent through and rejected.
+  assert.deepEqual(JSON.parse(calls[4][1].body), { tags: ["Alpine-Shadows-Acme"] });
 });
 
 test("Telnyx provisioning tags with the combined business name and agent name, sanitized and length-capped", async () => {
@@ -169,8 +172,40 @@ test("Telnyx provisioning tags with the combined business name and agent name, s
   const body = JSON.parse(calls[4][1].body);
   assert.equal(body.tags.length, 1);
   assert.ok(body.tags[0].length <= 50);
-  assert.ok(body.tags[0].startsWith("A Very Long Business Name"));
+  assert.ok(body.tags[0].startsWith("A-Very-Long-Business-Name"));
   assert.ok(!body.tags[0].includes("<"));
+  // Telnyx rejects anything outside letters/numbers/dashes/underscores.
+  assert.match(body.tags[0], /^[A-Za-z0-9_-]+$/);
+});
+
+test("a tag Telnyx would have rejected before (spaces, apostrophes, an ampersand) now reaches Telnyx's own allowed character set", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (calls.length === 1) return response({ data: [] });
+    if (calls.length === 2) return response({ data: [{ phone_number: "+17035550177" }] });
+    if (calls.length === 3) {
+      return response({ data: { id: "order-123", status: "pending", phone_numbers: [{ id: "sub-id", phone_number: "+17035550177" }] } });
+    }
+    if (calls.length === 4) return response({ data: [{ id: "telnyx-number-real-123", phone_number: "+17035550177" }] });
+    return response({ id: "telnyx-number-real-123" });
+  };
+  const client = createTelnyxClient({ apiKey: "telnyx-key", connectionId: "connection-123", fetchImpl });
+
+  // The exact combination that failed in production on 2026-09-24: a
+  // business name with spaces, joined with " - " to an agent name that
+  // also has spaces.
+  await client.ensureNumber({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    preferredPhone: "+17035550100",
+    agentName: "Desert Bloom - CWR",
+    businessName: "CWR Solutions",
+  });
+
+  const body = JSON.parse(calls[4][1].body);
+  assert.match(body.tags[0], /^[A-Za-z0-9_-]+$/, `tag "${body.tags[0]}" would be rejected by Telnyx`);
+  assert.equal(body.tags[0], "CWR-Solutions-Desert-Bloom-CWR");
 });
 
 test("Telnyx provisioning logs (instead of silently swallowing) a failed tag PATCH", async () => {
