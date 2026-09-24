@@ -3839,6 +3839,64 @@ test("completed PDF requests reconcile a missed SignWell completion webhook", as
   assert.equal(proposal.signatureRequest.recipients[0].signedAt, "2026-08-31T17:40:00.000Z");
 });
 
+test("a signed PDF archived before signedPdfKey existed downloads from its original flat key, without re-fetching from SignWell", async () => {
+  const assetCalls = [];
+  const getAssetSigner = async () => ({
+    async createUploadUrl() {
+      throw new Error("an already-archived PDF must not be uploaded again");
+    },
+    async createDownloadUrl(workspaceId, key) {
+      assetCalls.push([workspaceId, key]);
+      return `https://s3-download.example.com/${key}`;
+    },
+  });
+  // Mirrors a real production record: stored, but no signedPdfKey saved.
+  const proposal = {
+    id: "prp-legacy",
+    name: "Signed before signedPdfKey",
+    signatureRequest: {
+      provider: "signwell",
+      documentId: "signwell-doc-legacy",
+      status: "completed",
+      signedPdfStored: true,
+      completedAt: "2026-09-09T22:20:10.000Z",
+      recipients: [{ id: "1", name: "Jane Client", email: "jane@example.com", status: "signed" }],
+    },
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() {
+      return structuredClone(proposal);
+    },
+    async updateProposalSignature() {
+      throw new Error("nothing should be rewritten for an already-archived PDF");
+    },
+  };
+  const signWell = {
+    webhookId: "webhook-123",
+    client: {
+      async getCompletedPdfUrl() {
+        throw new Error("SignWell must not be contacted for an already-archived PDF");
+      },
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => signWell,
+    getAssetSigner,
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/proposals/prp-legacy/signature-requests/completed-pdf",
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).url, "https://s3-download.example.com/signed/prp-legacy.pdf");
+  assert.deepEqual(assetCalls, [["user-123", "signed/prp-legacy.pdf"]]);
+});
+
 test("proposal status refresh preserves SignWell sent and in-progress recipient states", async () => {
   let signatureRequest = {
     provider: "signwell",

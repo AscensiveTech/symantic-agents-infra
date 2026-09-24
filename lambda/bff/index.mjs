@@ -4516,8 +4516,18 @@ function signedPdfKey(proposalId, documentId) {
   return `signed/${proposalId}/${documentId}.pdf`;
 }
 
+// A record archived before signedPdfKey existed says signedPdfStored but not
+// where - those archives were always written to the flat per-proposal key.
+// Falling through to the documentId key for them pointed the download at a
+// file that was never written, so a real signed document couldn't be opened.
+function legacySignedPdfKey(proposalId) {
+  return `signed/${proposalId}.pdf`;
+}
+
 function signedSourceKey(proposalId, signatureRequest) {
-  return signatureRequest?.signedPdfKey ?? signedPdfKey(proposalId, signatureRequest?.documentId);
+  if (signatureRequest?.signedPdfKey) return signatureRequest.signedPdfKey;
+  if (signatureRequest?.signedPdfStored) return legacySignedPdfKey(proposalId);
+  return signedPdfKey(proposalId, signatureRequest?.documentId);
 }
 
 // Pull the signed PDF out of SignWell and into our own bucket. Until this runs
