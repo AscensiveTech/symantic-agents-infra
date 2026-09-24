@@ -558,11 +558,13 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
         ? [
           ...(transferRules.length
             ? [
-              "Transfer only when one of these rules matches what the caller says - including asking for someone by a "
-                + "name that matches. While transferring, say exactly: \"Sure, I'll transfer your call to a staff member "
-                + "so they can assist you.\" Never say who you're transferring to.",
+              "Transfer only when what the caller says matches the MEANING of one of these rules - never require their "
+                + "exact wording. \"I need to talk to a staff member\" matches a rule phrased \"talk to a human\"; asking "
+                + "for someone by a name listed as a phrase matches that rule too. While transferring, say exactly: "
+                + "\"Sure, I'll transfer your call to a staff member so they can assist you.\" Never say who you're "
+                + "transferring to.",
               ...transferRules.map(({ phrases, toolName }) =>
-                `- If the caller mentions ${phrases.map((phrase) => `"${phrase}"`).join(", ")}: use ${toolName}.`),
+                `- If what the caller says means ${phrases.map((phrase) => `"${phrase}"`).join(" or ")}: use ${toolName}.`),
             ]
             : []),
           ...(declineRules ? [declineRules] : []),
@@ -571,6 +573,8 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
         ]
         : [
           "This agent never transfers a call.",
+          "Match by the MEANING of what the caller says, never their exact wording - \"I need to talk to a staff "
+            + "member\" matches a response phrased \"talk to a human\".",
           ...(noTransferRulesLines ? [noTransferRulesLines] : []),
           ...(declineRules ? [declineRules] : []),
           `- For anything that doesn't match one of the responses above, ${NO_TRANSFER_FIXED_LINE}`,
@@ -956,8 +960,8 @@ function formatDeclineRules(rules) {
     const phrases = Array.isArray(rule?.phrases) ? rule.phrases.map(text).filter(Boolean) : [];
     const message = text(rule?.message);
     if (!phrases.length || !message) return [];
-    const phraseList = phrases.map((phrase) => `"${phrase}"`).join(", ");
-    return [`- If the caller mentions ${phraseList}: say "${message}" and don't transfer.`];
+    const phraseList = phrases.map((phrase) => `"${phrase}"`).join(" or ");
+    return [`- If what the caller says means ${phraseList}: say "${message}" and don't transfer.`];
   }).join("\n");
 }
 
@@ -976,8 +980,8 @@ function formatNoTransferRules(rules) {
       : [];
     const message = text(rule?.message);
     if (!phrases.length || !message) return [];
-    const phraseList = phrases.map((phrase) => `"${phrase}"`).join(", ");
-    return [`- If the caller mentions ${phraseList}: say "${message}" and take a message.`];
+    const phraseList = phrases.map((phrase) => `"${phrase}"`).join(" or ");
+    return [`- If what the caller says means ${phraseList}: say "${message}" and take a message.`];
   }).join("\n");
 }
 

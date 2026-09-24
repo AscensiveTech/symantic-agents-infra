@@ -418,8 +418,9 @@ test("Allow transfers: each rule becomes its own tool (its number, or the Defaul
   for (const tool of transfers) assert.equal(tool.execution_message_description, "Sure, I'll transfer your call to a staff member so they can assist you.");
   const rules = section(config.prompt, "CALL TRANSFERS");
   assert.match(rules, /"chest pain": use transfer_call_1\./);
-  assert.match(rules, /"Sunny", "billing": use transfer_call_2\./);
+  assert.match(rules, /"Sunny" or "billing": use transfer_call_2\./);
   assert.match(rules, /"I want to talk to a human\.": say "No one is available - I'll take a message\." and don't transfer/);
+  assert.match(rules, /Transfer only when what the caller says matches the MEANING/);
   assert.match(rules, /matches no rule above: don't transfer - use TAKING\s+A MESSAGE/);
   assert.match(rules, /Never say who you're transferring to/);
   assert.doesNotMatch(config.prompt, /transfer to \+?\d/);
@@ -448,6 +449,36 @@ test("Do Not Allow: no transfer tools at all, each rule's own response, then the
   assert.doesNotMatch(rules, /billing question/);
   assert.match(rules, /My apologies\. Since no one is available/);
   assert.doesNotMatch(config.prompt, /transfer_call/);
+  assert.match(rules, /Match by the MEANING of what the caller says, never their exact wording/);
+});
+
+test("phrase matching is by meaning, not literal text: a rule's tool line and a legacy/no-transfer rule's own line both read 'means', never 'mentions'", () => {
+  const withEverything = {
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      allowCallTransfers: true,
+      emergencyRules: [
+        { phrases: ["talk to a human"], transferTarget: "+17035550102" },
+        { phrases: ["911 emergency"], transferTarget: "720431997", action: "decline", message: "Please call 911." },
+      ],
+    },
+  };
+  const allowPrompt = buildReceptionistPrompt(withEverything, profile);
+  assert.match(allowPrompt, /If what the caller says means "talk to a human": use transfer_call_1\./);
+  assert.match(allowPrompt, /If what the caller says means "911 emergency": say "Please call 911\." and don't transfer\./);
+  assert.doesNotMatch(allowPrompt, /If the caller mentions/);
+
+  const noTransferPrompt = buildReceptionistPrompt({
+    ...agent,
+    configuration: {
+      ...agent.configuration,
+      allowCallTransfers: false,
+      noTransferRules: [{ phrases: ["talk to a staff"], message: "Someone will call you back." }],
+    },
+  }, profile);
+  assert.match(noTransferPrompt, /If what the caller says means "talk to a staff": say "Someone will call you back\."/);
+  assert.doesNotMatch(noTransferPrompt, /If the caller mentions/);
 });
 
 test("requests for a specific person never confirm, deny, or repeat a name", () => {
