@@ -7,6 +7,7 @@ import {
   buildReceptionistPrompt,
   resolveAllowedInboundCountries,
   resolveAmbientSound,
+  resolveAmbientSoundVolume,
   resolveCallHandling,
   resolveConfiguredVoiceId,
   resolveGreeting,
@@ -135,6 +136,21 @@ test("the agent's chosen ambient sound reaches the Retell config, and an unknown
   assert.equal(build("").ambientSound, null);
   assert.equal(build("rainforest").ambientSound, null);
   assert.equal(resolveAmbientSound({ configuration: {} }), null);
+});
+
+test("the agent's chosen ambient sound volume reaches the Retell config, clamped into Retell's 0.1-1 range and defaulted when unset", () => {
+  const build = (ambientSoundVolume) => buildReceptionistConfig({
+    workspaceId: "workspace-123",
+    agent: { ...agent, configuration: { ...agent.configuration, ambientSound: "coffee-shop", ambientSoundVolume } },
+    profile,
+    toolBaseUrl: "https://api.example.com",
+    voiceId: "retell-voice-1",
+  });
+  assert.equal(build(0.3).ambientSoundVolume, 0.3);
+  assert.equal(build(undefined).ambientSoundVolume, 0.5);
+  assert.equal(build(5).ambientSoundVolume, 1);
+  assert.equal(build(-2).ambientSoundVolume, 0.1);
+  assert.equal(resolveAmbientSoundVolume({ configuration: {} }), 0.5);
 });
 
 test("resolveCallHandling applies defaults and clamps to the Retell range", () => {

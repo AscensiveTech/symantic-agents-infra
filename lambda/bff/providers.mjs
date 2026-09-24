@@ -338,6 +338,10 @@ export function createRetellClient({
       // null, so clearing it on an existing agent actually removes it at
       // Retell rather than leaving the previous track in place.
       ambient_sound: config.ambientSound || null,
+      // Retell ignores this when ambient_sound is unset, so only send it
+      // alongside a chosen track (resolveAmbientSoundVolume in
+      // receptionist.mjs always returns a value in Retell's 0.1-1 range).
+      ...(config.ambientSound ? { ambient_sound_volume: config.ambientSoundVolume } : {}),
       agent_name: `Symantic ${symanticAgentId} · ${agentName}`,
       // Explicit rather than relying on Retell's account-level default -
       // call_started is what makes an "ongoing" row show up in Call History

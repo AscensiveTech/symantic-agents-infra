@@ -723,6 +723,9 @@ export function buildReceptionistConfig({
     // Read by the Retell provider as ambient_sound. It was never set here,
     // so every agent went out with no background track whatever was chosen.
     ambientSound: resolveAmbientSound(agent),
+    // Read by the Retell provider as ambient_sound_volume, only sent when
+    // ambientSound is set. See resolveAmbientSoundVolume below.
+    ambientSoundVolume: resolveAmbientSoundVolume(agent),
   };
 }
 
@@ -741,6 +744,18 @@ const AMBIENT_SOUNDS = new Set([
 export function resolveAmbientSound(agent) {
   const value = text(agent?.configuration?.ambientSound);
   return AMBIENT_SOUNDS.has(value) ? value : null;
+}
+
+// Mirrors the frontend's lib/domain/ambient-sound.ts clamp/default - kept in
+// sync by hand since the two repos don't share code.
+const AMBIENT_SOUND_VOLUME_MIN = 0.1;
+const AMBIENT_SOUND_VOLUME_MAX = 1;
+const AMBIENT_SOUND_VOLUME_DEFAULT = 0.5;
+
+export function resolveAmbientSoundVolume(agent) {
+  const raw = agent?.configuration?.ambientSoundVolume;
+  const value = typeof raw === "number" && Number.isFinite(raw) ? raw : AMBIENT_SOUND_VOLUME_DEFAULT;
+  return Math.min(AMBIENT_SOUND_VOLUME_MAX, Math.max(AMBIENT_SOUND_VOLUME_MIN, value));
 }
 
 const SUPPORTED_LANGUAGES = new Set(["en-US", "es-419"]);

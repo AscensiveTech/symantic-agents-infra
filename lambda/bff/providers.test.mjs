@@ -482,6 +482,36 @@ test("Retell agent body passes a chosen ambient sound through to Retell verbatim
   assert.equal(agentCall.ambient_sound, "coffee-shop");
 });
 
+test("Retell agent body sends ambient_sound_volume alongside a chosen ambient sound, and omits it entirely when no sound is chosen", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (String(url).includes("/v2/list-agents")) return response([]);
+    if (String(url).endsWith("/create-retell-llm")) return response({ llm_id: "llm-123" }, 201);
+    return response({ agent_id: "retell-agent-123" }, 201);
+  };
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl });
+
+  await client.upsertAgent({
+    symanticAgentId: "agent-123",
+    agentName: "Maya",
+    greeting: "Thanks for calling.",
+    config: { prompt: "Compiled prompt", voice: "retell-Cimo", ambientSound: "coffee-shop", ambientSoundVolume: 0.3 },
+  });
+  const withVolume = JSON.parse(calls[2][1].body);
+  assert.equal(withVolume.ambient_sound_volume, 0.3);
+
+  calls.length = 0;
+  await client.upsertAgent({
+    symanticAgentId: "agent-456",
+    agentName: "Maya",
+    greeting: "Thanks for calling.",
+    config: { prompt: "Compiled prompt", voice: "retell-Cimo", ambientSound: null, ambientSoundVolume: 0.3 },
+  });
+  const withoutSound = JSON.parse(calls[2][1].body);
+  assert.equal("ambient_sound_volume" in withoutSound, false);
+});
+
 test("Retell imports a Telnyx DID and binds it to the synced agent", async () => {
   const calls = [];
   const client = createRetellClient({
