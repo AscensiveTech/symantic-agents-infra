@@ -6308,15 +6308,18 @@ function usageQuotaStore(overrides = {}) {
     counters.set(sk, row);
   };
   const payments = new Map(); // sk -> record
+  const receptionistPayments = new Map(); // sk -> record
   return {
     _proposals: proposals,
     _counters: counters,
     _payments: payments,
+    _receptionistPayments: receptionistPayments,
     async ensureWorkspace() {},
     async getProfile() { return { timezone: "UTC" }; },
     async getWorkspace() { return { workspaceId: "user-123", tier: "repository", createdAt: "2026-09-10T00:00:00.000Z" }; },
     async listWorkspaces() { return []; },
     async listMemberships() { return []; },
+    async listAgents() { return []; },
     async countProposals() { return 0; },
     async countProposalTemplates() { return 0; },
     async listProposalPayments() { return [...payments.values()]; },
@@ -6326,6 +6329,11 @@ function usageQuotaStore(overrides = {}) {
     },
     async deleteProposalPayment(_workspaceId, paidAt, paymentId) {
       payments.delete(`payment#${paidAt}#${paymentId}`);
+    },
+    async listReceptionistPayments() { return [...receptionistPayments.values()]; },
+    async putReceptionistPayment(_workspaceId, payment) {
+      receptionistPayments.set(`rpayment#${payment.agentId}#${payment.period}#${payment.paymentId}`, payment);
+      return payment;
     },
     async listProposals() { return [...proposals.values()]; },
     async createProposal(_workspaceId, proposal) {
@@ -6780,6 +6788,76 @@ test("a super admin logs a payment for a company and it shows up in that company
   assert.equal(delBody.payments.length, 1);
   assert.ok(delBody.payments[0].canceledAt);
   assert.equal(delBody.payments[0].cancelReason, "duplicate of the Sept invoice");
+});
+
+test("a super admin marks a receptionist agent's billing cycle as paid, and it shows up scoped to that agent", async () => {
+  const base = usageQuotaStore();
+  const store = {
+    ...base,
+    async getMembership(userId) {
+      return { userId, workspaceId: "user-123", role: "company-admin", status: "active", name: "Sulav" };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const bad = authenticatedEvent("POST", "/platform/companies/user-123/receptionist-payments", { agentId: "agent-1", period: "not-a-period", paidAt: "2026-09-05", amount: 349, receivedBy: "Ops" });
+  bad.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(bad)).statusCode, 400);
+
+  const log = authenticatedEvent("POST", "/platform/companies/user-123/receptionist-payments", {
+    agentId: "agent-1", period: "2026-09", paidAt: "2026-09-05", amount: 349, receivedBy: "Ops", method: "ACH",
+  });
+  log.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const logged = await handler(log);
+  assert.equal(logged.statusCode, 201);
+  const afterLog = JSON.parse(logged.body);
+  assert.equal(afterLog.payments["agent-1"].length, 1);
+  assert.equal(afterLog.payments["agent-1"][0].amount, 349);
+  assert.equal(afterLog.payments["agent-1"][0].loggedByUserId, "user-123");
+
+  // A second agent on the same workspace has its own independent ledger.
+  const logOther = authenticatedEvent("POST", "/platform/companies/user-123/receptionist-payments", {
+    agentId: "agent-2", period: "2026-09", paidAt: "2026-09-06", amount: 649, receivedBy: "Ops",
+  });
+  logOther.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const loggedOther = await handler(logOther);
+  const afterLogOther = JSON.parse(loggedOther.body);
+  assert.equal(afterLogOther.payments["agent-1"].length, 1);
+  assert.equal(afterLogOther.payments["agent-2"].length, 1);
+
+  const list = authenticatedEvent("GET", "/platform/companies/user-123/receptionist-payments");
+  list.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const listed = await handler(list);
+  assert.equal(listed.statusCode, 200);
+  assert.equal(JSON.parse(listed.body).payments["agent-1"].length, 1);
+
+  const paymentId = afterLog.payments["agent-1"][0].paymentId;
+  const noReason = authenticatedEvent("DELETE", `/platform/companies/user-123/receptionist-payments/${paymentId}`, undefined);
+  noReason.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  assert.equal((await handler(noReason)).statusCode, 400);
+
+  const del = authenticatedEvent("DELETE", `/platform/companies/user-123/receptionist-payments/${paymentId}`, { reason: "logged against the wrong agent" });
+  del.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  const afterDel = await handler(del);
+  assert.equal(afterDel.statusCode, 200);
+  const delBody = JSON.parse(afterDel.body);
+  assert.equal(store._receptionistPayments.size, 2);
+  assert.ok(delBody.payments["agent-1"][0].canceledAt);
+  assert.equal(delBody.payments["agent-1"][0].cancelReason, "logged against the wrong agent");
+  // The other agent's payment is untouched.
+  assert.equal(delBody.payments["agent-2"][0].canceledAt, "");
+});
+
+test("a company-admin cannot mark a receptionist agent's billing cycle as paid", async () => {
+  const store = usageQuotaStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const denied = authenticatedEvent("POST", "/platform/companies/user-123/receptionist-payments", {
+    agentId: "agent-1", period: "2026-09", paidAt: "2026-09-05", amount: 349, receivedBy: "Ops",
+  });
+  denied.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  assert.equal((await handler(denied)).statusCode, 403);
 });
 
 test("PATCH /platform/companies/{id} accepts a per-company proposal price override", async () => {

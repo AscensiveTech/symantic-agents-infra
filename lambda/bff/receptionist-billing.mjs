@@ -355,3 +355,103 @@ export function costBreakdown(actualSeconds, priceMonthly, overageCharge) {
 function round2(value) {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
+
+// Manual paid/unpaid ledger, one row per agent per billing cycle -
+// mirrors lambda/bff/proposal-usage.mjs's payment ledger pattern, except
+// receptionist billing is per-agent (each agent picks its own plan, see
+// resolveAgentPlan above) rather than one shared workspace-level product,
+// so each row also carries an agentId and is keyed by
+// `rpayment#<agentId>#<period>#<paymentId>` in the store. Usage itself
+// (buildUsage above) stays purely computed from call records - this ledger
+// only tracks what a super admin has manually logged as received, never
+// derived automatically.
+
+function normalizeReceptionistPayment(row) {
+  const str = (v) => (typeof v === "string" ? v : "");
+  return {
+    paymentId: str(row?.paymentId),
+    agentId: str(row?.agentId),
+    period: str(row?.period),
+    paidAt: str(row?.paidAt),
+    amount: money(row?.amount) ?? 0,
+    receivedBy: str(row?.receivedBy),
+    method: str(row?.method),
+    note: str(row?.note),
+    loggedByName: str(row?.loggedByName),
+    loggedByUserId: str(row?.loggedByUserId),
+    createdAt: str(row?.createdAt),
+    // Soft-delete: a canceled payment stays in the history as a
+    // struck-through entry and no longer counts as paid.
+    canceledAt: str(row?.canceledAt),
+    canceledByName: str(row?.canceledByName),
+    canceledByUserId: str(row?.canceledByUserId),
+    cancelReason: str(row?.cancelReason),
+  };
+}
+
+function money(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? round2(n) : null;
+}
+
+const PERIOD_PATTERN = /^\d{4}-\d{2}$/;
+
+// Identity-like field (the staff member's name) - same allowlist used by
+// validProposalPayment in proposal-usage.mjs.
+const IDENTITY_NAME_INVALID_CHARS = /[^\p{L}\p{M}\p{N}\s&.,'()/#!*-]/u;
+
+/**
+ * Validate a super-admin "mark this agent's billing cycle as paid" body.
+ * Returns a clean record (minus server-set fields) or null.
+ */
+export function validReceptionistPayment(body) {
+  if (!body || typeof body !== "object") return null;
+  const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
+  if (!agentId) return null;
+  const period = typeof body.period === "string" ? body.period.trim() : "";
+  if (!PERIOD_PATTERN.test(period)) return null;
+  const paidAt = typeof body.paidAt === "string" ? body.paidAt.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(paidAt)) return null;
+  const amount = money(body.amount);
+  if (amount == null) return null;
+  const receivedBy = typeof body.receivedBy === "string" ? body.receivedBy.trim() : "";
+  if (!receivedBy || receivedBy.length > 120 || IDENTITY_NAME_INVALID_CHARS.test(receivedBy)) return null;
+  const method = typeof body.method === "string" ? body.method.trim() : "";
+  if (method.length > 60) return null;
+  const note = typeof body.note === "string" ? body.note.trim() : "";
+  if (note.length > 500) return null;
+  return { agentId, period, paidAt, amount, receivedBy, method, note };
+}
+
+/**
+ * Group a workspace's receptionist payment rows by agentId, most recent
+ * period first, each entry normalized and canceled ones kept (struck
+ * through by the frontend) rather than dropped.
+ *
+ * @param {Array} paymentRows  `rpayment#...` rows from the store
+ * @returns {Map<string, Array>} agentId -> sorted payment list
+ */
+export function groupReceptionistPaymentsByAgent(paymentRows) {
+  const byAgent = new Map();
+  for (const row of Array.isArray(paymentRows) ? paymentRows : []) {
+    const payment = normalizeReceptionistPayment(row);
+    if (!payment.paymentId || !payment.agentId || !payment.period) continue;
+    const list = byAgent.get(payment.agentId) ?? [];
+    list.push(payment);
+    byAgent.set(payment.agentId, list);
+  }
+  for (const list of byAgent.values()) {
+    list.sort((a, b) => `${b.period}#${b.paidAt}`.localeCompare(`${a.period}#${a.paidAt}`));
+  }
+  return byAgent;
+}
+
+/**
+ * Whether a given agent+period has an active (non-canceled) logged payment.
+ */
+export function isReceptionistPeriodPaid(paymentRows, agentId, period) {
+  return (Array.isArray(paymentRows) ? paymentRows : []).some((row) => {
+    const payment = normalizeReceptionistPayment(row);
+    return payment.agentId === agentId && payment.period === period && payment.paymentId && !payment.canceledAt;
+  });
+}

@@ -22,6 +22,9 @@ import {
   resolveAccountPlan,
   resolveAgentPlan,
   resolveCallBlocklist,
+  groupReceptionistPaymentsByAgent,
+  isReceptionistPeriodPaid,
+  validReceptionistPayment,
 } from "./receptionist-billing.mjs";
 import {
   billingAnchorDay,
@@ -2658,6 +2661,63 @@ async function handlePlatformCompanies(event, {
       return json(200, await loadProposalBilling(store, target.workspaceId));
     }
 
+    if (target.kind === "receptionist-payments" && method === "GET") {
+      const rows = typeof store.listReceptionistPayments === "function"
+        ? await store.listReceptionistPayments(target.workspaceId)
+        : [];
+      const byAgent = groupReceptionistPaymentsByAgent(rows);
+      return json(200, { payments: Object.fromEntries(byAgent) });
+    }
+
+    if (target.kind === "receptionist-payments" && method === "POST") {
+      const clean = validReceptionistPayment(readBody(event));
+      if (!clean) {
+        return json(400, {
+          message: "Invalid payment. Provide agentId, period (YYYY-MM), paidAt (YYYY-MM-DD), amount, and receivedBy.",
+        });
+      }
+      const nowIso = new Date().toISOString();
+      await store.putReceptionistPayment(target.workspaceId, {
+        ...clean,
+        paymentId: randomUUID(),
+        loggedByName: actor.membership?.name || actor.userId,
+        loggedByUserId: actor.userId,
+        createdAt: nowIso,
+      });
+      const rows = typeof store.listReceptionistPayments === "function"
+        ? await store.listReceptionistPayments(target.workspaceId)
+        : [];
+      return json(201, { payments: Object.fromEntries(groupReceptionistPaymentsByAgent(rows)) });
+    }
+
+    if (target.kind === "receptionist-payment" && method === "DELETE") {
+      const body = readBody(event) || {};
+      const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+      if (!reason || reason.length > 500) {
+        return json(400, { message: "A short comment about the change is required." });
+      }
+      const rows = typeof store.listReceptionistPayments === "function"
+        ? await store.listReceptionistPayments(target.workspaceId)
+        : [];
+      const existing = rows
+        .map((row) => row)
+        .find((row) => row.paymentId === target.paymentId);
+      if (!existing) return json(404, { message: "Payment not found" });
+      const nowIso = new Date().toISOString();
+      const actorName = actor.membership?.name || actor.userId;
+      await store.putReceptionistPayment(target.workspaceId, {
+        ...existing,
+        canceledAt: nowIso,
+        canceledByName: actorName,
+        canceledByUserId: actor.userId,
+        cancelReason: reason,
+      });
+      const next = typeof store.listReceptionistPayments === "function"
+        ? await store.listReceptionistPayments(target.workspaceId)
+        : [];
+      return json(200, { payments: Object.fromEntries(groupReceptionistPaymentsByAgent(next)) });
+    }
+
     if (target.kind === "users" && method === "GET") {
       return json(200, await store.listMemberships(target.workspaceId));
     }
@@ -2916,11 +2976,14 @@ function buildMonthlyByAgent(calls, { timezone, agentNames }) {
 // every live agent's own plan instead of one shared value.
 // `monthlyByAgent` is always every agent, regardless of that filter.
 async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
-  const [allCalls, profile, workspace, agents] = await Promise.all([
+  const [allCalls, profile, workspace, agents, paymentRows] = await Promise.all([
     listCallsForUsage(store, workspaceId),
     typeof store.getProfile === "function" ? store.getProfile(workspaceId) : null,
     typeof store.getWorkspace === "function" ? store.getWorkspace(workspaceId) : null,
     typeof store.listAgents === "function" ? store.listAgents(workspaceId).catch(() => []) : [],
+    agentId && typeof store.listReceptionistPayments === "function"
+      ? store.listReceptionistPayments(workspaceId).catch(() => [])
+      : [],
   ]);
   const now = new Date();
   const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
@@ -2943,6 +3006,7 @@ async function loadWorkspaceUsage(store, workspaceId, { agentId } = {}) {
     discountPct: discountPct || undefined,
     billingCycle: {
       ...usage.billingCycle,
+      ...(agentId ? { paidStatus: isReceptionistPeriodPaid(paymentRows, agentId, usage.billingCycle.period) ? "paid" : "unpaid" } : {}),
       // A deleted agent's past calls still count toward this cycle's total
       // minutes (cycleMinutes, computed separately above) - just dropped
       // from this per-agent breakdown, since it's what drives the sidebar's
@@ -3486,6 +3550,8 @@ function getPlatformCompanyTarget(event, path) {
     ["proposal-usage", /^\/platform\/companies\/([^/]+)\/proposal-usage$/],
     ["proposal-payments", /^\/platform\/companies\/([^/]+)\/proposal-payments$/],
     ["proposal-payment", /^\/platform\/companies\/([^/]+)\/proposal-payments\/([A-Za-z0-9._-]{1,64})$/],
+    ["receptionist-payments", /^\/platform\/companies\/([^/]+)\/receptionist-payments$/],
+    ["receptionist-payment", /^\/platform\/companies\/([^/]+)\/receptionist-payments\/([A-Za-z0-9._-]{1,64})$/],
     ["legal-acceptances", /^\/platform\/companies\/([^/]+)\/legal-acceptances$/],
     ["company", /^\/platform\/companies\/([^/]+)$/],
   ];
@@ -3499,7 +3565,7 @@ function getPlatformCompanyTarget(event, path) {
       const userId = kind === "user"
         ? decodeURIComponent(event?.pathParameters?.userId ?? match[2])
         : null;
-      const paymentId = kind === "proposal-payment"
+      const paymentId = kind === "proposal-payment" || kind === "receptionist-payment"
         ? decodeURIComponent(event?.pathParameters?.paymentId ?? match[2])
         : null;
       if (
@@ -7505,6 +7571,39 @@ export function createDynamoStore(client, commands, tableNames) {
         TableName: tableNames.workspaceUsage,
         Key: marshall({ workspaceId, period: `payment#${paidAt}#${paymentId}` }),
       }));
+    },
+
+    async listReceptionistPayments(workspaceId) {
+      if (!tableNames.workspaceUsage) return [];
+      const items = [];
+      let exclusiveStartKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tableNames.workspaceUsage,
+          KeyConditionExpression: "workspaceId = :workspaceId AND begins_with(#period, :prefix)",
+          ExpressionAttributeNames: { "#period": "period" },
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":prefix": "rpayment#" }),
+          ConsistentRead: false,
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map((item) => unmarshall(item)));
+        exclusiveStartKey = result.LastEvaluatedKey;
+      } while (exclusiveStartKey);
+      return items;
+    },
+
+    async putReceptionistPayment(workspaceId, payment) {
+      if (!tableNames.workspaceUsage) return payment;
+      // No expiresAt - payment records are permanent (unlike usage counters).
+      await client.send(new commands.PutItemCommand({
+        TableName: tableNames.workspaceUsage,
+        Item: marshall({
+          workspaceId,
+          period: `rpayment#${payment.agentId}#${payment.period}#${payment.paymentId}`,
+          ...payment,
+        }),
+      }));
+      return payment;
     },
 
     async setProposalUsageCounter(workspaceId, period, patch) {

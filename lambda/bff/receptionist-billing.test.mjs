@@ -6,10 +6,13 @@ import {
   billedMinutes,
   buildUsage,
   costBreakdown,
+  groupReceptionistPaymentsByAgent,
+  isReceptionistPeriodPaid,
   periodKey,
   resolveAccountPlan,
   resolveAgentPlan,
   resolveCallBlocklist,
+  validReceptionistPayment,
 } from "./receptionist-billing.mjs";
 
 const agent = (receptionistPlan, extra = {}) => ({
@@ -218,4 +221,58 @@ test("buildUsage breaks the cycle's minutes down per agent, most minutes first",
     { agentId: "agent-b", minutes: 2, calls: 2 },
     { agentId: "unassigned", minutes: 1, calls: 1 },
   ]);
+});
+
+const validPayment = (extra = {}) => ({
+  agentId: "agent-1",
+  period: "2026-09",
+  paidAt: "2026-09-05",
+  amount: 349,
+  receivedBy: "Jordan Ascensive",
+  ...extra,
+});
+
+test("validReceptionistPayment accepts a well-formed manual payment", () => {
+  const clean = validReceptionistPayment(validPayment({ method: "ACH", note: "Invoice #204" }));
+  assert.deepEqual(clean, {
+    agentId: "agent-1",
+    period: "2026-09",
+    paidAt: "2026-09-05",
+    amount: 349,
+    receivedBy: "Jordan Ascensive",
+    method: "ACH",
+    note: "Invoice #204",
+  });
+});
+
+test("validReceptionistPayment rejects a malformed period, missing agentId, or bad amount", () => {
+  assert.equal(validReceptionistPayment(validPayment({ period: "September 2026" })), null);
+  assert.equal(validReceptionistPayment(validPayment({ agentId: "" })), null);
+  assert.equal(validReceptionistPayment(validPayment({ amount: -5 })), null);
+  assert.equal(validReceptionistPayment(validPayment({ paidAt: "not-a-date" })), null);
+  assert.equal(validReceptionistPayment(null), null);
+});
+
+test("groupReceptionistPaymentsByAgent buckets rows per agent, most recent period first, and keeps canceled rows", () => {
+  const rows = [
+    { paymentId: "p1", agentId: "agent-1", period: "2026-07", paidAt: "2026-07-01", amount: 349, receivedBy: "A" },
+    { paymentId: "p2", agentId: "agent-1", period: "2026-09", paidAt: "2026-09-01", amount: 349, receivedBy: "A" },
+    { paymentId: "p3", agentId: "agent-1", period: "2026-08", paidAt: "2026-08-01", amount: 349, receivedBy: "A", canceledAt: "2026-08-10T00:00:00Z" },
+    { paymentId: "p4", agentId: "agent-2", period: "2026-09", paidAt: "2026-09-02", amount: 649, receivedBy: "B" },
+  ];
+  const byAgent = groupReceptionistPaymentsByAgent(rows);
+  assert.deepEqual(byAgent.get("agent-1").map((p) => p.period), ["2026-09", "2026-08", "2026-07"]);
+  assert.equal(byAgent.get("agent-1")[1].canceledAt, "2026-08-10T00:00:00Z");
+  assert.deepEqual(byAgent.get("agent-2").map((p) => p.period), ["2026-09"]);
+});
+
+test("isReceptionistPeriodPaid is true only for an active (non-canceled) payment matching agent+period", () => {
+  const rows = [
+    { paymentId: "p1", agentId: "agent-1", period: "2026-09", paidAt: "2026-09-01", amount: 349, receivedBy: "A" },
+    { paymentId: "p2", agentId: "agent-1", period: "2026-08", paidAt: "2026-08-01", amount: 349, receivedBy: "A", canceledAt: "2026-08-10T00:00:00Z" },
+  ];
+  assert.equal(isReceptionistPeriodPaid(rows, "agent-1", "2026-09"), true);
+  assert.equal(isReceptionistPeriodPaid(rows, "agent-1", "2026-08"), false);
+  assert.equal(isReceptionistPeriodPaid(rows, "agent-1", "2026-07"), false);
+  assert.equal(isReceptionistPeriodPaid(rows, "agent-2", "2026-09"), false);
 });
