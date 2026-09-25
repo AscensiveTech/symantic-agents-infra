@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   MAX_MARSHALLED_CALL_ITEM_BYTES,
   billedMinutes,
+  createCrmSyncClient,
   createDynamoPostcallStore,
   createHandler,
   extractCallerNameFromTranscript,
@@ -1034,3 +1035,111 @@ function webhookEvent(eventName, call) {
     body: JSON.stringify({ event: eventName, call }),
   };
 }
+
+// ---------------------------------------------------------------- CRM sync ----
+
+function crmHarness({ status = { connectionState: "connected", mappingStatus: "valid" }, alreadySynced = false, sendError } = {}) {
+  const sent = [];
+  const marked = [];
+  const crm = {
+    async getConnectionStatus(workspaceId) {
+      return workspaceId === "workspace-123" ? status : null;
+    },
+    async markQueued(workspaceId, callId) {
+      marked.push({ workspaceId, callId });
+      return !alreadySynced;
+    },
+    async send(message) {
+      if (sendError) throw sendError;
+      sent.push(message);
+    },
+  };
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({ async upsertCall() {} }),
+    getRecordingStore: async () => null,
+    getUsageStore: async () => null,
+    getCrmSync: async () => crm,
+    now: () => new Date("2026-09-25T14:05:00.000Z"),
+  });
+  return { handler, sent, marked };
+}
+
+function crmCall(overrides = {}) {
+  return {
+    call_id: "retell-crm-1",
+    direction: "inbound",
+    from_number: "+17035550100",
+    to_number: "+17035550177",
+    start_timestamp: 1_800_000_000_000,
+    end_timestamp: 1_800_000_060_000,
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    transcript_with_tool_calls: [],
+    call_analysis: { call_summary: "Asked about hours." },
+    ...overrides,
+  };
+}
+
+test("call_analyzed enqueues a CRM sync when the workspace has a mapped CRM", async () => {
+  const { handler, sent, marked } = crmHarness();
+  const response = await handler(callAnalyzedEvent(crmCall()));
+  assert.equal(response.statusCode, 204);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].workspaceId, "workspace-123");
+  assert.match(sent[0].callId, /^call-/);
+  assert.equal(sent[0].provider, "monday");
+  assert.deepEqual(marked, [{ workspaceId: "workspace-123", callId: sent[0].callId }]);
+});
+
+test("CRM sync is only enqueued on call_analyzed, not call_started or call_ended", async () => {
+  const { handler, sent } = crmHarness();
+  await handler(callStartedEvent(crmCall()));
+  await handler(callEndedEvent(crmCall()));
+  assert.equal(sent.length, 0);
+});
+
+test("no CRM sync for test calls, spam, anonymous callers, or unconfigured CRMs", async () => {
+  for (const [label, harness, call] of [
+    ["test call", crmHarness(), crmCall({ metadata: { workspaceId: "workspace-123", kind: "test" } })],
+    ["spam", crmHarness(), crmCall({ call_analysis: { custom_analysis_data: { is_spam: true } } })],
+    ["anonymous", crmHarness(), crmCall({ from_number: undefined })],
+    ["not connected", crmHarness({ status: null }), crmCall()],
+    ["reauth", crmHarness({ status: { connectionState: "reauth_required", mappingStatus: "valid" } }), crmCall()],
+    ["unmapped", crmHarness({ status: { connectionState: "connected", mappingStatus: "unconfigured" } }), crmCall()],
+    ["already synced", crmHarness({ alreadySynced: true }), crmCall()],
+  ]) {
+    const response = await harness.handler(callAnalyzedEvent(call));
+    assert.equal(response.statusCode, 204, label);
+    assert.equal(harness.sent.length, 0, label);
+  }
+});
+
+test("a failed CRM enqueue fails the webhook so Retell retries it", async () => {
+  const { handler } = crmHarness({ sendError: new Error("SQS unavailable") });
+  const response = await handler(callAnalyzedEvent(crmCall()));
+  assert.equal(response.statusCode, 500);
+});
+
+test("the CRM client never re-arms a call that already synced", async () => {
+  const commands = [];
+  const client = createCrmSyncClient({
+    dynamodb: {
+      GetItemCommand: class { constructor(input) { this.input = input; } },
+      UpdateItemCommand: class { constructor(input) { this.input = input; } },
+    },
+    dynamoClient: {
+      async send(command) {
+        commands.push(command.input);
+        throw Object.assign(new Error("condition"), { name: "ConditionalCheckFailedException" });
+      },
+    },
+    sqs: {},
+    sqsClient: {},
+    connectionsTable: "crm",
+    callsTable: "calls",
+    queueUrl: "q",
+  });
+  assert.equal(await client.markQueued("ws", "call-1"), false);
+  assert.match(commands[0].ConditionExpression, /crmStatus <> :synced/);
+});

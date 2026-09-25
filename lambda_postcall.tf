@@ -125,6 +125,8 @@ resource "aws_lambda_function" "postcall" {
       WORKSPACE_USAGE_TABLE   = aws_dynamodb_table.control_plane["workspace_usage"].name
       RETELL_SECRET_ARN       = aws_secretsmanager_secret.providers["retell"].arn
       CALL_ARTIFACTS_BUCKET   = aws_s3_bucket.call_artifacts.bucket
+      CRM_SYNC_QUEUE_URL      = aws_sqs_queue.crm_sync.url
+      CRM_CONNECTIONS_TABLE   = aws_dynamodb_table.crm_connections.name
     }
   }
 

@@ -820,6 +820,7 @@ export function createHandler({
   verifySignature = verifyRetellSignature,
   toolBaseUrl = process.env.PUBLIC_API_BASE_URL,
   invokeCallDigest = defaultInvokeCallDigest,
+  lookupCrmContext = defaultLookupCrmContext,
   emailSenderAddress = process.env.EMAIL_SENDER_ADDRESS,
 } = {}) {
   // A new handler may be backed by a different store (tests, or a config
@@ -836,6 +837,7 @@ export function createHandler({
           getRetellApiKey,
           verifySignature,
           toolBaseUrl,
+          lookupCrmContext,
         });
       }
 
@@ -5548,6 +5550,7 @@ async function handleInboundLookup(event, {
   getRetellApiKey,
   verifySignature,
   toolBaseUrl,
+  lookupCrmContext = async () => CRM_CONTEXT_UNAVAILABLE,
 }) {
   const rawBody = readRawBody(event);
   const signature = readHeader(event?.headers, "x-retell-signature");
@@ -5608,12 +5611,21 @@ async function handleInboundLookup(event, {
     });
     return json(200, { call_inbound: { reject: true } });
   }
+  // Started only once the call is going to be answered (a rejected caller
+  // costs no CRM API call), and run alongside the overage check. It never
+  // rejects and is capped at CRM_LOOKUP_BUDGET_MS, so a slow or broken CRM
+  // can only ever mean "no caller context", never a delayed or failed call.
+  const crmContextPromise = lookupCrmContext({
+    workspaceId: phoneNumber.workspaceId,
+    callerNumber: input.call_inbound.from_number,
+  }).catch(() => CRM_CONTEXT_UNAVAILABLE);
   // We never decline a call just because the account is past its plan
   // minutes - it's always answered, and billed at the plan's overage rate
   // instead (see receptionist-billing.mjs). `isOverage` just tags the call
   // so the customer can see which calls landed after their plan minutes
   // were used this cycle; it carries no reject behavior.
   const isOverage = await inboundIsOverage(store, phoneNumber.workspaceId, profile, workspace);
+  const crmContext = await crmContextPromise;
   return json(200, {
     call_inbound: {
       override_agent_id: agent.retellAgentId,
@@ -5621,6 +5633,7 @@ async function handleInboundLookup(event, {
         workspaceId: phoneNumber.workspaceId,
         agentId: phoneNumber.agentId,
         ...agentClock(effectiveProfile(agent, profile)),
+        crm_context: typeof crmContext === "string" && crmContext ? crmContext : CRM_CONTEXT_UNAVAILABLE,
       },
       metadata: {
         workspaceId: phoneNumber.workspaceId,
@@ -8429,6 +8442,119 @@ export async function getDefaultStore() {
 let userDirectoryPromise;
 
 let callDigestLambdaPromise;
+
+// Must match NO_CRM_CONTEXT in lambda/crm/context.mjs and the Retell LLM's
+// default_dynamic_variables (providers.mjs).
+export const CRM_CONTEXT_UNAVAILABLE = "Not available.";
+// Retell holds the caller on ringing for up to 10s waiting for this webhook;
+// the CRM gets a small, fixed slice of that - including the Lambda invoke.
+export const CRM_LOOKUP_BUDGET_MS = 1_500;
+
+let crmLookupClientsPromise;
+
+/**
+ * Caller context from the workspace's CRM, via the CRM Lambda (which owns
+ * the tokens and the Monday adapter). A cheap DynamoDB read first skips the
+ * invoke entirely for workspaces with no usable CRM. Never throws.
+ */
+export function createCrmContextLookup({
+  getConnectionStatus,
+  invoke,
+  budgetMs = CRM_LOOKUP_BUDGET_MS,
+  now = Date.now,
+  log = console,
+}) {
+  return async function lookupCrmContext({ workspaceId, callerNumber }) {
+    const started = Number(now());
+    let outcome = "skipped";
+    const controller = new AbortController();
+    let timer;
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        outcome = "timeout";
+        controller.abort();
+        resolve(CRM_CONTEXT_UNAVAILABLE);
+      }, budgetMs);
+    });
+    const work = (async () => {
+      if (!workspaceId || typeof callerNumber !== "string" || !callerNumber) return CRM_CONTEXT_UNAVAILABLE;
+      const status = await getConnectionStatus(workspaceId);
+      if (
+        status?.connectionState !== "connected" ||
+        status?.mappingStatus !== "valid" ||
+        Number(status?.pausedUntil) > Number(now())
+      ) {
+        return CRM_CONTEXT_UNAVAILABLE;
+      }
+      const result = await invoke({ action: "lookup", workspaceId, callerNumber }, controller.signal);
+      outcome = typeof result?.status === "string" ? result.status : "error";
+      return typeof result?.context === "string" && result.context ? result.context : CRM_CONTEXT_UNAVAILABLE;
+    })().catch((error) => {
+      if (outcome !== "timeout") {
+        outcome = "error";
+        log.warn?.("CRM caller lookup failed; answering without CRM context", { name: error?.name });
+      }
+      return CRM_CONTEXT_UNAVAILABLE;
+    });
+    try {
+      return await Promise.race([work, deadline]);
+    } finally {
+      clearTimeout(timer);
+      if (outcome !== "skipped") {
+        console.log(JSON.stringify({
+          _aws: {
+            Timestamp: Number(now()),
+            CloudWatchMetrics: [{
+              Namespace: "Symantic/CRM",
+              Dimensions: [["Outcome"]],
+              Metrics: [{ Name: "InboundLookupLatency", Unit: "Milliseconds" }],
+            }],
+          },
+          Outcome: outcome,
+          InboundLookupLatency: Number(now()) - started,
+        }));
+      }
+    }
+  };
+}
+
+async function defaultLookupCrmContext(input) {
+  const functionName = process.env.CRM_LOOKUP_FUNCTION_NAME;
+  const table = process.env.CRM_CONNECTIONS_TABLE;
+  if (!functionName || !table) return CRM_CONTEXT_UNAVAILABLE;
+  crmLookupClientsPromise ??= Promise.all([
+    import("@aws-sdk/client-dynamodb"),
+    import("@aws-sdk/client-lambda"),
+  ]).then(([dynamodb, lambda]) => {
+    const dynamoClient = new dynamodb.DynamoDBClient({});
+    const lambdaClient = new lambda.LambdaClient({});
+    return createCrmContextLookup({
+      async getConnectionStatus(workspaceId) {
+        const result = await dynamoClient.send(new dynamodb.GetItemCommand({
+          TableName: table,
+          Key: { workspaceId: { S: workspaceId }, provider: { S: "monday" } },
+          ProjectionExpression: "connectionState, mappingStatus, pausedUntil",
+        }));
+        const item = result.Item ?? {};
+        return {
+          connectionState: item.connectionState?.S,
+          mappingStatus: item.mappingStatus?.S,
+          pausedUntil: item.pausedUntil?.N ? Number(item.pausedUntil.N) : undefined,
+        };
+      },
+      async invoke(payload, abortSignal) {
+        const result = await lambdaClient.send(new lambda.InvokeCommand({
+          FunctionName: functionName,
+          Payload: new TextEncoder().encode(JSON.stringify(payload)),
+        }), { abortSignal });
+        if (result.FunctionError) throw new Error(`CRM lookup function failed: ${result.FunctionError}`);
+        const text = new TextDecoder().decode(result.Payload ?? new Uint8Array());
+        return text ? JSON.parse(text) : null;
+      },
+    });
+  });
+  return (await crmLookupClientsPromise)(input);
+}
 
 // "Send me a test" runs the real digest code path synchronously, so the admin
 // sees exactly what the scheduled email will look like.

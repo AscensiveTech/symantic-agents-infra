@@ -15,6 +15,9 @@ locals {
     signwell = {
       description = "SignWell API key, webhook ID, and test-mode configuration"
     }
+    monday-oauth = {
+      description = "Monday.com OAuth 2.1 app credentials (clientId, clientSecret, signingSecret, appId) for the CRM integration"
+    }
     anthropic = {
       description = "Anthropic API key used for the most-asked-questions digest (premium feature)"
     }

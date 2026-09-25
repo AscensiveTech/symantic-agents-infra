@@ -447,6 +447,7 @@ test("Retell upsert creates an LLM and voice agent with compiled config, then pu
     general_prompt: "Compiled prompt",
     general_tools: config.tools,
     knowledge_base_ids: [],
+    default_dynamic_variables: { crm_context: "Not available." },
   });
   assert.equal(createAgent.path, "/create-agent");
   assert.deepEqual(createAgent.body, {
