@@ -593,7 +593,8 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
         + "by that name works here, and never repeat the name back in any form.",
       "- Never say \"no one here by that name\", \"they don't work here anymore\", \"they're not in today\", or \"let me "
         + "check if they're in\" - each one confirms or denies something.",
-      `- Say only: "Someone from ${businessName} will call you back - let me take a message." Then follow TAKING A `
+      `- Say only: "I'm not able to share that kind of information, but I can make sure someone from ${businessName} `
+        + `gets your message and calls you back." Then follow TAKING A `
         + "MESSAGE"
         + (allowCallTransfers && transferRules.length ? ", unless one of the CALL TRANSFERS rules matches." : "."),
       "- If they press, repeat the same line once. Stay warm - don't explain the policy or sound suspicious.",
@@ -990,9 +991,9 @@ function formatDeclineRules(rules) {
 // Matches the exact wording the frontend seeds into Role Instructions
 // (NO_TRANSFER_ROLE_INSTRUCTIONS_ADDENDUM, lib/mock-data/data.ts) - kept
 // as one literal string here too so the two can't quietly drift apart.
-const NO_TRANSFER_FIXED_LINE = "say: \"My apologies. Since no one is "
-  + "available at the moment, please leave a message and I will ask the "
-  + "team to call you as soon as they are available.\" Then take a message.";
+const NO_TRANSFER_FIXED_LINE = "say: \"I'm not authorized to make transfers, "
+  + "but I can make sure someone from the business gets your message and "
+  + "calls you back as soon as they're available.\" Then take a message.";
 
 function formatNoTransferRules(rules) {
   if (!Array.isArray(rules) || !rules.length) return "";
