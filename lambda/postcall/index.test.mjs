@@ -818,6 +818,97 @@ test("successful lead and message tool outputs backfill missing records", async 
   }
 });
 
+test("two identical successful tool calls in one call collapse to one Actions Taken entry, but distinct ones stay distinct", async () => {
+  let persistedCall;
+  const store = {
+    async upsertCall(record) {
+      persistedCall = structuredClone(record);
+    },
+    async upsertMessage() {},
+    async upsertAppointment() {},
+  };
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => store,
+    now: () => new Date("2026-08-16T14:00:00.000Z"),
+  });
+  const messageArgs = (suffix) => ({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    callId: "retell-call-123",
+    idempotencyKey: `retell-call-123-message_take-${suffix}`,
+    name: "Alicia Chen",
+    phone: "+15715550129",
+    message: `Message ${suffix}`,
+    urgency: "normal",
+  });
+  const call = {
+    call_id: "retell-call-123",
+    call_status: "ended",
+    metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+    transcript_with_tool_calls: [
+      {
+        role: "tool_call_invocation",
+        tool_call_id: "tool-1",
+        name: "message_take",
+        arguments: JSON.stringify(messageArgs("first")),
+      },
+      {
+        role: "tool_call_result",
+        tool_call_id: "tool-1",
+        content: JSON.stringify({ ok: true, messageId: "msg-1", status: "received" }),
+        successful: true,
+      },
+      {
+        role: "tool_call_invocation",
+        tool_call_id: "tool-2",
+        name: "message_take",
+        arguments: JSON.stringify(messageArgs("second")),
+      },
+      {
+        role: "tool_call_result",
+        tool_call_id: "tool-2",
+        content: JSON.stringify({ ok: true, messageId: "msg-2", status: "received" }),
+        successful: true,
+      },
+      {
+        role: "tool_call_invocation",
+        tool_call_id: "tool-3",
+        name: "calendar_create_booking",
+        arguments: JSON.stringify({ ...messageArgs("n/a"), service: "Oil change" }),
+      },
+      {
+        role: "tool_call_result",
+        tool_call_id: "tool-3",
+        content: JSON.stringify({ ok: true, appointmentId: "apt-1", status: "confirmed" }),
+        successful: true,
+      },
+      {
+        role: "tool_call_invocation",
+        tool_call_id: "tool-4",
+        name: "calendar_create_booking",
+        arguments: JSON.stringify({ ...messageArgs("n/a"), service: "Tire rotation" }),
+      },
+      {
+        role: "tool_call_result",
+        tool_call_id: "tool-4",
+        content: JSON.stringify({ ok: true, appointmentId: "apt-2", status: "confirmed" }),
+        successful: true,
+      },
+    ],
+  };
+
+  const response = await handler(callEndedEvent(call));
+
+  assert.equal(response.statusCode, 204);
+  assert.deepEqual(persistedCall.actions, [
+    "Took a message for the office",
+    "Booked appointment · Oil change",
+    "Booked appointment · Tire rotation",
+  ]);
+});
+
 test("Dynamo store synchronously writes calls, conditional backfills, and testedAt", async () => {
   class PutItemCommand {
     constructor(input) {

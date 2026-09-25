@@ -441,7 +441,12 @@ function describeActions(toolLog) {
       }
       return [];
     });
-  return out.length ? out : undefined;
+  // Two calls to the same tool in one conversation (e.g. two separate
+  // messages taken a few minutes apart) otherwise show as the same line
+  // twice - dedupe while keeping first-seen order. Distinct labels (two
+  // different "Booked appointment · <service>" strings) stay distinct.
+  const deduped = [...new Set(out)];
+  return deduped.length ? deduped : undefined;
 }
 
 // Copy the Retell recording into our own S3 bucket. Returns the object key on success,
