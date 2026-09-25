@@ -2,6 +2,22 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
 
+// Minimal DynamoDB AttributeValue marshaller for tests that fake
+// UpdateItemCommand's ReturnValues response - mirrors the real
+// marshall/unmarshall pair defined locally in index.mjs (not exported,
+// and this codebase has no @aws-sdk/util-dynamodb dependency).
+function marshall(value) {
+  if (value === null || value === undefined) return { NULL: true };
+  if (typeof value === "string") return { S: value };
+  if (typeof value === "number") return { N: String(value) };
+  if (typeof value === "boolean") return { BOOL: value };
+  if (Array.isArray(value)) return { L: value.map((item) => marshall(item)) };
+  if (typeof value === "object") {
+    return { M: Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined).map(([k, v]) => [k, marshall(v)])) };
+  }
+  throw new Error(`Cannot marshall value: ${value}`);
+}
+
 async function loadBff() {
   try {
     return await import("./index.mjs");
@@ -2601,7 +2617,12 @@ test("Dynamo agent updates preserve provider foreign keys", async () => {
   const client = {
     async send(command) {
       sent = command;
-      return {};
+      const item = { workspaceId: "workspace-123", agentId: "agent-123", ...agent };
+      return {
+        Attributes: Object.fromEntries(
+          Object.entries(item).filter(([, v]) => v !== undefined).map(([k, v]) => [k, marshall(v)]),
+        ),
+      };
     },
   };
   const { createDynamoStore } = await loadBff();
@@ -2861,6 +2882,11 @@ test("POST attach-phone-number provisions the DID and imports it into an already
       events.push(["putPhoneNumber", record]);
       return record;
     },
+    async updateAgentRuntime(workspaceId, agentId, updates) {
+      events.push(["updateAgentRuntime", updates]);
+      Object.assign(agent, updates);
+      return agent;
+    },
   };
   const providers = {
     telnyx: {
@@ -2895,6 +2921,10 @@ test("POST attach-phone-number provisions the DID and imports it into an already
   const body = JSON.parse(response.body);
   assert.equal(body.phoneNumber.id, "phone-agent-123");
   assert.equal(body.phoneNumber.phoneNumber, "+17035550177");
+  // The roster tile reads this back from the agent record, not just the
+  // one-time HTTP response - it must be persisted here too.
+  const runtimeUpdate = events.find(([kind]) => kind === "updateAgentRuntime");
+  assert.equal(runtimeUpdate[1].configuration.platformDid, "+17035550177");
   assert.ok(
     events.findIndex(([name]) => name === "importPhoneNumber") <
       events.findIndex(([name]) => name === "putPhoneNumber"),
@@ -3195,13 +3225,15 @@ test("POST start-test-call creates a Retell phone call without marking the draft
       };
     },
     async updateAgentRuntime(_workspaceId, _agentId, updates) {
-      assert.deepEqual(updates, { retellAgentId: "retell-agent-123" });
+      runtimeUpdates.push(updates);
+      Object.assign(agent, updates);
       return { ...agent, ...updates };
     },
     async putPhoneNumber() {
       return undefined;
     },
   };
+  const runtimeUpdates = [];
   let phoneCallInput;
   const { createHandler } = await loadBff();
   const handler = createHandler({
@@ -3256,6 +3288,10 @@ test("POST start-test-call creates a Retell phone call without marking the draft
   });
   assert.equal(agent.configuration.tested, false);
   assert.equal(agent.configuration.testedAt, undefined);
+  // The roster tile reads platformDid back from the agent record on its
+  // next GET /agents - a Test call provisioning a number must persist it
+  // here too, not just return it in this one-time response.
+  assert.ok(runtimeUpdates.some((update) => update.configuration?.platformDid === "+17035550177"));
 });
 
 test("POST inbound lookup uses Retell's call_inbound request and response contract", async () => {

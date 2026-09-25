@@ -582,17 +582,36 @@ export function createRetellClient({
           : null;
         if (!existingLlmId) {
           // No Retell LLM attached (e.g. switched to another engine in the
-          // dashboard) - attach a fresh one, the only case that still
-          // sends response_engine on an update.
+          // dashboard, or `existing` only came from the findAgentBySymanticId
+          // list fallback, whose summary rows omit response_engine) -
+          // attach a fresh one, the only case that still sends
+          // response_engine on an update. Still has to go through a draft
+          // version like publishFromApp does - an already-published agent
+          // rejects update-agent outright ("Cannot update published agent
+          // other than version title") once it has any versions, which
+          // every real agent does by this point.
           const llmId = await createLlm({ greeting, config });
-          await retellRequest(`/update-agent/${encodeURIComponent(resolvedId)}`, {
+          const versions = await listAgentVersions(resolvedId);
+          const livePublished = versions.find((version) => version.is_published);
+          let draftVersion = versions[0] && !versions[0].is_published ? versions[0].version : null;
+          if (draftVersion === null) {
+            const created = await retellRequest(agentPath("create-agent-version", resolvedId), {
+              method: "POST",
+              body: { base_version: livePublished?.version ?? 0 },
+            });
+            if (!Number.isInteger(created?.version)) {
+              throw new ProviderRequestError("Retell", "Retell draft version is required");
+            }
+            draftVersion = created.version;
+          }
+          await retellRequest(agentPath("update-agent", resolvedId, `?version=${draftVersion}`), {
             method: "PATCH",
             body: agentBody({ llmId, symanticAgentId, agentName, config }),
           });
-          const publishedVersion = await publishLatestDraft(resolvedId);
+          await publishVersion(resolvedId, draftVersion);
           await followLatestPublished(resolvedId);
           const live = await readLivePublished(resolvedId);
-          return { retellAgentId: resolvedId, publishedVersion, fingerprints: retellFingerprints(live?.agent, live?.llm) };
+          return { retellAgentId: resolvedId, publishedVersion: draftVersion, fingerprints: retellFingerprints(live?.agent, live?.llm) };
         }
         const { response_engine: _engine, ...agentPatch } = agentBody({ llmId: existingLlmId, symanticAgentId, agentName, config });
         const published = await publishFromApp(resolvedId, {

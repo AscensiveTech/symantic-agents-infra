@@ -1928,6 +1928,14 @@ export function createHandler({
               activatedAt,
               updatedAt: activatedAt,
               everPublished: true,
+              // The activate response already returns the provisioned
+              // number, but that's a one-time HTTP payload - without also
+              // persisting it here, every later GET /agents (the roster
+              // tile) read a blank platformDid and never showed the phone
+              // number at all, even though it was really provisioned.
+              ...(phoneResult.phoneNumber?.telnyxPhoneNumber
+                ? { configuration: { ...agent.configuration, platformDid: phoneResult.phoneNumber.telnyxPhoneNumber } }
+                : {}),
             },
           );
         } catch (error) {
@@ -1974,6 +1982,15 @@ export function createHandler({
           toolBaseUrl,
           phoneStatus: agent.status === "active" ? "active" : "draft",
         });
+        // Same as activate above - without this, the roster tile's next
+        // GET /agents still shows no phone number even though one is now
+        // really attached.
+        if (synced.phoneNumber?.telnyxPhoneNumber) {
+          await store.updateAgentRuntime(workspaceId, agentAction.agentId, {
+            configuration: { ...agent.configuration, platformDid: synced.phoneNumber.telnyxPhoneNumber },
+            updatedAt: new Date().toISOString(),
+          });
+        }
         return json(200, { phoneNumber: toPublicPhoneNumber(synced.phoneNumber) });
       }
 
@@ -6052,6 +6069,16 @@ export async function syncPhoneNumber({
 // exists.
 export async function syncReceptionistRuntime(args) {
   const phoneResult = await syncPhoneNumber(args);
+  // Without this, a number provisioned here (e.g. via the Test button,
+  // start-test-call below) never reaches the agent's own record, so the
+  // roster tile's next GET /agents still shows no phone number even
+  // though one is really attached - the exact bug this was chasing.
+  if (phoneResult.phoneNumber?.telnyxPhoneNumber && args.agent?.configuration?.platformDid !== phoneResult.phoneNumber.telnyxPhoneNumber) {
+    await args.store.updateAgentRuntime(args.workspaceId, args.agentId, {
+      configuration: { ...args.agent.configuration, platformDid: phoneResult.phoneNumber.telnyxPhoneNumber },
+      updatedAt: new Date().toISOString(),
+    });
+  }
   return { phoneNumber: phoneResult.phoneNumber, retellAgentId: phoneResult.retellAgentId };
 }
 
@@ -7714,7 +7741,7 @@ export function createDynamoStore(client, commands, tableNames) {
       const values = Object.fromEntries(
         entries.map(([, value], index) => [`:value${index}`, value]),
       );
-      await client.send(new commands.UpdateItemCommand({
+      const result = await client.send(new commands.UpdateItemCommand({
         TableName: tableNames.agents,
         Key: marshall({ workspaceId, agentId }),
         UpdateExpression: `SET ${
@@ -7731,11 +7758,17 @@ export function createDynamoStore(client, commands, tableNames) {
           }
           : names,
         ExpressionAttributeValues: marshall(values),
+        ReturnValues: "ALL_NEW",
       }));
-      return {
-        ...agent,
-        ...(invalidateTest ? { tested: false } : {}),
-      };
+      // Read back what's really in DynamoDB now, instead of just echoing
+      // the input - a field this update never touched (e.g. retellAgentId,
+      // which the frontend's Save Changes payload never carries) would
+      // otherwise come back undefined here even though the table still has
+      // its real value, silently breaking every caller downstream that
+      // trusts this return value (syncRetellAgent's resulting "no
+      // retellAgentId" fallback is exactly what caused Retell to reject an
+      // already-published agent's update - see providers.mjs upsertAgent).
+      return toAgentRecord(unmarshall(result.Attributes));
     },
 
     async updateAgentRuntime(workspaceId, agentId, updates) {

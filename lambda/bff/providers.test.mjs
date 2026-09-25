@@ -710,6 +710,66 @@ test("Retell upsert updates and publishes an agent the app created that was neve
   assert.equal(live.agent.voice_id, "retell-Cimo");
 });
 
+test("Retell upsert re-attaches a missing LLM on an already-published agent through a draft version, instead of PATCHing the published version directly", async () => {
+  // Regression test: an agent with no response_engine.llm_id (e.g. the
+  // findAgentBySymanticId list fallback, whose summary rows omit it, or a
+  // genuinely detached engine) used to go straight to
+  // PATCH /update-agent/{id} with no ?version= - which a real, already-
+  // published agent (every live agent, by definition) rejects outright:
+  // "Cannot update published agent other than version title". This must
+  // go through create-agent-version -> update the draft -> publish, the
+  // same as the normal publishFromApp path.
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const href = String(url);
+    calls.push([href, init]);
+    if (href.includes("/create-retell-llm")) return response({ llm_id: "llm-new-123" }, 201);
+    if (href.includes("/get-agent/agent-published-123") && !href.includes("version")) {
+      // No response_engine.llm_id at all - the exact condition that used
+      // to trigger the unsafe direct-PATCH branch.
+      return response({ agent_id: "agent-published-123", response_engine: { type: "custom-llm" } });
+    }
+    if (href.includes("/list-agent-versions/agent-published-123")) {
+      return response({ items: [{ version: 0, is_published: true }], has_more: false });
+    }
+    if (href.includes("/create-agent-version/agent-published-123")) {
+      return response({ agent_id: "agent-published-123", version: 1, is_published: false, response_engine: { type: "retell-llm", llm_id: "llm-new-123", version: 0 } }, 201);
+    }
+    if (href.includes("/update-agent/agent-published-123")) {
+      assert.match(href, /\?version=1$/, "must target the new draft version, never the published one");
+      return response({ agent_id: "agent-published-123", version: 1, is_published: false });
+    }
+    if (href.includes("/publish-agent-version/agent-published-123")) {
+      const body = JSON.parse(init.body);
+      assert.equal(body.version, 1);
+      return response({ message: "Agent version published successfully" });
+    }
+    if (href.includes("/list-phone-numbers")) return response([]);
+    if (href.includes("/get-agent/agent-published-123")) {
+      // readLivePublished's own read-back after publishing - either
+      // version answers fine for this test's purposes.
+      return response({ agent_id: "agent-published-123", version: 1, is_published: true, response_engine: { type: "retell-llm", llm_id: "llm-new-123", version: 0 } });
+    }
+    if (href.includes("/get-retell-llm/llm-new-123")) {
+      return response({ llm_id: "llm-new-123", version: 0, is_published: true });
+    }
+    throw new Error(`Unexpected request in test: ${href}`);
+  };
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl });
+
+  const result = await client.upsertAgent({
+    retellAgentId: "agent-published-123",
+    symanticAgentId: "agent-123",
+    agentName: "Maya",
+    greeting: "Hello.",
+    config: { prompt: "Updated prompt", tools: [], voice: "retell-Cimo" },
+  });
+
+  assert.equal(result.retellAgentId, "agent-published-123");
+  assert.equal(result.publishedVersion, 1);
+  assert.ok(calls.some(([href]) => href.includes("/publish-agent-version/agent-published-123")));
+});
+
 test("Retell test call sends provider IDs only in the provider request", async () => {
   const calls = [];
   const client = createRetellClient({
