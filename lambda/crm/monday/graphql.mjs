@@ -31,6 +31,7 @@ const CODE_MAP = new Map([
   ["RecordInvalidException", CRM_ERROR.INVALID_VALUE],
   ["InvalidArgumentException", CRM_ERROR.INVALID_VALUE],
   ["InvalidItemIdException", CRM_ERROR.NOT_FOUND],
+  ["ItemNotFoundInBoard", CRM_ERROR.NOT_FOUND],
   ["ResourceNotFoundException", CRM_ERROR.NOT_FOUND],
   ["missingRequiredPermissions", CRM_ERROR.FORBIDDEN],
   ["UserUnauthorizedException", CRM_ERROR.FORBIDDEN],

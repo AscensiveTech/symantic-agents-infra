@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { buildCallActivity } from "./activity.mjs";
 import { deriveCallFacts, localDatePlusDays } from "./facts.mjs";
@@ -97,21 +97,23 @@ export function createCrmSync({
     }
 
     const linkKey = linkKeyFor(providerId, facts.phoneE164);
-    const lease = await store.acquireLinkLease(workspaceId, linkKey, callId, Number(now()) + LEASE_MS);
+    // Unique per attempt, not per call: two deliveries of the same message
+    // must serialize too, not share the lease.
+    const leaseOwner = `${callId}:${randomUUID()}`;
+    const lease = await store.acquireLinkLease(workspaceId, linkKey, leaseOwner, Number(now()) + LEASE_MS);
     if (!lease) {
       metrics?.count("LeaseBusy", { Provider: providerId });
-      throw new CrmError(CRM_ERROR.LEASE_BUSY, "Another call from this number is syncing", {
-        retryAfterSeconds: 15,
+      throw new CrmError(CRM_ERROR.LEASE_BUSY, "Another sync for this number is running", {
+        retryAfterSeconds: 30,
       });
     }
 
-    await store.updateCallSync(workspaceId, callId, {
-      crmStatus: "in_progress",
-      crmProvider: providerId,
-      crmAttempts: attempt,
-    });
-
     try {
+      await store.updateCallSync(workspaceId, callId, {
+        crmStatus: "in_progress",
+        crmProvider: providerId,
+        crmAttempts: attempt,
+      });
       const result = await sessions.withSession(connection, (session) =>
         runSync({ session, provider, call, facts, link: lease, linkKey, connection })
       );
@@ -146,7 +148,7 @@ export function createCrmSync({
       });
       return handleFailure({ error, call, connection, finalAttempt });
     } finally {
-      await store.releaseLinkLease(workspaceId, linkKey, callId).catch(() => {});
+      await store.releaseLinkLease(workspaceId, linkKey, leaseOwner).catch(() => {});
     }
   }
 

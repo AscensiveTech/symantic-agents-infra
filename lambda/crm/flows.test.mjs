@@ -466,6 +466,36 @@ test("duplicates: truly parallel workers on the same number still create one lea
   assert.equal(leads[0].updates.length, 3);
 });
 
+test("duplicates: the same message delivered to two workers at once yields one lead and one note", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall();
+  const results = await Promise.allSettled([
+    h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: call.callId }),
+    h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: call.callId }),
+  ]);
+  assert.equal(results.filter((r) => r.status === "rejected" && r.reason.code === "lease_busy").length, 1,
+    "the second delivery waits for the lease");
+  h.enqueueCall(call);
+  await h.drain();
+  const leads = [...h.monday.items.values()].filter((item) => item.boardId === h.board.id);
+  assert.equal(leads.length, 1);
+  assert.equal(leads[0].updates.length, 1);
+});
+
+test("a failure writing the in-progress marker still releases the phone lease", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall();
+  h.store.failNext("updateCallSync", Object.assign(new Error("throttled"), { name: "ThrottlingException" }));
+  await assert.rejects(h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: call.callId }));
+  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`);
+  assert.equal(link.leaseOwner, undefined, "lease released");
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "synced");
+});
+
 test("duplicates: Monday commits create_item but the response is lost - the retry reuses it", async () => {
   const h = createHarness();
   await h.connectAndMap();

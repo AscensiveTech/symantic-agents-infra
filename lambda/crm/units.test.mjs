@@ -124,6 +124,9 @@ test("graphql client classifies Monday failures", async () => {
   assert.equal(unknown.code, CRM_ERROR.PROVIDER_ERROR);
   assert.equal(unknown.retryable, true, "unknown errors retry a bounded number of times, then dead-letter");
 
+  const itemGone = await classify(jsonResponse(200, { errors: [{ message: "x", extensions: { code: "ItemNotFoundInBoard" } }] }));
+  assert.equal(itemGone.code, CRM_ERROR.NOT_FOUND);
+
   const forbidden = await classify(jsonResponse(200, { errors: [{ message: "x", extensions: { code: "missingRequiredPermissions" } }] }));
   assert.equal(forbidden.code, CRM_ERROR.FORBIDDEN);
 });

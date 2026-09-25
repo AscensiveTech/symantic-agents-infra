@@ -323,17 +323,21 @@ export function createMondayCrmAdapter({ graphql }) {
   };
 
   async function queryBoards(session, ids) {
+    // One board by id (validation) or the account's most recently used ones
+    // (the mapping picker). `ids` is left out entirely rather than sent null.
     const run = (settingsField) => graphql.request({
       accessToken: session.accessToken,
       operation: "list_boards",
-      query: `query ($ids: [ID!]) {
-        boards(ids: $ids, limit: 200, state: active, order_by: used_at) {
-          id name
-          workspace { name }
-          columns { id title type ${settingsField} }
-        }
-      }`,
-      variables: { ids },
+      query: ids
+        ? `query ($ids: [ID!]) {
+            boards(ids: $ids) { id name workspace { name } columns { id title type ${settingsField} } }
+          }`
+        : `query {
+            boards(limit: 100, state: active, order_by: used_at) {
+              id name workspace { name } columns { id title type ${settingsField} }
+            }
+          }`,
+      variables: ids ? { ids } : {},
     });
     let data;
     try {

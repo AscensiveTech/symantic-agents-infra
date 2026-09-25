@@ -39,7 +39,7 @@ RED = colors.HexColor("#fbe7e3")
 VERIFICATION = {
     "status": "Pre-deployment (local + integration suites). Deployed figures are added after rollout.",
     "rows": [
-        ["CRM Lambda unit + flow tests", "80 passing", "Adapter, OAuth, sessions, sync, lookup, worker, webhook, isolation"],
+        ["CRM Lambda unit + flow tests", "82 passing", "Adapter, OAuth, sessions, sync, lookup, worker, webhook, isolation"],
         ["Post-call Lambda tests", "29 passing (6 new)", "Enqueue gating, test/spam/anonymous skips, retry on enqueue failure"],
         ["BFF tests", "403 passing (6 new)", "Inbound lookup budget, fail-open, no CRM call for rejected callers"],
         ["Other Lambda suites", "142 passing", "tools, oauth, digest, kb-refresh, most-asked-refresh (regression)"],
