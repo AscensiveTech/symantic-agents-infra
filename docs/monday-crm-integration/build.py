@@ -37,15 +37,28 @@ GREEN = colors.HexColor("#e8f3e5")
 RED = colors.HexColor("#fbe7e3")
 
 VERIFICATION = {
-    "status": "Pre-deployment (local + integration suites). Deployed figures are added after rollout.",
+    "status": "Deployed to dev (agents.symantic.ai) on 2026-09-25 and verified with a synthetic workspace and "
+              "fictional number; Monday calls were real, against a deliberately invalid token, because the Monday app "
+              "credentials are not registered yet. A successful Monday write is covered by the flow tests only.",
     "rows": [
-        ["CRM Lambda unit + flow tests", "82 passing", "Adapter, OAuth, sessions, sync, lookup, worker, webhook, isolation"],
-        ["Post-call Lambda tests", "29 passing (6 new)", "Enqueue gating, test/spam/anonymous skips, retry on enqueue failure"],
-        ["BFF tests", "403 passing (6 new)", "Inbound lookup budget, fail-open, no CRM call for rejected callers"],
-        ["Other Lambda suites", "142 passing", "tools, oauth, digest, kb-refresh, most-asked-refresh (regression)"],
-        ["Frontend unit tests", "625 passing (17 new)", "Connect, callback errors, mapping editor, states, disconnect, retry"],
-        ["Frontend lint / typecheck / build", "clean", "eslint --max-warnings=0, tsc, next build"],
-        ["Terraform", "fmt + validate clean", "Plan against dev: 36 add, 8 in-place, 0 destroy"],
+        ["CRM Lambda unit + flow tests", "89 passing", "Adapter, OAuth, sessions, keeper, sync, lookup, worker, webhook, isolation"],
+        ["Post-call / BFF / other Lambda suites", "29 / 403 / 142 passing", "CRM enqueue + inbound lookup; full regression"],
+        ["Frontend", "625 passing; lint, tsc, build clean", "Connect, callback errors, mapping editor, states, retry"],
+        ["DynamoDB integration (real tables)", "6 / 6", "CAS, refresh lock, leases, watermark, null-remove, GSI projection"],
+        ["Deployed: inbound call, no CRM", "200, unchanged", "crm_context 'Not available.'; no invoke"],
+        ["Deployed: Monday rejecting", "all calls answered", "Fail-open; connection flagged reauth_required"],
+        ["Deployed: post-call -> worker", "8 s queue-to-done", "Call row written; sync failed cleanly (reauth); 1 row per call"],
+        ["Deployed: daily-cap pause", "resumed after 65 s", "Message deferred for the 60 s pause, then processed"],
+        ["Deployed: settings API", "as designed", "503 not configured, 403 member, 401 anon, forged state rejected"],
+        ["Deployed: keeper / DLQ", "flagged in 1 run / DLQ after 8, redrive OK", "Keeper flagged a dead grant before any call; poison message dead-lettered after 8 attempts (DLQ alarm fired), then replayed once after the fix"],
+        ["Deployed: tools, post-call regression", "OK", "Existing Retell tool endpoint and post-call ingest unchanged"],
+    ],
+    "latency": [
+        ["Path (measured end to end from the client, 12 samples)", "p50", "p90"],
+        ["Inbound webhook, no CRM connected (baseline)", "317 ms", "480 ms"],
+        ["CRM connected: status read + warm 'live' invoke", "345 ms (+28 ms)", "556 ms"],
+        ["Monday round trip from Lambda (API logs)", "121-199 ms warm", "586-859 ms new TLS"],
+        ["Healthy lookup, derived: overhead + one Monday read", "~+0.2 s", "~+0.9 s; hard cap 1.5 s"],
     ],
 }
 
@@ -160,7 +173,7 @@ def architecture_diagram():
     box(d, bx, 156, 92, 36, "BFF Lambda", "inbound webhook")
     box(d, bx, 104, 92, 36, "Post-call Lambda", "call_analyzed")
     box(d, bx, 14, 92, 60, "State (DynamoDB)", "crm-connections\n(KMS-encrypted tokens)\ncrm-links, calls.crm*")
-    box(d, cx, 156, cw, 86, "crm Lambda", "settings API, OAuth,\nwebhook, call lookup", fill=LIME)
+    box(d, cx, 156, cw, 86, "crm Lambda", "settings API, OAuth, webhook\ncall lookup (alias 'live',\nprovisioned) + token keeper\n(EventBridge, 10 min)", fill=LIME)
     box(d, cx, 104, cw, 36, "SQS crm-sync", "DLQ after 8 attempts")
     box(d, cx, 38, cw, 44, "crm-worker Lambda", "post-call sync", fill=LIME)
 
@@ -298,7 +311,7 @@ story = []
 story += [
     p("Monday CRM integration", H1),
     p("How the AI receptionist uses Monday.com, and why it is built this way. Describes the implementation "
-      "merged in symantic-agents-infra and symantic-agents-frontend (branch feat/monday-crm).", SMALL),
+      "merged in symantic-agents-infra (PRs #46, #47) and symantic-agents-frontend (PR #71).", SMALL),
     Spacer(1, 8),
     p("<b>What it does.</b> When a call comes in, the receptionist looks the caller up in the business's Monday "
       "board and, if they are known, greets them with that context. After every call, a background worker finds or "
@@ -309,7 +322,8 @@ story += [
         ["Decision", "Choice"],
         ["Integration path", "Direct Monday GraphQL API, authorized per business through a Monday OAuth 2.1 app"],
         ["Domain boundary", "CrmProvider contract; Monday lives only in lambda/crm/monday/"],
-        ["Live call", "One bounded read (1.5 s cap, fail-open) during the inbound webhook; no writes"],
+        ["Live call", "One bounded read (1.5 s cap, fail-open) on a warm, provisioned Lambda alias; no writes, "
+         "no token refresh (a 10-minute keeper refreshes tokens ahead of expiry)"],
         ["After the call", "SQS queue -> crm-worker Lambda -> Monday; DLQ after 8 attempts"],
         ["Inbound events", "Only Monday's app-uninstall webhook; no board webhooks, no polling"],
         ["Duplicates", "Per-phone lease, search-before-create, Monday Idempotency-Key, Ref: marker, watermark"],
@@ -354,6 +368,9 @@ story += [
         "Legacy Monday tokens stop working on 2026-10-01; this is built on OAuth 2.1 only (PKCE S256, rotating refresh "
         "tokens). Access tokens (1 h) and refresh tokens are KMS-encrypted with a dedicated key; the encryption "
         "context binds each ciphertext to its workspace and purpose.",
+        "A token keeper (EventBridge, every 10 minutes) refreshes any access token with under 25 minutes left, so "
+        "the call-time lookup never refreshes - and a revoked grant is found by the keeper, not by a caller. It "
+        "refreshes five accounts at a time within a 10-second budget; one account's failure never stops the rest.",
         "Refresh is serialized across Lambda containers by a short lock on the connection row and committed with a "
         "tokenVersion compare-and-swap, so a rotated refresh token is never lost to a race. A rejected refresh or a "
         "second 401 marks the connection <i>reauth_required</i>; the UI shows Reconnect.",
@@ -369,6 +386,9 @@ story += [
 
     KeepTogether([p("5. During the call: caller lookup", H2), lookup_diagram()]),
     *bullets([
+        "The BFF invokes the lookup through the crm Lambda's <i>live</i> alias, which keeps a provisioned, "
+        "pre-initialized instance (SDK clients built at init) - no cold start while the caller hears ringing. The "
+        "settings API and the keeper use the unqualified function and never take that capacity.",
         "Started only after the call is accepted (a blocked or rejected caller costs no Monday call), in parallel "
         "with the overage check. Hard budget: 1.5 s including the Lambda invoke; the invoke is aborted at the "
         "deadline. Retell allows 10 s here while the caller hears ringing.",
@@ -447,7 +467,7 @@ story += [
         ["Monday slow / timeout / 5xx", "No context; call continues", "Retry: 30 s, 60 s, 2 min ... 15 min, then DLQ"],
         ["Rate limited (429, complexity)", "No context", "Retry after Monday's retry_in_seconds"],
         ["Daily API cap", "No context; lookups paused", "Connection paused until 00:05 UTC; messages wait, then catch up"],
-        ["Token expired", "Refreshed if the lock is free", "Refreshed; one retry on 401"],
+        ["Token near expiry", "Never happens: the keeper refreshes 25 min ahead", "Refreshed; one retry on 401"],
         ["Grant revoked / 6-month limit", "No context", "reauth_required; call marked failed; re-queued on reconnect"],
         ["Board or column deleted, label missing", "No context", "Mapping marked invalid, call failed (no pointless "
          "retries); re-queued when the admin fixes the mapping"],
@@ -475,7 +495,8 @@ story += [
         ["ApiLatency, ApiCall (by operation and outcome)", "Symantic/CRM metrics (EMF logs)"],
         ["InboundLookupLatency (by outcome), Lookup, LookupLatency", "BFF and crm Lambda"],
         ["SyncSucceeded / SyncFailed / SyncRetried / DeadLettered / SyncDuration / QueueAge", "crm-worker"],
-        ["RateLimited, TokenRefresh, TokenFailure, OAuth, Webhook, LeaseBusy, StaleLink", "crm and crm-worker"],
+        ["RateLimited, TokenRefresh, TokenFailure, KeeperRefreshed, KeeperFailed, OAuth, Webhook, LeaseBusy, "
+         "StaleLink", "crm and crm-worker"],
         ["Alarms: DLQ not empty; queue older than 1 h; worker errors; >=10 lookup timeouts / 15 min; "
          ">=5 mapping failures / h", "CloudWatch (optional SNS via crm_alarm_topic_arn)"],
     ], [0.62, 0.38]),
@@ -493,6 +514,8 @@ story += [
         "Replays are safe - sync is idempotent.",
         "<b>Admin-fixable failures</b> (reconnect, mapping) retry themselves when fixed; 'Retry failed calls' on the "
         "Integrations page re-queues the last 7 days.",
+        "<b>Capacity knobs</b>: crm_provisioned_concurrency (default 1, about $3/month) sizes the warm lookup "
+        "instances; the keeper schedule is the crm-token-keeper EventBridge rule.",
         "<b>Monday API version</b> is pinned (2026-07, variable monday_api_version). Move it forward deliberately when "
         "Monday announces its deprecation, and rerun the suites.",
         "<b>Existing agents</b> receive the prompt's CALLER RECORD section the next time they are saved (as with "
@@ -506,7 +529,13 @@ story += [
     KeepTogether([
         p("13. Verification", H2),
         p(VERIFICATION["status"], SMALL),
-        table([["Suite", "Result", "Covers"], *VERIFICATION["rows"]], [0.3, 0.2, 0.5]),
+        table([["Check", "Result", "Covers"], *VERIFICATION["rows"]], [0.32, 0.22, 0.46]),
+    ]),
+    KeepTogether([
+        p("Live-call latency", H3),
+        table(VERIFICATION["latency"], [0.56, 0.22, 0.22]),
+        p("Before the token keeper and the provisioned alias, a lookup that had to refresh the token took "
+          "1.4-2.8 s and ran past its budget - found by this measurement and fixed in infra PR #47.", SMALL),
     ]),
 ]
 
