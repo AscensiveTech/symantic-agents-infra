@@ -321,6 +321,8 @@ resource "aws_lambda_function" "bff" {
       ANTHROPIC_SECRET_ARN        = aws_secretsmanager_secret.providers["anthropic"].arn
       PUBLIC_API_BASE_URL         = aws_apigatewayv2_api.bff.api_endpoint
       CALL_DIGEST_FUNCTION_NAME   = aws_lambda_function.digest.function_name
+      CRM_LOOKUP_FUNCTION_NAME    = aws_lambda_function.crm.function_name
+      CRM_CONNECTIONS_TABLE       = aws_dynamodb_table.crm_connections.name
       EMAIL_SENDER_ADDRESS        = var.email_sender_address
     }
   }

@@ -3420,6 +3420,8 @@ test("POST inbound lookup uses Retell's call_inbound request and response contra
     workspaceId: "workspace-123",
     agentId: "agent-123",
     timezone: "America/New_York",
+    // No CRM connected: the prompt's caller-record section says so.
+    crm_context: "Not available.",
   });
   assert.deepEqual(body.call_inbound.override_agent_id, "retell-agent-123");
   assert.deepEqual(body.call_inbound.metadata, {
@@ -9185,4 +9187,149 @@ test("GET most-asked-questions returns entitled:false with no digests for a non-
   const response = await handler(authenticatedEvent("GET", "/workspaces/me/most-asked-questions"));
   assert.equal(response.statusCode, 200);
   assert.deepEqual(JSON.parse(response.body), { entitled: false, digests: [] });
+});
+
+// ------------------------------------------------------ CRM caller context ----
+
+function inboundEvent(fromNumber = "+17035550100") {
+  return {
+    requestContext: { http: { method: "POST", path: "/retell/inbound-lookup" } },
+    rawPath: "/retell/inbound-lookup",
+    headers: { "x-retell-signature": "sig" },
+    body: JSON.stringify({ event: "call_inbound", call_inbound: { to_number: "+17035550177", from_number: fromNumber } }),
+  };
+}
+
+function inboundStore(extra = {}) {
+  return {
+    async getPhoneNumberByDid() {
+      return { workspaceId: "workspace-123", agentId: "agent-123" };
+    },
+    async getAgent() {
+      return { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
+    },
+    async getProfile() {
+      return receptionistProfile();
+    },
+    ...extra,
+  };
+}
+
+test("inbound lookup passes CRM caller context to Retell as crm_context", async () => {
+  const { createHandler } = await loadBff();
+  const lookups = [];
+  const handler = createHandler({
+    getStore: async () => inboundStore(),
+    getRetellApiKey: async () => "k",
+    verifySignature: () => true,
+    lookupCrmContext: async (input) => {
+      lookups.push(input);
+      return "Existing contact in the business's CRM; name on file: Jane Doe.";
+    },
+  });
+  const response = await handler(inboundEvent());
+  const vars = JSON.parse(response.body).call_inbound.dynamic_variables;
+  assert.equal(vars.crm_context, "Existing contact in the business's CRM; name on file: Jane Doe.");
+  assert.deepEqual(lookups, [{ workspaceId: "workspace-123", callerNumber: "+17035550100" }]);
+});
+
+test("inbound lookup answers normally when the CRM lookup throws", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => inboundStore(),
+    getRetellApiKey: async () => "k",
+    verifySignature: () => true,
+    lookupCrmContext: async () => { throw new Error("boom"); },
+  });
+  const response = await handler(inboundEvent());
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.call_inbound.override_agent_id, "retell-agent-123");
+  assert.equal(body.call_inbound.dynamic_variables.crm_context, "Not available.");
+});
+
+test("inbound lookup never spends a CRM call on a caller it rejects", async () => {
+  const { createHandler } = await loadBff();
+  let lookups = 0;
+  const handler = createHandler({
+    getStore: async () => inboundStore({
+      async getAgent() {
+        return { status: "draft" };
+      },
+      async createDeclinedCall(record) {
+        return record;
+      },
+    }),
+    getRetellApiKey: async () => "k",
+    verifySignature: () => true,
+    lookupCrmContext: async () => {
+      lookups += 1;
+      return "x";
+    },
+  });
+  const response = await handler(inboundEvent());
+  assert.deepEqual(JSON.parse(response.body), { call_inbound: { reject: true } });
+  assert.equal(lookups, 0);
+});
+
+test("CRM context lookup gives up at its budget and aborts the invoke", async () => {
+  const { createCrmContextLookup } = await loadBff();
+  let aborted = false;
+  const lookup = createCrmContextLookup({
+    budgetMs: 80,
+    getConnectionStatus: async () => ({ connectionState: "connected", mappingStatus: "valid" }),
+    invoke: (_payload, signal) => new Promise((resolve) => {
+      signal.addEventListener("abort", () => { aborted = true; });
+      setTimeout(() => resolve({ status: "found", context: "late" }), 1000);
+    }),
+    log: {},
+  });
+  const started = Date.now();
+  const context = await lookup({ workspaceId: "ws", callerNumber: "+17035550100" });
+  const elapsed = Date.now() - started;
+  assert.equal(context, "Not available.");
+  assert.ok(elapsed < 300, `took ${elapsed}ms`);
+  assert.equal(aborted, true);
+});
+
+test("CRM context lookup skips the invoke for workspaces without a usable CRM", async () => {
+  const { createCrmContextLookup } = await loadBff();
+  for (const status of [
+    null,
+    { connectionState: "disconnected", mappingStatus: "valid" },
+    { connectionState: "reauth_required", mappingStatus: "valid" },
+    { connectionState: "connected", mappingStatus: "invalid" },
+    { connectionState: "connected", mappingStatus: "valid", pausedUntil: Date.now() + 60_000 },
+  ]) {
+    let invoked = false;
+    const lookup = createCrmContextLookup({
+      getConnectionStatus: async () => status,
+      invoke: async () => { invoked = true; return { context: "x" }; },
+    });
+    assert.equal(await lookup({ workspaceId: "ws", callerNumber: "+17035550100" }), "Not available.");
+    assert.equal(invoked, false, JSON.stringify(status));
+  }
+  const noNumber = createCrmContextLookup({
+    getConnectionStatus: async () => { throw new Error("should not read"); },
+    invoke: async () => ({}),
+  });
+  assert.equal(await noNumber({ workspaceId: "ws", callerNumber: undefined }), "Not available.");
+});
+
+test("CRM context lookup returns the CRM Lambda's context, or the default on a failed invoke", async () => {
+  const { createCrmContextLookup } = await loadBff();
+  const ok = createCrmContextLookup({
+    getConnectionStatus: async () => ({ connectionState: "connected", mappingStatus: "valid" }),
+    invoke: async (payload) => {
+      assert.deepEqual(payload, { action: "lookup", workspaceId: "ws", callerNumber: "+17035550100" });
+      return { status: "found", context: "Existing contact" };
+    },
+  });
+  assert.equal(await ok({ workspaceId: "ws", callerNumber: "+17035550100" }), "Existing contact");
+  const failing = createCrmContextLookup({
+    getConnectionStatus: async () => ({ connectionState: "connected", mappingStatus: "valid" }),
+    invoke: async () => { throw new Error("Lambda throttled"); },
+    log: {},
+  });
+  assert.equal(await failing({ workspaceId: "ws", callerNumber: "+17035550100" }), "Not available.");
 });

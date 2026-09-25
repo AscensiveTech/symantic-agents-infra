@@ -92,6 +92,7 @@ export function createHandler({
   getStore = getDefaultStore,
   getRecordingStore = getDefaultRecordingStore,
   getUsageStore = getDefaultUsageStore,
+  getCrmSync = getDefaultCrmSync,
   fetchImpl = globalThis.fetch,
   now = () => new Date(),
 } = {}) {
@@ -331,6 +332,9 @@ export function createHandler({
       ) {
         await store.markAgentTested(workspaceId, agentId, timestamp);
       }
+      if (eventType === "call_analyzed") {
+        await enqueueCrmSync({ getCrmSync, call, record });
+      }
       return noContent();
     } catch (error) {
       console.error("Post-call ingest failed", {
@@ -343,6 +347,23 @@ export function createHandler({
     }
   };
 }
+
+// Hand the analyzed call to the CRM sync worker (lambda/crm/worker.mjs).
+// Only when the workspace has a CRM connected and mapped; test calls, spam
+// and callers with no number never reach a CRM. A failure here fails the
+// webhook so Retell retries it - every step above is idempotent, and the
+// worker dedupes on the call id.
+async function enqueueCrmSync({ getCrmSync, call, record }) {
+  if (call?.metadata?.kind === "test" || record.outcome === "spam" || !record.callerNumber) return;
+  const crm = await getCrmSync();
+  if (!crm) return;
+  const status = await crm.getConnectionStatus(record.workspaceId);
+  if (status?.connectionState !== "connected" || status?.mappingStatus !== "valid") return;
+  if (!await crm.markQueued(record.workspaceId, record.callId)) return;
+  await crm.send({ workspaceId: record.workspaceId, callId: record.callId, provider: CRM_PROVIDER });
+}
+
+const CRM_PROVIDER = "monday";
 
 function normalizeToolLog(value) {
   return Array.isArray(value)
@@ -1097,6 +1118,71 @@ async function getDefaultStore() {
     )
   );
   return storePromise;
+}
+
+let crmSyncPromise;
+
+export function createCrmSyncClient({ dynamodb, dynamoClient, sqs, sqsClient, connectionsTable, callsTable, queueUrl, now = () => new Date() }) {
+  return {
+    async getConnectionStatus(workspaceId) {
+      const result = await dynamoClient.send(new dynamodb.GetItemCommand({
+        TableName: connectionsTable,
+        Key: marshall({ workspaceId, provider: CRM_PROVIDER }),
+        ProjectionExpression: "connectionState, mappingStatus",
+        ConsistentRead: true,
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
+    },
+    // Arms the call for sync; false when it has already synced (a repeated
+    // call_analyzed webhook), so nothing is enqueued twice for a done call.
+    async markQueued(workspaceId, callId) {
+      const timestamp = now().toISOString();
+      try {
+        await dynamoClient.send(new dynamodb.UpdateItemCommand({
+          TableName: callsTable,
+          Key: marshall({ workspaceId, callId }),
+          UpdateExpression: "SET crmStatus = :pending, crmProvider = :provider, crmQueuedAt = :at, crmUpdatedAt = :at",
+          ConditionExpression: "attribute_exists(workspaceId) AND (attribute_not_exists(crmStatus) OR crmStatus <> :synced)",
+          ExpressionAttributeValues: marshall({
+            ":pending": "pending",
+            ":provider": CRM_PROVIDER,
+            ":at": timestamp,
+            ":synced": "synced",
+          }),
+        }));
+        return true;
+      } catch (error) {
+        if (error?.name === "ConditionalCheckFailedException") return false;
+        throw error;
+      }
+    },
+    async send(message) {
+      await sqsClient.send(new sqs.SendMessageCommand({
+        QueueUrl: queueUrl,
+        MessageBody: JSON.stringify({ v: 1, ...message }),
+      }));
+    },
+  };
+}
+
+// Null (sync disabled) until the CRM queue and table are configured.
+async function getDefaultCrmSync() {
+  const queueUrl = process.env.CRM_SYNC_QUEUE_URL;
+  const connectionsTable = process.env.CRM_CONNECTIONS_TABLE;
+  if (!queueUrl || !connectionsTable) return null;
+  crmSyncPromise ??= Promise.all([
+    import("@aws-sdk/client-dynamodb"),
+    import("@aws-sdk/client-sqs"),
+  ]).then(([dynamodb, sqs]) => createCrmSyncClient({
+    dynamodb,
+    dynamoClient: new dynamodb.DynamoDBClient({}),
+    sqs,
+    sqsClient: new sqs.SQSClient({}),
+    connectionsTable,
+    callsTable: process.env.CALLS_TABLE,
+    queueUrl,
+  }));
+  return crmSyncPromise;
 }
 
 export const handler = createHandler();

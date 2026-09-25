@@ -19,6 +19,11 @@ function canonical(value) {
   return value ?? null;
 }
 
+// Filled in per call by the inbound webhook (see handleInboundLookup); this
+// default covers calls that skip it - dashboard test calls and web calls - so
+// the prompt never shows a raw {{crm_context}} placeholder.
+const DEFAULT_DYNAMIC_VARIABLES = Object.freeze({ crm_context: "Not available." });
+
 const sameValue = (left, right) => JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
 
 // One hash per field of a published agent and its LLM ("agent.voice_id",
@@ -317,6 +322,7 @@ export function createRetellClient({
         general_prompt: config.prompt,
         general_tools: config.tools,
         knowledge_base_ids: config.knowledgeBaseIds ?? [],
+        default_dynamic_variables: DEFAULT_DYNAMIC_VARIABLES,
       },
     });
     return required(result?.llm_id, "Retell llm_id");
@@ -494,6 +500,7 @@ export function createRetellClient({
       general_prompt: config.prompt,
       general_tools: config.tools,
       knowledge_base_ids: config.knowledgeBaseIds ?? [],
+      default_dynamic_variables: DEFAULT_DYNAMIC_VARIABLES,
     };
   }
 
