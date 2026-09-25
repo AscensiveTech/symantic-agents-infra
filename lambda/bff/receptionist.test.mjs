@@ -463,7 +463,7 @@ test("Do Not Allow: no transfer tools at all, each rule's own response, then the
   assert.match(rules, /This agent never transfers a call\./);
   assert.match(rules, /"talk to a supervisor": say "I'll pass that along/);
   assert.doesNotMatch(rules, /billing question/);
-  assert.match(rules, /My apologies\. Since no one is available/);
+  assert.match(rules, /I'm not authorized to make transfers, but I can make sure someone from the business gets your message/);
   assert.doesNotMatch(config.prompt, /transfer_call/);
   assert.match(rules, /Match by the MEANING of what the caller says, never their exact wording/);
 });
@@ -501,7 +501,7 @@ test("requests for a specific person never confirm, deny, or repeat a name", () 
   const person = section(buildReceptionistPrompt(agent, profile), "REQUESTS FOR A SPECIFIC PERSON");
   assert.match(person, /never confirm or deny that anyone\s+by that name works here/);
   assert.match(person, /never repeat the name back/);
-  assert.match(person, /Someone from Arc Dental will call you back/);
+  assert.match(person, /I'm not able to share that kind of information, but I can make sure someone from Arc Dental gets your message/);
 });
 
 test("spam, off-topic, flirting, abuse, and no-progress handling - never accusing the caller", () => {
