@@ -53,6 +53,11 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       maybeFail("getConnection");
       return clone(connections.get(key(workspaceId, provider)));
     },
+    async listConnected() {
+      return [...connections.values()]
+        .filter((row) => row.connectionState === "connected")
+        .map((row) => ({ workspaceId: row.workspaceId, provider: row.provider }));
+    },
     async listConnectionsByAccount(provider, accountId) {
       return [...connections.values()]
         .filter((row) => row.provider === provider && row.accountId === String(accountId))

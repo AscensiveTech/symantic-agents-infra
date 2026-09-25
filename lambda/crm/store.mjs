@@ -128,6 +128,27 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return items;
     },
 
+    // For the token keeper: every connected connection (a small table - one
+    // row per workspace and provider).
+    async listConnected() {
+      requireTable(connections);
+      const items = [];
+      let startKey;
+      do {
+        const result = await client.send(new commands.ScanCommand({
+          TableName: connections,
+          FilterExpression: "connectionState = :connected",
+          ProjectionExpression: "workspaceId, #provider",
+          ExpressionAttributeNames: { "#provider": "provider" },
+          ExpressionAttributeValues: marshall({ ":connected": "connected" }),
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map(unmarshall));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+      return items;
+    },
+
     // A fresh (re)authorization. Keeps the saved mapping so reconnecting
     // doesn't make the admin configure fields again.
     saveAuthorization(workspaceId, provider, record) {
