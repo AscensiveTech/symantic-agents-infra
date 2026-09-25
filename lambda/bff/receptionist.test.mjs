@@ -395,6 +395,16 @@ test("critical rules: caller number, clock, no email, never guess, tool-confirme
   assert.doesNotMatch(noBooking, /booked under/);
 });
 
+test("critical rules: never re-ask for information (especially the caller's name) already given earlier in the call", () => {
+  const rules = section(buildReceptionistPrompt(agent, profile), "CRITICAL RULES");
+  assert.match(rules, /Never ask for information you already have from earlier in this same call - especially the caller's name/);
+});
+
+test("one thing at a time: don't fall back to a generic \"how can I help\" every turn", () => {
+  const oneThing = section(buildReceptionistPrompt(agent, profile), "ONE THING AT A TIME");
+  assert.match(oneThing, /Don't fall back to a generic "How can I help you today\?" after every turn/);
+});
+
 test("the context line explains why the AI is answering, and the message flow asks name, reason, and confirms the number one at a time", () => {
   const prompt = buildReceptionistPrompt(agent, profile);
 
@@ -405,6 +415,7 @@ test("the context line explains why the AI is answering, and the message flow as
   assert.match(message, /If they ask\s+what it is, tell them/);
   assert.match(message, /message_take/);
   assert.match(message, /Never promise a callback time\. Never ask for an email/);
+  assert.match(message, /unless you already have it from earlier in this call, in which case use that/);
   assert.match(section(prompt, "ONE THING AT A TIME"), /Bad: .*\nGood: /);
 });
 
