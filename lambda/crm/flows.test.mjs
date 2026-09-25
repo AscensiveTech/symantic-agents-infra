@@ -878,12 +878,16 @@ test("keeper: a revoked grant is flagged before the next call arrives", async ()
 test("keeper: one tenant's storage error does not stop the others", async () => {
   const h = createHarness();
   await h.connectAndMap();
-  h.store.seedConnection({ workspaceId: "ws-b", provider: "monday", connectionState: "connected", accessTokenExpiresAt: 0 });
+  h.store.seedConnection({
+    workspaceId: "ws-b",
+    provider: "monday",
+    connectionState: "connected",
+    accessTokenExpiresAt: h.clock() + 24 * 60 * 60 * 1000,
+  });
   h.store.failNext("getConnection", Object.assign(new Error("throttled"), { name: "ThrottlingException" }));
-  h.clock.advance(40 * 60 * 1000);
   const result = await h.runtime.refreshTokens();
-  assert.equal(result.failed, 1);
-  assert.equal(result.refreshed + result.failed, 2);
+  assert.equal(result.failed, 1, "the throttled tenant");
+  assert.equal(result.fresh, 1, "the other tenant was still checked");
 });
 
 test("keeper: skips disconnected workspaces and never touches their tokens", async () => {
