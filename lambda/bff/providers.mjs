@@ -342,6 +342,10 @@ export function createRetellClient({
       // alongside a chosen track (resolveAmbientSoundVolume in
       // receptionist.mjs always returns a value in Retell's 0.1-1 range).
       ...(config.ambientSound ? { ambient_sound_volume: config.ambientSoundVolume } : {}),
+      // Custom word pronunciations (IPA/CMU). Sent as null rather than
+      // omitted when empty, so clearing every entry actually clears it at
+      // Retell instead of leaving stale ones from an earlier save.
+      pronunciation_dictionary: config.pronunciationDictionary?.length ? config.pronunciationDictionary : null,
       agent_name: `Symantic ${symanticAgentId} · ${agentName}`,
       // Explicit rather than relying on Retell's account-level default -
       // call_started is what makes an "ongoing" row show up in Call History

@@ -453,6 +453,7 @@ test("Retell upsert creates an LLM and voice agent with compiled config, then pu
     response_engine: { type: "retell-llm", llm_id: "llm_1" },
     voice_id: "retell-Cimo",
     ambient_sound: null,
+    pronunciation_dictionary: null,
     agent_name: "Symantic agent-123 · Maya",
     webhook_events: ["call_started", "call_ended", "call_analyzed"],
   });
@@ -510,6 +511,37 @@ test("Retell agent body sends ambient_sound_volume alongside a chosen ambient so
   });
   const withoutSound = JSON.parse(calls[2][1].body);
   assert.equal("ambient_sound_volume" in withoutSound, false);
+});
+
+test("Retell agent body sends pronunciation_dictionary verbatim when present, and null when the list is empty", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([String(url), init]);
+    if (String(url).includes("/v2/list-agents")) return response([]);
+    if (String(url).endsWith("/create-retell-llm")) return response({ llm_id: "llm-123" }, 201);
+    return response({ agent_id: "retell-agent-123" }, 201);
+  };
+  const client = createRetellClient({ apiKey: "retell-key", fetchImpl });
+
+  const dictionary = [{ word: "CWR", alphabet: "ipa", phoneme: "siː dʌbəljuː ɑːr" }];
+  await client.upsertAgent({
+    symanticAgentId: "agent-123",
+    agentName: "Maya",
+    greeting: "Thanks for calling.",
+    config: { prompt: "Compiled prompt", voice: "retell-Cimo", pronunciationDictionary: dictionary },
+  });
+  const withDictionary = JSON.parse(calls[2][1].body);
+  assert.deepEqual(withDictionary.pronunciation_dictionary, dictionary);
+
+  calls.length = 0;
+  await client.upsertAgent({
+    symanticAgentId: "agent-456",
+    agentName: "Maya",
+    greeting: "Thanks for calling.",
+    config: { prompt: "Compiled prompt", voice: "retell-Cimo", pronunciationDictionary: [] },
+  });
+  const withoutDictionary = JSON.parse(calls[2][1].body);
+  assert.equal(withoutDictionary.pronunciation_dictionary, null);
 });
 
 test("Retell imports a Telnyx DID and binds it to the synced agent", async () => {
