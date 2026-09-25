@@ -2199,9 +2199,20 @@ export function createHandler({
           const planFix = willBeLive && !incomingPlan && previousPlan && agent.configuration
             ? { configuration: { ...agent.configuration, receptionistPlan: previousPlan } }
             : {};
+          // Same failure mode as the plan guard above: platformDid is set
+          // server-side only (by activate/attach-phone-number/a Test call)
+          // and the frontend's draft never carries it, so an ordinary save
+          // was silently wiping a real, already-provisioned phone number
+          // off the agent record every time - Retell/Telnyx still had it
+          // correctly attached the whole time, only our own copy vanished.
+          const existingPlatformDid = existing?.configuration?.platformDid;
+          const platformDidFix = existingPlatformDid && !agent.configuration?.platformDid
+            ? { configuration: { ...agent.configuration, ...planFix.configuration, platformDid: existingPlatformDid } }
+            : {};
           const saved = {
             ...agent,
             ...planFix,
+            ...platformDidFix,
             // Editing an already-active agent keeps it active and pushes the
             // change straight to Retell (below) instead of silently taking
             // it offline - a customer who edits a live receptionist expects

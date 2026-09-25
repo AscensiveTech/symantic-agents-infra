@@ -921,6 +921,57 @@ test("PUT agent (real save) on an already-active agent never blanks a plan it al
   assert.equal(synced, true);
 });
 
+test("PUT agent (real save) on an already-active agent never blanks a real phone number the frontend draft never carries", async () => {
+  let synced = false;
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return {
+        id: "agent-123",
+        name: "Samantha",
+        status: "active",
+        capabilities: [],
+        configuration: { greeting: "Live greeting", voice: "voice-1", platformDid: "+13017561422" },
+      };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      return { id: agentId, ...patch };
+    },
+    async getProfile() {
+      return { businessName: "Arc Dental", timezone: "America/New_York" };
+    },
+    async updateAgentRuntime() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({
+      retell: {
+        async upsertAgent() { synced = true; return { retellAgentId: "retell-1" }; },
+      },
+      resolveVoiceId(requestedVoice) { return requestedVoice || "voice-1"; },
+    }),
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  // The wizard's own draft never carries platformDid at all - it's set
+  // server-side only (activate/attach-phone-number/a Test call) - so an
+  // ordinary save's configuration was silently wiping a real, already-
+  // provisioned number off the agent record, even though Retell/Telnyx
+  // still had it correctly attached the whole time.
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    { id: "agent-123", name: "Samantha", role: "Phone operations", description: "Answers calls", status: "active", capabilities: [], configuration: { greeting: "New greeting" } },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.configuration.greeting, "New greeting");
+  assert.equal(body.configuration.platformDid, "+13017561422");
+  assert.equal(synced, true);
+});
+
 test("PUT agent (real save) on an already-active agent still applies a genuine, intentional plan change", async () => {
   const store = {
     async ensureWorkspace() {},
