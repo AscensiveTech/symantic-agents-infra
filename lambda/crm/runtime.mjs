@@ -1,4 +1,5 @@
 import { createCrmApi } from "./api.mjs";
+import { createTokenKeeper } from "./keeper.mjs";
 import { createCrmLookup } from "./lookup.mjs";
 import { createMetrics } from "./metrics.mjs";
 import { createMondayCrmAdapter } from "./monday/adapter.mjs";
@@ -51,6 +52,7 @@ export function composeRuntime({
     changeVisibility,
     sync: createCrmSync({ store, providers, sessions, appUrl, metrics, now, log }),
     lookup: createCrmLookup({ store, providers, sessions, metrics, now, log }),
+    refreshTokens: createTokenKeeper({ store, sessions, metrics, now, log }),
     api: createCrmApi({
       store,
       adapter,

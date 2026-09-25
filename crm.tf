@@ -14,6 +14,17 @@ variable "crm_alarm_topic_arn" {
   default     = ""
 }
 
+variable "crm_provisioned_concurrency" {
+  description = "Always-warm copies of the crm Lambda's call-time lookup alias (no cold start while a caller hears ringing)."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.crm_provisioned_concurrency >= 0 && var.crm_provisioned_concurrency <= 10 && floor(var.crm_provisioned_concurrency) == var.crm_provisioned_concurrency
+    error_message = "crm_provisioned_concurrency must be an integer from 0 through 10."
+  }
+}
+
 variable "monday_api_version" {
   description = "Pinned Monday GraphQL API version (API-Version header)."
   type        = string
@@ -224,9 +235,10 @@ resource "aws_iam_role_policy" "crm_runtime" {
     Version = "2012-10-17"
     Statement = [
       {
+        # Scan: the token keeper walks the (one-row-per-workspace) table.
         Sid      = "ManageCrmConnections"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
         Resource = [aws_dynamodb_table.crm_connections.arn, "${aws_dynamodb_table.crm_connections.arn}/index/accountId-index"]
       },
       {
@@ -294,6 +306,7 @@ resource "aws_lambda_function" "crm" {
   architectures = ["arm64"]
   memory_size   = 256
   timeout       = 15
+  publish       = true
 
   filename         = data.archive_file.crm.output_path
   source_code_hash = data.archive_file.crm.output_base64sha256
@@ -311,6 +324,45 @@ resource "aws_lambda_function" "crm" {
   tags = {
     Name = "${local.name_prefix}-crm"
   }
+}
+
+# The BFF invokes the lookup through this alias, which keeps provisioned
+# (pre-initialized) instances; the settings API and the token keeper use the
+# unqualified function so they never take that capacity from a live call.
+resource "aws_lambda_alias" "crm_live" {
+  name             = "live"
+  description      = "Published crm Lambda version for call-time lookups."
+  function_name    = aws_lambda_function.crm.function_name
+  function_version = aws_lambda_function.crm.version
+}
+
+resource "aws_lambda_provisioned_concurrency_config" "crm" {
+  count                             = var.crm_provisioned_concurrency > 0 ? 1 : 0
+  function_name                     = aws_lambda_function.crm.function_name
+  qualifier                         = aws_lambda_alias.crm_live.name
+  provisioned_concurrent_executions = var.crm_provisioned_concurrency
+}
+
+# Token keeper: refreshes Monday access tokens before they expire so the
+# call-time lookup never has to (see lambda/crm/keeper.mjs).
+resource "aws_cloudwatch_event_rule" "crm_token_keeper" {
+  name                = "${local.name_prefix}-crm-token-keeper"
+  description         = "Refresh CRM access tokens ahead of expiry."
+  schedule_expression = "rate(10 minutes)"
+}
+
+resource "aws_cloudwatch_event_target" "crm_token_keeper" {
+  rule  = aws_cloudwatch_event_rule.crm_token_keeper.name
+  arn   = aws_lambda_function.crm.arn
+  input = jsonencode({ action = "refresh-tokens" })
+}
+
+resource "aws_lambda_permission" "crm_token_keeper" {
+  statement_id  = "AllowEventBridgeTokenKeeper"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.crm.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.crm_token_keeper.arn
 }
 
 resource "aws_apigatewayv2_integration" "crm" {
@@ -504,7 +556,7 @@ resource "aws_iam_role_policy" "bff_crm_lookup" {
         Sid      = "InvokeCrmLookup"
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
-        Resource = aws_lambda_function.crm.arn
+        Resource = aws_lambda_alias.crm_live.arn
       },
       {
         # Status only (the BFF can't decrypt tokens - no KMS grant).

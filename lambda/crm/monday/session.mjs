@@ -140,7 +140,13 @@ export function createMondaySessionFactory({
     return tokens.accessToken;
   }
 
-  async function accessTokenFor(connection, { forceRefresh = false, waitMs = 3_000 } = {}) {
+  async function accessTokenFor(connection, {
+    forceRefresh = false,
+    waitMs = 3_000,
+    // The token keeper refreshes well ahead of expiry so the live call path
+    // never has to; everyone else only refreshes once a token is (nearly) out.
+    minValidityMs = ACCESS_TOKEN_SKEW_MS,
+  } = {}) {
     if (connection?.connectionState === "reauth_required") {
       throw new CrmError(CRM_ERROR.REAUTH_REQUIRED, "Monday authorization must be renewed");
     }
@@ -153,10 +159,10 @@ export function createMondaySessionFactory({
     }
     if (!forceRefresh) {
       const cached = cache.get(cacheKey(connection));
-      if (cached && cached.expiresAt - ACCESS_TOKEN_SKEW_MS > nowMs) return cached.accessToken;
+      if (cached && cached.expiresAt - minValidityMs > nowMs) return cached.accessToken;
       if (
         connection.encryptedAccessToken &&
-        Number(connection.accessTokenExpiresAt) - ACCESS_TOKEN_SKEW_MS > nowMs
+        Number(connection.accessTokenExpiresAt) - minValidityMs > nowMs
       ) {
         return useStored(connection);
       }

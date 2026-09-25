@@ -155,7 +155,16 @@ export function createCrmSync({
   async function handleFailure({ error, call, connection, finalAttempt }) {
     const { workspaceId, callId } = call;
     if (!(error instanceof CrmError)) {
-      if (finalAttempt) await failPermanently(call, connection, error);
+      if (finalAttempt) {
+        await failPermanently(call, connection, error);
+      } else {
+        await store.updateCallSync(workspaceId, callId, {
+          crmStatus: "retrying",
+          crmLastErrorCode: "unexpected",
+          crmLastErrorAt: new Date(Number(now())).toISOString(),
+        }).catch(() => {});
+        metrics?.count("SyncRetried", { Provider: connection.provider, Outcome: "unexpected" });
+      }
       throw error;
     }
     switch (error.code) {

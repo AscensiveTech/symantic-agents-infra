@@ -842,3 +842,61 @@ test("unknown routes 404", async () => {
   const h = createHarness();
   assert.equal((await h.api("GET", "/crm/nope", { sub: "sub-admin-a" })).statusCode, 404);
 });
+
+// ============================================================ token keeper ====
+
+test("keeper: refreshes tokens nearing expiry so the call-time lookup never has to", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
+  const fresh = await h.runtime.refreshTokens();
+  assert.deepEqual(fresh, { connected: 1, refreshed: 0, fresh: 1, failed: 0 }, "a new token is left alone");
+
+  h.clock.advance(40 * 60 * 1000);
+  const due = await h.runtime.refreshTokens();
+  assert.equal(due.refreshed, 1);
+  assert.equal(h.monday.count("oauth_refresh_token"), 1);
+
+  h.clock.advance(30 * 60 * 1000);
+  h.monday.reset();
+  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  assert.equal(lookup.status, "found");
+  assert.equal(h.monday.count("oauth_refresh_token"), 0, "no refresh on the live path");
+});
+
+test("keeper: a revoked grant is flagged before the next call arrives", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  h.monday.revokeAll();
+  h.clock.advance(40 * 60 * 1000);
+  const result = await h.runtime.refreshTokens();
+  assert.equal(result.failed, 1);
+  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "reauth_required");
+  assert.equal(h.metrics.sum("KeeperFailed"), 1);
+});
+
+test("keeper: skips disconnected workspaces and never touches their tokens", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
+  h.clock.advance(55 * 60 * 1000);
+  assert.deepEqual(await h.runtime.refreshTokens(), { connected: 0, refreshed: 0, fresh: 0, failed: 0 });
+});
+
+test("an unexpected (non-Monday) failure is recorded on the call while it retries", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall();
+  h.store.failNext("updateCallSync", Object.assign(new Error("throttled"), { name: "ThrottlingException" }));
+  await assert.rejects(h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: call.callId }));
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.equal(row.crmStatus, "retrying");
+  assert.equal(row.crmLastErrorCode, "unexpected");
+});
+
+test("the Lambda handler routes the scheduled keeper event", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const handler = createHandler({ getRuntime: async () => h.runtime });
+  assert.deepEqual(await handler({ action: "refresh-tokens" }), { connected: 1, refreshed: 0, fresh: 1, failed: 0 });
+});
