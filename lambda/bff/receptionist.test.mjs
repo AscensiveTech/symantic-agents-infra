@@ -13,6 +13,7 @@ import {
   resolveGreeting,
   resolveLanguage,
   resolvePauseBeforeSpeakingMs,
+  resolvePronunciationDictionary,
   resolveStartSpeaker,
   spokenAgentName,
 } from "./receptionist.mjs";
@@ -151,6 +152,40 @@ test("the agent's chosen ambient sound volume reaches the Retell config, clamped
   assert.equal(build(5).ambientSoundVolume, 1);
   assert.equal(build(-2).ambientSoundVolume, 0.1);
   assert.equal(resolveAmbientSoundVolume({ configuration: {} }), 0.5);
+});
+
+test("resolvePronunciationDictionary keeps only complete, valid entries, rejects an unsupported alphabet, and caps at 10", () => {
+  assert.deepEqual(resolvePronunciationDictionary({ configuration: {} }), []);
+  assert.deepEqual(resolvePronunciationDictionary({ configuration: { pronunciationDictionary: [] } }), []);
+
+  const withEntries = resolvePronunciationDictionary({
+    configuration: {
+      pronunciationDictionary: [
+        { word: "CWR", alphabet: "ipa", phoneme: "siː dʌbəljuː ɑːr" },
+        { word: "no phoneme", alphabet: "ipa", phoneme: "" },
+        { word: "", alphabet: "cmu", phoneme: "should be dropped" },
+        { word: "bad alphabet", alphabet: "pinyin", phoneme: "x" },
+        { word: "Nguyen", alphabet: "cmu", phoneme: "W IH N" },
+      ],
+    },
+  });
+  assert.deepEqual(withEntries, [
+    { word: "CWR", alphabet: "ipa", phoneme: "siː dʌbəljuː ɑːr" },
+    { word: "Nguyen", alphabet: "cmu", phoneme: "W IH N" },
+  ]);
+
+  const tooMany = resolvePronunciationDictionary({
+    configuration: {
+      pronunciationDictionary: Array.from({ length: 15 }, (_, index) => ({
+        word: `word-${index}`,
+        alphabet: "ipa",
+        phoneme: `phoneme-${index}`,
+      })),
+    },
+  });
+  assert.equal(tooMany.length, 10);
+  assert.equal(tooMany[0].word, "word-0");
+  assert.equal(tooMany[9].word, "word-9");
 });
 
 test("resolveCallHandling applies defaults and clamps to the Retell range", () => {

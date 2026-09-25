@@ -734,6 +734,9 @@ export function buildReceptionistConfig({
     // Read by the Retell provider as ambient_sound_volume, only sent when
     // ambientSound is set. See resolveAmbientSoundVolume below.
     ambientSoundVolume: resolveAmbientSoundVolume(agent),
+    // Read by the Retell provider as pronunciation_dictionary. See
+    // resolvePronunciationDictionary below.
+    pronunciationDictionary: resolvePronunciationDictionary(agent),
   };
 }
 
@@ -764,6 +767,30 @@ export function resolveAmbientSoundVolume(agent) {
   const raw = agent?.configuration?.ambientSoundVolume;
   const value = typeof raw === "number" && Number.isFinite(raw) ? raw : AMBIENT_SOUND_VOLUME_DEFAULT;
   return Math.min(AMBIENT_SOUND_VOLUME_MAX, Math.max(AMBIENT_SOUND_VOLUME_MIN, value));
+}
+
+// Retell's own allowed alphabets also include pinyin/jyutping, but only
+// IPA and CMU are offered in our UI.
+const PRONUNCIATION_ALPHABETS = new Set(["ipa", "cmu"]);
+const PRONUNCIATION_DICTIONARY_MAX_ENTRIES = 10;
+
+// Reads agent.configuration.pronunciationDictionary, keeps only complete,
+// valid entries (word + phoneme both non-empty, a supported alphabet),
+// and caps at 10 - a server-side backstop behind the UI's own cap and
+// validation, so a hand-edited or stale record can never reach Retell
+// with more entries or a bad shape than the UI would ever produce.
+export function resolvePronunciationDictionary(agent) {
+  const raw = agent?.configuration?.pronunciationDictionary;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((entry) => entry && typeof entry === "object")
+    .map((entry) => ({
+      word: text(entry.word),
+      alphabet: text(entry.alphabet),
+      phoneme: text(entry.phoneme),
+    }))
+    .filter((entry) => entry.word && entry.phoneme && PRONUNCIATION_ALPHABETS.has(entry.alphabet))
+    .slice(0, PRONUNCIATION_DICTIONARY_MAX_ENTRIES);
 }
 
 const SUPPORTED_LANGUAGES = new Set(["en-US", "es-419"]);
