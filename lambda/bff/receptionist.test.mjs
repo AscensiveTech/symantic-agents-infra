@@ -562,6 +562,12 @@ test("spam, off-topic, flirting, abuse, and no-progress handling - never accusin
   assert.equal(section(noSpam, "SPAM"), null);
 });
 
+test("closing: the goodbye line and end_call happen in the same turn, and it's never said twice", () => {
+  const closing = section(buildReceptionistPrompt(agent, profile), "CLOSING");
+  assert.match(closing, /and call end_call in that same turn - never say the line and leave end_call for later/);
+  assert.match(closing, /Never say that closing line more than once in a call/);
+});
+
 test("booking on: types (no buffers), scheduling window, full booking and reschedule/cancel flows naming the calendar functions; off: none of it", () => {
   const booking = {
     ...agent,

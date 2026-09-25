@@ -637,7 +637,10 @@ export function buildReceptionistPrompt(agent, workspaceProfile) {
         + "talking. Stay quiet and let them finish. Never talk over them or end mid-sentence.",
       "- Something new: handle it, then ask again. Silence: \"Are you still there?\" once, then wait.",
       `- Only after a clear close ("no thanks", "that's all", "goodbye"): "Thank you for calling ${businessName}, have `
-        + "a great day!\" Then call end_call. Only spam, continued abuse, and emergencies end sooner.",
+        + "a great day!\" and call end_call in that same turn - never say the line and leave end_call for later. Only "
+        + "spam, continued abuse, and emergencies end sooner.",
+      "- Never say that closing line more than once in a call. If you already said it and the call is somehow still "
+        + "going (end_call hasn't taken effect yet), stay quiet rather than saying it again.",
     ],
     ...(roleInstructions
       ? [[
