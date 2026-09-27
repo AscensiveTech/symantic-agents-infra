@@ -57,6 +57,14 @@ export function createCrmLookup({
         return provider.findContactByPhone(timed, phoneE164);
       }, { waitMs: 0 });
 
+      // Never give the receptionist context from an arbitrary duplicate. A
+      // human must first merge or correct the Monday records that share this
+      // phone number; we also deliberately avoid caching either record.
+      if (contact?.matchCount > 1) {
+        metrics?.count("AmbiguousMatch", { Provider: providerId });
+        return result("ambiguous", { reason: "duplicate_phone" });
+      }
+
       // Remember the answer for the post-call sync (saves it a search). A
       // write failure here must not cost the caller anything.
       const checkedAt = new Date(Number(now())).toISOString();

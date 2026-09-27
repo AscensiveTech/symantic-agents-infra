@@ -242,6 +242,66 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // An app uninstall is different from a user choosing Disconnect. Monday's
+    // lifecycle policy requires app-derived data to be removed, so purge the
+    // connection, phone-to-item links and CRM-only fields on retained calls.
+    // The connection row is deleted last: a retried webhook can finish a
+    // partial purge, while a completed duplicate delivery is harmless.
+    async purgeProviderData(workspaceId, provider) {
+      requireTable(links);
+      requireTable(tables.calls);
+      let removedLinks = 0;
+      let scrubbedCalls = 0;
+
+      let startKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: links,
+          KeyConditionExpression: "workspaceId = :workspaceId",
+          ProjectionExpression: "workspaceId, linkKey",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+        const rows = (result.Items ?? []).map(unmarshall)
+          .filter((row) => String(row.linkKey ?? "").startsWith(`${provider}#`));
+        await Promise.all(rows.map((row) => client.send(new commands.DeleteItemCommand({
+          TableName: links,
+          Key: marshall({ workspaceId, linkKey: row.linkKey }),
+        }))));
+        removedLinks += rows.length;
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+
+      startKey = undefined;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tables.calls,
+          KeyConditionExpression: "workspaceId = :workspaceId",
+          ProjectionExpression: "workspaceId, callId, crmProvider",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+        const rows = (result.Items ?? []).map(unmarshall)
+          .filter((row) => row.crmProvider === provider);
+        await Promise.all(rows.map((row) => update(tables.calls, { workspaceId, callId: row.callId }, {
+          remove: [
+            "crmProvider", "crmStatus", "crmItemId", "crmItemUrl", "crmActivityId",
+            "crmCreated", "crmQueuedAt", "crmUpdatedAt", "crmLastErrorCode", "crmLastErrorAt",
+          ],
+          condition: "attribute_exists(workspaceId)",
+          conditional: true,
+        })));
+        scrubbedCalls += rows.length;
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+
+      await client.send(new commands.DeleteItemCommand({
+        TableName: connections,
+        Key: marshall({ workspaceId, provider }),
+      }));
+      return { removedLinks, scrubbedCalls };
+    },
+
     saveMapping(workspaceId, provider, mapping, { status, problems }) {
       return update(connections, { workspaceId, provider }, {
         set: { mapping, mappingStatus: status, mappingProblems: problems ?? [], mappingCheckedAt: iso(), updatedAt: iso() },
