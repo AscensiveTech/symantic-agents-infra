@@ -115,6 +115,26 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       row.disconnectedAt = iso();
       return clone(row);
     },
+    async purgeProviderData(workspaceId, provider) {
+      let removedLinks = 0;
+      let scrubbedCalls = 0;
+      for (const [rowKey, row] of links) {
+        if (row.workspaceId === workspaceId && String(row.linkKey ?? "").startsWith(`${provider}#`)) {
+          links.delete(rowKey);
+          removedLinks += 1;
+        }
+      }
+      for (const row of callRows.values()) {
+        if (row.workspaceId !== workspaceId || row.crmProvider !== provider) continue;
+        for (const field of [
+          "crmProvider", "crmStatus", "crmItemId", "crmItemUrl", "crmActivityId",
+          "crmCreated", "crmQueuedAt", "crmUpdatedAt", "crmLastErrorCode", "crmLastErrorAt",
+        ]) delete row[field];
+        scrubbedCalls += 1;
+      }
+      connections.delete(key(workspaceId, provider));
+      return { removedLinks, scrubbedCalls };
+    },
     async saveMapping(workspaceId, provider, mapping, { status, problems }) {
       const row = connections.get(key(workspaceId, provider));
       if (!row) return null;

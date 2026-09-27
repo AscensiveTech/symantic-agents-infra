@@ -304,11 +304,9 @@ export function createCrmApi({
       if (body.type === "uninstall") {
         const connections = await store.listConnectionsByAccount(PROVIDER, accountId);
         for (const connection of connections) {
-          if (connection.connectionState !== "disconnected") {
-            await store.disconnect(connection.workspaceId, PROVIDER, "app_uninstalled");
-          }
+          await store.purgeProviderData(connection.workspaceId, PROVIDER);
         }
-        log.info?.("Monday app uninstalled", { accountId, disconnected: connections.length });
+        log.info?.("Monday app uninstalled", { accountId, purged: connections.length });
       }
       return json(200, { ok: true });
     },

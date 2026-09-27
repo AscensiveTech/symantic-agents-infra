@@ -210,6 +210,23 @@ test("lookup: an unknown caller gets no context and a remembered negative answer
   assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550111")}`).state, "none");
 });
 
+test("lookup: duplicate phone matches provide no context and cache no arbitrary record", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  h.monday.addItem(h.board.id, { name: "Jane One", phone: "+12025550198" });
+  h.monday.addItem(h.board.id, { name: "Jane Two", phone: "+12025550198" });
+
+  const result = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.reason, "duplicate_phone");
+  assert.equal(result.context, NO_CRM_CONTEXT);
+  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`);
+  assert.notEqual(link?.state, "linked");
+  assert.equal(link?.externalId, undefined);
+  assert.equal(h.metrics.sum("AmbiguousMatch", { Provider: "monday" }), 1);
+});
+
 test("lookup: a linked record deleted in Monday falls back to a phone search", async () => {
   const h = createHarness();
   await h.connectAndMap();
@@ -430,6 +447,27 @@ test("sync: spam, anonymous callers and unconnected workspaces are skipped witho
 });
 
 // ==================================================== duplicate safety ====
+
+test("duplicates: sync refuses to update an arbitrary phone match", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const first = h.monday.addItem(h.board.id, { name: "Jane One", phone: "+12025550198" });
+  const second = h.monday.addItem(h.board.id, { name: "Jane Two", phone: "+12025550198" });
+  const call = h.seedCall();
+  h.enqueueCall(call);
+
+  await h.drain();
+
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.equal(row.crmStatus, "failed");
+  assert.equal(row.crmLastErrorCode, "ambiguous_match");
+  assert.equal(first.updates.length, 0);
+  assert.equal(second.updates.length, 0);
+  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`);
+  assert.notEqual(link?.state, "linked");
+  assert.equal(link?.externalId, undefined);
+  assert.equal(h.metrics.sum("AmbiguousMatch", { Provider: "monday" }), 1);
+});
 
 test("duplicates: the same call delivered many times yields one lead and one note", async () => {
   const h = createHarness();
@@ -789,15 +827,32 @@ function lifecycle(h, { type = "uninstall", accountId = "5550001", secret = TEST
   });
 }
 
-test("webhook: a verified uninstall disconnects every workspace on that Monday account only", async () => {
+test("webhook: a verified uninstall purges provider data for that Monday account only", async () => {
   const h = createHarness();
   await h.connectAndMap();
   h.store.seedConnection({ workspaceId: "ws-b", provider: "monday", accountId: "999", connectionState: "connected" });
+  const call = h.seedCall({
+    crmStatus: "synced",
+    crmItemId: "123",
+    crmItemUrl: "https://example.monday.com/boards/1/pulses/123",
+    crmActivityId: "456",
+  });
+  await h.store.saveLink("ws-a", linkKeyFor("monday", call.callerNumber), {
+    provider: "monday",
+    state: "linked",
+    externalId: "123",
+  });
   const response = await lifecycle(h);
   assert.equal(response.statusCode, 200);
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "disconnected");
-  assert.equal(h.store.connections.get("ws-a\0monday").disconnectReason, "app_uninstalled");
-  assert.equal(h.store.connections.get("ws-a\0monday").encryptedRefreshToken, undefined);
+  assert.equal(h.store.connections.has("ws-a\0monday"), false);
+  assert.equal(h.store.links.has(`ws-a\0${linkKeyFor("monday", call.callerNumber)}`), false);
+  const retainedCall = h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.equal(retainedCall.callSummary, call.callSummary, "independent call history is retained");
+  assert.equal(retainedCall.crmProvider, undefined);
+  assert.equal(retainedCall.crmItemId, undefined);
+  assert.equal(retainedCall.crmItemUrl, undefined);
+  assert.equal(retainedCall.crmActivityId, undefined);
+  assert.equal(retainedCall.crmStatus, undefined);
   assert.equal(h.store.connections.get("ws-b\0monday").connectionState, "connected");
   assert.equal((await lifecycle(h)).statusCode, 200, "duplicate delivery is harmless");
 });
