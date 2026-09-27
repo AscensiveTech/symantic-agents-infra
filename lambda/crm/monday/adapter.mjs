@@ -325,37 +325,32 @@ export function createMondayCrmAdapter({ graphql }) {
   async function queryBoards(session, ids) {
     // One board by id (validation) or the account's most recently used ones
     // (the mapping picker). `ids` is left out entirely rather than sent null.
-    const run = (settingsField) => graphql.request({
+    // Do not select workspace metadata here. Monday allows board access with
+    // boards:read, but resolving workspace fields can require the separate
+    // workspaces:read scope. Field mapping does not need workspace metadata.
+    const data = await graphql.request({
       accessToken: session.accessToken,
       operation: "list_boards",
       query: ids
         ? `query ($ids: [ID!]) {
-            boards(ids: $ids) { id name workspace { name } columns { id title type ${settingsField} } }
+            boards(ids: $ids) { id name columns { id title type settings } }
           }`
         : `query {
             boards(limit: 100, state: active, order_by: used_at) {
-              id name workspace { name } columns { id title type ${settingsField} }
+              id name columns { id title type settings }
             }
           }`,
       variables: ids ? { ids } : {},
     });
-    let data;
-    try {
-      data = await run("settings");
-    } catch (error) {
-      // Older API versions only expose settings as a JSON string.
-      if (!(error instanceof CrmError) || error.code !== CRM_ERROR.PROVIDER_ERROR) throw error;
-      data = await run("settings_str");
-    }
     return (data?.boards ?? []).map((board) => ({
       id: String(board.id),
       name: board.name,
-      workspaceName: board.workspace?.name ?? null,
+      workspaceName: null,
       columns: (board.columns ?? []).map((column) => ({
         id: column.id,
         title: column.title,
         type: column.type,
-        labels: column.type === "status" ? statusLabels(column.settings ?? column.settings_str) : [],
+        labels: column.type === "status" ? statusLabels(column.settings) : [],
       })),
     }));
   }
