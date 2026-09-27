@@ -285,6 +285,37 @@ test("suggestMapping picks columns by type and title", () => {
   assert.equal(mapping.columns.source.id, "text_source");
 });
 
+test("board discovery only requests data covered by the boards scope", async () => {
+  const requests = [];
+  const adapter = createMondayCrmAdapter({
+    graphql: {
+      async request(input) {
+        requests.push(input);
+        return {
+          boards: [{
+            id: "42",
+            name: "Leads",
+            columns: [{
+              id: "status",
+              title: "Status",
+              type: "status",
+              settings: { labels: [{ id: 1, label: "New Lead" }] },
+            }],
+          }],
+        };
+      },
+    },
+  });
+
+  const boards = await adapter.listBoards({ accessToken: "token" });
+
+  assert.equal(requests.length, 1, "board discovery is a single API request");
+  assert.doesNotMatch(requests[0].query, /workspace\s*\{/);
+  assert.doesNotMatch(requests[0].query, /settings_str/);
+  assert.equal(boards[0].workspaceName, null);
+  assert.deepEqual(boards[0].columns[0].labels, ["New Lead"]);
+});
+
 test("adapter finds a caller whatever format the phone was typed in", async () => {
   const { monday, board, adapter, session } = adapterWithBoard();
   monday.addItem(board.id, { name: "Other", phone: "+13105550198" });
