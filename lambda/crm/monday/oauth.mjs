@@ -39,6 +39,7 @@ export function buildAuthorizeUrl({ clientId, redirectUri, state, codeChallenge 
   url.searchParams.set("state", state);
   url.searchParams.set("code_challenge", codeChallenge);
   url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("force_install_if_needed", "true");
   return url.toString();
 }
 

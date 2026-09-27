@@ -178,6 +178,7 @@ test("PKCE pair and authorize URL follow Monday's OAuth 2.1 flow", () => {
   assert.equal(url.searchParams.get("code_challenge_method"), "S256");
   assert.equal(url.searchParams.get("code_challenge"), challenge);
   assert.equal(url.searchParams.get("scope"), MONDAY_SCOPES.join(" "));
+  assert.equal(url.searchParams.get("force_install_if_needed"), "true");
   assert.ok(!MONDAY_SCOPES.includes("webhooks:write"), "no board-webhook scope requested");
 });
 
