@@ -378,6 +378,7 @@ locals {
   crm_authorized_routes = toset([
     "GET /crm/connection",
     "DELETE /crm/connection",
+    "GET /crm/monday/setup",
     "POST /crm/monday/start",
     "GET /crm/monday/boards",
     "PUT /crm/mapping",

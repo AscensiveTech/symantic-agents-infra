@@ -10,6 +10,7 @@ import { buildColumnValues, createMondayCrmAdapter, suggestMapping } from "./mon
 import { createMondayGraphqlClient, DEFAULT_MONDAY_API_VERSION } from "./monday/graphql.mjs";
 import {
   buildAuthorizeUrl,
+  buildInstallUrl,
   createMondayOAuthClient,
   createPkcePair,
   MONDAY_SCOPES,
@@ -180,6 +181,15 @@ test("PKCE pair and authorize URL follow Monday's OAuth 2.1 flow", () => {
   assert.equal(url.searchParams.get("scope"), MONDAY_SCOPES.join(" "));
   assert.equal(url.searchParams.get("force_install_if_needed"), "true");
   assert.ok(!MONDAY_SCOPES.includes("webhooks:write"), "no board-webhook scope requested");
+});
+
+test("Monday app installation uses the dedicated account-level install flow", () => {
+  const url = new URL(buildInstallUrl({ clientId: "public-client-id" }));
+  assert.equal(url.origin + url.pathname, "https://auth.monday.com/oauth2/authorize");
+  assert.equal(url.searchParams.get("client_id"), "public-client-id");
+  assert.equal(url.searchParams.get("response_type"), "install");
+  assert.equal(url.searchParams.has("redirect_uri"), false);
+  assert.equal(url.searchParams.has("state"), false);
 });
 
 test("oauth client exchanges a code and rotates refresh tokens exactly once", async () => {

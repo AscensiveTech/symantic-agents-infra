@@ -36,6 +36,7 @@ test("connect: OAuth round trip stores encrypted tokens and never exposes them",
 
 test("connect: only workspace admins can start, and only signed-in members can read", async () => {
   const h = createHarness();
+  assert.equal((await h.api("GET", "/crm/monday/setup", { sub: "sub-member-a", groups: [] })).statusCode, 403);
   assert.equal((await h.api("POST", "/crm/monday/start", { sub: "sub-member-a", groups: [] })).statusCode, 403);
   assert.equal((await h.api("POST", "/crm/monday/start", {})).statusCode, 401);
   assert.equal((await h.api("GET", "/crm/connection", {})).statusCode, 401);
@@ -43,6 +44,14 @@ test("connect: only workspace admins can start, and only signed-in members can r
   assert.equal((await h.api("GET", "/crm/connection", { sub: "sub-unknown" })).statusCode, 401);
   assert.equal((await h.api("DELETE", "/crm/connection", { sub: "sub-member-a", groups: [] })).statusCode, 403);
   assert.equal((await h.api("PUT", "/crm/mapping", { sub: "sub-member-a", groups: [], body: {} })).statusCode, 403);
+});
+
+test("connect: a customer admin receives the public app installation URL", async () => {
+  const h = createHarness();
+  const setup = body(await h.api("GET", "/crm/monday/setup", { sub: "sub-admin-a" }));
+  const url = new URL(setup.installUrl);
+  assert.equal(url.searchParams.get("client_id"), TEST_APP_SECRET.clientId);
+  assert.equal(url.searchParams.get("response_type"), "install");
 });
 
 test("connect: a missing app registration fails clearly instead of half-connecting", async () => {
