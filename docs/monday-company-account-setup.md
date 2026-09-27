@@ -92,10 +92,12 @@ Do not replace the Terraform-managed secret resource. Rotate its value by adding
 The monday.com app and backend credentials are configured. End-to-end user OAuth still needs an authenticated Symantic workspace session:
 
 1. Sign in to <https://agents.symantic.ai/integrations> with an authorized Symantic workspace account.
-2. Select **Connect monday.com** and approve the six listed permissions for the intended monday.com account.
-3. Map the target monday.com board and columns in the Symantic integration settings.
-4. Place a test receptionist call that creates or updates a lead.
-5. Verify the expected item and update in monday.com, then confirm the corresponding success entry in the CRM worker logs.
+2. Select **Connect Monday**. Symantic displays a two-step account setup panel.
+3. Select **Open monday install**, choose the intended customer account, and have that account's monday administrator approve installation.
+4. Return to Symantic and select **I've installed it — authorize**. Choose the same monday account and approve the six listed permissions.
+5. Map the target monday.com board and columns in the Symantic integration settings.
+6. Place a test receptionist call that creates or updates a lead.
+7. Verify the expected item and update in monday.com, then confirm the corresponding success entry in the CRM worker logs.
 
 No Symantic workspace credentials were available during this setup, so the OAuth connection, board mapping, and test-call write were not attempted.
 
@@ -103,9 +105,17 @@ No Symantic workspace credentials were available during this setup, so the OAuth
 
 If the monday.com authorization screen reports **App is not installed**, check the account selector in the upper-right corner before changing the app configuration.
 
-The app is installed in the AscensiveTech company account. Installations are account-specific, so another account, such as `kotlasaisaranreddys-team`, must install the app before it can authorize access.
+The app is installed in the AscensiveTech company account. Installations are account-specific, so another account, such as `kotlasaisaranreddys-team`, must install the app before it can authorize access. Installing it in AscensiveTech does not install it for any other monday account.
 
-The Symantic backend includes `force_install_if_needed=true` in monday.com authorization URLs. For a customer account where the app is not installed, monday.com should automatically redirect an account administrator through installation and then return to OAuth. A non-administrator may still need their monday.com administrator to approve or install the app, depending on that account's security policies.
+The Symantic backend still includes `force_install_if_needed=true` in authorization URLs as a fallback. In testing, monday.com's OAuth 2.1 page did not consistently perform that automatic installation handoff and instead left the **Authorize** button disabled. Symantic therefore uses an explicit install-first flow:
+
+1. The signed-in Symantic workspace administrator requests the setup link.
+2. Symantic returns the public monday install URL; no OAuth state or token is created yet.
+3. A monday administrator installs the app in the account that owns the desired boards.
+4. The Symantic administrator returns and starts OAuth; a fresh one-time state and PKCE pair are created at this point.
+5. monday authorizes the already-installed app and returns the customer to Symantic for board mapping.
+
+A non-administrator cannot bypass monday's account-level approval. They must send the installation link to an administrator of their monday account, then return to Symantic to complete authorization.
 
 The banner stating that the app has not been reviewed or approved by monday.com is expected for this privately distributed app and is separate from the installation error.
 
@@ -118,4 +128,4 @@ The banner stating that the app has not been reviewed or approved by monday.com 
 
 ## Repository context
 
-This operational setup started from the `infra` repository at commit `a559ceb` and is tracked with the seamless-install change on branch `codex/monday-seamless-install` for review through the normal pull-request workflow.
+This operational setup started from the `infra` repository at commit `a559ceb`. The initial seamless-install change was merged through pull request 49. The explicit install-first customer flow is tracked on branch `codex/monday-install-first-flow` for review through the normal pull-request workflow.

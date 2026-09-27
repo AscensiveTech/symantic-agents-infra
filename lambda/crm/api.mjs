@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { FIELD_TYPES, suggestMapping } from "./monday/adapter.mjs";
-import { buildAuthorizeUrl, createPkcePair, verifyMondayJwt } from "./monday/oauth.mjs";
+import { buildAuthorizeUrl, buildInstallUrl, createPkcePair, verifyMondayJwt } from "./monday/oauth.mjs";
 import { isConnectionUsable } from "./provider.mjs";
 
 const PROVIDER = "monday";
@@ -112,6 +112,12 @@ export function createCrmApi({
       const identity = await requireIdentity(event);
       const connection = await store.getConnection(identity.workspaceId, PROVIDER);
       return json(200, toPublicConnection(connection, now));
+    },
+
+    async "GET /crm/monday/setup"(event) {
+      await requireIdentity(event, { admin: true });
+      const secret = await loadAppSecret(getAppSecret);
+      return json(200, { installUrl: buildInstallUrl({ clientId: secret.clientId }) });
     },
 
     async "POST /crm/monday/start"(event) {
