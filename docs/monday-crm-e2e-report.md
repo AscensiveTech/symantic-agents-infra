@@ -8,7 +8,7 @@ Live run: `20260927T130336Z-22707`
 
 The implemented monday.com capabilities are working end to end against a real monday account. A real OAuth grant was obtained, a temporary board was created and mapped, a signed Retell `call_analyzed` event crossed the deployed post-call Lambda, SQS and CRM worker, and a real monday item was created, retrieved, updated and annotated. Replay, tenant-isolation, webhook-signature, token-refresh and cleanup checks also passed.
 
-The integration is ready for the implemented workflow after the changes in this validation are deployed. It is not a general conversational monday CRUD tool. The receptionist automatically looks up an inbound caller by phone and synchronizes analyzed calls after the conversation. It does not expose LLM-selectable CRM tools, search by a spoken name, arbitrary contact edits, deals, companies or deletion.
+The integration is ready for the implemented workflow. The changes from this validation were merged and deployed: the CRM live alias is version 5 and the frontend Amplify release and production smoke test succeeded. It is not a general conversational monday CRUD tool. The receptionist automatically looks up an inbound caller by phone and synchronizes analyzed calls after the conversation. It does not expose LLM-selectable CRM tools, search by a spoken name, arbitrary contact edits, deals, companies or deletion.
 
 Two issues were found and fixed:
 
