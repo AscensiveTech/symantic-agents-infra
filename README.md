@@ -7,10 +7,12 @@ Terraform for hosting **symantic-agents-frontend** on AWS Amplify (`WEB_COMPUTE`
 | Path | Purpose |
 |------|---------|
 | `bootstrap/` | One-time S3 state bucket (versioned, encrypted, public blocked) |
-| `amplify.tf` | Amplify app, production branch, SSR IAM role, registry secret |
-| `amplify_domain.tf` | Route53 + Amplify domain association for `agents.symantic.ai` |
-| `github_oidc.tf` | CI deploy role (`StartJob` / `GetJob` only) |
+| `platform_*.tf` | Amplify, DNS, Cognito, API/BFF, legal, memberships, and CI deploy identity |
+| `product_data.tf` / `product_storage.tf` | Product-owned DynamoDB and S3 resources in the shared root module |
+| `receptionist_*.tf` | AI Receptionist runtimes, calendars, CRM, notifications, and schedules |
+| `lambda/` | Function-oriented deployment source boundaries |
 | `backend-config/` | Per-env S3 backend config (native `use_lockfile`) |
+| `docs/architecture.md` | Product ownership, AWS inventory, dependency rules, and safety constraints |
 
 ## Prerequisites
 
