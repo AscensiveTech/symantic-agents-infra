@@ -238,13 +238,13 @@ resource "aws_iam_role_policy" "crm_runtime" {
         # Scan: the token keeper walks the (one-row-per-workspace) table.
         Sid      = "ManageCrmConnections"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"]
         Resource = [aws_dynamodb_table.crm_connections.arn, "${aws_dynamodb_table.crm_connections.arn}/index/accountId-index"]
       },
       {
         Sid      = "ManageCrmLinks"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.crm_links.arn
       },
       {
@@ -378,6 +378,7 @@ locals {
   crm_authorized_routes = toset([
     "GET /crm/connection",
     "DELETE /crm/connection",
+    "GET /crm/monday/setup",
     "POST /crm/monday/start",
     "GET /crm/monday/boards",
     "PUT /crm/mapping",

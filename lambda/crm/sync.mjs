@@ -191,6 +191,7 @@ export function createCrmSync({
         }]).catch(() => {});
         return failPermanently(call, connection, error);
       case CRM_ERROR.INVALID_VALUE:
+      case CRM_ERROR.AMBIGUOUS_MATCH:
         return failPermanently(call, connection, error);
       case CRM_ERROR.DAILY_LIMIT: {
         const resetAt = nextUtcMidnight(Number(now()));
@@ -242,7 +243,13 @@ export function createCrmSync({
       if (!recentlyNotFound) found = await provider.findContactByPhone(session, facts.phoneE164);
       if (!found && facts.email) found = await provider.findContactByEmail(session, facts.email);
       if (found) {
-        if (found.matchCount > 1) metrics?.count("AmbiguousMatch", { Provider: provider.id });
+        if (found.matchCount > 1) {
+          metrics?.count("AmbiguousMatch", { Provider: provider.id });
+          throw new CrmError(
+            CRM_ERROR.AMBIGUOUS_MATCH,
+            "Multiple CRM records match this caller",
+          );
+        }
         await store.saveLink(workspaceId, linkKey, {
           provider: provider.id,
           phoneE164: facts.phoneE164,

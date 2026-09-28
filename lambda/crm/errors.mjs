@@ -14,6 +14,7 @@ export const CRM_ERROR = Object.freeze({
   NOT_FOUND: "not_found",
   MAPPING_INVALID: "mapping_invalid",
   INVALID_VALUE: "invalid_value",
+  AMBIGUOUS_MATCH: "ambiguous_match",
   NOT_CONNECTED: "not_connected",
   PROVIDER_ERROR: "provider_error",
 });

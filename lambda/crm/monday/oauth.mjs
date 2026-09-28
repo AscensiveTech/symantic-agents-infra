@@ -39,6 +39,20 @@ export function buildAuthorizeUrl({ clientId, redirectUri, state, codeChallenge 
   url.searchParams.set("state", state);
   url.searchParams.set("code_challenge", codeChallenge);
   url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("force_install_if_needed", "true");
+  return url.toString();
+}
+
+/**
+ * monday.com treats app installation and OAuth authorization as separate
+ * account-level actions. This URL deliberately performs only the install so
+ * a customer admin can add the public app to their own monday account before
+ * Symantic starts the short-lived OAuth transaction.
+ */
+export function buildInstallUrl({ clientId }) {
+  const url = new URL(MONDAY_AUTHORIZE_URL);
+  url.searchParams.set("client_id", clientId);
+  url.searchParams.set("response_type", "install");
   return url.toString();
 }
 
