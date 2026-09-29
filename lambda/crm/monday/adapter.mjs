@@ -354,7 +354,7 @@ export function createMondayCrmAdapter({ graphql }) {
             boards(ids: $ids) { id name columns { id title type settings } }
           }`
         : `query {
-            boards(limit: 100, state: active, order_by: used_at, board_kind: [public, share]) {
+            boards(limit: 100, state: active, order_by: used_at) {
               id name columns { id title type settings }
             }
           }`,
