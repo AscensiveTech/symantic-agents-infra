@@ -16,6 +16,10 @@ export const FIELD_TYPES = Object.freeze({
   followUpDate: ["date"],
   nextAppointment: ["date"],
   source: ["text", "long_text"],
+  transcriptSummary: ["text", "long_text"],
+  fullTranscript: ["long_text"],
+  audioLink: ["text", "long_text", "link"],
+  callDuration: ["numbers", "text"],
 });
 const REQUIRED_FIELDS = Object.freeze(["phone"]);
 
@@ -319,6 +323,20 @@ export function createMondayCrmAdapter({ graphql }) {
       return { ok: problems.length === 0, problems, board };
     },
 
+    async createColumn(session, boardId, title, columnType) {
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "create_column",
+        query: `mutation ($board: ID!, $title: String!, $type: ColumnType!) {
+          create_column(board_id: $board, title: $title, column_type: $type) { id title type }
+        }`,
+        variables: { board: String(boardId), title, type: columnType },
+      });
+      const col = data?.create_column;
+      if (!col?.id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the created column");
+      return { id: col.id, title: col.title, type: col.type };
+    },
+
     suggestMapping,
   };
 
@@ -336,7 +354,7 @@ export function createMondayCrmAdapter({ graphql }) {
             boards(ids: $ids) { id name columns { id title type settings } }
           }`
         : `query {
-            boards(limit: 100, state: active, order_by: used_at) {
+            boards(limit: 100, state: active, order_by: used_at, board_kind: [public, share]) {
               id name columns { id title type settings }
             }
           }`,
@@ -379,6 +397,10 @@ export function suggestMapping(board) {
       followUpDate: pick(["date"], /follow/i),
       nextAppointment: pick(["date"], /appoint|meeting|next/i),
       source: pick(["text", "long_text"], /source/i),
+      transcriptSummary: pick(["text", "long_text"], /summary|transcript.*sum/i),
+      fullTranscript: pick(["long_text"], /transcript/i),
+      audioLink: pick(["text", "long_text", "link"], /audio|recording|listen/i),
+      callDuration: pick(["numbers", "text"], /duration|length/i),
     }).filter(([, value]) => value)),
     labels: {
       newLead: labels.find((label) => /new/i.test(label)) ?? null,
@@ -419,6 +441,22 @@ export function buildColumnValues(mapping, patch, { isNew }) {
   if (patch.followUpDate) set("followUpDate", { date: patch.followUpDate });
   if (patch.nextAppointmentAt === null) set("nextAppointment", null);
   else if (patch.nextAppointmentAt) set("nextAppointment", utcDateTime(patch.nextAppointmentAt));
+  if (patch.transcriptSummary) set("transcriptSummary", textValue("transcriptSummary", truncate(patch.transcriptSummary, 5000)));
+  if (patch.fullTranscript) set("fullTranscript", { text: truncate(patch.fullTranscript, 50000) });
+  if (patch.audioLink) {
+    const col = columns.audioLink;
+    if (col?.id) {
+      values[col.id] = col.type === "link"
+        ? { url: patch.audioLink, text: "Listen" }
+        : textValue("audioLink", patch.audioLink);
+    }
+  }
+  if (patch.callDuration !== undefined && patch.callDuration !== null) {
+    const col = columns.callDuration;
+    if (col?.id) {
+      values[col.id] = col.type === "numbers" ? String(patch.callDuration) : textValue("callDuration", `${patch.callDuration} min`);
+    }
+  }
   return values;
 }
 

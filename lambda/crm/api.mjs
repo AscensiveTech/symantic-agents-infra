@@ -246,6 +246,24 @@ export function createCrmApi({
       });
     },
 
+    async "POST /crm/monday/columns"(event) {
+      const identity = await requireIdentity(event, { admin: true });
+      const body = readBody(event);
+      const boardId = typeof body?.boardId === "string" || typeof body?.boardId === "number"
+        ? String(body.boardId).trim() : "";
+      if (!/^\d{1,20}$/.test(boardId)) throw new ApiError(400, "invalid_request", "Invalid board ID.");
+      const title = typeof body?.title === "string" ? body.title.trim().slice(0, 100) : "";
+      if (!title) throw new ApiError(400, "invalid_request", "Column title is required.");
+      const columnType = typeof body?.columnType === "string" ? body.columnType : "";
+      const allowed = new Set(["phone", "email", "status", "people", "date", "text", "long_text", "numbers", "link"]);
+      if (!allowed.has(columnType)) throw new ApiError(400, "invalid_request", `Invalid column type: ${columnType}`);
+      const column = await requireUsableSession(identity.workspaceId, async (session) => {
+        const data = await adapter.createColumn(session, boardId, title, columnType);
+        return data;
+      });
+      return json(200, column);
+    },
+
     async "PUT /crm/mapping"(event) {
       const identity = await requireIdentity(event, { admin: true });
       const requested = normalizeMappingInput(readBody(event)?.mapping);
@@ -382,6 +400,8 @@ function normalizeMappingInput(value) {
     columns,
     labels: { newLead: label(value.labels?.newLead), followUp: label(value.labels?.followUp) },
     defaultOwnerId: owner,
+    autoCreateContacts: value.autoCreateContacts === true,
+    updateExistingContacts: value.updateExistingContacts === true,
   };
 }
 
