@@ -49,12 +49,15 @@ const ITEM_FIELDS = `
  * and CrmError failures.
  */
 export function createMondayCrmAdapter({ graphql }) {
+  // Column ids needed to read a matched row (phone, email, status, owner).
   function readColumns(mapping) {
     return ["phone", "email", "status", "owner"]
       .map((field) => mapping?.columns?.[field]?.id)
       .filter(Boolean);
   }
 
+  // The mapped board id; a mapping without a board or phone column can't be
+  // used for matching.
   function requireBoard(mapping) {
     const boardId = mapping?.boardId;
     if (!boardId || !mapping?.columns?.phone?.id) {
@@ -65,6 +68,8 @@ export function createMondayCrmAdapter({ graphql }) {
     return String(boardId);
   }
 
+  // A Monday item as a CRM contact, or null when archived, deleted or on a
+  // different board.
   function toContact(item, mapping) {
     if (!item || item.state !== "active") return null;
     if (String(item.board?.id ?? "") !== String(mapping.boardId)) return null;
@@ -83,6 +88,8 @@ export function createMondayCrmAdapter({ graphql }) {
     };
   }
 
+  // Rows on the mapped board whose column contains the value; callers confirm
+  // exact matches themselves.
   async function searchByColumn(session, columnId, value, operation) {
     const mapping = session.mapping;
     const boardId = requireBoard(mapping);
@@ -104,12 +111,15 @@ export function createMondayCrmAdapter({ graphql }) {
       .filter(Boolean);
   }
 
+  // The most recently updated of several matching rows.
   function newest(contacts) {
     return [...contacts].sort((a, b) =>
       String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""))
     )[0] ?? null;
   }
 
+  // Adds how many rows matched, so the sync can refuse to guess between
+  // duplicates.
   function withMatchCount(contact, count) {
     if (!contact) return null;
     const { updatedAt: _updatedAt, ...rest } = contact;
@@ -119,6 +129,7 @@ export function createMondayCrmAdapter({ graphql }) {
   return {
     id: MONDAY_PROVIDER_ID,
 
+    // Finds the caller's row by phone number on the mapped board.
     async findContactByPhone(session, phoneE164) {
       const national = nationalNumber(phoneE164);
       if (!national) return null;
@@ -134,6 +145,7 @@ export function createMondayCrmAdapter({ graphql }) {
       return withMatchCount(newest(matches), matches.length);
     },
 
+    // Finds the caller's row by email when the phone didn't match.
     async findContactByEmail(session, email) {
       const columnId = session.mapping?.columns?.email?.id;
       const wanted = normalizeEmail(email);
@@ -143,6 +155,8 @@ export function createMondayCrmAdapter({ graphql }) {
       return withMatchCount(newest(matches), matches.length);
     },
 
+    // Re-reads a known row by id to confirm it still exists on the mapped
+    // board.
     async getContact(session, externalId) {
       const mapping = session.mapping;
       requireBoard(mapping);
@@ -156,6 +170,8 @@ export function createMondayCrmAdapter({ graphql }) {
       return withMatchCount(toContact(data?.items?.[0], mapping), 1);
     },
 
+    // Creates a new lead row for a caller with no row yet, with the mapped
+    // fields and New Lead label.
     async createLead(session, input, { idempotencyKey } = {}) {
       const mapping = session.mapping;
       const boardId = requireBoard(mapping);
@@ -192,6 +208,8 @@ export function createMondayCrmAdapter({ graphql }) {
       };
     },
 
+    // Adds the call as an update on the caller's row and refreshes the mapped
+    // fields, in one request.
     async logCallActivity(session, externalId, activity, { fields, idempotencyKey } = {}) {
       const mapping = session.mapping;
       const boardId = requireBoard(mapping);
@@ -252,6 +270,8 @@ export function createMondayCrmAdapter({ graphql }) {
       return { fieldsApplied: true };
     },
 
+    // Looks for an update we already posted for this call, so a retry after a
+    // timeout doesn't post it twice.
     async findActivityByRef(session, externalId, ref) {
       const data = await graphql.request({
         accessToken: session.accessToken,
@@ -269,6 +289,8 @@ export function createMondayCrmAdapter({ graphql }) {
 
     // ---- connection management (settings API only) ----
 
+    // Who connected and which Monday account, shown on the card and used to
+    // spot a renewal with a different account.
     async describeAccount(session) {
       const data = await graphql.request({
         accessToken: session.accessToken,
@@ -285,11 +307,13 @@ export function createMondayCrmAdapter({ graphql }) {
       };
     },
 
+    // Boards offered in the mapping picker (subitem boards are left out).
     async listBoards(session) {
       const boards = await queryBoards(session, null);
       return boards.filter((board) => !/^Subitems of /i.test(board.name));
     },
 
+    // Monday users that can be picked as the default owner of new leads.
     async listUsers(session) {
       const data = await graphql.request({
         accessToken: session.accessToken,
@@ -301,6 +325,9 @@ export function createMondayCrmAdapter({ graphql }) {
         .map((user) => ({ id: String(user.id), name: user.name }));
     },
 
+    // Checks a mapping against the board as it is now: board exists, each
+    // mapped column still exists with a compatible type, and the status
+    // labels are real.
     async validateMapping(session, mapping) {
       const problems = [];
       if (!mapping?.boardId) {
@@ -352,6 +379,8 @@ export function createMondayCrmAdapter({ graphql }) {
       return { ok: problems.length === 0, problems, board };
     },
 
+    // Adds one column to a board; used when building or repairing the calls
+    // board.
     async createColumn(session, boardId, title, columnType) {
       const data = await graphql.request({
         accessToken: session.accessToken,
@@ -453,6 +482,8 @@ export function createMondayCrmAdapter({ graphql }) {
       return { boardId: board.id, columns };
     },
 
+    // Writes one call as a new row on the calls board. The idempotency key
+    // makes a retried write return the same row.
     async createCallsRow(session, boardId, { name, values }, { idempotencyKey } = {}) {
       const data = await graphql.request({
         accessToken: session.accessToken,
@@ -468,6 +499,8 @@ export function createMondayCrmAdapter({ graphql }) {
       return String(id);
     },
 
+    // Changes cells on an existing calls-board row (follow-up edits, link
+    // rewrites).
     async updateCallsRow(session, boardId, itemId, values) {
       if (!Object.keys(values).length) return;
       await graphql.request({
@@ -501,6 +534,7 @@ export function createMondayCrmAdapter({ graphql }) {
     return String(id);
   }
 
+  // Board details with columns, for the picker or for checking one board.
   async function queryBoards(session, ids) {
     // One board by id (validation) or the account's most recently used ones
     // (the mapping picker). `ids` is left out entirely rather than sent null.
@@ -544,6 +578,8 @@ export function createMondayCrmAdapter({ graphql }) {
 /** A starting mapping for a board, by column type and title. */
 export function suggestMapping(board) {
   const columns = board?.columns ?? [];
+  // First column of the given types, preferring one whose title matches the
+  // pattern.
   const pick = (types, pattern) => {
     const ofType = columns.filter((column) => types.includes(column.type));
     const column = (pattern && ofType.find((c) => pattern.test(c.title))) ?? (pattern ? null : ofType[0]);
@@ -590,10 +626,12 @@ export function suggestMapping(board) {
 export function buildColumnValues(mapping, patch, { isNew }) {
   const columns = mapping?.columns ?? {};
   const values = {};
+  // Adds a value only when that field is mapped to a column.
   const set = (field, value) => {
     const column = columns[field];
     if (column?.id && value !== undefined) values[column.id] = value;
   };
+  // Long Text columns take { text }, plain Text columns take the string.
   const textValue = (field, text) =>
     columns[field]?.type === "long_text" ? { text } : text;
 
@@ -658,6 +696,7 @@ export function buildColumnValues(mapping, patch, { isNew }) {
   return values;
 }
 
+// A Monday date column value (UTC date and time) from ISO text.
 function utcDateTime(iso) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return undefined;
@@ -665,6 +704,7 @@ function utcDateTime(iso) {
   return { date: text.slice(0, 10), time: text.slice(11, 19) };
 }
 
+// Label names from a status column's settings (JSON text or object).
 function statusLabels(settings) {
   let parsed = settings;
   if (typeof settings === "string") {
@@ -687,6 +727,7 @@ function statusLabels(settings) {
   return [];
 }
 
+// A phone cell as E.164, using the cell's country when it has one.
 function readPhone(value) {
   if (!value) return null;
   const parsed = parseJson(value.value);
@@ -694,22 +735,26 @@ function readPhone(value) {
   return toE164(raw, parsed?.countryShortName || "US");
 }
 
+// An email cell, normalised.
 function readEmail(value) {
   if (!value) return null;
   const parsed = parseJson(value.value);
   return normalizeEmail(parsed?.email ?? value.text);
 }
 
+// A cell's display text, or null when empty.
 function textOf(value) {
   return typeof value?.text === "string" && value.text.trim() ? value.text.trim() : null;
 }
 
+// Lower-case email when it looks valid, otherwise null.
 function normalizeEmail(value) {
   if (typeof value !== "string") return null;
   const email = value.trim().toLowerCase();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
 }
 
+// Parses a cell's JSON value; null when missing or invalid.
 function parseJson(value) {
   if (typeof value !== "string" || !value) return null;
   try {
@@ -719,11 +764,14 @@ function parseJson(value) {
   }
 }
 
+// Caps text to Monday's length limits, with an ellipsis.
 function truncate(value, max) {
   const text = String(value ?? "");
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+// The error that matters most from a list: not found, then unauthorized, then
+// the first.
 function pickError(errors) {
   if (!Array.isArray(errors) || !errors.length) return null;
   return errors.find((error) => error.code === CRM_ERROR.NOT_FOUND) ??

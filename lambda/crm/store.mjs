@@ -12,6 +12,8 @@
 // Every read and write is keyed by workspaceId, which always comes from the
 // caller's verified identity or from a row we wrote - never from a CRM.
 
+// Key for the caller-to-CRM-row link: per connection (so per agent) and per
+// phone number, so each agent's board keeps its own match for a caller.
 export function linkKeyFor(provider, phoneE164) {
   return `${provider}#${phoneE164}`;
 }
@@ -24,9 +26,16 @@ const TOKEN_FIELDS = [
   "refreshLockUntil",
 ];
 
+// DynamoDB persistence for the CRM integration: connections (one per agent),
+// caller links, per-call sync fields, OAuth states and the lookups the
+// reminders need. Conditional writes keep concurrent workers from overwriting
+// each other.
 export function createDynamoCrmStore(client, commands, tables, { now = Date.now } = {}) {
+  // Current time as ISO text, from the injectable clock.
   const iso = () => new Date(Number(now())).toISOString();
 
+  // Strongly consistent single-item read (optionally only some fields); null
+  // when missing.
   async function get(table, key, projection) {
     requireTable(table);
     const result = await client.send(new commands.GetItemCommand({
@@ -108,6 +117,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return get(connections, { workspaceId, provider });
     },
 
+    // Every connection for one Monday account, via the account index. The
+    // uninstall webhook uses it to disconnect them all.
     async listConnectionsByAccount(provider, accountId) {
       requireTable(connections);
       const items = [];
@@ -181,6 +192,9 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Claims the right to refresh this connection's tokens. Only succeeds on
+    // the expected token version with no live lock, so two workers never
+    // refresh (and burn) the same rotating refresh token.
     acquireRefreshLock(workspaceId, provider, expectedVersion, untilMs) {
       return update(connections, { workspaceId, provider }, {
         set: { refreshLockUntil: untilMs },
@@ -191,6 +205,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       }).then(Boolean);
     },
 
+    // Drops the refresh lock after a refresh attempt, whatever the outcome.
     releaseRefreshLock(workspaceId, provider) {
       return update(connections, { workspaceId, provider }, {
         remove: ["refreshLockUntil"],
@@ -224,6 +239,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // The grant stopped working (expired or revoked): the card asks the admin
+    // to reconnect. Only moves a connected record.
     markReauthRequired(workspaceId, provider, reason) {
       return update(connections, { workspaceId, provider }, {
         set: { connectionState: "reauth_required", reauthReason: reason, updatedAt: iso() },
@@ -234,6 +251,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Marks the connection disconnected and clears its tokens. The mapping
+    // and calls board record are kept for a later reconnect.
     disconnect(workspaceId, provider, reason) {
       const timestamp = iso();
       return update(connections, { workspaceId, provider }, {
@@ -309,6 +328,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return { removedLinks, scrubbedCalls };
     },
 
+    // Saves the board mapping with its validation result and any per-field
+    // problems.
     saveMapping(workspaceId, provider, mapping, { status, problems }) {
       return update(connections, { workspaceId, provider }, {
         set: { mapping, mappingStatus: status, mappingProblems: problems ?? [], mappingCheckedAt: iso(), updatedAt: iso() },
@@ -317,6 +338,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Flags the mapping invalid (e.g. a mapped column was deleted in Monday)
+    // so syncing to that board stops until it's fixed.
     markMappingInvalid(workspaceId, provider, problems) {
       return update(connections, { workspaceId, provider }, {
         set: { mappingStatus: "invalid", mappingProblems: problems, mappingCheckedAt: iso(), updatedAt: iso() },
@@ -325,6 +348,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Stops syncing until a time (rate limit, daily limit, inactive account).
+    // Calls are retried afterwards.
     pause(workspaceId, provider, untilMs, reason) {
       return update(connections, { workspaceId, provider }, {
         set: { pausedUntil: untilMs, pauseReason: reason, updatedAt: iso() },
@@ -333,6 +358,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Last sync outcome shown on the card: time of the last success, or the
+    // last error code.
     recordSyncResult(workspaceId, provider, { status, errorCode }) {
       const timestamp = iso();
       return update(connections, { workspaceId, provider }, {
@@ -400,6 +427,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return Boolean(saved);
     },
 
+    // The "Also sync calls to one of my boards" switch.
     setBoardSyncEnabled(workspaceId, provider, enabled) {
       return update(connections, { workspaceId, provider }, {
         set: { boardSyncEnabled: Boolean(enabled), updatedAt: iso() },
@@ -408,6 +436,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Ends a pause early (e.g. the account is active again) and resets the
+    // inactive notice so a future outage emails again.
     clearPause(workspaceId, provider) {
       return update(connections, { workspaceId, provider }, {
         remove: ["pausedUntil", "pauseReason", "accountInactiveNotifiedAt"],
@@ -426,6 +456,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return Boolean(saved);
     },
 
+    // Remembers when the keeper last replayed failed calls, so replays are
+    // spaced out.
     markAutoRequeued(workspaceId, provider) {
       return update(connections, { workspaceId, provider }, {
         set: { autoRequeuedAt: Number(now()) },
@@ -439,6 +471,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return get(links, { workspaceId, linkKey });
     },
 
+    // Short lease on one caller's link so two calls from the same number
+    // don't both create a new lead at once.
     acquireLinkLease(workspaceId, linkKey, owner, untilMs) {
       return update(links, { workspaceId, linkKey }, {
         set: { leaseOwner: owner, leaseExpiresAt: untilMs },
@@ -448,6 +482,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Releases the caller lease, only if we still hold it.
     releaseLinkLease(workspaceId, linkKey, owner) {
       return update(links, { workspaceId, linkKey }, {
         remove: ["leaseOwner", "leaseExpiresAt"],
@@ -457,6 +492,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Saves which CRM row a caller maps to, plus the newest call applied to
+    // it.
     saveLink(workspaceId, linkKey, fields) {
       return update(links, { workspaceId, linkKey }, {
         set: { ...fields, updatedAt: iso() },
@@ -479,6 +516,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return get(tables.calls, { workspaceId, callId });
     },
 
+    // Writes sync fields (status, item ids, errors) onto the call row.
     updateCallSync(workspaceId, callId, fields) {
       return update(tables.calls, { workspaceId, callId }, {
         set: { ...fields, crmUpdatedAt: iso() },
@@ -520,6 +558,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return items;
     },
 
+    // This workspace's failed syncs since a time, for the keeper's outage
+    // replay.
     async listFailedCalls(workspaceId, sinceIso) {
       requireTable(tables.calls);
       const items = [];
@@ -556,12 +596,16 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return workspace?.crmReminderAlert ?? null;
     },
 
+    // Company saved for this number on the Contacts page, used for the
+    // Company column.
     async getContactCompany(workspaceId, phoneNumber) {
       if (!tables.contacts || !phoneNumber) return null;
       const contact = await get(tables.contacts, { workspaceId, phoneNumber }, ["companyName"]);
       return typeof contact?.companyName === "string" && contact.companyName.trim() ? contact.companyName.trim() : null;
     },
 
+    // Active company admins, the fallback reminder recipients when the
+    // connecting admin has left.
     async listWorkspaceAdmins(workspaceId) {
       requireTable(tables.memberships);
       const items = [];
@@ -588,10 +632,13 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return get(tables.agents, { workspaceId, agentId }, ["agentId", "workspaceId", "name", "status"]);
     },
 
+    // A user's workspace membership (workspace, role, status, email).
     getMembership(userId) {
       return get(tables.memberships, { userId });
     },
 
+    // Saves a one-time OAuth state for the Monday consent round trip; never
+    // overwrites an existing one.
     async putOAuthState(record) {
       requireTable(tables.oauthStates);
       await client.send(new commands.PutItemCommand({
@@ -603,6 +650,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return record;
     },
 
+    // Reads and deletes the OAuth state in one step, so a callback URL can
+    // only be used once.
     async consumeOAuthState(state) {
       requireTable(tables.oauthStates);
       const result = await client.send(new commands.DeleteItemCommand({
@@ -615,6 +664,8 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
   };
 }
 
+// ProjectionExpression with #names, so reserved words like "state" are safe
+// to read.
 function projectionOf(fields) {
   const names = Object.fromEntries(fields.map((field, i) => [`#p${i}`, field]));
   return {
@@ -623,10 +674,14 @@ function projectionOf(fields) {
   };
 }
 
+// Fails loudly when a table env var is missing, instead of a confusing SDK
+// error.
 function requireTable(value) {
   if (!value) throw new Error("CRM DynamoDB table environment variable is required");
 }
 
+// Plain JS value to DynamoDB's typed form (small local marshaller, so the SDK
+// util isn't bundled).
 function toAttributeValue(value) {
   if (value === null) return { NULL: true };
   if (typeof value === "string") return { S: value };
@@ -645,6 +700,7 @@ function toAttributeValue(value) {
   throw new TypeError(`Unsupported DynamoDB value: ${typeof value}`);
 }
 
+// A plain object as a DynamoDB item; undefined fields are left out.
 export function marshall(value) {
   return Object.fromEntries(
     Object.entries(value)
@@ -653,6 +709,7 @@ export function marshall(value) {
   );
 }
 
+// DynamoDB's typed form back to a plain JS value.
 function fromAttributeValue(value) {
   if (value.S !== undefined) return value.S;
   if (value.N !== undefined) return Number(value.N);
@@ -667,6 +724,7 @@ function fromAttributeValue(value) {
   return undefined;
 }
 
+// A DynamoDB item as a plain object.
 function unmarshall(item) {
   return Object.fromEntries(
     Object.entries(item).map(([key, value]) => [key, fromAttributeValue(value)]),

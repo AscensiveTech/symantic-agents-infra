@@ -16,6 +16,9 @@ const OUTCOME_LABELS = {
   abandoned: "Caller hung up",
 };
 
+// Everything the CRM needs from one call (caller, contact details, outcome,
+// appointment, times), worked out once so the calls board and the customer's
+// board agree.
 export function deriveCallFacts(call, { timezone } = {}) {
   const actions = toolActions(Array.isArray(call?.toolLog) ? call.toolLog : []);
   const successful = actions.filter((action) => action.successful);
@@ -79,11 +82,13 @@ export function localDatePlusDays(iso, timezone, days) {
     month: "2-digit",
     day: "2-digit",
   }).formatToParts(base);
+  // Numeric part of the formatted date.
   const get = (type) => Number(parts.find((part) => part.type === type)?.value);
   const local = new Date(Date.UTC(get("year"), get("month") - 1, get("day") + days));
   return local.toISOString().slice(0, 10);
 }
 
+// A readable date and time in the business's timezone (UTC when unknown).
 export function formatLocal(iso, timezone) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
@@ -94,6 +99,7 @@ export function formatLocal(iso, timezone) {
   }).format(date);
 }
 
+// Appointment details from a successful booking or reschedule tool call.
 function appointmentFrom(action, kind) {
   const output = action.output ?? {};
   const args = action.arguments ?? {};
@@ -106,6 +112,7 @@ function appointmentFrom(action, kind) {
   };
 }
 
+// Pairs each tool call with its result, so only successful bookings count.
 function toolActions(toolLog) {
   const results = new Map(
     toolLog
@@ -126,6 +133,7 @@ function toolActions(toolLog) {
     });
 }
 
+// An object from an object or JSON text; null otherwise.
 function parseObject(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) return value;
   if (typeof value !== "string") return null;
@@ -137,15 +145,18 @@ function parseObject(value) {
   }
 }
 
+// Trimmed text, or null when empty.
 function text(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+// Lower-case email when it looks valid, otherwise null.
 function normalizeEmail(value) {
   const email = text(value)?.toLowerCase();
   return email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
 }
 
+// The timezone if the runtime knows it, otherwise null.
 function validTimezone(value) {
   if (typeof value !== "string" || !value) return null;
   try {
@@ -156,6 +167,7 @@ function validTimezone(value) {
   }
 }
 
+// The transcript as plain "Speaker: text" lines.
 export function transcriptText(transcript) {
   if (typeof transcript === "string") return transcript.trim() || null;
   if (!Array.isArray(transcript)) return null;
@@ -168,6 +180,7 @@ export function transcriptText(transcript) {
 
 const FOLLOW_UP_STATUS_LABELS = { not_started: "Not started", in_progress: "In progress", resolved: "Resolved" };
 
+// Follow-up as one line: status, assignee and comment.
 export function followUpText(followUp) {
   if (!followUp || typeof followUp !== "object") return null;
   const parts = [

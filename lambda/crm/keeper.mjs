@@ -73,6 +73,9 @@ export function createTokenKeeper({
       counts.requeued += await requeueFailed(connection.workspaceId, connection.provider, { onlyCodes: OUTAGE_ERROR_CODES, limit: 100 });
     }
 
+    // One worker lane: refreshes connections until the queue is empty or the
+    // time budget runs out. Leftovers are counted and handled on the next
+    // run.
     async function lane() {
       while (queue.length) {
         if (Number(now()) - started > budgetMs) {

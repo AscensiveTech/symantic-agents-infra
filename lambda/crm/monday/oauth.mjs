@@ -24,12 +24,15 @@ export const MONDAY_SCOPES = Object.freeze([
 
 const REFRESH_TOKEN_MAX_LIFETIME_MS = 180 * 24 * 60 * 60 * 1000;
 
+// PKCE verifier and challenge, so a stolen authorization code can't be
+// exchanged by anyone else.
 export function createPkcePair(random = () => randomBytes(48)) {
   const verifier = Buffer.from(random()).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   return { verifier, challenge };
 }
 
+// Monday's consent screen URL with our scopes, state and PKCE challenge.
 export function buildAuthorizeUrl({ clientId, redirectUri, state, codeChallenge }) {
   const url = new URL(MONDAY_AUTHORIZE_URL);
   url.searchParams.set("client_id", clientId);
@@ -56,12 +59,16 @@ export function buildInstallUrl({ clientId }) {
   return url.toString();
 }
 
+// Monday OAuth: exchange a code, refresh (tokens rotate on every refresh) and
+// revoke.
 export function createMondayOAuthClient({
   fetchImpl = globalThis.fetch,
   getAppSecret,
   now = Date.now,
   timeoutMs = 8_000,
 }) {
+  // Form POST to a Monday OAuth endpoint with a timeout; errors become
+  // CrmErrors.
   async function post(url, body, operation) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -110,6 +117,8 @@ export function createMondayOAuthClient({
     }
   }
 
+  // Token pair plus expiry times from Monday's response. The refresh grant
+  // lasts six months from consent.
   function normalizeTokens(value, { authorizedAt }) {
     const accessToken = value?.access_token;
     const refreshToken = value?.refresh_token;
@@ -133,6 +142,7 @@ export function createMondayOAuthClient({
   }
 
   return {
+    // Swaps the authorization code for tokens at the end of the consent flow.
     async exchangeCode({ code, redirectUri, codeVerifier }) {
       const secret = await getAppSecret();
       const value = await post(MONDAY_TOKEN_URL, {
@@ -146,6 +156,7 @@ export function createMondayOAuthClient({
       return normalizeTokens(value, { authorizedAt: Number(now()) });
     },
 
+    // Gets a new token pair; the old refresh token stops working.
     async refresh({ refreshToken, authorizedAt }) {
       const secret = await getAppSecret();
       const value = await post(MONDAY_TOKEN_URL, {
@@ -157,6 +168,7 @@ export function createMondayOAuthClient({
       return normalizeTokens(value, { authorizedAt });
     },
 
+    // Revokes a token on disconnect. An already-invalid token counts as done.
     async revoke({ token, hint }) {
       const secret = await getAppSecret();
       await post(MONDAY_REVOKE_URL, {
@@ -176,6 +188,8 @@ function jwtExpiryMs(token) {
   return Number.isFinite(exp) && exp > 0 ? exp * 1000 : null;
 }
 
+// Reads a JWT's payload without verifying it. Callers that must trust it
+// (the Monday webhook) check the signature first.
 function decodeJwtPayload(token) {
   if (typeof token !== "string") return null;
   const parts = token.split(".");
