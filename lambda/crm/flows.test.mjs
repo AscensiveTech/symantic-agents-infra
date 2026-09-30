@@ -1306,6 +1306,9 @@ test("renewal: approving with a different Monday account keeps but flags the map
   const h = createHarness();
   await h.connectAndMap();
   const firstBoard = h.store.connections.get("ws-a\0monday#agent-a").callsBoard.id;
+  // Real Monday accounts can't see each other's boards; the fake shares one
+  // list, so hide the first account's board from the new account's search.
+  h.monday.boardsById.get(String(firstBoard)).name = "Other account's board";
   h.monday.switchAccount("7770002", "Other Co");
   await h.connect();
   const after = h.store.connections.get("ws-a\0monday#agent-a");
@@ -1378,4 +1381,39 @@ test("connect: the OAuth callback only queues the calls board, so it returns fas
   await h.drain();
   assert.equal(h.monday.count("create_board"), 1);
   assert.equal(h.store.connections.get("ws-a\0monday#agent-a").callsBoard.status, "active");
+});
+
+test("calls board dedupe: two workers at once create one board; a lost record reuses the board by name", async () => {
+  const h = createHarness();
+  await h.connect();
+  const connection = h.store.connections.get("ws-a monday#agent-a");
+  const first = connection.callsBoard.id;
+  // The record is lost (e.g. a timed-out save): the next sync finds the
+  // agent's existing board by name instead of creating another.
+  delete connection.callsBoard;
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(h.store.connections.get("ws-a monday#agent-a").callsBoard.id, first);
+  assert.equal(h.monday.createdBoards.length, 1, "no second board");
+
+  // Two calls race with no board on record: the claim lets only one build it.
+  delete h.store.connections.get("ws-a monday#agent-a").callsBoard;
+  h.monday.boardsById.get(String(first)).name = "renamed by the customer";
+  const a = h.seedCall({ callerNumber: "+12025550111" });
+  const b = h.seedCall({ callerNumber: "+12025550122" });
+  await Promise.allSettled([
+    h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: a.callId }),
+    h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: b.callId }),
+  ]);
+  assert.equal(h.monday.createdBoards.length, 2, "exactly one new board despite two concurrent syncs");
+});
+
+test("calls board dedupe is per agent: each agent still gets its own board", async () => {
+  const h = createHarness();
+  await h.connect();
+  await h.connect({ sub: "sub-admin-b" });
+  assert.equal(h.monday.createdBoards.length, 2);
+  const names = h.monday.createdBoards.map((id) => h.monday.boardsById.get(id).name).sort();
+  assert.deepEqual(names, ["Symantic AI Calls - Front Desk", "Symantic AI Calls - Reception"]);
 });

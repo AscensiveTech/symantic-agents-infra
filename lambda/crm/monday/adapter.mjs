@@ -383,20 +383,7 @@ export function createMondayCrmAdapter({ graphql }) {
       const columns = {};
       try {
         for (const column of CALLS_BOARD_COLUMNS) {
-          const defaults = column.labels
-            ? JSON.stringify({ labels: Object.fromEntries(column.labels.map((label, index) => [String(index + 1), label])) })
-            : undefined;
-          const data = await graphql.request({
-            accessToken: session.accessToken,
-            operation: "create_column",
-            query: `mutation ($board: ID!, $title: String!, $type: ColumnType!, $defaults: JSON) {
-              create_column(board_id: $board, title: $title, column_type: $type, defaults: $defaults) { id }
-            }`,
-            variables: { board: boardId, title: column.title, type: column.type, defaults },
-          });
-          const id = data?.create_column?.id;
-          if (!id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the created column");
-          columns[column.key] = String(id);
+          columns[column.key] = await createCallsColumn(session, boardId, column);
         }
       } catch (error) {
         await graphql.request({
@@ -408,6 +395,21 @@ export function createMondayCrmAdapter({ graphql }) {
         throw error;
       }
       return { boardId, columns };
+    },
+
+    // Find a calls board we already created for this agent (same name), so
+    // a lost record, a reconnect or a timed-out attempt never leads to a
+    // second board. Any of our columns missing from it are added back.
+    async findCallsBoard(session, { name, excludeId = null }) {
+      const board = (await queryBoards(session, null))
+        .find((candidate) => candidate.name === name && candidate.id !== String(excludeId ?? ""));
+      if (!board) return null;
+      const columns = {};
+      for (const column of CALLS_BOARD_COLUMNS) {
+        const existing = board.columns.find((candidate) => candidate.title === column.title);
+        columns[column.key] = existing ? existing.id : await createCallsColumn(session, board.id, column);
+      }
+      return { boardId: board.id, columns };
     },
 
     async createCallsRow(session, boardId, { name, values }, { idempotencyKey } = {}) {
@@ -439,6 +441,24 @@ export function createMondayCrmAdapter({ graphql }) {
 
     suggestMapping,
   };
+
+  // One of the calls board's fixed columns; status columns get their labels.
+  async function createCallsColumn(session, boardId, column) {
+    const defaults = column.labels
+      ? JSON.stringify({ labels: Object.fromEntries(column.labels.map((label, index) => [String(index + 1), label])) })
+      : undefined;
+    const data = await graphql.request({
+      accessToken: session.accessToken,
+      operation: "create_column",
+      query: `mutation ($board: ID!, $title: String!, $type: ColumnType!, $defaults: JSON) {
+        create_column(board_id: $board, title: $title, column_type: $type, defaults: $defaults) { id }
+      }`,
+      variables: { board: String(boardId), title: column.title, type: column.type, defaults },
+    });
+    const id = data?.create_column?.id;
+    if (!id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the created column");
+    return String(id);
+  }
 
   async function queryBoards(session, ids) {
     // One board by id (validation) or the account's most recently used ones
