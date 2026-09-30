@@ -109,6 +109,7 @@ async function createAwsRuntime() {
     businessProfiles: env.BUSINESS_PROFILES_TABLE,
     contacts: env.CONTACTS_TABLE,
     agents: env.AGENTS_TABLE,
+    workspaces: env.WORKSPACES_TABLE,
     memberships: env.WORKSPACE_MEMBERSHIPS_TABLE,
     oauthStates: env.OAUTH_STATES_TABLE,
   });

@@ -74,6 +74,9 @@ export function createCrmApi({
         if (error.code === CRM_ERROR.REAUTH_REQUIRED || error.code === CRM_ERROR.NOT_CONNECTED) {
           throw new ApiError(409, "reauth_required", "Monday authorization expired. Reconnect to continue.");
         }
+        if (error.code === CRM_ERROR.ACCOUNT_INACTIVE) {
+          throw new ApiError(409, "account_inactive", "Monday says this account is inactive (suspended, closed or unpaid). Reactivate it in Monday, then try again.");
+        }
         if (error.retryable) {
           throw new ApiError(503, error.code, "Monday is not responding right now. Try again shortly.", {
             retryAfterSeconds: error.retryAfterSeconds,
@@ -193,6 +196,11 @@ export function createCrmApi({
           codeVerifier: stateRecord.codeVerifier,
         });
         const account = await adapter.describeAccount({ accessToken: tokens.accessToken, mapping: null });
+        // Tokens are swapped only after everything above succeeded, so a
+        // failed renewal leaves the working connection untouched.
+        const previous = await store.getConnection(workspaceId, key);
+        const switchedAccount = Boolean(previous?.accountId && account.accountId &&
+          String(previous.accountId) !== String(account.accountId));
         const [encryptedAccessToken, encryptedRefreshToken] = await Promise.all([
           tokenCrypto.encrypt({ plaintext: tokens.accessToken, workspaceId, provider: PROVIDER, purpose: "access" }),
           tokenCrypto.encrypt({ plaintext: tokens.refreshToken, workspaceId, provider: PROVIDER, purpose: "refresh" }),
@@ -213,7 +221,21 @@ export function createCrmApi({
           accessTokenExpiresAt: tokens.accessTokenExpiresAt,
           refreshTokenExpiresAt: tokens.refreshTokenExpiresAt,
         });
-        connection = await revalidate(workspaceId, connection);
+        if (switchedAccount) {
+          // Renewed with a different Monday account: the saved board lives in
+          // the old one. Keep the mapping (switching back fixes it) but flag
+          // it, and log calls to a board in the account now connected.
+          await store.saveCallsBoard(workspaceId, key, null);
+          connection = await store.markMappingInvalid(workspaceId, key, [{
+            field: "board",
+            code: "account_changed",
+            message: `You renewed with a different Monday account (${account.accountName ?? account.accountId}). Renew again with ${previous.accountName ?? "the original account"}, or choose a board from this account.`,
+          }]) ?? connection;
+          connection = await store.getConnection(workspaceId, key) ?? connection;
+          metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "account_changed" });
+        } else {
+          connection = await revalidate(workspaceId, connection);
+        }
         connection = await ensureCallsBoard(connection);
         if (connection.connectionState === "connected") await requeueFailed(workspaceId, key);
         metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "connected" });
@@ -333,6 +355,19 @@ export function createCrmApi({
       const saved = await store.setBoardSyncEnabled(identity.workspaceId, key, enabled);
       log.info?.("CRM board sync toggled", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), enabled });
       return json(200, toPublicConnection(saved, now));
+    },
+
+    // "Check Again" on the card after the customer reactivates their Monday
+    // account: if Monday answers, logging resumes and missed calls replay.
+    async "POST /crm/check-account"(event) {
+      const identity = await requireIdentity(event, { admin: true });
+      const key = await requireAgentKey(identity, event);
+      await requireUsableSession(identity.workspaceId, key, (session) => adapter.describeAccount(session));
+      await store.clearPause(identity.workspaceId, key);
+      const requeued = await requeueFailed(identity.workspaceId, key);
+      const saved = await store.getConnection(identity.workspaceId, key);
+      log.info?.("CRM account check passed", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), requeued });
+      return json(200, { ...toPublicConnection(saved, now), requeued });
     },
 
     async "POST /crm/sync/retry"(event) {

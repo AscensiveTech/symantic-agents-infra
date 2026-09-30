@@ -105,6 +105,9 @@ export function createCrmLookup({
       if (error instanceof CrmError && error.code === CRM_ERROR.DAILY_LIMIT) {
         await store.pause(workspaceId, connectionKey, nextUtcMidnight(Number(now())), "daily_limit").catch(() => {});
       }
+      if (error instanceof CrmError && error.code === CRM_ERROR.ACCOUNT_INACTIVE) {
+        await store.pause(workspaceId, connectionKey, Number(now()) + 24 * 60 * 60 * 1000, "account_inactive").catch(() => {});
+      }
       log.warn?.("CRM lookup failed; call continues without CRM context", {
         workspaceId,
         caller: maskPhone(phoneE164),

@@ -8,7 +8,7 @@ import { createHmac } from "node:crypto";
 // ---------------------------------------------------------------------------
 // In-memory CRM store with the same conditional semantics as store.mjs.
 // ---------------------------------------------------------------------------
-export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {}, contacts = {}, agents = {} } = {}) {
+export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {}, contacts = {}, agents = {}, reminderSettings = {} } = {}) {
   const connections = new Map();
   const links = new Map();
   const callRows = new Map(calls.map((call) => [`${call.workspaceId}\0${call.callId}`, structuredClone(call)]));
@@ -186,6 +186,20 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       row.boardSyncEnabled = Boolean(enabled);
       return clone(row);
     },
+    async clearPause(workspaceId, provider) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row) return null;
+      delete row.pausedUntil;
+      delete row.pauseReason;
+      delete row.accountInactiveNotifiedAt;
+      return clone(row);
+    },
+    async markAccountInactiveNotified(workspaceId, provider) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row || row.accountInactiveNotifiedAt) return false;
+      row.accountInactiveNotifiedAt = iso();
+      return true;
+    },
     async markAutoRequeued(workspaceId, provider) {
       const row = connections.get(key(workspaceId, provider));
       if (row) row.autoRequeuedAt = Number(now());
@@ -260,6 +274,9 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     async getProfileTimezone(workspaceId) {
       return profiles[workspaceId]?.timezone ?? null;
     },
+    async getCrmReminderSettings(workspaceId) {
+      return clone(reminderSettings[workspaceId]);
+    },
     async getContactCompany(workspaceId, phoneNumber) {
       return contacts[key(workspaceId, phoneNumber)]?.companyName ?? null;
     },
@@ -320,7 +337,9 @@ export const TEST_APP_SECRET = Object.freeze({
   appId: "10001",
 });
 
-export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {}) {
+export function createFakeMonday({ now = Date.now, accountId: initialAccountId = "5550001" } = {}) {
+  let accountId = initialAccountId;
+  let accountName = "Acme Dental";
   let nextId = 900_000_000;
   const id = () => String(nextId++);
   const boards = new Map();
@@ -657,7 +676,7 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
         return { data: { change_multiple_column_values: { id: item.id } } };
       }
       case "me":
-        return { data: { me: { id: "71", name: "Sam Lee", email: "sam@acme.test", account: { id: accountId, name: "Acme Dental", slug: "acme" } } } };
+        return { data: { me: { id: "71", name: "Sam Lee", email: "sam@acme.test", account: { id: accountId, name: accountName, slug: "acme" } } } };
       case "boards": {
         const wanted = v.ids ? v.ids.map(String) : null;
         const list = [...boards.values()].filter((board) => !board.deleted && (!wanted || wanted.includes(board.id)));
@@ -748,6 +767,11 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
     addItem,
     createdBoards,
     boardCreation,
+    /** Consent from now on comes from a different Monday account. */
+    switchAccount(id, name) {
+      accountId = String(id);
+      accountName = name;
+    },
     boardsById: boards,
     /** Pre-authorize: the user approved consent for this PKCE challenge. */
     issueCode({ redirectUri, challenge }) {

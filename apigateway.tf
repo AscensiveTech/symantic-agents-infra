@@ -66,6 +66,8 @@ locals {
     "GET /workspaces/me/usage-threshold-alert",
     "PUT /workspaces/me/usage-threshold-alert",
     "POST /workspaces/me/usage-threshold-alert/test",
+    "GET /workspaces/me/crm-reminder-alert",
+    "PUT /workspaces/me/crm-reminder-alert",
     "GET /workspaces/me/notifications",
     "PATCH /workspaces/me/notifications/{notificationId}",
     "DELETE /workspaces/me/notifications",

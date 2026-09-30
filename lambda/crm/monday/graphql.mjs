@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { CRM_ERROR, CrmError } from "../errors.mjs";
+import { CRM_ERROR, CrmError, looksLikeInactiveAccount } from "../errors.mjs";
 
 const MONDAY_API_URL = "https://api.monday.com/v2";
 // Pinned so a quarterly Monday release can't change behavior under us. Bump
@@ -135,6 +135,9 @@ export function createMondayGraphqlClient({
 function classifyHttp(status, body, retryAfter, operation) {
   const first = Array.isArray(body?.errors) ? body.errors[0] : null;
   const providerCode = first?.extensions?.code ?? body?.error_code;
+  if (looksLikeInactiveAccount(first?.message, body?.error_message, body?.message, providerCode)) {
+    return new CrmError(CRM_ERROR.ACCOUNT_INACTIVE, `Monday ${operation}: account inactive`, { statusCode: status, providerCode });
+  }
   if (providerCode && CODE_MAP.has(providerCode)) {
     return classifyGraphqlError(first ?? { extensions: { code: providerCode } }, retryAfter, operation, status);
   }
@@ -172,6 +175,9 @@ function classifyHttp(status, body, retryAfter, operation) {
 
 function classifyGraphqlError(error, retryAfter, operation, statusCode) {
   const providerCode = error?.extensions?.code ?? error?.extensions?.error_code ?? null;
+  if (looksLikeInactiveAccount(error?.message, providerCode)) {
+    return new CrmError(CRM_ERROR.ACCOUNT_INACTIVE, `Monday ${operation}: account inactive`, { statusCode, providerCode: providerCode ?? undefined });
+  }
   const code = CODE_MAP.get(providerCode) ?? CRM_ERROR.PROVIDER_ERROR;
   const perError = Number(
     error?.extensions?.retry_in_seconds ?? error?.extensions?.error_data?.retry_in_seconds,
@@ -198,6 +204,7 @@ function classifyGraphqlError(error, retryAfter, operation, statusCode) {
 // When a document fails for several reasons, act on the one that matters
 // most: an auth or quota problem outranks a bad column value.
 const SEVERITY = [
+  CRM_ERROR.ACCOUNT_INACTIVE,
   CRM_ERROR.UNAUTHORIZED,
   CRM_ERROR.DAILY_LIMIT,
   CRM_ERROR.RATE_LIMITED,

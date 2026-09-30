@@ -23,20 +23,50 @@ function isNewerStage(stage, sent) {
 }
 
 export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now, log = console }) {
-  async function recipients(connection) {
+  // The admin who connected this agent's Monday (or, if they've left, every
+  // active company admin) plus the people on the workspace's "Monday
+  // Reconnect Reminders" list. Nobody when that setting is switched off.
+  async function recipients(connection, settings) {
+    if (settings?.enabled === false) return [];
     const connector = connection.authorizedBy ? await store.getMembership(connection.authorizedBy).catch(() => null) : null;
-    if (connector?.workspaceId === connection.workspaceId && connector.status === "active" && connector.email) {
-      return [connector.email];
+    const primary = connector?.workspaceId === connection.workspaceId && connector.status === "active" && connector.email
+      ? [connector.email]
+      : (await store.listWorkspaceAdmins(connection.workspaceId)).map((admin) => admin.email);
+    const extra = Array.isArray(settings?.recipients) ? settings.recipients : [];
+    return [...new Set([...primary, ...extra].filter(Boolean).map((email) => String(email).toLowerCase()))];
+  }
+
+  // One email per inactive spell when the Monday account itself is
+  // suspended, closed or unpaid.
+  async function notifyInactive(connection) {
+    if (connection.accountInactiveNotifiedAt) return false;
+    const settings = await store.getCrmReminderSettings?.(connection.workspaceId).catch(() => null);
+    const to = await recipients(connection, settings);
+    if (!to.length) return false;
+    if (!await store.markAccountInactiveNotified(connection.workspaceId, connection.provider)) return false;
+    const agentId = connection.agentId ?? agentIdOf(connection.provider);
+    const agent = agentId ? await store.getAgent(connection.workspaceId, agentId).catch(() => null) : null;
+    const message = renderInactiveEmail({ connection, appUrl, agentId, agentName: agent?.name ?? null });
+    for (const address of to) {
+      try {
+        await sendEmail({ to: address, ...message });
+      } catch (error) {
+        log.warn?.("Monday account-inactive notice not sent", { workspaceId: connection.workspaceId, name: error?.name });
+      }
     }
-    const admins = await store.listWorkspaceAdmins(connection.workspaceId);
-    return [...new Set(admins.map((admin) => admin.email).filter(Boolean))];
+    return true;
   }
 
   return async function remind(connection) {
     if (!sendEmail) return false;
+    if (connection.pauseReason === "account_inactive" && Number(connection.pausedUntil) > Number(now())) {
+      return notifyInactive(connection);
+    }
     const stage = reminderStage(connection, Number(now()));
     if (!stage || !isNewerStage(stage, connection.reauthReminderStage)) return false;
-    const to = await recipients(connection);
+    const settings = await store.getCrmReminderSettings?.(connection.workspaceId).catch(() => null);
+    const to = await recipients(connection, settings);
+    if (!to.length) return false;
     // Claim the stage first: a crash after sending must not email twice.
     const claimed = await store.markReauthReminder(connection.workspaceId, connection.provider, stage, connection.reauthReminderStage ?? null);
     if (!claimed) return false;
@@ -50,13 +80,13 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
         log.warn?.("Monday reconnect reminder not sent", { workspaceId: connection.workspaceId, stage, name: error?.name });
       }
     }
-    return to.length > 0;
+    return true;
   };
 }
 
 export function renderReauthEmail({ stage, connection, appUrl, agentId = null, agentName = null }) {
   const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
-  const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}` : base;
+  const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}&crm=renew` : `${base}?crm=renew`;
   const account = connection.accountName ? ` (${connection.accountName})` : "";
   const forAgent = agentName ? ` for your "${agentName}" agent` : "";
   const expiry = Number(connection.refreshTokenExpiresAt);
@@ -70,18 +100,35 @@ export function renderReauthEmail({ stage, connection, appUrl, agentId = null, a
   const lines = expired
     ? [
       `The AI Receptionist's connection to Monday${account}${forAgent} has ended, so new calls are no longer being logged to Monday.`,
-      "Calls are still answered normally. Reconnect Monday and the calls that were missed in the meantime are logged automatically.",
+      "Calls are still answered normally. Renew the connection and the calls missed in the meantime are logged automatically. Your boards and field mapping are kept - it takes one click.",
     ]
     : [
       `Monday requires the AI Receptionist's connection${account}${forAgent} to be renewed every six months. It ends on ${when}.`,
-      "Reconnecting takes one click and keeps your field mapping. If it lapses, calls are still answered but stop being logged to Monday until you reconnect.",
+      "Renewing takes one click, and your boards and field mapping are kept. If it lapses, calls are still answered but stop being logged to Monday until you renew.",
     ];
-  const text = [...lines, "", `Reconnect Monday: ${link}`].join("\n");
+  const text = [...lines, "", `Renew Monday Connection: ${link}`].join("\n");
   const html = [
     ...lines.map((line) => `<p style="margin:0 0 14px;font-size:14px;line-height:1.5;">${escapeHtml(line)}</p>`),
-    `<p style="margin:20px 0;"><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#1c1c17;color:#ffffff;text-decoration:none;font-weight:600;">Reconnect Monday</a></p>`,
+    `<p style="margin:20px 0;"><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#1c1c17;color:#ffffff;text-decoration:none;font-weight:600;">Renew Monday Connection</a></p>`,
   ].join("");
   return { subject, text, html };
+}
+
+export function renderInactiveEmail({ connection, appUrl, agentId = null, agentName = null }) {
+  const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
+  const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}` : base;
+  const account = connection.accountName ? ` (${connection.accountName})` : "";
+  const forAgent = agentName ? ` for your "${agentName}" agent` : "";
+  const lines = [
+    `Monday says your account${account} is inactive - suspended, closed or unpaid - so calls${forAgent} are not being logged to Monday right now.`,
+    "Calls are still answered normally. Reactivate the account in Monday, then click Check Again on the Monday card. Calls missed in the meantime are logged automatically.",
+  ];
+  const text = [...lines, "", `Open Monday settings: ${link}`].join("\n");
+  const html = [
+    ...lines.map((line) => `<p style="margin:0 0 14px;font-size:14px;line-height:1.5;">${escapeHtml(line)}</p>`),
+    `<p style="margin:20px 0;"><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#1c1c17;color:#ffffff;text-decoration:none;font-weight:600;">Open Monday Settings</a></p>`,
+  ].join("");
+  return { subject: "Monday account inactive: calls aren't being logged", text, html };
 }
 
 function escapeHtml(value) {

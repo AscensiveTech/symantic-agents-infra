@@ -19,6 +19,7 @@ const PROVIDER_IDEMPOTENCY_WINDOW_MS = 25 * 60 * 1000;
 // saving a second search for a brand-new caller.
 const NEGATIVE_LOOKUP_TTL_MS = 15 * 60 * 1000;
 const FOLLOW_UP_DAYS = 1;
+export const ACCOUNT_INACTIVE_PAUSE_MS = 24 * 60 * 60 * 1000;
 const LEAD_SOURCE = "AI Receptionist";
 
 /**
@@ -232,6 +233,15 @@ export function createCrmSync({
         await store.pause(workspaceId, connection.provider, resetAt, "daily_limit").catch(() => {});
         metrics?.count("RateLimited", { Provider: providerIdOf(connection.provider), Outcome: "daily_limit" });
         error.retryAfterSeconds = Math.ceil((resetAt - Number(now())) / 1000);
+        break;
+      }
+      case CRM_ERROR.ACCOUNT_INACTIVE: {
+        // Calls are still answered; logging waits a day at a time until the
+        // Monday account is active again, then catches up.
+        const resumeAt = Number(now()) + ACCOUNT_INACTIVE_PAUSE_MS;
+        await store.pause(workspaceId, connection.provider, resumeAt, "account_inactive").catch(() => {});
+        metrics?.count("AccountInactive", { Provider: providerIdOf(connection.provider) });
+        error.retryAfterSeconds = Math.ceil(ACCOUNT_INACTIVE_PAUSE_MS / 1000);
         break;
       }
       case CRM_ERROR.RATE_LIMITED:

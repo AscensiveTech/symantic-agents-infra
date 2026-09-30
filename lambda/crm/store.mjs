@@ -373,6 +373,24 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    clearPause(workspaceId, provider) {
+      return update(connections, { workspaceId, provider }, {
+        remove: ["pausedUntil", "pauseReason", "accountInactiveNotifiedAt"],
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
+    // Once per inactive spell (cleared with the pause).
+    async markAccountInactiveNotified(workspaceId, provider) {
+      const saved = await update(connections, { workspaceId, provider }, {
+        set: { accountInactiveNotifiedAt: iso() },
+        condition: "attribute_exists(workspaceId) AND attribute_not_exists(accountInactiveNotifiedAt)",
+        conditional: true,
+      });
+      return Boolean(saved);
+    },
+
     markAutoRequeued(workspaceId, provider) {
       return update(connections, { workspaceId, provider }, {
         set: { autoRequeuedAt: Number(now()) },
@@ -473,6 +491,13 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
     async getProfileTimezone(workspaceId) {
       const profile = await get(tables.businessProfiles, { workspaceId }, ["timezone"]);
       return typeof profile?.timezone === "string" ? profile.timezone : null;
+    },
+
+    // The workspace's "Monday Reconnect Reminders" alert setting.
+    async getCrmReminderSettings(workspaceId) {
+      if (!tables.workspaces) return null;
+      const workspace = await get(tables.workspaces, { workspaceId }, ["crmReminderAlert"]);
+      return workspace?.crmReminderAlert ?? null;
     },
 
     async getContactCompany(workspaceId, phoneNumber) {
