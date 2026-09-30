@@ -357,10 +357,12 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return Boolean(saved);
     },
 
+    // Also clears the "board deleted" email flags: a new or restored board
+    // starts a fresh notice cycle.
     saveCallsBoard(workspaceId, provider, callsBoard) {
       return update(connections, { workspaceId, provider }, {
         set: { callsBoard },
-        remove: ["callsBoardClaimAt"],
+        remove: ["callsBoardClaimAt", ...(callsBoard?.status === "deleted" ? [] : ["callsBoardDeletedNoticeAt", "callsBoardDeletedReminderAt"])],
         condition: "attribute_exists(workspaceId)",
         conditional: true,
       });
@@ -374,6 +376,25 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
         set: { callsBoardClaimAt: nowMs },
         condition: "attribute_exists(workspaceId) AND (attribute_not_exists(callsBoardClaimAt) OR callsBoardClaimAt < :stale)",
         conditionValues: { ":stale": nowMs - staleMs },
+        conditional: true,
+      });
+      return Boolean(saved);
+    },
+
+    // Stop Logging / Turn Back On for the auto-created calls board.
+    setCallsBoardEnabled(workspaceId, provider, enabled) {
+      return update(connections, { workspaceId, provider }, {
+        set: { callsBoardEnabled: Boolean(enabled), updatedAt: iso() },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
+    // Once-only flags for the "calls board deleted" email and its reminder.
+    async markCallsBoardNotice(workspaceId, provider, field) {
+      const saved = await update(connections, { workspaceId, provider }, {
+        set: { [field]: iso() },
+        condition: `attribute_exists(workspaceId) AND attribute_not_exists(${field})`,
         conditional: true,
       });
       return Boolean(saved);
@@ -476,6 +497,27 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
         conditional: true,
       });
       return Boolean(saved);
+    },
+
+    // One agent's calls (optionally analyzed since a time), with just the
+    // fields the calls-board rebuild and reconnect catch-up need.
+    async listAgentCalls(workspaceId, agentId, { since } = {}) {
+      requireTable(tables.calls);
+      const items = [];
+      let startKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tables.calls,
+          KeyConditionExpression: "workspaceId = :workspaceId",
+          FilterExpression: since ? "agentId = :agentId AND analyzedAt >= :since" : "agentId = :agentId",
+          ProjectionExpression: "callId, agentId, callerNumber, outcome, demoSeed, analyzedAt, crmStatus, crmCallsItemId, crmCallsBoardId",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":agentId": agentId, ...(since ? { ":since": since } : {}) }),
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map(unmarshall));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+      return items;
     },
 
     async listFailedCalls(workspaceId, sinceIso) {

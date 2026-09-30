@@ -22,6 +22,7 @@ export function createTokenKeeper({
   sessions,
   requeueFailed,
   remindReauth,
+  checkCallsBoard,
   metrics,
   now = Date.now,
   log = console,
@@ -43,6 +44,10 @@ export function createTokenKeeper({
       try {
         const connection = await store.getConnection(workspaceId, provider);
         if (connection?.connectionState !== "connected") return;
+        // Board check first, so a deletion found now is emailed in this run.
+        await checkCallsBoard?.(connection).catch((error) => {
+          log.warn?.("Calls board check failed", { workspaceId, provider, ...describeError(error) });
+        });
         await remindReauth?.(connection);
         if (Number(connection.accessTokenExpiresAt) - Number(now()) > REFRESH_AHEAD_MS) {
           counts.fresh += 1;

@@ -6,6 +6,20 @@ import { getRuntime } from "./runtime.mjs";
 export const MAX_ATTEMPTS = 8;
 const MAX_VISIBILITY_SECONDS = 12 * 60 * 60;
 
+// Queue messages with a `kind` are background jobs for one agent's Monday
+// connection (message.provider is its connection key):
+//   ensure-calls-board - build (or, with recreate, replace) the calls board;
+//                        with rebuild, then queue its full history.
+//   calls-board-row    - write one call's row to the calls board only.
+//   catch-up           - after a reconnect, queue calls missed meanwhile.
+//   rewrite-links      - one-time fix of a call's "Listen" links.
+const BACKGROUND_JOBS = {
+  "ensure-calls-board": (sync, m) => sync.ensureCallsBoard({ workspaceId: m.workspaceId, provider: m.provider, recreate: m.recreate === true, rebuild: m.rebuild === true }),
+  "calls-board-row": (sync, m) => sync.syncCallsBoardRow({ workspaceId: m.workspaceId, callId: m.callId, provider: m.provider }),
+  "catch-up": (sync, m) => sync.catchUpAfterReconnect({ workspaceId: m.workspaceId, provider: m.provider, since: m.since }),
+  "rewrite-links": (sync, m) => sync.rewriteCallLinks({ workspaceId: m.workspaceId, callId: m.callId, provider: m.provider }),
+};
+
 /** Exponential backoff with jitter, unless the error names its own wait. */
 export function backoffSeconds(error, attempt, random = Math.random) {
   if (Number.isFinite(error?.retryAfterSeconds) && error.retryAfterSeconds > 0) {
@@ -41,12 +55,17 @@ export function createWorker({
       } catch {
         message = null;
       }
-      if (message?.kind === "ensure-calls-board" && typeof message.workspaceId === "string" && typeof message.provider === "string") {
+      // Background jobs other than "sync this call" (see BACKGROUND_JOBS).
+      const job = BACKGROUND_JOBS[message?.kind];
+      if (job && typeof message.workspaceId === "string" && typeof message.provider === "string") {
         try {
-          await sync.ensureCallsBoard({ workspaceId: message.workspaceId, provider: message.provider });
+          await job(sync, message);
         } catch (error) {
           batchItemFailures.push({ itemIdentifier: record.messageId });
-          log.warn?.("Calls board creation will retry", { workspaceId: message.workspaceId, ...describeError(error) });
+          log.warn?.("CRM background job will retry", { kind: message.kind, workspaceId: message.workspaceId, ...describeError(error) });
+          if (attempt < MAX_ATTEMPTS) {
+            await changeVisibility(record.receiptHandle, backoffSeconds(error, attempt, random)).catch(() => {});
+          }
         }
         continue;
       }
@@ -66,6 +85,7 @@ export function createWorker({
           callId: message.callId,
           attempt,
           finalAttempt: attempt >= MAX_ATTEMPTS,
+          verifyExisting: message.verifyExisting === true,
         });
       } catch (error) {
         batchItemFailures.push({ itemIdentifier: record.messageId });

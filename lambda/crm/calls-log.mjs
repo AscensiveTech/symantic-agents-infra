@@ -1,18 +1,31 @@
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { followUpText, transcriptText } from "./facts.mjs";
 import { agentIdOf, providerIdOf } from "./provider.mjs";
-import { buildCallsRow, callsBoardName, callsRowName } from "./monday/calls-board.mjs";
+import { buildCallsRow, CALLS_BOARD_COLUMNS, callsBoardName, callsRowName } from "./monday/calls-board.mjs";
 
 /**
  * The auto-created "Symantic AI Calls" board: one per connected agent, one
- * row per call. It is best effort around the customer's own board - a
- * refusal to create the board (permissions, plan limits) is recorded on the
- * connection and shown in settings, never allowed to block the rest.
+ * row per call, written next to (never instead of) the customer's own board.
+ *
+ * Board lifecycle, per agent (connection.callsBoard.status):
+ *   active   - rows are written to it.
+ *   failed   - Monday refused to create it (permissions, plan limit); the
+ *              next call tries again.
+ *   deleted  - it was deleted in Monday. It is NOT recreated automatically:
+ *              calls are still answered and kept in Call History, and wait
+ *              until an admin clicks Recreate Board (or restores it from
+ *              Monday's trash). Then the full history is rebuilt.
+ * connection.callsBoardEnabled === false - the admin chose Stop Logging.
  */
+
 // A claim this old belongs to a crashed attempt and can be taken over.
 const CLAIM_STALE_MS = 3 * 60 * 1000;
+// Monday's "this board doesn't exist any more" answers.
+const BOARD_GONE_STATES = new Set(["deleted", "archived", "missing"]);
 
 export function createCallsLog({ store, providers, appUrl, metrics, log = console, now = Date.now }) {
+  const stamp = () => new Date(Number(now())).toISOString();
+
   async function agentName(connection) {
     const agentId = connection.agentId ?? agentIdOf(connection.provider);
     if (!agentId || !store.getAgent) return null;
@@ -20,32 +33,60 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     return agent?.name ?? null;
   }
 
-  // Make sure this agent has exactly one calls board: reuse the saved one,
-  // else one we already created under the agent's board name (a lost save,
-  // a timed-out attempt, a reconnect), else create it. A per-agent claim on
-  // the connection row stops two workers creating boards at the same time.
-  // Throws a CrmError when Monday refuses (recorded on the connection) and a
-  // retryable LEASE_BUSY while another worker holds the claim.
-  async function ensureBoard(session, connection, { force = false } = {}) {
+  async function save(connection, record) {
+    await store.saveCallsBoard(connection.workspaceId, connection.provider, record);
+    connection.callsBoard = record;
+    return record;
+  }
+
+  // The board was deleted in Monday: remember it (keeping its id, so a
+  // restore from Monday's trash can be recognised) and stop writing.
+  async function markDeleted(connection) {
+    const board = connection.callsBoard ?? {};
+    if (board.status === "deleted") return board;
+    metrics?.count("CallsBoard", { Provider: providerIdOf(connection.provider), Outcome: "deleted" });
+    log.info?.("Calls board deleted in Monday", { workspaceId: connection.workspaceId, boardId: board.id });
+    return save(connection, { ...board, status: "deleted", deletedAt: stamp() });
+  }
+
+  /**
+   * Make sure this agent has exactly one usable calls board and return it.
+   *  - an active board is returned as is (first adding any of our columns
+   *    it's missing, e.g. "Call ID" on boards made before it existed);
+   *  - a deleted board is only replaced when `recreate` is set (the admin's
+   *    Recreate Board), never on its own;
+   *  - otherwise reuse a board we already made under the agent's board name
+   *    (a lost save, a timed-out attempt), else create one.
+   * A per-agent claim on the connection row stops two workers from creating
+   * boards at once. Throws a CrmError when Monday refuses (recorded on the
+   * connection), and a retryable LEASE_BUSY while another worker holds the
+   * claim.
+   */
+  async function ensureBoard(session, connection, { recreate = false } = {}) {
     const existing = connection.callsBoard;
-    if (!force && existing?.status === "active" && existing.id) return existing;
     const provider = providers.get(connection.provider);
+    if (existing?.status === "active" && existing.id) {
+      const missing = CALLS_BOARD_COLUMNS.some((column) => !existing.columns?.[column.key]);
+      if (!missing || !provider.repairCallsBoard) return existing;
+      const repaired = await provider.repairCallsBoard(session, existing.id);
+      return repaired ? save(connection, { ...existing, columns: repaired.columns }) : existing;
+    }
+    if (existing?.status === "deleted" && !recreate) {
+      throw new CrmError(CRM_ERROR.NOT_FOUND, "Calls board was deleted; waiting for an admin", { resource: "calls_board" });
+    }
     if (!await store.claimCallsBoard(connection.workspaceId, connection.provider, CLAIM_STALE_MS)) {
       throw new CrmError(CRM_ERROR.LEASE_BUSY, "Calls board is being created", { retryAfterSeconds: 30 });
     }
     const name = callsBoardName(await agentName(connection));
     try {
-      const reused = await provider.findCallsBoard?.(session, { name, excludeId: force ? existing?.id : null });
+      const excludeId = existing?.status === "deleted" ? existing.id : null;
+      const reused = await provider.findCallsBoard?.(session, { name, excludeId });
       const { boardId, columns } = reused ?? await provider.createCallsBoard(session, { name });
-      const record = { id: boardId, columns, status: "active", createdAt: new Date(Number(now())).toISOString() };
-      await store.saveCallsBoard(connection.workspaceId, connection.provider, record);
-      connection.callsBoard = record;
       metrics?.count("CallsBoard", { Provider: providerIdOf(connection.provider), Outcome: reused ? "reused" : "created" });
-      return record;
+      return save(connection, { id: boardId, columns, status: "active", createdAt: stamp() });
     } catch (error) {
-      const record = { id: null, columns: null, status: "failed", errorCode: boardErrorCode(error), failedAt: new Date(Number(now())).toISOString() };
-      await store.saveCallsBoard(connection.workspaceId, connection.provider, record).catch(() => {});
-      connection.callsBoard = record;
+      const record = { id: null, columns: null, status: "failed", errorCode: boardErrorCode(error), failedAt: stamp() };
+      await save(connection, record).catch(() => {});
       metrics?.count("CallsBoard", { Provider: providerIdOf(connection.provider), Outcome: record.errorCode });
       log.warn?.("Calls board not created", { workspaceId: connection.workspaceId, ...describeError(error) });
       throw error;
@@ -67,41 +108,78 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
   }
 
   /**
-   * One row for this call. Returns the row id, or null when the board can't
-   * exist (Monday refused to create it). Outages throw, so the call retries.
+   * One row for this call on the agent's calls board. Returns:
+   *   { status: "written", itemId, boardId } - the row exists (new or found);
+   *   { status: "held" }    - the board was deleted; the call waits for Recreate;
+   *   { status: "off" }     - the admin switched the calls board off;
+   *   { status: "refused" } - Monday won't let us create the board.
+   * `verifyExisting` (rebuilds and catch-ups) first looks the call up by its
+   * Call ID, so a row that's already there is linked instead of duplicated.
+   * Outages throw, so the caller retries.
    */
-  async function logCall(session, connection, call, facts, { idempotencyKey }) {
+  async function logCall(session, connection, call, facts, { idempotencyKey, verifyExisting = false }) {
     const provider = providers.get(connection.provider);
-    if (!provider?.createCallsRow) return null;
+    if (!provider?.createCallsRow) return { status: "off" };
+    if (connection.callsBoardEnabled === false) return { status: "off" };
+    if (connection.callsBoard?.status === "deleted") return { status: "held" };
     let board;
     try {
       board = await ensureBoard(session, connection);
     } catch (error) {
-      if (isBoardRefusal(error)) return null;
+      if (isBoardRefusal(error)) return { status: "refused" };
       throw error;
     }
     try {
-      return await provider.createCallsRow(session, board.id, rowFor(connection, call, facts), { idempotencyKey });
+      if (verifyExisting) {
+        const found = await provider.findCallsRow?.(session, board, facts.callId);
+        if (found) return { status: "written", itemId: found, boardId: board.id };
+      }
+      // Keyed per board: a rebuilt board gets its own rows, while retries on
+      // the same board are replayed by Monday instead of duplicated.
+      const itemId = await provider.createCallsRow(session, board.id, rowFor(connection, call, facts), {
+        idempotencyKey: `${idempotencyKey}-${board.id}`,
+      });
+      return { status: "written", itemId, boardId: board.id };
     } catch (error) {
-      // Board deleted in Monday (or a column removed): build a new one once.
       if (!(error instanceof CrmError) || (error.code !== CRM_ERROR.MAPPING_INVALID && error.code !== CRM_ERROR.NOT_FOUND)) throw error;
-      metrics?.count("CallsBoard", { Provider: providerIdOf(connection.provider), Outcome: "recreated" });
-      try {
-        board = await ensureBoard(session, connection, { force: true });
-      } catch (createError) {
-        if (isBoardRefusal(createError)) return null;
-        throw createError;
+      // Board or column gone. A deleted board waits for the admin; a
+      // removed column is added back and the write tried once more.
+      const state = await provider.callsBoardState?.(session, board.id).catch(() => "unknown");
+      if (BOARD_GONE_STATES.has(state)) {
+        await markDeleted(connection);
+        return { status: "held" };
       }
-      try {
-        return await provider.createCallsRow(session, board.id, rowFor(connection, call, facts), { idempotencyKey: `${idempotencyKey}-r` });
-      } catch (retryError) {
-        if (!isBoardRefusal(retryError)) throw retryError;
-        await store.saveCallsBoard(connection.workspaceId, connection.provider, {
-          ...board, status: "failed", errorCode: boardErrorCode(retryError), failedAt: new Date(Number(now())).toISOString(),
-        }).catch(() => {});
-        return null;
-      }
+      const repaired = await provider.repairCallsBoard?.(session, board.id);
+      if (!repaired) throw error;
+      await save(connection, { ...board, columns: repaired.columns });
+      const itemId = await provider.createCallsRow(session, board.id, rowFor(connection, call, facts), {
+        idempotencyKey: `${idempotencyKey}-${board.id}-r`,
+      });
+      return { status: "written", itemId, boardId: board.id };
     }
+  }
+
+  /**
+   * The 10-minute check: is this agent's board still in Monday? Returns
+   * "deleted" when it just disappeared, "restored" when a deleted board is
+   * back (restored from Monday's trash), otherwise null.
+   */
+  async function checkBoard(session, connection) {
+    const provider = providers.get(connection.provider);
+    const board = connection.callsBoard;
+    if (!board?.id || !provider?.callsBoardState || connection.callsBoardEnabled === false) return null;
+    if (board.status !== "active" && board.status !== "deleted") return null;
+    const state = await provider.callsBoardState(session, board.id);
+    if (board.status === "active" && BOARD_GONE_STATES.has(state)) {
+      await markDeleted(connection);
+      return "deleted";
+    }
+    if (board.status === "deleted" && state === "active") {
+      await save(connection, { id: board.id, columns: board.columns, status: "active", createdAt: board.createdAt ?? stamp(), restoredAt: stamp() });
+      metrics?.count("CallsBoard", { Provider: providerIdOf(connection.provider), Outcome: "restored" });
+      return "restored";
+    }
+    return null;
   }
 
   async function updateFollowUp(session, connection, call) {
@@ -109,12 +187,21 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     const board = connection.callsBoard;
     const column = board?.columns?.followUp;
     if (!provider?.updateCallsRow || board?.status !== "active" || !column || !call.crmCallsItemId) return false;
+    if (call.crmCallsBoardId && String(call.crmCallsBoardId) !== String(board.id)) return false;
     const text = followUpText(call.followUp);
     await provider.updateCallsRow(session, board.id, call.crmCallsItemId, { [column]: { text: text ?? "" } });
     return true;
   }
 
-  return { ensureBoard, logCall, updateFollowUp };
+  return { ensureBoard, logCall, checkBoard, markDeleted, updateFollowUp };
+}
+
+// Is this call's row on the agent's current calls board? Rows written before
+// we tracked the board id count as current.
+export function callsRowIsCurrent(call, connection) {
+  if (!call?.crmCallsItemId) return false;
+  if (!call.crmCallsBoardId) return true;
+  return String(call.crmCallsBoardId) === String(connection?.callsBoard?.id ?? "");
 }
 
 // Monday said no to the board itself - retrying won't change that.

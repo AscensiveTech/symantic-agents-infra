@@ -1179,7 +1179,7 @@ test("calls board: connecting creates 'Symantic AI Calls - <agent>' with the fix
   assert.equal(board.name, "Symantic AI Calls - Front Desk");
   assert.deepEqual(board.columns.slice(1).map((c) => c.title), [
     "Phone", "Company Name", "Date & Time", "Duration (Min)", "Direction", "Outcome", "Reason for Call",
-    "Summary", "Appointment Set", "Sentiment", "Follow-Up", "Email", "Recording", "Transcript",
+    "Summary", "Appointment Set", "Sentiment", "Follow-Up", "Email", "Recording", "Transcript", "Call ID",
   ]);
   assert.deepEqual(board.columns.find((c) => c.title === "Direction").labels, ["Inbound", "Outbound"]);
   assert.equal(connection.boardSyncEnabled, false, "your own board is opt-in");
@@ -1243,7 +1243,7 @@ test("calls board: Monday refusing to create it never fails the connection, and 
   assert.equal(h.monday.count("create_item"), 1, "the lead was created on your board");
 });
 
-test("calls board: deleted in Monday, it is rebuilt once and the call is logged there", async () => {
+test("calls board deleted in Monday: never recreated on its own; the call is held and still synced to your own board", async () => {
   const h = createHarness();
   await h.connect();
   const first = callsBoardOf(h).board;
@@ -1251,10 +1251,16 @@ test("calls board: deleted in Monday, it is rebuilt once and the call is logged 
   const call = h.seedCall();
   h.enqueueCall(call);
   await h.drain();
-  const { connection, board } = callsBoardOf(h);
-  assert.notEqual(board.id, first.id);
-  assert.equal(connection.callsBoard.status, "active");
-  assert.equal([...h.monday.items.values()].filter((item) => item.boardId === board.id).length, 1);
+  const { connection } = callsBoardOf(h);
+  assert.equal(connection.callsBoard.status, "deleted");
+  assert.equal(connection.callsBoard.id, first.id, "the old id is kept so a restore is recognised");
+  assert.equal(h.monday.createdBoards.length, 1, "no replacement board without an admin");
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.equal(row.crmStatus, "synced");
+  assert.equal(row.crmCallsItemId, undefined, "held: no row yet");
+  const pub = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
+  assert.equal(pub.callsBoard.status, "deleted");
+  assert.match(pub.callsBoard.message, /was deleted in Monday/);
 });
 
 test("board sync toggle: off skips your board but keeps the mapping; on resumes it", async () => {
@@ -1416,4 +1422,158 @@ test("calls board dedupe is per agent: each agent still gets its own board", asy
   assert.equal(h.monday.createdBoards.length, 2);
   const names = h.monday.createdBoards.map((id) => h.monday.boardsById.get(id).name).sort();
   assert.deepEqual(names, ["Symantic AI Calls - Front Desk", "Symantic AI Calls - Reception"]);
+});
+
+// ============================================================ Part H ====
+
+function rowsOn(h, boardId) {
+  return [...h.monday.items.values()].filter((item) => item.boardId === String(boardId) && item.state === "active");
+}
+
+test("Recreate Board builds a new board and puts the agent's full history on it, once", async () => {
+  const h = createHarness();
+  await h.connect();
+  const calls = [h.seedCall(), h.seedCall({ callerNumber: "+12025550111" }), h.seedCall({ callerNumber: "+12025550122", demoSeed: true })];
+  for (const call of calls) h.enqueueCall(call);
+  await h.drain();
+  const old = callsBoardOf(h).board;
+  assert.equal(rowsOn(h, old.id).length, 2, "sample calls never go to Monday");
+  old.deleted = true;
+  const held = h.seedCall({ callerNumber: "+12025550133" });
+  h.enqueueCall(held);
+  await h.drain();
+
+  const response = await h.api("POST", "/crm/calls-board", { sub: "sub-admin-a", body: { action: "recreate" } });
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).callsBoardQueued, true);
+  await h.drain();
+  const { connection, board } = callsBoardOf(h);
+  assert.notEqual(board.id, old.id);
+  assert.equal(connection.callsBoard.status, "active");
+  assert.equal(rowsOn(h, board.id).length, 3, "full history plus the held call");
+
+  // Running the rebuild again adds nothing.
+  await h.api("POST", "/crm/calls-board", { sub: "sub-admin-a", body: { action: "start" } });
+  await h.drain();
+  assert.equal(rowsOn(h, board.id).length, 3);
+});
+
+test("the 10-minute check spots a deleted board, emails once, reminds after 3 days, and resumes when it's restored", async () => {
+  const h = createHarness();
+  await h.connect();
+  const board = callsBoardOf(h).board;
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  board.deleted = true;
+  await h.runtime.refreshTokens();
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").callsBoard.status, "deleted");
+
+  // Restored from Monday's trash: same board, active again, nothing re-added.
+  board.deleted = false;
+  const missed = h.seedCall({ callerNumber: "+12025550111" });
+  await h.runtime.refreshTokens();
+  await h.drain();
+  const connection = h.store.connections.get("ws-a\0monday#agent-a");
+  assert.equal(connection.callsBoard.status, "active");
+  assert.equal(connection.callsBoard.id, board.id);
+  assert.equal(rowsOn(h, board.id).length, 2, "the restored board gets only the call it missed");
+  void missed;
+});
+
+test("board-deleted emails: once right away and one reminder after 3 days", async () => {
+  const { createReauthReminders } = await import("./reminders.mjs");
+  const { createMemoryCrmStore } = await import("./test-support/fakes.mjs");
+  let now = Date.parse("2026-09-01T00:00:00Z");
+  const store = createMemoryCrmStore({
+    now: () => now,
+    memberships: { "user-dana": { workspaceId: "ws", status: "active", role: "company-admin", email: "dana@example.com" } },
+    agents: { "ws\0agent-1": { name: "Front Desk", status: "active" } },
+  });
+  store.seedConnection({ workspaceId: "ws", provider: "monday#agent-1", agentId: "agent-1", connectionState: "connected", authorizedBy: "user-dana",
+    refreshTokenExpiresAt: now + 90 * 86_400_000, callsBoard: { id: "1", status: "deleted" } });
+  const sent = [];
+  const remind = createReauthReminders({ store, sendEmail: async (m) => { sent.push(m); }, appUrl: "https://app.test", now: () => now });
+  const conn = () => store.getConnection("ws", "monday#agent-1");
+  assert.equal(await remind(await conn()), true);
+  assert.equal(await remind(await conn()), false);
+  now += 3 * 86_400_000;
+  assert.equal(await remind(await conn()), true);
+  assert.equal(await remind(await conn()), false);
+  assert.deepEqual(sent.map((m) => m.subject), ["Your Monday calls board was deleted", "Reminder: your Monday calls board is still missing"]);
+  assert.match(sent[0].html, /agentId=agent-1&amp;crm=board/);
+  assert.match(sent[0].text, /"Front Desk" agent/);
+});
+
+test("Stop Logging writes nothing to a calls board; turning it back on adds what's missing", async () => {
+  const h = createHarness();
+  await h.connect();
+  const board = callsBoardOf(h).board;
+  const stop = await h.api("POST", "/crm/calls-board", { sub: "sub-admin-a", body: { action: "stop" } });
+  assert.equal(JSON.parse(stop.body).callsBoardEnabled, false);
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(rowsOn(h, board.id).length, 0);
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "synced");
+  await h.api("POST", "/crm/calls-board", { sub: "sub-admin-a", body: { action: "start" } });
+  await h.drain();
+  assert.equal(rowsOn(h, board.id).length, 1);
+  assert.equal((await h.api("POST", "/crm/calls-board", { sub: "sub-admin-a", body: { action: "nope" } })).statusCode, 400);
+});
+
+test("reconnect with the board still there: only calls taken while disconnected are added, never duplicates", async () => {
+  const h = createHarness();
+  await h.connect();
+  const before = h.seedCall();
+  h.enqueueCall(before);
+  await h.drain();
+  const board = callsBoardOf(h).board;
+  assert.equal(rowsOn(h, board.id).length, 1);
+
+  await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
+  h.clock.advance(60_000);
+  // Taken while disconnected: never queued, so it has no sync status.
+  const during = h.seedCall({ callerNumber: "+12025550111", analyzedAt: new Date(h.clock()).toISOString(), crmStatus: undefined });
+  void during;
+  await h.connect();
+  await h.drain();
+  assert.equal(callsBoardOf(h).board.id, board.id, "same board reused");
+  assert.equal(rowsOn(h, board.id).length, 2, "only the missed call was added");
+
+  await h.connect();
+  await h.drain();
+  assert.equal(rowsOn(h, board.id).length, 2, "reconnecting again adds nothing");
+});
+
+test("a call whose record was lost but whose row exists is linked by Call ID, not written twice", async () => {
+  const h = createHarness();
+  await h.connect();
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const board = callsBoardOf(h).board;
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  const itemId = row.crmCallsItemId;
+  delete row.crmCallsItemId;
+  delete row.crmCallsBoardId;
+  await h.runtime.sync.syncCallsBoardRow({ workspaceId: "ws-a", callId: call.callId, provider: "monday#agent-a" });
+  assert.equal(rowsOn(h, board.id).length, 1);
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmCallsItemId, itemId);
+});
+
+test("Listen links go to Call History's pop-up for that call, and old links can be rewritten in place", async () => {
+  const h = createHarness();
+  await h.connect();
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const board = callsBoardOf(h).board;
+  const recordingColumn = board.columns.find((c) => c.title === "Recording").id;
+  const item = rowsOn(h, board.id)[0];
+  assert.match(item.values[recordingColumn].value, new RegExp(`/call-history\\?call=${call.callId}`));
+  item.values[recordingColumn] = { text: "Listen", value: JSON.stringify({ url: "https://old/calls/x" }) };
+  const result = await h.runtime.sync.rewriteCallLinks({ workspaceId: "ws-a", callId: call.callId, provider: "monday#agent-a" });
+  assert.equal(result.updated, 1);
+  assert.equal(rowsOn(h, board.id).length, 1, "updated in place");
 });
