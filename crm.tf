@@ -498,6 +498,13 @@ resource "aws_iam_role_policy" "crm_worker_runtime" {
         Resource = aws_dynamodb_table.control_plane["business_profiles"].arn
       },
       {
+        # Names the auto-created "Symantic AI Calls - <agent>" board.
+        Sid      = "ReadAgentName"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["agents"].arn
+      },
+      {
         Sid      = "ReadContactCompany"
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem"]

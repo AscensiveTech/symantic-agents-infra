@@ -41,6 +41,15 @@ export function createWorker({
       } catch {
         message = null;
       }
+      if (message?.kind === "ensure-calls-board" && typeof message.workspaceId === "string" && typeof message.provider === "string") {
+        try {
+          await sync.ensureCallsBoard({ workspaceId: message.workspaceId, provider: message.provider });
+        } catch (error) {
+          batchItemFailures.push({ itemIdentifier: record.messageId });
+          log.warn?.("Calls board creation will retry", { workspaceId: message.workspaceId, ...describeError(error) });
+        }
+        continue;
+      }
       if (
         typeof message?.workspaceId !== "string" || !message.workspaceId ||
         typeof message?.callId !== "string" || !message.callId

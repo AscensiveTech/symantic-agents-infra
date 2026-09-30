@@ -177,8 +177,8 @@ test("reconnect after re-authorization keeps the mapping, revalidates it, and re
   const row = h.store.connections.get("ws-a\0monday#agent-a");
   assert.equal(row.connectionState, "connected");
   assert.equal(row.mappingStatus, "valid");
-  assert.equal(h.queue.messages.length, 1, "the failed call was re-queued");
-  await h.drain();
+  // Reconnecting re-queued the failed call; the worker (run by connect())
+  // has already synced it.
   assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "synced");
 });
 
@@ -1364,4 +1364,18 @@ test("agent deletion: disconnect-agent revokes and clears this agent's Monday on
   assert.equal(h.monday.revoked.length, 1);
   assert.deepEqual(await h.runtime.disconnectAgent({ workspaceId: "ws-a", agentId: "agent-a2" }), { status: "none" });
   assert.deepEqual(await h.runtime.disconnectAgent({ workspaceId: "ws-a", agentId: "agent-a" }), { status: "none" }, "safe to run twice");
+});
+
+test("connect: the OAuth callback only queues the calls board, so it returns fast; the worker builds it", async () => {
+  const h = createHarness();
+  const start = await h.api("POST", "/crm/monday/start", { sub: "sub-admin-a", body: { returnTo: "/integrations" } });
+  const url = new URL(JSON.parse(start.body).authorizeUrl);
+  const code = h.monday.issueCode({ redirectUri: url.searchParams.get("redirect_uri"), challenge: url.searchParams.get("code_challenge") });
+  const callback = await h.api("GET", "/crm/oauth/monday/callback", { query: { code, state: url.searchParams.get("state") } });
+  assert.match(callback.headers.location, /crm=connected/);
+  assert.equal(h.monday.count("create_board"), 0, "no board work inside the callback");
+  assert.equal(h.queue.messages.length, 1);
+  await h.drain();
+  assert.equal(h.monday.count("create_board"), 1);
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").callsBoard.status, "active");
 });

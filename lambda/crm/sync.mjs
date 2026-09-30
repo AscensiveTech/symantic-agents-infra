@@ -437,7 +437,23 @@ export function createCrmSync({
     }
   }
 
-  return { syncCall, syncFollowUp };
+  // Queued right after an agent connects: build its calls board with the
+  // worker's longer time budget. Refusals are recorded on the connection by
+  // ensureBoard; outages throw so SQS retries.
+  async function ensureCallsBoard({ workspaceId, provider: connectionKey }) {
+    const connection = await store.getConnection(workspaceId, connectionKey);
+    if (connection?.connectionState !== "connected") return { status: "skipped", reason: "not_connected" };
+    if (connection.callsBoard?.status === "active" && connection.callsBoard.id) return { status: "exists" };
+    try {
+      await sessions.withSession(connection, (session) => callsLog.ensureBoard(session, connection));
+      return { status: "created" };
+    } catch (error) {
+      if (error instanceof CrmError && !error.retryable) return { status: "refused", code: error.code };
+      throw error;
+    }
+  }
+
+  return { syncCall, syncFollowUp, ensureCallsBoard };
 }
 
 // Stable per call and bounded in length (Monday documents no key limit).

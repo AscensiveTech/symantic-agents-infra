@@ -107,6 +107,8 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
     const callback = await api("GET", "/crm/oauth/monday/callback", {
       query: { code, state: url.searchParams.get("state") },
     });
+    // The calls board is built by the worker moments after connecting.
+    await drain();
     return { start, url, callback };
   }
 
