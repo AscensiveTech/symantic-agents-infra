@@ -585,22 +585,30 @@ export function createCrmSync({
     const provider = providers.get(connectionKey);
     const url = callLink(appUrl, callId);
     let updated = 0;
+    let gone = 0;
+    // A row someone deleted in Monday has no link left to fix: skip it
+    // instead of retrying forever.
+    const unlessGone = async (write) => {
+      try {
+        await write();
+        updated += 1;
+      } catch (error) {
+        if (!(error instanceof CrmError) || error.code !== CRM_ERROR.NOT_FOUND) throw error;
+        gone += 1;
+      }
+    };
     await sessions.withSession(connection, async (session) => {
       const board = connection.callsBoard;
       if (board?.status === "active" && board.columns?.recording && callsRowIsCurrent(call, connection) && provider.updateCallsRow) {
-        await provider.updateCallsRow(session, board.id, call.crmCallsItemId, { [board.columns.recording]: { url, text: "Listen" } });
-        updated += 1;
+        await unlessGone(() => provider.updateCallsRow(session, board.id, call.crmCallsItemId, { [board.columns.recording]: { url, text: "Listen" } }));
       }
       if (call.crmItemId && isConnectionUsable(connection) && connection.mapping?.columns?.audioLink?.id && provider.updateFields) {
-        await provider.updateFields(session, call.crmItemId, { audioLink: url });
-        updated += 1;
+        await unlessGone(() => provider.updateFields(session, call.crmItemId, { audioLink: url }));
       }
     });
-    return { status: "done", updated };
+    return { status: "done", updated, gone };
   }
 
-  // The keeper's 10-minute check of an agent's calls board. A board back
-  // from Monday's trash gets every call it missed meanwhile.
   // The keeper's 10-minute check for one connection: is the calls board still
   // there (or back from Monday's trash), and - hourly - does the customer's
   // own board mapping still match Monday.
