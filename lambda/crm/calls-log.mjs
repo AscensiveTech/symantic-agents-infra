@@ -9,6 +9,9 @@ import { buildCallsRow, callsBoardName, callsRowName } from "./monday/calls-boar
  * refusal to create the board (permissions, plan limits) is recorded on the
  * connection and shown in settings, never allowed to block the rest.
  */
+// A claim this old belongs to a crashed attempt and can be taken over.
+const CLAIM_STALE_MS = 3 * 60 * 1000;
+
 export function createCallsLog({ store, providers, appUrl, metrics, log = console, now = Date.now }) {
   async function agentName(connection) {
     const agentId = connection.agentId ?? agentIdOf(connection.provider);
@@ -17,18 +20,27 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     return agent?.name ?? null;
   }
 
-  // Create the board (or reuse the saved one). Returns the connection's
-  // callsBoard record; throws a CrmError when Monday refuses.
+  // Make sure this agent has exactly one calls board: reuse the saved one,
+  // else one we already created under the agent's board name (a lost save,
+  // a timed-out attempt, a reconnect), else create it. A per-agent claim on
+  // the connection row stops two workers creating boards at the same time.
+  // Throws a CrmError when Monday refuses (recorded on the connection) and a
+  // retryable LEASE_BUSY while another worker holds the claim.
   async function ensureBoard(session, connection, { force = false } = {}) {
     const existing = connection.callsBoard;
     if (!force && existing?.status === "active" && existing.id) return existing;
     const provider = providers.get(connection.provider);
+    if (!await store.claimCallsBoard(connection.workspaceId, connection.provider, CLAIM_STALE_MS)) {
+      throw new CrmError(CRM_ERROR.LEASE_BUSY, "Calls board is being created", { retryAfterSeconds: 30 });
+    }
+    const name = callsBoardName(await agentName(connection));
     try {
-      const { boardId, columns } = await provider.createCallsBoard(session, { name: callsBoardName(await agentName(connection)) });
+      const reused = await provider.findCallsBoard?.(session, { name, excludeId: force ? existing?.id : null });
+      const { boardId, columns } = reused ?? await provider.createCallsBoard(session, { name });
       const record = { id: boardId, columns, status: "active", createdAt: new Date(Number(now())).toISOString() };
       await store.saveCallsBoard(connection.workspaceId, connection.provider, record);
       connection.callsBoard = record;
-      metrics?.count("CallsBoard", { Provider: providerIdOf(connection.provider), Outcome: "created" });
+      metrics?.count("CallsBoard", { Provider: providerIdOf(connection.provider), Outcome: reused ? "reused" : "created" });
       return record;
     } catch (error) {
       const record = { id: null, columns: null, status: "failed", errorCode: boardErrorCode(error), failedAt: new Date(Number(now())).toISOString() };

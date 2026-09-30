@@ -360,9 +360,23 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
     saveCallsBoard(workspaceId, provider, callsBoard) {
       return update(connections, { workspaceId, provider }, {
         set: { callsBoard },
+        remove: ["callsBoardClaimAt"],
         condition: "attribute_exists(workspaceId)",
         conditional: true,
       });
+    },
+
+    // Only one worker/request may create an agent's calls board at a time.
+    // A claim older than staleMs (a crashed attempt) can be taken over.
+    async claimCallsBoard(workspaceId, provider, staleMs) {
+      const nowMs = Number(now());
+      const saved = await update(connections, { workspaceId, provider }, {
+        set: { callsBoardClaimAt: nowMs },
+        condition: "attribute_exists(workspaceId) AND (attribute_not_exists(callsBoardClaimAt) OR callsBoardClaimAt < :stale)",
+        conditionValues: { ":stale": nowMs - staleMs },
+        conditional: true,
+      });
+      return Boolean(saved);
     },
 
     setBoardSyncEnabled(workspaceId, provider, enabled) {

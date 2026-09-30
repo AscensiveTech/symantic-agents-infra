@@ -178,7 +178,15 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       const row = connections.get(key(workspaceId, provider));
       if (!row) return null;
       row.callsBoard = structuredClone(callsBoard);
+      delete row.callsBoardClaimAt;
       return clone(row);
+    },
+    async claimCallsBoard(workspaceId, provider, staleMs) {
+      const row = connections.get(key(workspaceId, provider));
+      const nowMs = Number(now());
+      if (!row || (row.callsBoardClaimAt !== undefined && row.callsBoardClaimAt >= nowMs - staleMs)) return false;
+      row.callsBoardClaimAt = nowMs;
+      return true;
     },
     async setBoardSyncEnabled(workspaceId, provider, enabled) {
       const row = connections.get(key(workspaceId, provider));
