@@ -26,6 +26,86 @@ function isNewerStage(stage, sent) {
   return STAGES.indexOf(stage) > STAGES.indexOf(sent ?? "");
 }
 
+// Who gets Monday emails for a connection: the admin who connected that
+// agent's Monday (or, if they've left, every active company admin) plus the
+// workspace's "Monday Reconnect Reminders" list. Nobody when that setting is
+// switched off.
+async function reminderRecipients(store, connection, settings) {
+  if (settings?.enabled === false) return [];
+  const connector = connection.authorizedBy ? await store.getMembership(connection.authorizedBy).catch(() => null) : null;
+  const primary = connector?.workspaceId === connection.workspaceId && connector.status === "active" && connector.email
+    ? [connector.email]
+    : (await store.listWorkspaceAdmins(connection.workspaceId)).map((admin) => admin.email);
+  const extra = Array.isArray(settings?.recipients) ? settings.recipients : [];
+  return [...new Set([...primary, ...extra].filter(Boolean).map((email) => String(email).toLowerCase()))];
+}
+
+// "Heads up: Monday was disconnected" - sent every time an agent's Monday
+// connection ends, whatever the cause, so nobody assumes calls are still
+// being logged. Once per disconnect (a reconnect re-arms it). Never throws:
+// a failed email must not undo or block the disconnect itself.
+export function createDisconnectNotifier({ store, sendEmail, appUrl, now = Date.now, log = console }) {
+  return async function notifyDisconnected(connection, { reason, byName = null } = {}) {
+    if (!sendEmail || !connection) return false;
+    try {
+      const settings = await store.getCrmReminderSettings?.(connection.workspaceId).catch(() => null);
+      const to = await reminderRecipients(store, connection, settings);
+      if (!to.length) return false;
+      // The uninstall purge deletes the row right after, so there's nothing
+      // to claim; every other path claims first so a retry can't email twice.
+      if (reason !== "uninstalled" &&
+        !await store.markCallsBoardNotice(connection.workspaceId, connection.provider, "disconnectNoticeAt")) {
+        return false;
+      }
+      const agentId = connection.agentId ?? agentIdOf(connection.provider);
+      const agent = agentId ? await store.getAgent(connection.workspaceId, agentId).catch(() => null) : null;
+      const message = renderDisconnectedEmail({
+        connection, appUrl, agentId, agentName: agent?.name ?? null, reason, byName, at: Number(now()),
+      });
+      for (const address of to) {
+        await sendEmail({ to: address, ...message }).catch((error) => {
+          log.warn?.("Monday disconnect notice not sent", { workspaceId: connection.workspaceId, name: error?.name });
+        });
+      }
+      return true;
+    } catch (error) {
+      log.warn?.("Monday disconnect notice failed", { workspaceId: connection?.workspaceId, name: error?.name });
+      return false;
+    }
+  };
+}
+
+// Subject, text and HTML for "Monday was disconnected from <agent>": when,
+// why (by whom, from Monday, or because the agent was deleted), what it
+// means for calls, and how to resume.
+export function renderDisconnectedEmail({ connection, appUrl, agentId = null, agentName = null, reason, byName = null, at }) {
+  const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
+  const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}&crm=renew` : base;
+  const agent = agentName ? `your "${agentName}" agent` : "one of your agents";
+  const account = connection.accountName ? ` (${connection.accountName})` : "";
+  const when = new Date(Number(at)).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
+  const how = reason === "uninstalled"
+    ? "from Monday.com - the Symantic AI app was removed from your Monday account"
+    : reason === "agent_deleted"
+      ? "because the agent was deleted"
+      : byName ? `by ${byName} in Symantic AI` : "in Symantic AI";
+  const lines = [
+    `Heads up: Monday.com${account} was disconnected from ${agent} on ${when}.`,
+    `This was done ${how}.`,
+    reason === "agent_deleted"
+      ? "Nothing more is logged to Monday for this agent. What's already in Monday stays there."
+      : "Calls are still answered and saved in Call History, but they're no longer logged to Monday. To resume, reconnect Monday on Calendar & CRM.",
+    ...(reason === "user_disconnected" ? ["Calls taken while disconnected are sent to Monday after you reconnect."] : []),
+  ];
+  const button = reason === "agent_deleted" ? null : "Reconnect Monday";
+  const text = [...lines, ...(button ? ["", `${button}: ${link}`] : [])].join("\n");
+  const html = [
+    ...lines.map((line) => `<p style="margin:0 0 14px;font-size:14px;line-height:1.5;">${escapeHtml(line)}</p>`),
+    ...(button ? [`<p style="margin:20px 0;"><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#1c1c17;color:#ffffff;text-decoration:none;font-weight:600;">${button}</a></p>`] : []),
+  ].join("");
+  return { subject: `Monday.com was disconnected${agentName ? ` from "${agentName}"` : ""}`, text, html };
+}
+
 // Sends the Monday emails the keeper triggers: reconnect reminders (14 days,
 // 3 days, expired), account inactive, and calls board deleted (right away,
 // then once more after 3 days). Each is recorded on the connection so it's
@@ -34,15 +114,7 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
   // The admin who connected this agent's Monday (or, if they've left, every
   // active company admin) plus the people on the workspace's "Monday
   // Reconnect Reminders" list. Nobody when that setting is switched off.
-  async function recipients(connection, settings) {
-    if (settings?.enabled === false) return [];
-    const connector = connection.authorizedBy ? await store.getMembership(connection.authorizedBy).catch(() => null) : null;
-    const primary = connector?.workspaceId === connection.workspaceId && connector.status === "active" && connector.email
-      ? [connector.email]
-      : (await store.listWorkspaceAdmins(connection.workspaceId)).map((admin) => admin.email);
-    const extra = Array.isArray(settings?.recipients) ? settings.recipients : [];
-    return [...new Set([...primary, ...extra].filter(Boolean).map((email) => String(email).toLowerCase()))];
-  }
+  const recipients = (connection, settings) => reminderRecipients(store, connection, settings);
 
   // One email per inactive spell when the Monday account itself is
   // suspended, closed or unpaid.

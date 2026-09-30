@@ -31,7 +31,7 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
     now: clock,
     profiles: { "ws-a": { timezone: "America/New_York" }, "ws-b": { timezone: "Europe/London" } },
     memberships: {
-      "sub-admin-a": { workspaceId: "ws-a", status: "active" },
+      "sub-admin-a": { workspaceId: "ws-a", status: "active", role: "company-admin", email: "admin-a@example.com" },
       "sub-member-a": { workspaceId: "ws-a", status: "active" },
       "sub-admin-b": { workspaceId: "ws-b", status: "active" },
       "sub-disabled": { workspaceId: "ws-a", status: "disabled" },
@@ -50,7 +50,10 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
     warn: (message, fields) => logs.push({ level: "warn", message, fields }),
     error: (message, fields) => logs.push({ level: "error", message, fields }),
   };
+  // Every email the CRM would send (reminders, disconnect notices).
+  const emails = [];
   const runtime = composeRuntime({
+    sendEmail: async (message) => { emails.push(message); },
     store,
     getAppSecret: async () => secret,
     tokenCrypto,
@@ -96,8 +99,9 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
   const api = (method, path, options) => runtime.api(httpEvent(method, path, options));
 
   /** Full OAuth round trip through the real API: start -> consent -> callback. */
-  async function connect({ sub = "sub-admin-a", returnTo = "/integrations" } = {}) {
-    const start = await api("POST", "/crm/monday/start", { sub, body: { returnTo } });
+  // `agent` connects a different agent than the workspace default.
+  async function connect({ sub = "sub-admin-a", returnTo = "/integrations", agent } = {}) {
+    const start = await api("POST", "/crm/monday/start", { sub, body: { returnTo }, agent });
     if (start.statusCode !== 200) return { start };
     const url = new URL(JSON.parse(start.body).authorizeUrl);
     const code = monday.issueCode({
@@ -112,8 +116,8 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
     return { start, url, callback };
   }
 
-  async function configureMapping({ sub = "sub-admin-a", overrides = {} } = {}) {
-    const boards = JSON.parse((await api("GET", "/crm/monday/boards", { sub })).body);
+  async function configureMapping({ sub = "sub-admin-a", overrides = {}, agent } = {}) {
+    const boards = JSON.parse((await api("GET", "/crm/monday/boards", { sub, agent })).body);
     const target = boards.boards.find((b) => b.id === board.id);
     const mapping = {
       ...target.suggestion,
@@ -121,7 +125,7 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
       defaultOwnerId: "72",
       ...overrides,
     };
-    return api("PUT", "/crm/mapping", { sub, body: { mapping } });
+    return api("PUT", "/crm/mapping", { sub, body: { mapping }, agent });
   }
 
   async function connectAndMap(options = {}) {
@@ -192,6 +196,7 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
     connect,
     configureMapping,
     connectAndMap,
+    emails,
     seedCall,
     enqueueCall,
     drain,

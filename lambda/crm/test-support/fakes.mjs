@@ -71,7 +71,7 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     },
     async saveAuthorization(workspaceId, provider, record) {
       const row = connections.get(key(workspaceId, provider)) ?? { workspaceId, provider, createdAt: iso() };
-      for (const field of ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason", "reauthReminderStage"]) {
+      for (const field of ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason", "reauthReminderStage", "disconnectNoticeAt"]) {
         delete row[field];
       }
       apply(row, record);
@@ -124,11 +124,12 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       row.disconnectedAt = iso();
       return clone(row);
     },
-    async purgeProviderData(workspaceId, provider) {
+    async purgeProviderData(workspaceId, provider, { boardIds = [] } = {}) {
       let removedLinks = 0;
       let scrubbedCalls = 0;
+      const prefixes = [`${provider}#`, ...boardIds.map((boardId) => `${String(provider).split("#")[0]}#board#${boardId}#`)];
       for (const [rowKey, row] of links) {
-        if (row.workspaceId === workspaceId && String(row.linkKey ?? "").startsWith(`${provider}#`)) {
+        if (row.workspaceId === workspaceId && prefixes.some((prefix) => String(row.linkKey ?? "").startsWith(prefix))) {
           links.delete(rowKey);
           removedLinks += 1;
         }

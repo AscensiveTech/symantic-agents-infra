@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import { NO_CRM_CONTEXT } from "./context.mjs";
 import { createHandler } from "./index.mjs";
-import { linkKeyFor } from "./store.mjs";
+import { boardLinkKeyFor, linkKeyFor } from "./store.mjs";
 import { signJwt, TEST_APP_SECRET } from "./test-support/fakes.mjs";
 import { APP_URL, createHarness, toolLogFor } from "./test-support/harness.mjs";
 
@@ -192,7 +192,7 @@ test("lookup: an existing caller gets CRM context in one Monday call", async () 
   assert.equal(result.status, "found");
   assert.match(result.context, /name on file: Jane Doe; status: Qualified; account owner: Sam Lee/);
   assert.equal(h.monday.graphqlCount(), 1);
-  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`).externalId, jane.id);
+  assert.equal(h.store.links.get(`ws-a\0${boardLinkKeyFor("monday#agent-a", h.board.id, "+12025550198")}`).externalId, jane.id);
 
   h.monday.reset();
   const again = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
@@ -207,7 +207,7 @@ test("lookup: an unknown caller gets no context and a remembered negative answer
   const result = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550111" });
   assert.equal(result.status, "not_found");
   assert.equal(result.context, NO_CRM_CONTEXT);
-  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550111")}`).state, "none");
+  assert.equal(h.store.links.get(`ws-a\0${boardLinkKeyFor("monday#agent-a", h.board.id, "+12025550111")}`).state, "none");
 });
 
 test("lookup: duplicate phone matches provide no context and cache no arbitrary record", async () => {
@@ -221,7 +221,7 @@ test("lookup: duplicate phone matches provide no context and cache no arbitrary 
   assert.equal(result.status, "ambiguous");
   assert.equal(result.reason, "duplicate_phone");
   assert.equal(result.context, NO_CRM_CONTEXT);
-  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`);
+  const link = h.store.links.get(`ws-a\0${boardLinkKeyFor("monday#agent-a", h.board.id, "+12025550198")}`);
   assert.notEqual(link?.state, "linked");
   assert.equal(link?.externalId, undefined);
   assert.equal(h.metrics.sum("AmbiguousMatch", { Provider: "monday" }), 1);
@@ -236,7 +236,7 @@ test("lookup: a linked record deleted in Monday falls back to a phone search", a
   const replacement = h.monday.addItem(h.board.id, { name: "Jane (new)", phone: "+12025550198" });
   const result = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.match(result.context, /Jane \(new\)/);
-  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`).externalId, replacement.id);
+  assert.equal(h.store.links.get(`ws-a\0${boardLinkKeyFor("monday#agent-a", h.board.id, "+12025550198")}`).externalId, replacement.id);
 });
 
 test("lookup: Monday slow, down, rate-limited or rejecting never throws and never blocks past the budget", async () => {
@@ -463,7 +463,7 @@ test("duplicates: sync refuses to update an arbitrary phone match", async () => 
   assert.equal(row.crmLastErrorCode, "ambiguous_match");
   assert.equal(first.updates.length, 0);
   assert.equal(second.updates.length, 0);
-  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`);
+  const link = h.store.links.get(`ws-a\0${boardLinkKeyFor("monday#agent-a", h.board.id, "+12025550198")}`);
   assert.notEqual(link?.state, "linked");
   assert.equal(link?.externalId, undefined);
   assert.equal(h.metrics.sum("AmbiguousMatch", { Provider: "monday" }), 1);
@@ -537,7 +537,7 @@ test("a failure writing the in-progress marker still releases the phone lease", 
   const call = h.seedCall({ crmCallsItemId: "row-1" });
   h.store.failNext("updateCallSync", Object.assign(new Error("throttled"), { name: "ThrottlingException" }));
   await assert.rejects(h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: call.callId }));
-  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`);
+  const link = h.store.links.get(`ws-a\0${boardLinkKeyFor("monday#agent-a", h.board.id, "+12025550198")}`);
   assert.equal(link.leaseOwner, undefined, "lease released");
   h.enqueueCall(call);
   await h.drain();
@@ -1710,4 +1710,134 @@ test("board-sync-needs-attention email: once per breakage, re-armed when the map
   await store.markMappingInvalid("ws", "monday#agent-1", [{ field: "board", code: "board_missing", message: "The board was deleted." }]);
   assert.equal(await remind(await current()), true, "a new breakage emails again");
   assert.equal(renderMappingInvalidEmail({ connection: { mapping }, appUrl: "https://x" }).subject, "Monday board sync needs attention");
+});
+
+// ============================================ Part K: shared Monday account ====
+
+// An English agent (agent-a) and a Spanish agent (agent-es) in one workspace,
+// both connected to the same Monday account and mapped to the same board.
+async function twoAgentsOneBoard() {
+  const h = createHarness();
+  h.store.seedAgent("ws-a", "agent-es", { name: "Spanish Line" });
+  await h.connectAndMap();
+  await h.connect({ agent: "agent-es" });
+  const mapped = await h.configureMapping({ agent: "agent-es" });
+  assert.equal(mapped.statusCode, 200, "the same board can be mapped by a second agent");
+  return h;
+}
+const rowsWithPhone = (h, phone) => [...h.monday.items.values()]
+  .filter((item) => item.boardId === String(h.board.id) && item.state === "active" &&
+    Object.values(item.values ?? {}).some((value) => String(value?.text ?? "").replace(/\D/g, "").endsWith(phone.replace(/\D/g, "").slice(-10))));
+
+test("two agents, one board: different callers at the same moment each get their own row", async () => {
+  const h = await twoAgentsOneBoard();
+  const english = h.seedCall({ callerNumber: "+12025550301", callerName: "Ann English" });
+  const spanish = h.seedCall({ agentId: "agent-es", callerNumber: "+12025550302", callerName: "Beto Spanish" });
+  h.enqueueCall(english);
+  h.enqueueCall(spanish);
+  await h.drain();
+  const a = h.store.callRows.get(`ws-a\0${english.callId}`);
+  const b = h.store.callRows.get(`ws-a\0${spanish.callId}`);
+  assert.equal(a.crmStatus, "synced");
+  assert.equal(b.crmStatus, "synced");
+  assert.ok(a.crmItemId && b.crmItemId && a.crmItemId !== b.crmItemId, "two separate rows");
+  assert.equal(rowsWithPhone(h, "+12025550301").length, 1);
+  assert.equal(rowsWithPhone(h, "+12025550302").length, 1);
+  const boardA = h.store.connections.get("ws-a\0monday#agent-a").callsBoard.id;
+  const boardB = h.store.connections.get("ws-a\0monday#agent-es").callsBoard.id;
+  assert.notEqual(boardA, boardB, "each agent keeps its own calls board");
+});
+
+test("two agents, one board: the same new caller reaching both at once gets exactly one row", async () => {
+  const h = await twoAgentsOneBoard();
+  const english = h.seedCall({ callerNumber: "+12025550303" });
+  const spanish = h.seedCall({ agentId: "agent-es", callerNumber: "+12025550303" });
+  h.enqueueCall(english);
+  h.enqueueCall(spanish);
+  await h.drain();
+  assert.equal(rowsWithPhone(h, "+12025550303").length, 1, "no duplicate row");
+  assert.equal(h.store.callRows.get(`ws-a\0${english.callId}`).crmItemId, h.store.callRows.get(`ws-a\0${spanish.callId}`).crmItemId);
+});
+
+test("a caller link saved per agent (before board-shared links) is still used", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const jane = h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
+  await h.store.saveLink("ws-a", linkKeyFor("monday#agent-a", "+12025550198"), {
+    provider: "monday", phoneE164: "+12025550198", state: "linked", externalId: jane.id, boardId: h.board.id,
+  });
+  h.monday.reset();
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmItemId, jane.id);
+  assert.equal(h.monday.count("find_by_phone"), 0, "no search needed");
+});
+
+test("disconnecting one agent leaves the other agent on the same Monday account working", async () => {
+  const h = await twoAgentsOneBoard();
+  const off = await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
+  assert.equal(off.statusCode, 200);
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "disconnected");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-es").connectionState, "connected");
+  assert.equal(h.monday.revoked.length, 0, "shared grant: not revoked at Monday");
+  const call = h.seedCall({ agentId: "agent-es", callerNumber: "+12025550304" });
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "synced", "the Spanish agent still syncs");
+});
+
+test("any disconnect emails the admins once: in-app (by whom), agent deleted, reconnect re-arms", async () => {
+  const h = createHarness();
+  await h.connect();
+  await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
+  assert.equal(h.monday.revoked.length, 1, "not shared: revoked at Monday");
+  const first = h.emails.filter((m) => /was disconnected/.test(m.subject));
+  assert.equal(first.length, 1);
+  assert.match(first[0].text, /by User sub-admin-a in Symantic AI/);
+  assert.match(first[0].text, /sent to Monday after you reconnect/);
+  assert.match(first[0].html, /Reconnect Monday/);
+  await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
+  assert.equal(h.emails.filter((m) => /was disconnected/.test(m.subject)).length, 1, "not twice for one disconnect");
+
+  await h.connect();
+  const deleted = await h.runtime.disconnectAgent({ workspaceId: "ws-a", agentId: "agent-a" });
+  assert.equal(deleted.status, "done");
+  const second = h.emails.filter((m) => /was disconnected/.test(m.subject));
+  assert.equal(second.length, 2, "a reconnect re-arms the notice");
+  assert.match(second[1].text, /because the agent was deleted/);
+  assert.doesNotMatch(second[1].html, /Reconnect Monday/);
+});
+
+test("uninstalling the Monday app emails once per connected agent before the data is purged", async () => {
+  const h = await twoAgentsOneBoard();
+  const response = await lifecycle(h);
+  assert.equal(response.statusCode, 200);
+  const notices = h.emails.filter((m) => /was disconnected/.test(m.subject));
+  assert.equal(notices.length, 2);
+  assert.ok(notices.every((m) => /Symantic AI app was removed/.test(m.text)));
+  assert.equal([...h.store.links.keys()].filter((k) => k.includes("#board#")).length, 0, "shared board links purged too");
+});
+
+test("a failing email never blocks the disconnect", async () => {
+  const { createDisconnectNotifier } = await import("./reminders.mjs");
+  const { createMemoryCrmStore } = await import("./test-support/fakes.mjs");
+  const store = createMemoryCrmStore({
+    memberships: { "user-dana": { workspaceId: "ws", status: "active", role: "company-admin", email: "dana@example.com" } },
+  });
+  store.seedConnection({ workspaceId: "ws", provider: "monday#agent-1", agentId: "agent-1", connectionState: "disconnected", authorizedBy: "user-dana" });
+  const notify = createDisconnectNotifier({ store, sendEmail: async () => { throw new Error("SES down"); }, appUrl: "https://x", log: { warn() {} } });
+  const connection = await store.getConnection("ws", "monday#agent-1");
+  assert.equal(await notify(connection, { reason: "user_disconnected" }), true);
+});
+
+test("the card and board picker say which other agents share the Monday account and board", async () => {
+  const h = await twoAgentsOneBoard();
+  const view = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
+  assert.deepEqual(view.sharedWith, [{ agentId: "agent-es", agentName: "Spanish Line" }]);
+  const boards = JSON.parse((await h.api("GET", "/crm/monday/boards", { sub: "sub-admin-a" })).body).boards;
+  assert.deepEqual(boards.find((b) => b.id === h.board.id).syncedBy, ["Spanish Line"]);
+  const solo = createHarness();
+  await solo.connect();
+  assert.deepEqual(JSON.parse((await solo.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).sharedWith, []);
 });

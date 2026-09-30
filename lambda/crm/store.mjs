@@ -18,6 +18,20 @@ export function linkKeyFor(provider, phoneE164) {
   return `${provider}#${phoneE164}`;
 }
 
+// Key for the caller link on one Monday board, shared by every agent that
+// syncs to that board (e.g. an English and a Spanish agent on one account).
+// Its lease makes two agents take turns on the same caller, so they can't
+// both create a row for them; different callers never wait on each other.
+// `provider` may be a connection key ("monday#agent-1") or "monday".
+export function boardLinkKeyFor(provider, boardId, phoneE164) {
+  return `${boardLinkPrefix(provider, boardId)}${phoneE164}`;
+}
+
+// Prefix of every caller link on one board, used to purge them on uninstall.
+export function boardLinkPrefix(provider, boardId) {
+  return `${String(provider).split("#")[0]}#board#${boardId}#`;
+}
+
 const TOKEN_FIELDS = [
   "encryptedAccessToken",
   "encryptedRefreshToken",
@@ -193,7 +207,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
           createdAt: undefined,
           updatedAt: timestamp,
         },
-        remove: ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason", "reauthReminderStage"],
+        remove: ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason", "reauthReminderStage", "disconnectNoticeAt"],
       }).then(async (saved) => {
         // First connection: no mapping yet.
         if (!saved.mappingStatus) {
@@ -292,8 +306,11 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
     // connection, phone-to-item links and CRM-only fields on retained calls.
     // The connection row is deleted last: a retried webhook can finish a
     // partial purge, while a completed duplicate delivery is harmless.
-    async purgeProviderData(workspaceId, provider) {
+    // `boardIds`: the boards this connection mapped, whose shared caller links
+    // go too (they came from the same Monday account).
+    async purgeProviderData(workspaceId, provider, { boardIds = [] } = {}) {
       requireTable(links);
+      const prefixes = [`${provider}#`, ...boardIds.map((boardId) => boardLinkPrefix(provider, boardId))];
       requireTable(tables.calls);
       let removedLinks = 0;
       let scrubbedCalls = 0;
@@ -308,7 +325,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
           ...(startKey ? { ExclusiveStartKey: startKey } : {}),
         }));
         const rows = (result.Items ?? []).map(unmarshall)
-          .filter((row) => String(row.linkKey ?? "").startsWith(`${provider}#`));
+          .filter((row) => prefixes.some((prefix) => String(row.linkKey ?? "").startsWith(prefix)));
         await Promise.all(rows.map((row) => client.send(new commands.DeleteItemCommand({
           TableName: links,
           Key: marshall({ workspaceId, linkKey: row.linkKey }),
