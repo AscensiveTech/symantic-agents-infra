@@ -1099,3 +1099,22 @@ test("sync: follow-up updates are skipped for unsynced calls and when no Follow-
   await h.drain();
   assert.equal((await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId })).reason, "no_follow_up_column");
 });
+
+test("boards: private, subitem and document boards are left out of the picker, but an already-mapped board keeps validating", async () => {
+  const h = createHarness();
+  const secret = h.monday.addBoard({ name: "Board Of Directors", kind: "private" });
+  h.monday.addBoard({ name: "Subitems of Leads", type: "sub_items_board" });
+  h.monday.addBoard({ name: "Meeting notes", type: "document" });
+  h.monday.addBoard({ name: "Shared With Client", kind: "share" });
+  await h.connect();
+  const listed = JSON.parse((await h.api("GET", "/crm/monday/boards", { sub: "sub-admin-a" })).body).boards.map((b) => b.name);
+  assert.deepEqual(listed.sort(), ["Leads", "Shared With Client"]);
+
+  await h.connectAndMap();
+  secret.kind = "private";
+  h.board.kind = "private";
+  const reconnect = await h.connect();
+  assert.equal(reconnect.callback.statusCode, 302);
+  const connection = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
+  assert.equal(connection.mappingStatus, "valid", "making the mapped board private later doesn't break syncing");
+});
