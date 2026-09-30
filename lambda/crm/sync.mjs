@@ -95,6 +95,7 @@ export function createCrmSync({
       await finish(call, "skipped", { crmLastErrorCode: reason });
       return { status: "skipped", reason };
     }
+    facts.companyName = await store.getContactCompany?.(workspaceId, facts.phoneE164).catch(() => null) ?? null;
 
     const linkKey = linkKeyFor(providerId, facts.phoneE164);
     // Unique per attempt, not per call: two deliveries of the same message
@@ -274,7 +275,7 @@ export function createCrmSync({
         name: facts.name ?? `New caller ${facts.phoneE164}`,
         phoneE164: facts.phoneE164,
         email: facts.email ?? undefined,
-        fields: { ...fieldPatch(facts, { isNew: true }), assignDefaultOwner: true, source: LEAD_SOURCE },
+        fields: { ...fieldPatch(facts, { isNew: true, call, appUrl }), assignDefaultOwner: true, source: LEAD_SOURCE },
       }, { idempotencyKey: `${idempotencyBase}-create` });
       await store.saveLink(workspaceId, linkKey, {
         provider: provider.id,
@@ -314,7 +315,7 @@ export function createCrmSync({
     }
 
     const applyFields = !created && isNewest(facts, link, linkUsable);
-    const fields = applyFields ? fieldPatch(facts, { isNew: false, link }) : undefined;
+    const fields = applyFields ? fieldPatch(facts, { isNew: false, link, call, appUrl }) : undefined;
     await store.updateCallSync(workspaceId, callId, {
       crmActivityAttemptedAt: new Date(Number(now())).toISOString(),
     });
@@ -336,7 +337,7 @@ export function createCrmSync({
         ({ externalId, url, created } = await resolve());
         await store.updateCallSync(workspaceId, callId, { crmItemId: externalId, crmItemUrl: url, crmCreated: created });
         logged = await provider.logCallActivity(session, externalId, activity, {
-          fields: created ? undefined : fieldPatch(facts, { isNew: false, link }),
+          fields: created ? undefined : fieldPatch(facts, { isNew: false, link, call, appUrl }),
           idempotencyKey: `${idempotencyBase}-note-${externalId}`,
         });
       } else {
@@ -363,7 +364,31 @@ export function createCrmSync({
     return { externalId, url, created, activityId: logged.activityId, fieldsApplied: logged.fieldsApplied };
   }
 
-  return { syncCall };
+  // A follow-up added or changed in Symantic after the call synced. Best
+  // effort: only the mapped Follow-Up column, on the row the call went to.
+  async function syncFollowUp({ workspaceId, callId }) {
+    const call = await store.getCall(workspaceId, callId);
+    if (!call?.crmItemId || call.crmStatus !== "synced") return { status: "skipped", reason: "not_synced" };
+    const providerId = call.crmProvider ?? "monday";
+    const connection = await store.getConnection(workspaceId, providerId);
+    if (!isConnectionUsable(connection) || !connection.mapping?.columns?.followUp?.id) {
+      return { status: "skipped", reason: "no_follow_up_column" };
+    }
+    const provider = providers.get(providerId);
+    if (!provider?.updateFields) return { status: "skipped", reason: "unsupported" };
+    try {
+      await sessions.withSession(connection, (session) =>
+        provider.updateFields(session, call.crmItemId, { followUp: followUpText(call.followUp) })
+      );
+      metrics?.count("FollowUpSynced", { Provider: providerId });
+      return { status: "synced" };
+    } catch (error) {
+      log.warn?.("CRM follow-up not synced", { workspaceId, callId, ...describeError(error) });
+      return { status: "failed", code: error instanceof CrmError ? error.code : "unexpected" };
+    }
+  }
+
+  return { syncCall, syncFollowUp };
 }
 
 function isNewest(facts, link, linkUsable) {
@@ -374,7 +399,7 @@ function isNewest(facts, link, linkUsable) {
 
 // Fields we own on the CRM record. Status is only ever set on creation, or
 // to "follow up" when this call needs one; the owner only on creation.
-function fieldPatch(facts, { isNew, link }) {
+function fieldPatch(facts, { isNew, link, call, appUrl }) {
   const patch = {
     lastCallAt: facts.endedAt ?? undefined,
     outcome: facts.outcomeLabel,
@@ -386,14 +411,52 @@ function fieldPatch(facts, { isNew, link }) {
   }
   const appointment = facts.appointment;
   if (appointment?.kind === "cancelled") {
-    // Clear the date only if it is the one we wrote - never someone else's.
     if (!isNew && appointment.startTimeUtc && link?.appointmentAt === appointment.startTimeUtc) {
       patch.nextAppointmentAt = null;
     }
   } else if (appointment?.startTimeUtc) {
     patch.nextAppointmentAt = appointment.startTimeUtc;
   }
+  if (facts.summary) patch.transcriptSummary = facts.summary;
+  const transcript = transcriptText(call?.transcript);
+  if (transcript) patch.fullTranscript = transcript;
+  if (facts.companyName) patch.companyName = facts.companyName;
+  if (typeof call?.userSentiment === "string" && call.userSentiment.trim()) patch.sentiment = call.userSentiment.trim();
+  const followUp = followUpText(call?.followUp);
+  if (followUp) patch.followUp = followUp;
+  if (appUrl && facts.callId) patch.audioLink = `${appUrl}/calls/${facts.callId}`;
+  if (facts.durationMs != null) patch.callDuration = Math.round(facts.durationMs / 60000);
+  if (facts.name) patch.callerName = facts.name;
+  if (facts.startedAt) {
+    patch.date = facts.startedAt;
+    patch.time = facts.startedAt;
+  }
+  if (facts.intent) patch.intent = facts.intent;
+  patch.direction = "Inbound";
+  if (facts.appointment) patch.appointment = facts.appointment.kind === "booked" || facts.appointment.kind === "rescheduled";
   return patch;
+}
+
+function transcriptText(transcript) {
+  if (typeof transcript === "string") return transcript.trim() || null;
+  if (!Array.isArray(transcript)) return null;
+  const text = transcript
+    .filter((line) => typeof line?.text === "string" && line.text.trim())
+    .map((line) => `${line.speaker ?? "Caller"}: ${line.text.trim()}`)
+    .join("\n");
+  return text || null;
+}
+
+const FOLLOW_UP_STATUS_LABELS = { not_started: "Not started", in_progress: "In progress", resolved: "Resolved" };
+
+function followUpText(followUp) {
+  if (!followUp || typeof followUp !== "object") return null;
+  const parts = [
+    FOLLOW_UP_STATUS_LABELS[followUp.status],
+    followUp.assigneeName ? `Assigned to ${followUp.assigneeName}` : null,
+    typeof followUp.comment === "string" && followUp.comment.trim() ? followUp.comment.trim() : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(" - ") : null;
 }
 
 // Remembers which appointment date we last wrote, so a later cancellation

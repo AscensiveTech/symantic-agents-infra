@@ -1801,6 +1801,7 @@ export function createHandler({
             ? null
             : { ...parsed.followUp, updatedAt: new Date().toISOString(), updatedBy: actorDisplayName(event, actor) };
           const updated = await store.updateCallFollowUp(workspaceId, callId, followUp);
+          if (updated?.crmStatus === "synced") await notifyCrmFollowUp({ workspaceId, callId });
           return json(200, toPublicCall(updated));
         }
 
@@ -8653,6 +8654,27 @@ async function defaultLookupCrmContext(input) {
     });
   });
   return (await crmLookupClientsPromise)(input);
+}
+
+let crmFollowUpClientPromise;
+
+// Push an edited follow-up to the CRM row, fire-and-forget (async invoke):
+// saving the follow-up never waits on, or fails because of, Monday.
+async function notifyCrmFollowUp({ workspaceId, callId }) {
+  const functionName = process.env.CRM_LOOKUP_FUNCTION_NAME;
+  if (!functionName) return;
+  try {
+    crmFollowUpClientPromise ??= import("@aws-sdk/client-lambda")
+      .then((lambda) => ({ lambda, client: new lambda.LambdaClient({}) }));
+    const { lambda, client } = await crmFollowUpClientPromise;
+    await client.send(new lambda.InvokeCommand({
+      FunctionName: functionName,
+      InvocationType: "Event",
+      Payload: new TextEncoder().encode(JSON.stringify({ action: "sync-follow-up", workspaceId, callId })),
+    }));
+  } catch (error) {
+    console.warn("CRM follow-up sync not requested", { name: error?.name });
+  }
 }
 
 // "Send me a test" runs the real digest code path synchronously, so the admin

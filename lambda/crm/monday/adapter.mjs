@@ -20,6 +20,15 @@ export const FIELD_TYPES = Object.freeze({
   fullTranscript: ["long_text"],
   audioLink: ["text", "long_text", "link"],
   callDuration: ["numbers", "text"],
+  callerName: ["text", "long_text"],
+  companyName: ["text", "long_text"],
+  date: ["date"],
+  time: ["text", "hour"],
+  sentiment: ["text"],
+  appointment: ["checkbox", "text"],
+  followUp: ["text", "long_text"],
+  direction: ["text"],
+  intent: ["text", "long_text"],
 });
 const REQUIRED_FIELDS = Object.freeze(["phone"]);
 
@@ -223,6 +232,25 @@ export function createMondayCrmAdapter({ graphql }) {
       };
     },
 
+    // Column writes only, no call note - for a change made in Symantic after
+    // the call already synced (e.g. its follow-up).
+    async updateFields(session, externalId, fields, { idempotencyKey } = {}) {
+      const mapping = session.mapping;
+      const boardId = requireBoard(mapping);
+      const values = buildColumnValues(mapping, fields, { isNew: false });
+      if (!Object.keys(values).length) return { fieldsApplied: false };
+      await graphql.request({
+        accessToken: session.accessToken,
+        operation: "update_fields",
+        idempotencyKey,
+        query: `mutation ($board: ID!, $item: ID!, $values: JSON!) {
+          change_multiple_column_values(board_id: $board, item_id: $item, column_values: $values, create_labels_if_missing: false) { id }
+        }`,
+        variables: { board: boardId, item: String(externalId), values: JSON.stringify(values) },
+      });
+      return { fieldsApplied: true };
+    },
+
     async findActivityByRef(session, externalId, ref) {
       const data = await graphql.request({
         accessToken: session.accessToken,
@@ -401,6 +429,15 @@ export function suggestMapping(board) {
       fullTranscript: pick(["long_text"], /transcript/i),
       audioLink: pick(["text", "long_text", "link"], /audio|recording|listen/i),
       callDuration: pick(["numbers", "text"], /duration|length/i),
+      callerName: pick(["text", "long_text"], /caller.*name|full.*name|contact.*name/i),
+      companyName: pick(["text", "long_text"], /company|organization|org/i),
+      date: pick(["date"], /^date$|call.*date|date.*time/i),
+      time: pick(["text", "hour"], /^time$|call.*time|date.*time/i),
+      sentiment: pick(["text"], /sentiment|mood/i),
+      appointment: pick(["checkbox", "text"], /appointment.*set|booked/i),
+      followUp: pick(["text", "long_text"], /follow.*up|action/i),
+      direction: pick(["text"], /direction|inbound|outbound/i),
+      intent: pick(["text", "long_text"], /intent|reason|purpose/i),
     }).filter(([, value]) => value)),
     labels: {
       newLead: labels.find((label) => /new/i.test(label)) ?? null,
@@ -457,6 +494,28 @@ export function buildColumnValues(mapping, patch, { isNew }) {
       values[col.id] = col.type === "numbers" ? String(patch.callDuration) : textValue("callDuration", `${patch.callDuration} min`);
     }
   }
+  if (patch.callerName) set("callerName", textValue("callerName", truncate(patch.callerName, 500)));
+  if (patch.companyName) set("companyName", textValue("companyName", truncate(patch.companyName, 500)));
+  if (patch.date) set("date", utcDateTime(patch.date));
+  if (patch.time) {
+    const col = columns.time;
+    if (col?.id) {
+      const d = new Date(patch.time);
+      if (!Number.isNaN(d.getTime())) {
+        values[col.id] = col.type === "hour" ? { hour: d.getUTCHours(), minute: d.getUTCMinutes() } : d.toISOString().slice(11, 19);
+      }
+    }
+  }
+  if (patch.sentiment) set("sentiment", truncate(patch.sentiment, 100));
+  if (typeof patch.appointment === "boolean") {
+    set("appointment", columns.appointment?.type === "checkbox"
+      ? (patch.appointment ? { checked: "true" } : null)
+      : (patch.appointment ? "Yes" : "No"));
+  }
+  if (patch.followUp) set("followUp", textValue("followUp", truncate(patch.followUp, 5000)));
+  else if (patch.followUp === null) set("followUp", textValue("followUp", ""));
+  if (patch.intent) set("intent", textValue("intent", truncate(patch.intent, 2000)));
+  if (patch.direction) set("direction", patch.direction);
   return values;
 }
 

@@ -8,7 +8,7 @@ import { createHmac } from "node:crypto";
 // ---------------------------------------------------------------------------
 // In-memory CRM store with the same conditional semantics as store.mjs.
 // ---------------------------------------------------------------------------
-export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {} } = {}) {
+export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {}, contacts = {} } = {}) {
   const connections = new Map();
   const links = new Map();
   const callRows = new Map(calls.map((call) => [`${call.workspaceId}\0${call.callId}`, structuredClone(call)]));
@@ -48,6 +48,9 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     seedCall(call) {
       callRows.set(key(call.workspaceId, call.callId), structuredClone(call));
     },
+    seedContact(contact) {
+      contacts[key(contact.workspaceId, contact.phoneNumber)] = structuredClone(contact);
+    },
 
     async getConnection(workspaceId, provider) {
       maybeFail("getConnection");
@@ -55,8 +58,8 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     },
     async listConnected() {
       return [...connections.values()]
-        .filter((row) => row.connectionState === "connected")
-        .map((row) => ({ workspaceId: row.workspaceId, provider: row.provider }));
+        .filter((row) => row.connectionState === "connected" || row.connectionState === "reauth_required")
+        .map((row) => ({ workspaceId: row.workspaceId, provider: row.provider, connectionState: row.connectionState }));
     },
     async listConnectionsByAccount(provider, accountId) {
       return [...connections.values()]
@@ -65,7 +68,7 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     },
     async saveAuthorization(workspaceId, provider, record) {
       const row = connections.get(key(workspaceId, provider)) ?? { workspaceId, provider, createdAt: iso() };
-      for (const field of ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason"]) {
+      for (const field of ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason", "reauthReminderStage"]) {
         delete row[field];
       }
       apply(row, record);
@@ -157,6 +160,22 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       row.pauseReason = reason;
       return clone(row);
     },
+    async markReauthReminder(workspaceId, provider, stage, previousStage) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row || (row.reauthReminderStage ?? null) !== (previousStage ?? null)) return false;
+      row.reauthReminderStage = stage;
+      return true;
+    },
+    async listWorkspaceAdmins(workspaceId) {
+      return Object.entries(memberships)
+        .filter(([, m]) => m.workspaceId === workspaceId && m.status === "active" && m.role === "company-admin")
+        .map(([userId, m]) => ({ userId, email: m.email ?? null, name: m.name ?? null }));
+    },
+    async markAutoRequeued(workspaceId, provider) {
+      const row = connections.get(key(workspaceId, provider));
+      if (row) row.autoRequeuedAt = Number(now());
+      return clone(row);
+    },
     async recordSyncResult(workspaceId, provider, { status, errorCode }) {
       const row = connections.get(key(workspaceId, provider));
       if (!row) return null;
@@ -221,10 +240,13 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     async listFailedCalls(workspaceId, sinceIso) {
       return [...callRows.values()]
         .filter((row) => row.workspaceId === workspaceId && row.crmStatus === "failed" && (row.analyzedAt ?? "") >= sinceIso)
-        .map((row) => ({ callId: row.callId, crmStatus: row.crmStatus, analyzedAt: row.analyzedAt }));
+        .map((row) => ({ callId: row.callId, crmStatus: row.crmStatus, crmLastErrorCode: row.crmLastErrorCode, analyzedAt: row.analyzedAt }));
     },
     async getProfileTimezone(workspaceId) {
       return profiles[workspaceId]?.timezone ?? null;
+    },
+    async getContactCompany(workspaceId, phoneNumber) {
+      return contacts[key(workspaceId, phoneNumber)]?.companyName ?? null;
     },
     async getMembership(userId) {
       return clone(memberships[userId]);
@@ -358,6 +380,7 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
     if (query.includes("items_page_by_column_values")) return "search";
     if (query.includes("create_item")) return "create_item";
     if (query.includes("create_update")) return query.includes("change_multiple_column_values") ? "log_call_and_fields" : "log_call";
+    if (query.includes("change_multiple_column_values")) return "update_fields";
     if (query.includes("updates(")) return "find_update";
     if (query.includes("items(ids")) return "get_item";
     if (query.includes("me {")) return "me";
@@ -561,6 +584,20 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
         }
         return errors.length ? { data, errors } : { data };
       }
+      case "update_fields": {
+        const item = resolveItem(v.item);
+        const board = boards.get(String(v.board));
+        if (!board || board.deleted) return errorBody("InvalidBoardIdException", "Board not found");
+        if (!item) return errorBody("InvalidItemIdException", "Item not found", { error_data: { item_id: v.item } });
+        const checked = validateColumnValues(board, v.values);
+        if (checked.error) return checked.error;
+        for (const [columnId, value] of Object.entries(checked.values)) {
+          if (value === null) delete item.values[columnId];
+          else item.values[columnId] = value;
+        }
+        item.updatedAt = new Date(Number(now())).toISOString();
+        return { data: { change_multiple_column_values: { id: item.id } } };
+      }
       case "me":
         return { data: { me: { id: "71", name: "Sam Lee", email: "sam@acme.test", account: { id: accountId, name: "Acme Dental", slug: "acme" } } } };
       case "boards": {
@@ -681,6 +718,10 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
     },
     reset() {
       requests.length = 0;
+    },
+    /** End a simulated outage: drop every pending failNext. */
+    recover() {
+      failures.length = 0;
     },
     deleteItem(itemId) {
       const item = items.get(String(itemId));

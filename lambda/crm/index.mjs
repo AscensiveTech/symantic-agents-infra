@@ -7,6 +7,8 @@ import { getRuntime } from "./runtime.mjs";
  *    Monday lifecycle webhook.
  *  - Direct invoke from the BFF during Retell's inbound-call webhook:
  *    { action: "lookup", workspaceId, callerNumber } -> caller context.
+ *  - Async invoke from the BFF: { action: "sync-follow-up", workspaceId, callId }
+ *    -> push an edited follow-up to the Monday row.
  *  - EventBridge schedule: { action: "refresh-tokens" } -> token keeper.
  * (The SQS consumer is worker.mjs, deployed as its own function.)
  */
@@ -27,6 +29,10 @@ export function createHandler({ getRuntime: loadRuntime = getRuntime } = {}) {
         console.error("CRM lookup could not start", { name: error?.name });
         return { status: "error", context: NO_CRM_CONTEXT };
       }
+    }
+    if (event?.action === "sync-follow-up") {
+      const runtime = await loadRuntime();
+      return runtime.syncFollowUp({ workspaceId: event.workspaceId, callId: event.callId });
     }
     if (event?.action === "refresh-tokens") {
       const runtime = await loadRuntime();

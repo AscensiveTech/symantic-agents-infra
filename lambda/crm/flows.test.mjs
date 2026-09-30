@@ -914,7 +914,7 @@ test("keeper: refreshes tokens nearing expiry so the call-time lookup never has 
   await h.connectAndMap();
   h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
   const fresh = await h.runtime.refreshTokens();
-  assert.deepEqual(fresh, { connected: 1, refreshed: 0, fresh: 1, failed: 0, deferred: 0 }, "a new token is left alone");
+  assert.deepEqual(fresh, { connected: 1, refreshed: 0, fresh: 1, failed: 0, deferred: 0, requeued: 0 }, "a new token is left alone");
 
   h.clock.advance(40 * 60 * 1000);
   const due = await h.runtime.refreshTokens();
@@ -959,7 +959,7 @@ test("keeper: skips disconnected workspaces and never touches their tokens", asy
   await h.connectAndMap();
   await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
   h.clock.advance(55 * 60 * 1000);
-  assert.deepEqual(await h.runtime.refreshTokens(), { connected: 0, refreshed: 0, fresh: 0, failed: 0, deferred: 0 });
+  assert.deepEqual(await h.runtime.refreshTokens(), { connected: 0, refreshed: 0, fresh: 0, failed: 0, deferred: 0, requeued: 0 });
 });
 
 test("an unexpected (non-Monday) failure is recorded on the call while it retries", async () => {
@@ -977,7 +977,7 @@ test("the Lambda handler routes the scheduled keeper event", async () => {
   const h = createHarness();
   await h.connectAndMap();
   const handler = createHandler({ getRuntime: async () => h.runtime });
-  assert.deepEqual(await handler({ action: "refresh-tokens" }), { connected: 1, refreshed: 0, fresh: 1, failed: 0, deferred: 0 });
+  assert.deepEqual(await handler({ action: "refresh-tokens" }), { connected: 1, refreshed: 0, fresh: 1, failed: 0, deferred: 0, requeued: 0 });
 });
 
 test("keeper: refreshes many tenants in parallel and defers what doesn't fit its time budget", async () => {
@@ -1009,4 +1009,93 @@ test("keeper: refreshes many tenants in parallel and defers what doesn't fit its
   assert.equal(peak, 5, "at most 5 refreshes at once");
   assert.ok(result.refreshed >= 5 && result.deferred > 0, JSON.stringify(result));
   assert.equal(result.refreshed + result.deferred, 12);
+});
+
+test("sync: call-history details reach the mapped columns, empty ones stay empty", async () => {
+  const h = createHarness();
+  h.board.columns.push(
+    { id: "text_company", title: "Company", type: "text" },
+    { id: "long_transcript", title: "Transcript", type: "long_text" },
+    { id: "text_sentiment", title: "Sentiment", type: "text" },
+    { id: "text_followup", title: "Follow-up notes", type: "text" },
+    { id: "text_direction", title: "Direction", type: "text" },
+  );
+  await h.connectAndMap();
+  h.store.seedContact({ workspaceId: "ws-a", phoneNumber: "+12025550198", companyName: "Acme Dental" });
+  const call = h.seedCall({
+    transcript: [{ speaker: "Agent", text: "Hello" }, { speaker: "Caller", text: "Hi, prices?" }],
+    userSentiment: "Positive",
+    followUp: { status: "in_progress", assigneeName: "Sam Lee", comment: "Call back Friday" },
+  });
+  h.enqueueCall(call);
+  await h.drain();
+
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  const item = h.monday.items.get(row.crmItemId);
+  assert.equal(item.values.text_company.text, "Acme Dental");
+  assert.equal(item.values.long_transcript.text, "Agent: Hello\nCaller: Hi, prices?");
+  assert.equal(item.values.text_sentiment.text, "Positive");
+  assert.equal(item.values.text_followup.text, "In progress - Assigned to Sam Lee - Call back Friday");
+  assert.equal(item.values.text_direction.text, "Inbound");
+
+  const bare = h.seedCall({ callerNumber: "+12025550111" });
+  h.enqueueCall(bare);
+  await h.drain();
+  const bareItem = h.monday.items.get(h.store.callRows.get(`ws-a\0${bare.callId}`).crmItemId);
+  assert.equal(bareItem.values.text_company, undefined);
+  assert.equal(bareItem.values.text_sentiment, undefined);
+});
+
+test("keeper: calls that failed through a long Monday outage are replayed automatically once Monday is back", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  h.monday.failNext("search", { status: 500, body: {}, times: 100 });
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a ${call.callId}`).crmStatus, "failed", "retries ran out during the outage");
+
+  const broken = h.seedCall({ callerNumber: "+12025550122" });
+  Object.assign(h.store.callRows.get(`ws-a ${broken.callId}`), { crmStatus: "failed", crmLastErrorCode: "mapping_invalid" });
+
+  h.monday.recover();
+  const first = await h.runtime.refreshTokens();
+  assert.equal(first.requeued, 1, "only the outage failure is replayed, not the mapping problem");
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a ${call.callId}`).crmStatus, "synced");
+  assert.equal(h.store.callRows.get(`ws-a ${broken.callId}`).crmStatus, "failed");
+
+  const again = await h.runtime.refreshTokens();
+  assert.equal(again.requeued, 0, "throttled to once per 30 minutes");
+});
+
+test("sync: a follow-up edited after the call synced updates the Monday row, and clearing it empties the column", async () => {
+  const h = createHarness();
+  h.board.columns.push({ id: "text_followup", title: "Follow-up notes", type: "text" });
+  await h.connectAndMap();
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.equal(row.crmStatus, "synced");
+
+  row.followUp = { status: "not_started", assigneeName: "Priya Shah", comment: "Send price list" };
+  assert.deepEqual(await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId }), { status: "synced" });
+  const item = h.monday.items.get(row.crmItemId);
+  assert.equal(item.values.text_followup.text, "Not started - Assigned to Priya Shah - Send price list");
+  assert.equal(item.updates.length, 1, "no extra call note");
+
+  delete row.followUp;
+  await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId });
+  assert.equal(item.values.text_followup?.text ?? "", "");
+});
+
+test("sync: follow-up updates are skipped for unsynced calls and when no Follow-Up column is mapped", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall();
+  assert.equal((await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId })).reason, "not_synced");
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal((await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId })).reason, "no_follow_up_column");
 });

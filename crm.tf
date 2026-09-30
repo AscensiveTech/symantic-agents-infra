@@ -192,12 +192,15 @@ locals {
     CRM_LINKS_TABLE             = aws_dynamodb_table.crm_links.name
     CALLS_TABLE                 = aws_dynamodb_table.control_plane["calls"].name
     BUSINESS_PROFILES_TABLE     = aws_dynamodb_table.control_plane["business_profiles"].name
+    CONTACTS_TABLE              = aws_dynamodb_table.control_plane["contacts"].name
     WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
     OAUTH_STATES_TABLE          = aws_dynamodb_table.oauth_states.name
     CRM_TOKENS_KMS_KEY_ID       = aws_kms_key.crm_tokens.arn
     MONDAY_OAUTH_SECRET_ARN     = aws_secretsmanager_secret.providers["monday-oauth"].arn
     MONDAY_API_VERSION          = var.monday_api_version
     CRM_SYNC_QUEUE_URL          = aws_sqs_queue.crm_sync.url
+    EMAIL_FROM                  = local.email_from
+    EMAIL_CONFIGURATION_SET     = aws_sesv2_configuration_set.notifications.configuration_set_name
   }
 }
 
@@ -266,6 +269,14 @@ resource "aws_iam_role_policy" "crm_runtime" {
         Action   = ["dynamodb:GetItem"]
         Resource = aws_dynamodb_table.workspace_memberships.arn
       },
+      {
+        # Reconnect reminders fall back to every company admin.
+        Sid      = "ListWorkspaceAdmins"
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query"]
+        Resource = "${aws_dynamodb_table.workspace_memberships.arn}/index/workspaceId-index"
+      },
+      local.ses_send_statement,
       {
         Sid      = "EncryptCrmTokens"
         Effect   = "Allow"
@@ -466,6 +477,12 @@ resource "aws_iam_role_policy" "crm_worker_runtime" {
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem"]
         Resource = aws_dynamodb_table.control_plane["business_profiles"].arn
+      },
+      {
+        Sid      = "ReadContactCompany"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["contacts"].arn
       },
       {
         Sid      = "EncryptCrmTokens"

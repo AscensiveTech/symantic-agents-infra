@@ -18,7 +18,8 @@ import {
 } from "./monday/oauth.mjs";
 import { countryForE164, maskPhone, nationalNumber, toE164 } from "./phone.mjs";
 import { assertCrmProvider, createProviderRegistry } from "./provider.mjs";
-import { createFakeMonday, signJwt, TEST_APP_SECRET } from "./test-support/fakes.mjs";
+import { createReauthReminders, reminderStage } from "./reminders.mjs";
+import { createFakeMonday, createMemoryCrmStore, signJwt, TEST_APP_SECRET } from "./test-support/fakes.mjs";
 import { toolLogFor } from "./test-support/harness.mjs";
 import { backoffSeconds } from "./worker.mjs";
 
@@ -500,4 +501,55 @@ test("backoff honours the provider's wait, else grows exponentially and caps", (
   assert.equal(backoffSeconds(new CrmError(CRM_ERROR.TRANSIENT, "x"), 3, zero), 120);
   assert.equal(backoffSeconds(new CrmError(CRM_ERROR.TRANSIENT, "x"), 10, zero), 900);
   assert.equal(backoffSeconds(new CrmError(CRM_ERROR.DAILY_LIMIT, "x", { retryAfterSeconds: 90_000 }), 1, zero), 43_200);
+});
+
+// ------------------------------------------------------ reauth reminders ----
+
+test("reconnect reminders: 14 days, 3 days and expired, each sent once to the connecting admin", async () => {
+  const DAY = 86_400_000;
+  let now = Date.parse("2026-09-01T00:00:00Z");
+  const expiry = now + 20 * DAY;
+  const store = createMemoryCrmStore({
+    now: () => now,
+    memberships: { "user-dana": { workspaceId: "ws", status: "active", role: "company-admin", email: "dana@example.com" } },
+  });
+  store.seedConnection({ workspaceId: "ws", provider: "monday", connectionState: "connected", authorizedBy: "user-dana", accountName: "Arc Dental", refreshTokenExpiresAt: expiry });
+  const sent = [];
+  const remind = createReauthReminders({ store, sendEmail: async (m) => { sent.push(m); }, appUrl: "https://app.test", now: () => now });
+  const conn = () => store.getConnection("ws", "monday");
+
+  assert.equal(await remind(await conn()), false, "nothing 20 days out");
+  now = expiry - 13 * DAY;
+  assert.equal(reminderStage(await conn(), now), "14d");
+  assert.equal(await remind(await conn()), true);
+  assert.equal(await remind(await conn()), false, "same stage is not repeated");
+  now = expiry - 2 * DAY;
+  assert.equal(await remind(await conn()), true);
+  await store.markReauthRequired("ws", "monday", "refresh_expired");
+  assert.equal(await remind(await conn()), true);
+  assert.deepEqual(sent.map((m) => m.to), ["dana@example.com", "dana@example.com", "dana@example.com"]);
+  assert.match(sent[0].subject, /Reconnect Monday before/);
+  assert.match(sent[2].subject, /reconnect Monday to resume call logging/);
+  assert.match(sent[2].html, /https:\/\/app\.test\/integrations/);
+
+  await store.saveAuthorization("ws", "monday", { refreshTokenExpiresAt: now + 180 * DAY });
+  assert.equal((await conn()).reauthReminderStage, undefined, "reconnecting resets the reminders");
+});
+
+test("reconnect reminders fall back to every active company admin when the connector has left", async () => {
+  const now = Date.parse("2026-09-01T00:00:00Z");
+  const store = createMemoryCrmStore({
+    now: () => now,
+    memberships: {
+      "user-gone": { workspaceId: "ws", status: "disabled", role: "company-admin", email: "gone@example.com" },
+      "user-a": { workspaceId: "ws", status: "active", role: "company-admin", email: "a@example.com" },
+      "user-b": { workspaceId: "ws", status: "active", role: "quotation-builder", email: "b@example.com" },
+      "user-c": { workspaceId: "other", status: "active", role: "company-admin", email: "c@example.com" },
+    },
+  });
+  store.seedConnection({ workspaceId: "ws", provider: "monday", connectionState: "connected", authorizedBy: "user-gone", refreshTokenExpiresAt: now + 86_400_000 });
+  const sent = [];
+  const remind = createReauthReminders({ store, sendEmail: async (m) => { sent.push(m.to); }, appUrl: "https://app.test", now: () => now });
+  await remind(await store.getConnection("ws", "monday"));
+  assert.deepEqual(sent, ["a@example.com"]);
 });

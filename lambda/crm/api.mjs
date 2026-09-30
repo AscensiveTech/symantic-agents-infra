@@ -1,15 +1,13 @@
 import { randomBytes } from "node:crypto";
-
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { FIELD_TYPES, suggestMapping } from "./monday/adapter.mjs";
 import { buildAuthorizeUrl, buildInstallUrl, createPkcePair, verifyMondayJwt } from "./monday/oauth.mjs";
 import { isConnectionUsable } from "./provider.mjs";
+import { createRequeuer } from "./requeue.mjs";
 
 const PROVIDER = "monday";
 const OAUTH_STATE_PROVIDER = "monday-crm";
 const STATE_TTL_SECONDS = 600;
-const RETRY_WINDOW_DAYS = 7;
-const MAX_REQUEUE = 500;
 const ADMIN_ROLES = new Set(["company-admin", "super-admin"]);
 const DEFAULT_RETURN_TO = "/integrations";
 
@@ -77,19 +75,7 @@ export function createCrmApi({
 
   // Re-send every recently failed call once the admin has fixed whatever
   // made it fail (reconnected, or corrected the mapping).
-  async function requeueFailed(workspaceId) {
-    const since = new Date(Number(now()) - RETRY_WINDOW_DAYS * 86_400_000).toISOString();
-    const failed = (await store.listFailedCalls(workspaceId, since)).slice(0, MAX_REQUEUE);
-    let requeued = 0;
-    for (const call of failed) {
-      if (await store.markCallQueued(workspaceId, call.callId, PROVIDER)) {
-        await enqueue({ workspaceId, callId: call.callId, provider: PROVIDER });
-        requeued += 1;
-      }
-    }
-    if (requeued) metrics?.emit("SyncRequeued", requeued, { Provider: PROVIDER });
-    return requeued;
-  }
+  const requeueFailed = createRequeuer({ store, enqueue, metrics, now, provider: PROVIDER });
 
   async function revalidate(workspaceId, connection) {
     if (!connection?.mapping) return connection;
@@ -163,8 +149,11 @@ export function createCrmApi({
         return back(DEFAULT_RETURN_TO, { crm: "error", reason: "invalid_state" });
       }
       if (query.error || typeof query.code !== "string" || !query.code) {
-        metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "denied" });
-        return back(stateRecord.returnTo, { crm: "error", reason: "authorization_denied" });
+        // access_denied is the user pressing Cancel; anything else is Monday
+        // refusing (commonly: this Monday user may not install apps).
+        const cancelled = !query.error || query.error === "access_denied";
+        metrics?.count("OAuth", { Provider: PROVIDER, Outcome: cancelled ? "denied" : "monday_error" });
+        return back(stateRecord.returnTo, { crm: "error", reason: cancelled ? "authorization_denied" : "install_not_allowed" });
       }
       const { workspaceId } = stateRecord;
       try {
@@ -400,8 +389,6 @@ function normalizeMappingInput(value) {
     columns,
     labels: { newLead: label(value.labels?.newLead), followUp: label(value.labels?.followUp) },
     defaultOwnerId: owner,
-    autoCreateContacts: value.autoCreateContacts === true,
-    updateExistingContacts: value.updateExistingContacts === true,
   };
 }
 
