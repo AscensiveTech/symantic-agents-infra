@@ -46,7 +46,7 @@ export function composeRuntime({
     sleep,
     metrics,
   });
-  const crmSync = createCrmSync({ store, providers, sessions, appUrl, metrics, now, log });
+  const crmSync = createCrmSync({ store, providers, sessions, appUrl, metrics, enqueue, now, log });
   const api = createCrmApi({
     store,
     adapter,
@@ -76,6 +76,7 @@ export function composeRuntime({
       sessions,
       requeueFailed: createRequeuer({ store, enqueue, metrics, now }),
       remindReauth: createReauthReminders({ store, sendEmail, appUrl, now, log }),
+      checkCallsBoard: crmSync.checkCallsBoard,
       metrics,
       now,
       log,

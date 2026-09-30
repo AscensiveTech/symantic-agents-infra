@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { buildCallActivity } from "./activity.mjs";
-import { createCallsLog } from "./calls-log.mjs";
+import { callsRowIsCurrent, createCallsLog } from "./calls-log.mjs";
+import { callLink } from "./monday/calls-board.mjs";
 import { deriveCallFacts, followUpText, localDatePlusDays, transcriptText } from "./facts.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone } from "./phone.mjs";
@@ -40,6 +41,7 @@ export function createCrmSync({
   sessions,
   appUrl,
   metrics,
+  enqueue,
   now = Date.now,
   log = console,
 }) {
@@ -63,10 +65,12 @@ export function createCrmSync({
     return { status: "failed", code };
   }
 
-  async function syncCall({ workspaceId, callId, attempt = 1, finalAttempt = false }) {
+  async function syncCall({ workspaceId, callId, attempt = 1, finalAttempt = false, verifyExisting = false }) {
     const started = Number(now());
     const call = await store.getCall(workspaceId, callId);
     if (!call) return { status: "skipped", reason: "call_not_found" };
+    // "Add Sample Calls" demo data never goes to a customer's CRM.
+    if (call.demoSeed === true) return { status: "skipped", reason: "sample_call" };
     if (call.crmStatus === "synced") {
       metrics?.count("SyncDuplicate", { Provider: providerIdOf(call.crmProvider) || "unknown" });
       return { status: "duplicate" };
@@ -99,15 +103,23 @@ export function createCrmSync({
     }
     facts.companyName = await store.getContactCompany?.(workspaceId, facts.phoneE164).catch(() => null) ?? null;
 
-    // 1. The auto-created calls board: one row per call, written once.
-    if (!call.crmCallsItemId) {
+    // 1. The auto-created calls board: one row per call, written once per
+    // board (a deleted board holds the call until an admin recreates it).
+    if (!callsRowIsCurrent(call, connection)) {
       try {
-        const rowId = await sessions.withSession(connection, (session) =>
-          callsLog.logCall(session, connection, call, facts, { idempotencyKey: `${idempotencyBaseFor(workspaceId, callId)}-calls` })
+        const result = await sessions.withSession(connection, (session) =>
+          callsLog.logCall(session, connection, call, facts, {
+            idempotencyKey: `${idempotencyBaseFor(workspaceId, callId)}-calls`,
+            verifyExisting,
+          })
         );
-        if (rowId) {
-          call.crmCallsItemId = rowId;
-          await store.updateCallSync(workspaceId, callId, { crmCallsItemId: rowId, crmProvider: connectionKey });
+        if (result.status === "written") {
+          call.crmCallsItemId = result.itemId;
+          await store.updateCallSync(workspaceId, callId, {
+            crmCallsItemId: result.itemId,
+            crmCallsBoardId: result.boardId,
+            crmProvider: connectionKey,
+          });
         }
       } catch (error) {
         log.warn?.("CRM calls board write failed", { workspaceId, callId, attempt, ...describeError(error) });
@@ -440,20 +452,128 @@ export function createCrmSync({
   // Queued right after an agent connects: build its calls board with the
   // worker's longer time budget. Refusals are recorded on the connection by
   // ensureBoard; outages throw so SQS retries.
-  async function ensureCallsBoard({ workspaceId, provider: connectionKey }) {
+  // Queued right after an agent connects (and by Recreate Board / turning
+  // the calls board back on): build its calls board with the worker's longer
+  // time budget. `recreate` replaces a board deleted in Monday; `rebuild`
+  // then queues every past call that isn't on the board yet. Refusals are
+  // recorded on the connection; outages throw so SQS retries.
+  async function ensureCallsBoard({ workspaceId, provider: connectionKey, recreate = false, rebuild = false }) {
     const connection = await store.getConnection(workspaceId, connectionKey);
     if (connection?.connectionState !== "connected") return { status: "skipped", reason: "not_connected" };
-    if (connection.callsBoard?.status === "active" && connection.callsBoard.id) return { status: "exists" };
+    if (connection.callsBoardEnabled === false) return { status: "skipped", reason: "off" };
+    if (connection.callsBoard?.status === "deleted" && !recreate) return { status: "skipped", reason: "deleted" };
     try {
-      await sessions.withSession(connection, (session) => callsLog.ensureBoard(session, connection));
-      return { status: "created" };
+      await sessions.withSession(connection, (session) => callsLog.ensureBoard(session, connection, { recreate }));
     } catch (error) {
       if (error instanceof CrmError && !error.retryable) return { status: "refused", code: error.code };
       throw error;
     }
+    const queued = rebuild ? await rebuildCallsBoard({ workspaceId, provider: connectionKey }) : 0;
+    return { status: "ready", queued };
   }
 
-  return { syncCall, syncFollowUp, ensureCallsBoard };
+  // Calls that belong on the calls board: real, analyzed calls with a caller
+  // number (spam, test/sample and anonymous calls are never logged).
+  function belongsOnCallsBoard(call) {
+    return Boolean(call.callerNumber) && call.demoSeed !== true && call.outcome !== "spam" && Boolean(call.analyzedAt);
+  }
+
+  // Full history onto the agent's current calls board: queue a row write for
+  // every eligible call whose row isn't on this board. Each write first
+  // looks the call up by Call ID, so running this twice adds nothing.
+  async function rebuildCallsBoard({ workspaceId, provider: connectionKey }) {
+    const connection = await store.getConnection(workspaceId, connectionKey);
+    if (!connection?.agentId || connection.callsBoard?.status !== "active" || !enqueue) return 0;
+    const calls = await store.listAgentCalls(workspaceId, connection.agentId);
+    let queued = 0;
+    for (const call of calls) {
+      if (!belongsOnCallsBoard(call) || callsRowIsCurrent(call, connection)) continue;
+      await enqueue({ kind: "calls-board-row", workspaceId, callId: call.callId, provider: connectionKey });
+      queued += 1;
+    }
+    metrics?.emit("CallsBoardRebuild", queued, { Provider: providerIdOf(connectionKey) });
+    log.info?.("Calls board rebuild queued", { workspaceId, queued });
+    return queued;
+  }
+
+  // One call's row on the calls board only (rebuilds): never touches the
+  // customer's own board or the call's sync status.
+  async function syncCallsBoardRow({ workspaceId, callId, provider: connectionKey }) {
+    const [call, connection] = await Promise.all([
+      store.getCall(workspaceId, callId),
+      store.getConnection(workspaceId, connectionKey),
+    ]);
+    if (!call || connection?.connectionState !== "connected" || callsRowIsCurrent(call, connection)) return { status: "skipped" };
+    const timezone = await store.getProfileTimezone(workspaceId).catch(() => null);
+    const facts = deriveCallFacts(call, { timezone });
+    if (!facts.phoneE164) return { status: "skipped" };
+    facts.companyName = await store.getContactCompany?.(workspaceId, facts.phoneE164).catch(() => null) ?? null;
+    const result = await sessions.withSession(connection, (session) =>
+      callsLog.logCall(session, connection, call, facts, {
+        idempotencyKey: `${idempotencyBaseFor(workspaceId, callId)}-calls`,
+        verifyExisting: true,
+      })
+    );
+    if (result.status === "written") {
+      await store.updateCallSync(workspaceId, callId, { crmCallsItemId: result.itemId, crmCallsBoardId: result.boardId });
+    }
+    return result;
+  }
+
+  // After a reconnect with the board still there: send only what's missing -
+  // calls taken while disconnected (never queued) and ones that failed.
+  // Each is checked by Call ID first, so nothing already on the board is
+  // added again.
+  async function catchUpAfterReconnect({ workspaceId, provider: connectionKey, since }) {
+    const connection = await store.getConnection(workspaceId, connectionKey);
+    if (!connection?.agentId || connection.connectionState !== "connected" || !enqueue) return 0;
+    const calls = await store.listAgentCalls(workspaceId, connection.agentId, { since });
+    let queued = 0;
+    for (const call of calls) {
+      if (!belongsOnCallsBoard(call)) continue;
+      if (call.crmStatus && call.crmStatus !== "failed") continue;
+      if (!await store.markCallQueued(workspaceId, call.callId, connectionKey)) continue;
+      await enqueue({ workspaceId, callId: call.callId, provider: connectionKey, verifyExisting: true });
+      queued += 1;
+    }
+    log.info?.("Reconnect catch-up queued", { workspaceId, queued });
+    return queued;
+  }
+
+  // One-time repair: point this call's "Listen" link (calls board and, when
+  // mapped, the customer's Audio Link column) at Call History.
+  async function rewriteCallLinks({ workspaceId, callId, provider: connectionKey }) {
+    const [call, connection] = await Promise.all([
+      store.getCall(workspaceId, callId),
+      store.getConnection(workspaceId, connectionKey),
+    ]);
+    if (!call || connection?.connectionState !== "connected" || !appUrl) return { status: "skipped" };
+    const provider = providers.get(connectionKey);
+    const url = callLink(appUrl, callId);
+    let updated = 0;
+    await sessions.withSession(connection, async (session) => {
+      const board = connection.callsBoard;
+      if (board?.status === "active" && board.columns?.recording && callsRowIsCurrent(call, connection) && provider.updateCallsRow) {
+        await provider.updateCallsRow(session, board.id, call.crmCallsItemId, { [board.columns.recording]: { url, text: "Listen" } });
+        updated += 1;
+      }
+      if (call.crmItemId && isConnectionUsable(connection) && connection.mapping?.columns?.audioLink?.id && provider.updateFields) {
+        await provider.updateFields(session, call.crmItemId, { audioLink: url });
+        updated += 1;
+      }
+    });
+    return { status: "done", updated };
+  }
+
+  // The keeper's 10-minute check of an agent's calls board. A board back
+  // from Monday's trash gets every call it missed meanwhile.
+  async function checkCallsBoard(connection) {
+    const result = await sessions.withSession(connection, (session) => callsLog.checkBoard(session, connection));
+    if (result === "restored") await rebuildCallsBoard({ workspaceId: connection.workspaceId, provider: connection.provider });
+    return result;
+  }
+
+  return { syncCall, syncFollowUp, ensureCallsBoard, checkCallsBoard, rebuildCallsBoard, syncCallsBoardRow, catchUpAfterReconnect, rewriteCallLinks };
 }
 
 // Stable per call and bounded in length (Monday documents no key limit).
@@ -502,7 +622,7 @@ function fieldPatch(facts, { isNew, link, call, appUrl }) {
   if (typeof call?.userSentiment === "string" && call.userSentiment.trim()) patch.sentiment = call.userSentiment.trim();
   const followUp = followUpText(call?.followUp);
   if (followUp) patch.followUp = followUp;
-  if (appUrl && facts.callId) patch.audioLink = `${appUrl}/calls/${facts.callId}`;
+  if (appUrl && facts.callId) patch.audioLink = callLink(appUrl, facts.callId);
   if (facts.durationMs != null) patch.callDuration = Math.round(facts.durationMs / 60000);
   if (facts.name) patch.callerName = facts.name;
   if (facts.startedAt) {

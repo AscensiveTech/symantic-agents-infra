@@ -98,6 +98,8 @@ export function createCrmApi({
   // builds it moments later; if even that fails, the first call does.
   async function queueCallsBoard(connection) {
     if (connection.callsBoard?.status === "active" && connection.callsBoard.id) return;
+    // A board deleted in Monday waits for the admin's Recreate Board.
+    if (connection.callsBoard?.status === "deleted" || connection.callsBoardEnabled === false) return;
     try {
       await enqueue({ kind: "ensure-calls-board", workspaceId: connection.workspaceId, provider: connection.provider });
     } catch (error) {
@@ -279,6 +281,13 @@ export function createCrmApi({
           connection = await revalidate(workspaceId, connection);
         }
         await queueCallsBoard(connection);
+        // Reconnecting after a disconnect: calls taken meanwhile were never
+        // queued. Send only those (each checked by Call ID, so nothing already
+        // on the board is added again).
+        if (previous?.connectionState === "disconnected" && previous.disconnectedAt) {
+          await enqueue({ kind: "catch-up", workspaceId, provider: key, since: previous.disconnectedAt })
+            .catch((error) => log.warn?.("Reconnect catch-up not queued", { workspaceId, ...describeError(error) }));
+        }
         if (connection.connectionState === "connected") await requeueFailed(workspaceId, key);
         metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "connected" });
         log.info?.("CRM connected", { workspaceId, agentId: stateRecord.agentId, accountId: account.accountId });
@@ -397,6 +406,40 @@ export function createCrmApi({
       return json(200, { ...toPublicConnection(saved, now), requeued });
     },
 
+    // The auto-created calls board, from the Monday card:
+    //   recreate - after it was deleted in Monday: build a new board and put
+    //              the agent's full call history on it;
+    //   stop     - stop logging to a calls board for this agent;
+    //   start    - turn it back on (builds or reuses the board, then adds
+    //              every call it's missing).
+    // Building happens in the worker; this only records the choice and queues it.
+    async "POST /crm/calls-board"(event) {
+      const identity = await requireIdentity(event, { admin: true });
+      const key = await requireAgentKey(identity, event);
+      const action = readBody(event)?.action;
+      if (!["recreate", "stop", "start"].includes(action)) {
+        throw new ApiError(400, "invalid_request", "action must be recreate, stop or start.");
+      }
+      const connection = await store.getConnection(identity.workspaceId, key);
+      if (connection?.connectionState !== "connected") throw new ApiError(409, "not_connected", "Connect Monday first.");
+      if (action === "stop") {
+        const saved = await store.setCallsBoardEnabled(identity.workspaceId, key, false);
+        log.info?.("Calls board turned off", { workspaceId: identity.workspaceId, agentId: agentIdOf(key) });
+        return json(200, toPublicConnection(saved, now));
+      }
+      await store.setCallsBoardEnabled(identity.workspaceId, key, true);
+      await enqueue({
+        kind: "ensure-calls-board",
+        workspaceId: identity.workspaceId,
+        provider: key,
+        recreate: connection.callsBoard?.status === "deleted",
+        rebuild: true,
+      });
+      log.info?.("Calls board rebuild queued", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), action });
+      const saved = await store.getConnection(identity.workspaceId, key);
+      return json(200, { ...toPublicConnection(saved, now), callsBoardQueued: true });
+    },
+
     async "POST /crm/sync/retry"(event) {
       const identity = await requireIdentity(event, { admin: true });
       const key = await requireAgentKey(identity, event);
@@ -469,6 +512,15 @@ const CALLS_BOARD_MESSAGES = {
 function publicCallsBoard(connection) {
   const board = connection.callsBoard;
   if (!board) return null;
+  if (board.status === "deleted") {
+    return {
+      id: null,
+      status: "deleted",
+      url: null,
+      message: "Your \u201cSymantic AI Calls\u201d board was deleted in Monday. Calls are still answered and kept in Call History; they'll be added to Monday once you recreate the board.",
+      deletedAt: board.deletedAt ?? null,
+    };
+  }
   const active = board.status === "active" && board.id;
   return {
     id: active ? String(board.id) : null,
@@ -497,6 +549,7 @@ function toPublicConnection(connection, now = Date.now) {
     reauthReason: connection.reauthReason ?? null,
     mappingStatus: connection.mappingStatus ?? "unconfigured",
     boardSyncEnabled: connection.boardSyncEnabled !== false,
+    callsBoardEnabled: connection.callsBoardEnabled !== false,
     callsBoard: publicCallsBoard(connection),
     mapping: connection.mapping ?? null,
     mappingProblems: connection.mappingProblems ?? [],

@@ -5,6 +5,7 @@
 import { agentIdOf } from "./provider.mjs";
 
 const DAY_MS = 86_400_000;
+const BOARD_REMINDER_AFTER_MS = 3 * DAY_MS;
 const STAGES = ["14d", "3d", "expired"];
 
 export function reminderStage(connection, nowMs) {
@@ -57,10 +58,40 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
     return true;
   }
 
+  // The agent's "Symantic AI Calls" board was deleted in Monday: email the
+  // admins once right away, and once more after 3 days if nobody has acted.
+  // Nothing is recreated without them.
+  async function notifyBoardDeleted(connection) {
+    const noticeAt = Date.parse(connection.callsBoardDeletedNoticeAt ?? "");
+    let field = null;
+    if (!Number.isFinite(noticeAt)) field = "callsBoardDeletedNoticeAt";
+    else if (!connection.callsBoardDeletedReminderAt && Number(now()) - noticeAt >= BOARD_REMINDER_AFTER_MS) field = "callsBoardDeletedReminderAt";
+    if (!field) return false;
+    const settings = await store.getCrmReminderSettings?.(connection.workspaceId).catch(() => null);
+    const to = await recipients(connection, settings);
+    if (!to.length) return false;
+    if (!await store.markCallsBoardNotice(connection.workspaceId, connection.provider, field)) return false;
+    const agentId = connection.agentId ?? agentIdOf(connection.provider);
+    const agent = agentId ? await store.getAgent(connection.workspaceId, agentId).catch(() => null) : null;
+    const message = renderBoardDeletedEmail({ connection, appUrl, agentId, agentName: agent?.name ?? null, reminder: field === "callsBoardDeletedReminderAt" });
+    for (const address of to) {
+      try {
+        await sendEmail({ to: address, ...message });
+      } catch (error) {
+        log.warn?.("Calls-board-deleted notice not sent", { workspaceId: connection.workspaceId, name: error?.name });
+      }
+    }
+    return true;
+  }
+
   return async function remind(connection) {
     if (!sendEmail) return false;
     if (connection.pauseReason === "account_inactive" && Number(connection.pausedUntil) > Number(now())) {
       return notifyInactive(connection);
+    }
+    if (connection.callsBoardEnabled !== false && connection.callsBoard?.status === "deleted" &&
+      await notifyBoardDeleted(connection)) {
+      return true;
     }
     const stage = reminderStage(connection, Number(now()));
     if (!stage || !isNewerStage(stage, connection.reauthReminderStage)) return false;
@@ -112,6 +143,26 @@ export function renderReauthEmail({ stage, connection, appUrl, agentId = null, a
     `<p style="margin:20px 0;"><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#1c1c17;color:#ffffff;text-decoration:none;font-weight:600;">Renew Monday Connection</a></p>`,
   ].join("");
   return { subject, text, html };
+}
+
+export function renderBoardDeletedEmail({ connection, appUrl, agentId = null, agentName = null, reminder = false }) {
+  const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
+  const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}&crm=board` : base;
+  const forAgent = agentName ? ` for your "${agentName}" agent` : "";
+  const lines = [
+    `The "Symantic AI Calls" board${forAgent} was deleted in Monday${connection.accountName ? ` (${connection.accountName})` : ""}.`,
+    "Calls are still answered and kept in Call History. Recreate the board and every call - including the ones taken since - is added to it automatically. Or choose Stop Logging if you don't want a calls board.",
+  ];
+  const text = [...lines, "", `Recreate Board: ${link}`].join("\n");
+  const html = [
+    ...lines.map((line) => `<p style="margin:0 0 14px;font-size:14px;line-height:1.5;">${escapeHtml(line)}</p>`),
+    `<p style="margin:20px 0;"><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#1c1c17;color:#ffffff;text-decoration:none;font-weight:600;">Recreate Board</a></p>`,
+  ].join("");
+  return {
+    subject: reminder ? "Reminder: your Monday calls board is still missing" : "Your Monday calls board was deleted",
+    text,
+    html,
+  };
 }
 
 export function renderInactiveEmail({ connection, appUrl, agentId = null, agentName = null }) {

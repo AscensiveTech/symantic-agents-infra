@@ -179,6 +179,10 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       if (!row) return null;
       row.callsBoard = structuredClone(callsBoard);
       delete row.callsBoardClaimAt;
+      if (callsBoard?.status !== "deleted") {
+        delete row.callsBoardDeletedNoticeAt;
+        delete row.callsBoardDeletedReminderAt;
+      }
       return clone(row);
     },
     async claimCallsBoard(workspaceId, provider, staleMs) {
@@ -187,6 +191,23 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       if (!row || (row.callsBoardClaimAt !== undefined && row.callsBoardClaimAt >= nowMs - staleMs)) return false;
       row.callsBoardClaimAt = nowMs;
       return true;
+    },
+    async setCallsBoardEnabled(workspaceId, provider, enabled) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row) return null;
+      row.callsBoardEnabled = Boolean(enabled);
+      return clone(row);
+    },
+    async markCallsBoardNotice(workspaceId, provider, field) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row || row[field]) return false;
+      row[field] = iso();
+      return true;
+    },
+    async listAgentCalls(workspaceId, agentId, { since } = {}) {
+      return [...callRows.values()]
+        .filter((row) => row.workspaceId === workspaceId && row.agentId === agentId && (!since || (row.analyzedAt ?? "") >= since))
+        .map(clone);
     },
     async setBoardSyncEnabled(workspaceId, provider, enabled) {
       const row = connections.get(key(workspaceId, provider));
@@ -432,6 +453,7 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
   });
 
   function classify(query) {
+    if (query.includes("{ id state }")) return "board_state";
     if (query.includes("create_board")) return "create_board";
     if (query.includes("create_column")) return "create_column";
     if (query.includes("archive_board")) return "archive_board";
@@ -494,6 +516,8 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
         out[columnId] = { text: value.time ? `${value.date} ${value.time}` : value.date, value: JSON.stringify(value) };
       } else if (column.type === "email") {
         out[columnId] = { text: value.email, value: JSON.stringify(value) };
+      } else if (column.type === "link") {
+        out[columnId] = { text: value.text, value: JSON.stringify(value) };
       } else if (column.type === "long_text") {
         out[columnId] = { text: value.text, value: JSON.stringify(value) };
       } else {
@@ -606,6 +630,10 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
         };
         board.columns.push(column);
         return { data: { create_column: { id: column.id } } };
+      }
+      case "board_state": {
+        const board = boards.get(String(v.ids?.[0]));
+        return { data: { boards: board ? [{ id: board.id, state: board.deleted ? "deleted" : "active" }] : [] } };
       }
       case "archive_board": {
         const board = boards.get(String(v.board));

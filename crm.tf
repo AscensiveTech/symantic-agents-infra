@@ -413,6 +413,7 @@ locals {
     "PUT /crm/board-sync",
     "POST /crm/sync/retry",
     "POST /crm/check-account",
+    "POST /crm/calls-board",
   ])
 
   # Both verify themselves: the callback by its one-time OAuth state, the
@@ -486,9 +487,10 @@ resource "aws_iam_role_policy" "crm_worker_runtime" {
         Resource = aws_dynamodb_table.crm_links.arn
       },
       {
-        Sid      = "ReadCallRecordSyncState"
-        Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Sid    = "ReadCallRecordSyncState"
+        Effect = "Allow"
+        # Query: rebuilding an agent's calls board / reconnect catch-up.
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.control_plane["calls"].arn
       },
       {

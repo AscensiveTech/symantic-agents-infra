@@ -397,6 +397,47 @@ export function createMondayCrmAdapter({ graphql }) {
       return { boardId, columns };
     },
 
+    // Is this board still there? "active", or "deleted"/"archived" (in
+    // Monday's trash), or "missing" when Monday no longer returns it at all.
+    async callsBoardState(session, boardId) {
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "board_state",
+        query: `query ($ids: [ID!]) { boards(ids: $ids) { id state } }`,
+        variables: { ids: [String(boardId)] },
+      });
+      return data?.boards?.[0]?.state ?? "missing";
+    },
+
+    // The row already on the calls board for this call, by our Call ID column.
+    async findCallsRow(session, board, callId) {
+      const column = board?.columns?.callId;
+      if (!column || !callId) return null;
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "find_calls_row",
+        query: `query ($board: ID!, $column: String!, $value: String!) {
+          items_page_by_column_values(board_id: $board, limit: 1, columns: [{ column_id: $column, column_values: [$value] }]) { items { id } }
+        }`,
+        variables: { board: String(board.id), column, value: String(callId) },
+      });
+      const id = data?.items_page_by_column_values?.items?.[0]?.id;
+      return id ? String(id) : null;
+    },
+
+    // Our saved board, with any of our columns that went missing (deleted by
+    // the customer, or added in a later version) created again.
+    async repairCallsBoard(session, boardId) {
+      const [board] = await queryBoards(session, [String(boardId)]);
+      if (!board) return null;
+      const columns = {};
+      for (const column of CALLS_BOARD_COLUMNS) {
+        const existing = board.columns.find((candidate) => candidate.title === column.title);
+        columns[column.key] = existing ? existing.id : await createCallsColumn(session, board.id, column);
+      }
+      return { boardId: board.id, columns };
+    },
+
     // Find a calls board we already created for this agent (same name), so
     // a lost record, a reconnect or a timed-out attempt never leads to a
     // second board. Any of our columns missing from it are added back.

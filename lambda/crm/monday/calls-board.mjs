@@ -24,7 +24,15 @@ export const CALLS_BOARD_COLUMNS = Object.freeze([
   { key: "email", title: "Email", type: "email" },
   { key: "recording", title: "Recording", type: "link" },
   { key: "transcript", title: "Transcript", type: "long_text" },
+  // Our call id: lets a rebuild or catch-up find a row that's already on the
+  // board instead of adding a duplicate.
+  { key: "callId", title: "Call ID", type: "text" },
 ]);
+
+// Where "Listen" goes: Call History, opened on that call's detail pop-up.
+export function callLink(appUrl, callId) {
+  return `${String(appUrl).replace(/\/+$/, "")}/call-history?call=${encodeURIComponent(callId)}`;
+}
 
 export function callsBoardName(agentName) {
   const suffix = typeof agentName === "string" && agentName.trim() ? ` - ${agentName.trim().slice(0, 60)}` : "";
@@ -71,9 +79,8 @@ export function buildCallsRow({ facts, call, columns, appUrl, transcript, follow
   set("sentiment", text(call?.userSentiment, 100));
   const followUpText = text(followUp, 5000);
   if (followUpText) set("followUp", { text: followUpText });
-  if (appUrl && facts.callId) {
-    set("recording", { url: `${String(appUrl).replace(/\/+$/, "")}/calls/${encodeURIComponent(facts.callId)}`, text: "Listen" });
-  }
+  if (appUrl && facts.callId) set("recording", { url: callLink(appUrl, facts.callId), text: "Listen" });
+  set("callId", facts.callId);
   const transcriptText = text(transcript, 50000);
   if (transcriptText) set("transcript", { text: transcriptText });
   return values;
