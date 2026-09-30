@@ -3,7 +3,6 @@ import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { FIELD_TYPES, suggestMapping } from "./monday/adapter.mjs";
 import { buildAuthorizeUrl, buildInstallUrl, createPkcePair, verifyMondayJwt } from "./monday/oauth.mjs";
 import { agentIdOf, connectionKeyFor, isConnectionUsable, providerIdOf } from "./provider.mjs";
-import { createCallsLog } from "./calls-log.mjs";
 import { createRequeuer } from "./requeue.mjs";
 
 const PROVIDER = "monday";
@@ -91,18 +90,19 @@ export function createCrmApi({
   // Re-send every recently failed call once the admin has fixed whatever
   // made it fail (reconnected, or corrected the mapping).
   const requeueFailed = createRequeuer({ store, enqueue, metrics, now });
-  const callsLog = createCallsLog({ store, providers: { get: () => adapter }, appUrl, metrics, log, now });
 
-  // The "Symantic AI Calls" board is created as soon as an agent connects.
-  // Never fatal: a refusal is saved on the connection and shown in settings,
-  // and the first synced call tries again.
-  async function ensureCallsBoard(connection) {
+  // The "Symantic AI Calls" board is created as soon as an agent connects,
+  // but NOT inside this request: creating it takes ~15 sequential Monday
+  // calls, which overran the callback's time budget (the customer saw
+  // "Service Unavailable" instead of being sent back). The sync worker
+  // builds it moments later; if even that fails, the first call does.
+  async function queueCallsBoard(connection) {
+    if (connection.callsBoard?.status === "active" && connection.callsBoard.id) return;
     try {
-      await sessions.withSession(connection, (session) => callsLog.ensureBoard(session, connection));
+      await enqueue({ kind: "ensure-calls-board", workspaceId: connection.workspaceId, provider: connection.provider });
     } catch (error) {
-      log.warn?.("Calls board not created at connect", { workspaceId: connection.workspaceId, ...describeError(error) });
+      log.warn?.("Calls board not queued at connect", { workspaceId: connection.workspaceId, ...describeError(error) });
     }
-    return await store.getConnection(connection.workspaceId, connection.provider) ?? connection;
   }
 
   async function revalidate(workspaceId, connection) {
@@ -278,7 +278,7 @@ export function createCrmApi({
         } else {
           connection = await revalidate(workspaceId, connection);
         }
-        connection = await ensureCallsBoard(connection);
+        await queueCallsBoard(connection);
         if (connection.connectionState === "connected") await requeueFailed(workspaceId, key);
         metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "connected" });
         log.info?.("CRM connected", { workspaceId, agentId: stateRecord.agentId, accountId: account.accountId });
