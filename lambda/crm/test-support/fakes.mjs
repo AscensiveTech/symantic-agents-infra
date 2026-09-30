@@ -317,10 +317,12 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
   const revoked = [];
   let tokenCounter = 0;
 
-  function addBoard({ name = "Leads", columns } = {}) {
+  function addBoard({ name = "Leads", columns, kind = "public", type = "board" } = {}) {
     const board = {
       id: id(),
       name,
+      kind,
+      type,
       columns: columns ?? [
         { id: "name", title: "Name", type: "name" },
         { id: "phone_mkx1", title: "Phone", type: "phone" },
@@ -608,6 +610,8 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
             boards: list.map((board) => ({
               id: board.id,
               name: board.name,
+              board_kind: board.kind,
+              type: board.type,
               workspace: { name: "Sales" },
               columns: board.columns.map((column) => ({
                 id: column.id,

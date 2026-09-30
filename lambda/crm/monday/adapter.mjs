@@ -383,12 +383,18 @@ export function createMondayCrmAdapter({ graphql }) {
           }`
         : `query {
             boards(limit: 100, state: active, order_by: used_at) {
-              id name columns { id title type settings }
+              id name board_kind type columns { id title type settings }
             }
           }`,
       variables: ids ? { ids } : {},
     });
-    return (data?.boards ?? []).map((board) => ({
+    // The picker lists only boards the whole team can see: private boards
+    // (and subitem/document boards) are left out. Validating an already
+    // mapped board by id skips this filter so an existing mapping keeps working.
+    const boards = (data?.boards ?? []).filter((board) =>
+      ids || (board.board_kind !== "private" && (board.type === undefined || board.type === null || board.type === "board"))
+    );
+    return boards.map((board) => ({
       id: String(board.id),
       name: board.name,
       workspaceName: null,
