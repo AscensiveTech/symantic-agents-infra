@@ -10,6 +10,7 @@
 //
 //   node scripts/migrate-crm-per-agent.mjs            # dry run (default)
 //   node scripts/migrate-crm-per-agent.mjs --apply    # write changes
+//   ... --agent <agentId>    # move it to this agent instead of the oldest
 //
 // Uses the AWS CLI (same credentials/region as Terraform). Table names
 // default to the symantic-dev stack; override with CRM_CONNECTIONS_TABLE,
@@ -18,6 +19,8 @@
 import { spawnSync } from "node:child_process";
 
 const apply = process.argv.includes("--apply");
+const agentFlag = process.argv.indexOf("--agent");
+const targetAgentId = agentFlag > -1 ? process.argv[agentFlag + 1] : null;
 const tables = {
   connections: process.env.CRM_CONNECTIONS_TABLE ?? "symantic-dev-crm-connections",
   links: process.env.CRM_LINKS_TABLE ?? "symantic-dev-crm-links",
@@ -70,7 +73,11 @@ for (const rawRow of legacy) {
     "--expression-attribute-values", JSON.stringify({ ":w": { S: row.workspaceId } }),
   ]).map(unmarshall).filter((agent) => agent.status !== "deleted")
     .sort((a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")));
-  const agent = agents[0];
+  const agent = targetAgentId ? agents.find((candidate) => candidate.agentId === targetAgentId) : agents[0];
+  if (targetAgentId && !agent) {
+    console.log(`- ${row.workspaceId}: agent ${targetAgentId} is not an active agent here; leaving the legacy row alone.`);
+    continue;
+  }
   if (!agent) {
     console.log(`- ${row.workspaceId}: no active agent; leaving the legacy row alone.`);
     continue;
