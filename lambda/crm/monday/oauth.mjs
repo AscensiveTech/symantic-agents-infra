@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
-import { CRM_ERROR, CrmError } from "../errors.mjs";
+import { CRM_ERROR, CrmError, looksLikeInactiveAccount } from "../errors.mjs";
 
 // Monday's OAuth 2.1 flow (the only one that works after 2026-10-01): PKCE
 // S256, one-hour JWT access tokens, rotating refresh tokens, and a hard
@@ -93,6 +93,11 @@ export function createMondayOAuthClient({
           `Monday ${operation} unavailable`,
           { statusCode: response.status, retryAfterSeconds: 30 },
         );
+      }
+      // A suspended/closed account is not a reason to reconnect: once the
+      // account is active again the same grant works.
+      if (looksLikeInactiveAccount(value?.error_description, value?.error, value?.message)) {
+        throw new CrmError(CRM_ERROR.ACCOUNT_INACTIVE, `Monday ${operation}: account inactive`, { statusCode: response.status });
       }
       // invalid_grant, revoked, expired, or a consumed rotating token: only a
       // fresh authorization fixes any of these.

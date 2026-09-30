@@ -6939,6 +6939,10 @@ function callDigestStore({ workspace = { workspaceId: "user-123", name: "Arc Den
       saved.push({ workspaceId, negativeSentimentAlert: settings });
       workspace = { ...workspace, negativeSentimentAlert: settings };
     },
+    async saveCrmReminderAlert(workspaceId, settings) {
+      saved.push({ workspaceId, crmReminderAlert: settings });
+      workspace = { ...workspace, crmReminderAlert: settings };
+    },
     async saveUsageThresholdAlert(workspaceId, settings) {
       saved.push({ workspaceId, usageThresholdAlert: settings });
       workspace = { ...workspace, usageThresholdAlert: settings };
@@ -7293,6 +7297,36 @@ test("usage-threshold-alert settings are an admin-only resource", async () => {
   const response = await handler(event);
 
   assert.equal(response.statusCode, 403);
+});
+
+// --- Monday reconnect reminder settings --------------------------------------
+
+test("crm-reminder-alert is on by default and saves up to 6 recipients, admin only", async () => {
+  const store = callDigestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const initial = await handler(companyAdminEvent("GET", "/workspaces/me/crm-reminder-alert"));
+  assert.deepEqual(JSON.parse(initial.body), { enabled: true, recipients: [] });
+
+  const saved = await handler(companyAdminEvent("PUT", "/workspaces/me/crm-reminder-alert", {
+    enabled: true,
+    recipients: ["Ops@ArcDental.com", "ops@arcdental.com"],
+  }));
+  assert.deepEqual(JSON.parse(saved.body), { enabled: true, recipients: ["ops@arcdental.com"] });
+  assert.equal(store.saved.at(-1).crmReminderAlert.recipients[0], "ops@arcdental.com");
+
+  const tooMany = await handler(companyAdminEvent("PUT", "/workspaces/me/crm-reminder-alert", {
+    enabled: true,
+    recipients: Array.from({ length: 7 }, (_, i) => `person${i}@arcdental.com`),
+  }));
+  assert.equal(tooMany.statusCode, 400);
+
+  const member = authenticatedEvent("GET", "/workspaces/me/crm-reminder-alert");
+  member.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  const memberStore = { async ensureWorkspace() {}, async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; } };
+  const memberHandler = createHandler({ getStore: async () => memberStore });
+  assert.equal((await memberHandler(member)).statusCode, 403);
 });
 
 // --- Notification history ------------------------------------------------------

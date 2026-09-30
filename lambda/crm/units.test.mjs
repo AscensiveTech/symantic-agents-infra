@@ -553,3 +553,51 @@ test("reconnect reminders fall back to every active company admin when the conne
   await remind(await store.getConnection("ws", "monday"));
   assert.deepEqual(sent, ["a@example.com"]);
 });
+
+test("reconnect reminders: the saved list is added to the connecting admin; switched off, nobody is emailed", async () => {
+  const now = Date.parse("2026-09-01T00:00:00Z");
+  const make = (settings) => {
+    const store = createMemoryCrmStore({
+      now: () => now,
+      memberships: { "user-dana": { workspaceId: "ws", status: "active", role: "company-admin", email: "dana@example.com" } },
+      agents: { "ws\0agent-1": { name: "Front Desk", status: "active" } },
+      reminderSettings: settings ? { ws: settings } : {},
+    });
+    store.seedConnection({ workspaceId: "ws", provider: "monday#agent-1", agentId: "agent-1", connectionState: "connected", authorizedBy: "user-dana", refreshTokenExpiresAt: now + 86_400_000 });
+    return store;
+  };
+  const sent = [];
+  const on = make({ enabled: true, recipients: ["ops@example.com", "DANA@example.com"] });
+  await createReauthReminders({ store: on, sendEmail: async (m) => { sent.push(m); }, appUrl: "https://app.test", now: () => now })(await on.getConnection("ws", "monday#agent-1"));
+  assert.deepEqual(sent.map((m) => m.to), ["dana@example.com", "ops@example.com"]);
+  assert.match(sent[0].html, /integrations\?agentId=agent-1&amp;crm=renew/);
+  assert.match(sent[0].html, /Renew Monday Connection/);
+  assert.match(sent[0].text, /boards and field mapping are kept/);
+  assert.match(sent[0].text, /"Front Desk" agent/);
+
+  const off = make({ enabled: false, recipients: ["ops@example.com"] });
+  const none = [];
+  const result = await createReauthReminders({ store: off, sendEmail: async (m) => { none.push(m); }, appUrl: "https://app.test", now: () => now })(await off.getConnection("ws", "monday#agent-1"));
+  assert.equal(result, false);
+  assert.equal(none.length, 0);
+  assert.equal((await off.getConnection("ws", "monday#agent-1")).reauthReminderStage, undefined, "stage not used up while off");
+});
+
+test("inactive Monday account: one notice per inactive spell, reset when it recovers", async () => {
+  const now = Date.parse("2026-09-01T00:00:00Z");
+  const store = createMemoryCrmStore({
+    now: () => now,
+    memberships: { "user-dana": { workspaceId: "ws", status: "active", role: "company-admin", email: "dana@example.com" } },
+  });
+  store.seedConnection({ workspaceId: "ws", provider: "monday#agent-1", connectionState: "connected", authorizedBy: "user-dana",
+    refreshTokenExpiresAt: now + 90 * 86_400_000, pausedUntil: now + 3_600_000, pauseReason: "account_inactive" });
+  const sent = [];
+  const remind = createReauthReminders({ store, sendEmail: async (m) => { sent.push(m); }, appUrl: "https://app.test", now: () => now });
+  assert.equal(await remind(await store.getConnection("ws", "monday#agent-1")), true);
+  assert.equal(await remind(await store.getConnection("ws", "monday#agent-1")), false);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].subject, /account inactive/);
+  assert.match(sent[0].text, /Check Again/);
+  await store.clearPause("ws", "monday#agent-1");
+  assert.equal((await store.getConnection("ws", "monday#agent-1")).accountInactiveNotifiedAt, undefined);
+});

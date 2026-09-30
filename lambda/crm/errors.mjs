@@ -17,6 +17,8 @@ export const CRM_ERROR = Object.freeze({
   AMBIGUOUS_MATCH: "ambiguous_match",
   NOT_CONNECTED: "not_connected",
   PROVIDER_ERROR: "provider_error",
+  // The customer's Monday account itself is suspended, closed or unpaid.
+  ACCOUNT_INACTIVE: "account_inactive",
 });
 
 const RETRYABLE = new Set([
@@ -29,7 +31,17 @@ const RETRYABLE = new Set([
   // Unrecognized provider errors are retried a bounded number of times and
   // then dead-lettered, where a person can look at them.
   CRM_ERROR.PROVIDER_ERROR,
+  // Retried slowly (a day apart) until the account is active again.
+  CRM_ERROR.ACCOUNT_INACTIVE,
 ]);
+
+// Monday documents no single code for a suspended, closed or unpaid account,
+// so recognise it from the error text.
+const INACTIVE_ACCOUNT = /account[^.]{0,40}\b(inactive|suspend\w*|deactivat\w*|disabled|frozen|closed|expired|locked)\b|\b(inactive|suspended|deactivated|frozen|closed)\b[^.]{0,20}account/i;
+
+export function looksLikeInactiveAccount(...texts) {
+  return texts.some((text) => typeof text === "string" && INACTIVE_ACCOUNT.test(text));
+}
 
 export class CrmError extends Error {
   constructor(code, message, {

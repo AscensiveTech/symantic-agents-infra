@@ -1463,6 +1463,34 @@ export function createHandler({
         return json(405, { message: "Method not allowed" });
       }
 
+      // Monday reconnect reminders: same shape as the usage alert (on by
+      // default, up to 6 people). The admin who connected an agent's Monday
+      // is always emailed on top of this list while it's on.
+      if (path === "/workspaces/me/crm-reminder-alert") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only workspace admins can manage Monday reconnect reminders" });
+        }
+        await store.ensureWorkspace(workspaceId);
+
+        if (method === "GET") {
+          const workspace = await store.getWorkspace(workspaceId);
+          return json(200, publicUsageThresholdAlert(workspace?.crmReminderAlert));
+        }
+
+        if (method === "PUT") {
+          const parsed = readUsageThresholdAlertSettings(readBody(event));
+          if (parsed.error) return json(400, { message: parsed.error });
+          await store.saveCrmReminderAlert(workspaceId, {
+            ...parsed.settings,
+            updatedAt: new Date().toISOString(),
+            updatedBy: actorDisplayName(event, actor),
+          });
+          return json(200, parsed.settings);
+        }
+
+        return json(405, { message: "Method not allowed" });
+      }
+
       if (path === "/workspaces/me/usage-threshold-alert/test" && method === "POST") {
         if (!isWorkspaceAdmin(actor)) {
           return json(403, { message: "Only workspace admins can manage usage threshold alerts" });
@@ -7174,6 +7202,15 @@ export function createDynamoStore(client, commands, tableNames) {
         TableName: tableNames.workspaces,
         Key: marshall({ workspaceId }),
         UpdateExpression: "SET negativeSentimentAlert = :alert",
+        ExpressionAttributeValues: marshall({ ":alert": settings }),
+      }));
+    },
+
+    async saveCrmReminderAlert(workspaceId, settings) {
+      await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.workspaces,
+        Key: marshall({ workspaceId }),
+        UpdateExpression: "SET crmReminderAlert = :alert",
         ExpressionAttributeValues: marshall({ ":alert": settings }),
       }));
     },

@@ -1272,3 +1272,81 @@ test("board sync toggle: off skips your board but keeps the mapping; on resumes 
   const on = await h.api("PUT", "/crm/board-sync", { sub: "sub-admin-a", body: { enabled: true } });
   assert.equal(JSON.parse(on.body).boardSyncEnabled, true);
 });
+
+// ============================================================== renewal ====
+
+test("renewal: renewing keeps the mapping and the calls board, and replays missed calls", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const before = h.store.connections.get("ws-a\0monday#agent-a");
+  const boardId = before.callsBoard.id;
+  const mapping = structuredClone(before.mapping);
+  await h.connect();
+  const after = h.store.connections.get("ws-a\0monday#agent-a");
+  assert.deepEqual(after.mapping, mapping);
+  assert.equal(after.callsBoard.id, boardId);
+  assert.equal(after.mappingStatus, "valid");
+  assert.equal(h.monday.createdBoards.length, 1);
+});
+
+test("renewal: a failure mid-renewal leaves the working connection exactly as it was", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const before = structuredClone(h.store.connections.get("ws-a\0monday#agent-a"));
+  h.monday.failNext("me", { status: 500, body: {} });
+  const { callback } = await h.connect();
+  assert.match(callback.headers.location, /crm=error&reason=connection_failed/);
+  const after = h.store.connections.get("ws-a\0monday#agent-a");
+  assert.equal(after.encryptedRefreshToken, before.encryptedRefreshToken);
+  assert.equal(after.tokenVersion, before.tokenVersion);
+  assert.deepEqual(after.mapping, before.mapping);
+});
+
+test("renewal: approving with a different Monday account keeps but flags the mapping and logs to a new board there", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const firstBoard = h.store.connections.get("ws-a\0monday#agent-a").callsBoard.id;
+  h.monday.switchAccount("7770002", "Other Co");
+  await h.connect();
+  const after = h.store.connections.get("ws-a\0monday#agent-a");
+  assert.equal(after.mappingStatus, "invalid");
+  assert.equal(after.mappingProblems[0].code, "account_changed");
+  assert.match(after.mappingProblems[0].message, /different Monday account \(Other Co\)/);
+  assert.ok(after.mapping, "mapping kept so switching back fixes it");
+  assert.notEqual(after.callsBoard.id, firstBoard);
+});
+
+test("inactive Monday account: syncing pauses for a day (no retry storm), calls still answered, Check Again resumes and replays", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  h.monday.failNext("create_calls_row", { status: 200, body: h.monday.errorBody("AccountDeactivated", "This account has been deactivated") });
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  const event = h.queue.receive();
+  h.queue.settle(event, await h.worker(event));
+  const connection = h.store.connections.get("ws-a\0monday#agent-a");
+  assert.equal(connection.pauseReason, "account_inactive");
+  assert.equal(connection.connectionState, "connected", "not a reconnect");
+  assert.ok(h.queue.messages[0].visibleAt - h.clock() >= 11 * 3_600_000, "retried hours later (SQS caps a delay at 12h), not in seconds");
+
+  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
+  assert.equal(lookup.reason, "paused", "the live call skips Monday instead of waiting on it");
+
+  const pub = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
+  assert.equal(pub.pauseReason, "account_inactive");
+
+  const check = await h.api("POST", "/crm/check-account", { sub: "sub-admin-a", body: {} });
+  assert.equal(check.statusCode, 200);
+  assert.equal(JSON.parse(check.body).pausedUntil, null);
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").pauseReason, undefined);
+});
+
+test("inactive Monday account: Check Again while still inactive explains what to do", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  h.monday.failNext("me", { status: 200, body: h.monday.errorBody("AccountSuspended", "Account is suspended") });
+  const check = await h.api("POST", "/crm/check-account", { sub: "sub-admin-a", body: {} });
+  assert.equal(check.statusCode, 409);
+  assert.equal(JSON.parse(check.body).error, "account_inactive");
+  assert.match(JSON.parse(check.body).message, /Reactivate it in Monday/);
+});

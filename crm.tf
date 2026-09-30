@@ -194,6 +194,7 @@ locals {
     BUSINESS_PROFILES_TABLE     = aws_dynamodb_table.control_plane["business_profiles"].name
     CONTACTS_TABLE              = aws_dynamodb_table.control_plane["contacts"].name
     AGENTS_TABLE                = aws_dynamodb_table.control_plane["agents"].name
+    WORKSPACES_TABLE            = aws_dynamodb_table.control_plane["workspaces"].name
     WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
     OAUTH_STATES_TABLE          = aws_dynamodb_table.oauth_states.name
     CRM_TOKENS_KMS_KEY_ID       = aws_kms_key.crm_tokens.arn
@@ -277,6 +278,13 @@ resource "aws_iam_role_policy" "crm_runtime" {
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem"]
         Resource = aws_dynamodb_table.control_plane["agents"].arn
+      },
+      {
+        # The workspace's "Monday Reconnect Reminders" recipients.
+        Sid      = "ReadReminderSettings"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["workspaces"].arn
       },
       {
         # Reconnect reminders fall back to every company admin.
@@ -404,6 +412,7 @@ locals {
     "PUT /crm/mapping",
     "PUT /crm/board-sync",
     "POST /crm/sync/retry",
+    "POST /crm/check-account",
   ])
 
   # Both verify themselves: the callback by its one-time OAuth state, the
@@ -722,4 +731,23 @@ output "crm_sync_queue_url" {
 output "crm_sync_dlq_url" {
   description = "Dead-letter queue for CRM sync; redrive after fixing the cause."
   value       = aws_sqs_queue.crm_sync_dlq.url
+}
+
+# Repeated failures finishing a Monday connect or renewal (Monday down, a
+# bad app secret, or a bug on our side). Customers see a message and can
+# retry; this tells us before they ask.
+resource "aws_cloudwatch_metric_alarm" "crm_oauth_failures" {
+  alarm_name          = "${local.name_prefix}-crm-oauth-failures"
+  alarm_description   = "5+ Monday connect/renewal attempts failed within an hour."
+  namespace           = "Symantic/CRM"
+  metric_name         = "OAuth"
+  dimensions          = { Provider = "monday", Outcome = "failed" }
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 1
+  threshold           = 5
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.crm_alarm_actions
+  ok_actions          = local.crm_alarm_actions
 }
