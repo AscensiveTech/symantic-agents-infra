@@ -1289,3 +1289,54 @@ test("disconnecting Cal.com removes the stored API key", async () => {
   assert.equal(stored.connectionState, "disconnected");
   assert.equal(stored.encryptedApiKey, undefined);
 });
+
+// ------------------------------------------------ disconnect for deletion ----
+
+function deletionHandler(records, { revokeStatus = 200, revokeFails = false } = {}) {
+  const connections = createInMemoryConnectionStore(records);
+  const revoked = [];
+  const handler = createHandler({
+    getConnectionStore: async () => connections,
+    getTokenCrypto: async () => ({ encryptToken: async () => "x", decryptToken: async () => "plain-refresh" }),
+    fetchImpl: async (url, init) => {
+      if (revokeFails) throw new Error("network down");
+      revoked.push({ url, body: String(init?.body) });
+      return new Response("", { status: revokeStatus });
+    },
+  });
+  return { handler, connections, revoked };
+}
+
+test("disconnect for deletion: Google is revoked at Google, our tokens cleared, and it's verified", async () => {
+  const { handler, connections, revoked } = deletionHandler([{
+    workspaceId, agentId, provider: "google-calendar", accountEmail: "dana@arcdental.com",
+    encryptedRefreshToken: "encrypted:a", connectionState: "connected",
+  }]);
+  const result = await handler({ action: "disconnect-calendar", workspaceId, agentId });
+  assert.deepEqual(result, { status: "done", provider: "google-calendar", accountEmail: "dana@arcdental.com" });
+  assert.equal(revoked[0].url, "https://oauth2.googleapis.com/revoke");
+  assert.match(revoked[0].body, /token=plain-refresh/);
+  const stored = await connections.get(workspaceId, agentId);
+  assert.equal(stored.connectionState, "disconnected");
+  assert.equal(stored.encryptedRefreshToken, undefined);
+});
+
+test("disconnect for deletion: an already-revoked Google token counts as done; Google down is reported, not hidden", async () => {
+  const seed = () => [{ workspaceId, agentId, provider: "google-calendar", encryptedRefreshToken: "encrypted:a", connectionState: "connected" }];
+  const already = deletionHandler(seed(), { revokeStatus: 400 });
+  assert.equal((await already.handler({ action: "disconnect-calendar", workspaceId, agentId })).status, "done");
+  const down = deletionHandler(seed(), { revokeStatus: 503 });
+  const result = await down.handler({ action: "disconnect-calendar", workspaceId, agentId });
+  assert.equal(result.status, "failed");
+  assert.equal(result.code, "provider_unavailable");
+  assert.equal((await down.connections.get(workspaceId, agentId)).connectionState, "connected", "nothing cleared when the revoke failed");
+});
+
+test("disconnect for deletion: Cal.com key removed; no calendar at all is 'none'", async () => {
+  const cal = deletionHandler([{ workspaceId, agentId, provider: "cal-com", encryptedApiKey: "enc:key", connectionState: "connected" }]);
+  const result = await cal.handler({ action: "disconnect-calendar", workspaceId, agentId });
+  assert.equal(result.status, "done");
+  assert.equal((await cal.connections.get(workspaceId, agentId)).encryptedApiKey, undefined);
+  const empty = deletionHandler([]);
+  assert.deepEqual(await empty.handler({ action: "disconnect-calendar", workspaceId, agentId }), { status: "none" });
+});

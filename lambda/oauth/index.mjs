@@ -507,7 +507,54 @@ export function createHandler(options = {}) {
       DEFAULT_INVITE_TTL_DAYS,
     now = Date.now,
     randomState = () => randomBytes(32).toString("base64url"),
+    fetchImpl = globalThis.fetch,
   } = options;
+
+  // Invoked directly by the BFF while an agent is being deleted. Revokes the
+  // agent's calendar access where the provider allows it (Google), always
+  // clears our stored credentials, then re-reads the record to prove it.
+  // Never throws: the BFF gets a status it can show the customer.
+  async function disconnectCalendarForDeletion({ workspaceId, agentId }) {
+    if (typeof workspaceId !== "string" || !workspaceId || typeof agentId !== "string" || !agentId) {
+      return { status: "failed", code: "invalid_request" };
+    }
+    try {
+      const store = await getConnectionStore();
+      const current = await store.get(workspaceId, agentId);
+      const hasCredentials = Boolean(current?.encryptedRefreshToken || current?.encryptedApiKey);
+      if (!current || current.connectionState === "disconnected" || !hasCredentials) {
+        return { status: "none" };
+      }
+      const provider = current.provider;
+      if (provider === "google-calendar" && current.encryptedRefreshToken) {
+        const tokenCrypto = await getTokenCrypto();
+        const refreshToken = await tokenCrypto.decryptToken({
+          encryptedToken: current.encryptedRefreshToken,
+          workspaceId,
+          agentId,
+          provider,
+        });
+        const response = await fetchImpl("https://oauth2.googleapis.com/revoke", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ token: refreshToken }).toString(),
+        });
+        // 400 means Google already considers the token invalid - revoked.
+        if (!response.ok && response.status !== 400) {
+          return { status: "failed", provider, code: "provider_unavailable", providerStatus: response.status };
+        }
+      }
+      await store.disconnect(workspaceId, agentId);
+      const after = await store.get(workspaceId, agentId);
+      if (after?.encryptedRefreshToken || after?.encryptedApiKey) {
+        return { status: "failed", provider, code: "not_cleared" };
+      }
+      return { status: "done", provider, accountEmail: current.accountEmail ?? null };
+    } catch (error) {
+      console.error("Calendar disconnect for deletion failed", { name: error?.name });
+      return { status: "failed", code: "unexpected" };
+    }
+  }
 
   async function requireAdminIdentity(event, membershipStore) {
     const identity = await resolveIdentity(event, membershipStore);
@@ -547,6 +594,7 @@ export function createHandler(options = {}) {
   }
 
   return async function handle(event) {
+    if (event?.action === "disconnect-calendar") return disconnectCalendarForDeletion(event);
     const method = event?.requestContext?.http?.method;
     const path = event?.rawPath ?? event?.requestContext?.http?.path ?? "";
     const startMatch = path.match(/^\/oauth\/([^/]+)\/start$/);

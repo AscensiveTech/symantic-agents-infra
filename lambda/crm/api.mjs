@@ -121,6 +121,48 @@ export function createCrmApi({
     }
   }
 
+  // Revoke at Monday (best effort - the grant dies with our copy either way)
+  // and delete our tokens.
+  async function disconnectConnection(connection, reason) {
+    if (connection.encryptedRefreshToken) {
+      try {
+        const refreshToken = await tokenCrypto.decrypt({
+          ciphertext: connection.encryptedRefreshToken,
+          workspaceId: connection.workspaceId,
+          provider: PROVIDER,
+          purpose: "refresh",
+        });
+        await oauthClient.revoke({ token: refreshToken, hint: "refresh_token" });
+      } catch (error) {
+        log.warn?.("Monday token revoke failed; deleting local tokens anyway", describeError(error));
+      }
+    }
+    return store.disconnect(connection.workspaceId, connection.provider, reason);
+  }
+
+  // Called (direct invoke) while an agent is being deleted. Never throws;
+  // "done" only after re-reading the row shows no tokens left.
+  async function disconnectAgent({ workspaceId, agentId }) {
+    if (typeof workspaceId !== "string" || !workspaceId || typeof agentId !== "string" || !agentId) {
+      return { status: "failed", code: "invalid_request" };
+    }
+    try {
+      const key = connectionKeyFor(PROVIDER, agentId);
+      const connection = await store.getConnection(workspaceId, key);
+      if (!connection || connection.connectionState === "disconnected") return { status: "none" };
+      await disconnectConnection(connection, "agent_deleted");
+      const after = await store.getConnection(workspaceId, key);
+      if (after?.connectionState !== "disconnected" || after.encryptedRefreshToken || after.encryptedAccessToken) {
+        return { status: "failed", code: "not_cleared" };
+      }
+      log.info?.("CRM disconnected for agent deletion", { workspaceId, agentId });
+      return { status: "done", accountName: connection.accountName ?? null };
+    } catch (error) {
+      log.error?.("CRM disconnect for agent deletion failed", { workspaceId, ...describeError(error) });
+      return { status: "failed", code: "unexpected" };
+    }
+  }
+
   const routes = {
     async "GET /crm/connection"(event) {
       const identity = await requireIdentity(event);
@@ -253,22 +295,7 @@ export function createCrmApi({
       const key = await requireAgentKey(identity, event);
       const connection = await store.getConnection(identity.workspaceId, key);
       if (!connection) return json(200, null);
-      // Best effort: revoke at Monday so the grant dies there too. Our copy is
-      // deleted either way.
-      if (connection.encryptedRefreshToken) {
-        try {
-          const refreshToken = await tokenCrypto.decrypt({
-            ciphertext: connection.encryptedRefreshToken,
-            workspaceId: identity.workspaceId,
-            provider: PROVIDER,
-            purpose: "refresh",
-          });
-          await oauthClient.revoke({ token: refreshToken, hint: "refresh_token" });
-        } catch (error) {
-          log.warn?.("Monday token revoke failed; deleting local tokens anyway", describeError(error));
-        }
-      }
-      const saved = await store.disconnect(identity.workspaceId, key, "user_disconnected");
+      const saved = await disconnectConnection(connection, "user_disconnected");
       log.info?.("CRM disconnected", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), by: identity.userId });
       return json(200, toPublicConnection(saved, now));
     },
@@ -412,7 +439,7 @@ export function createCrmApi({
     },
   };
 
-  return async function handleApi(event) {
+  async function handleApi(event) {
     const method = event?.requestContext?.http?.method;
     const path = event?.rawPath ?? event?.requestContext?.http?.path ?? "";
     const route = routes[`${method} ${path}`];
@@ -426,7 +453,9 @@ export function createCrmApi({
       log.error?.("CRM API request failed", { path, ...describeError(error) });
       return json(500, { error: "internal_error", message: "The request could not be completed." });
     }
-  };
+  }
+  handleApi.disconnectAgent = disconnectAgent;
+  return handleApi;
 }
 
 // Plain-language status of the auto-created calls board.

@@ -1350,3 +1350,18 @@ test("inactive Monday account: Check Again while still inactive explains what to
   assert.equal(JSON.parse(check.body).error, "account_inactive");
   assert.match(JSON.parse(check.body).message, /Reactivate it in Monday/);
 });
+
+test("agent deletion: disconnect-agent revokes and clears this agent's Monday only, and is 'none' when there's nothing", async () => {
+  const h = createHarness();
+  h.store.seedAgent("ws-a", "agent-a2", { name: "Spanish Line" });
+  await h.connectAndMap();
+  const result = await h.runtime.disconnectAgent({ workspaceId: "ws-a", agentId: "agent-a" });
+  assert.equal(result.status, "done");
+  assert.equal(result.accountName, "Acme Dental");
+  const row = h.store.connections.get("ws-a\0monday#agent-a");
+  assert.equal(row.connectionState, "disconnected");
+  assert.equal(row.encryptedRefreshToken, undefined);
+  assert.equal(h.monday.revoked.length, 1);
+  assert.deepEqual(await h.runtime.disconnectAgent({ workspaceId: "ws-a", agentId: "agent-a2" }), { status: "none" });
+  assert.deepEqual(await h.runtime.disconnectAgent({ workspaceId: "ws-a", agentId: "agent-a" }), { status: "none" }, "safe to run twice");
+});
