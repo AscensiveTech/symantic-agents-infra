@@ -727,12 +727,17 @@ export function createRetellClient({
       try {
         const existing = await retellRequest(`/get-agent/${encodeURIComponent(required(retellAgentId, "retellAgentId"))}`);
         llmId = existing?.response_engine?.type === "retell-llm" ? existing.response_engine.llm_id : null;
-      } catch {
-        // Agent may already be gone or unreachable - still try the delete below.
+      } catch (error) {
+        // Already gone (404): nothing left to delete. Anything else fails the
+        // step, so it's retried instead of silently leaving the LLM behind.
+        if (error?.providerStatus === 404) return;
+        throw error;
       }
       await retellRequest(`/delete-agent/${encodeURIComponent(retellAgentId)}`, { method: "DELETE" });
       if (llmId) {
-        await retellRequest(`/delete-retell-llm/${encodeURIComponent(llmId)}`, { method: "DELETE" });
+        await retellRequest(`/delete-retell-llm/${encodeURIComponent(llmId)}`, { method: "DELETE" }).catch((error) => {
+          if (error?.providerStatus !== 404) throw error;
+        });
       }
     },
 

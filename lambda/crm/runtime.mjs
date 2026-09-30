@@ -47,6 +47,20 @@ export function composeRuntime({
     metrics,
   });
   const crmSync = createCrmSync({ store, providers, sessions, appUrl, metrics, now, log });
+  const api = createCrmApi({
+    store,
+    adapter,
+    oauthClient,
+    sessions,
+    tokenCrypto,
+    getAppSecret,
+    enqueue,
+    metrics,
+    appUrl,
+    apiBaseUrl,
+    now,
+    log,
+  });
   return {
     store,
     adapter,
@@ -66,20 +80,8 @@ export function composeRuntime({
       now,
       log,
     }),
-    api: createCrmApi({
-      store,
-      adapter,
-      oauthClient,
-      sessions,
-      tokenCrypto,
-      getAppSecret,
-      enqueue,
-      metrics,
-      appUrl,
-      apiBaseUrl,
-      now,
-      log,
-    }),
+    api,
+    disconnectAgent: api.disconnectAgent,
   };
 }
 

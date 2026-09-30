@@ -272,3 +272,20 @@ resource "aws_lambda_permission" "oauth_api_gateway" {
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.bff.execution_arn}/*/*"
 }
+
+# Deleting an agent: the BFF asks this Lambda (which holds the calendar
+# tokens) to revoke and clear that agent's calendar connection first.
+resource "aws_iam_role_policy" "bff_disconnect_calendar" {
+  name = "${local.name_prefix}-bff-disconnect-calendar"
+  role = aws_iam_role.bff_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "DisconnectCalendarOnAgentDelete"
+      Effect   = "Allow"
+      Action   = ["lambda:InvokeFunction"]
+      Resource = aws_lambda_function.oauth.arn
+    }]
+  })
+}

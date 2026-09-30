@@ -1,3 +1,4 @@
+import { runAgentTeardown } from "./agent-teardown.mjs";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 import {
@@ -824,6 +825,7 @@ export function createHandler({
   toolBaseUrl = process.env.PUBLIC_API_BASE_URL,
   invokeCallDigest = defaultInvokeCallDigest,
   lookupCrmContext = defaultLookupCrmContext,
+  disconnectIntegrations = defaultDisconnectIntegrations,
   emailSenderAddress = process.env.EMAIL_SENDER_ADDRESS,
 } = {}) {
   // A new handler may be backed by a different store (tests, or a config
@@ -2371,14 +2373,36 @@ export function createHandler({
         void otherAgents;
         const providers = await getProviders();
 
-        if (agent.retellAgentId) {
-          await providers.retell.deleteAgentAndLlm(agent.retellAgentId).catch(() => {});
-        }
-        if (phoneNumber?.retellPhoneNumberId) {
-          await providers.retell.deletePhoneNumber(phoneNumber.retellPhoneNumberId).catch(() => {});
-        }
-        if (phoneNumber?.telnyxNumberId) {
-          await providers.telnyx.releaseNumber(phoneNumber.telnyxNumberId).catch(() => {});
+        // Calendar, Monday, Retell and Telnyx are each verifiably removed
+        // before the agent is marked deleted. If any step can't finish, the
+        // agent stays (flagged "incomplete" with the reason and what to do)
+        // and a retry resumes from the step that failed.
+        const integrations = await disconnectIntegrations();
+        const teardown = await runAgentTeardown({
+          workspaceId,
+          agent: { ...agent, agentId },
+          phoneNumber,
+          previous: agent.deletion?.steps,
+          services: {
+            disconnectCalendar: integrations.disconnectCalendar,
+            disconnectCrm: integrations.disconnectCrm,
+            retell: providers.retell,
+            telnyx: providers.telnyx,
+          },
+        });
+        if (!teardown.complete) {
+          const deletion = { status: "incomplete", steps: teardown.steps, updatedAt: new Date().toISOString() };
+          await store.updateAgentRuntime(workspaceId, agentId, { deletion });
+          console.warn("Agent deletion incomplete", {
+            workspaceId,
+            agentId,
+            failed: teardown.steps.find((step) => step.status === "failed")?.id,
+          });
+          return json(409, {
+            code: "deletion_incomplete",
+            message: "The agent couldn't be fully deleted yet. Nothing was deleted that can't be retried.",
+            deletion,
+          });
         }
         if (phoneNumber?.phoneNumberId) {
           await store.deletePhoneNumberRecord(workspaceId, phoneNumber.phoneNumberId);
@@ -2397,9 +2421,10 @@ export function createHandler({
             // agent used to have, so it has to be copied onto the agent
             // record itself here or it's lost for good.
             ...(phoneNumber?.telnyxPhoneNumber ? { deletedPhoneNumber: phoneNumber.telnyxPhoneNumber } : {}),
+            deletion: { status: "complete", steps: teardown.steps, completedAt: deletedAt },
             updatedAt: deletedAt,
           });
-          return json(200, toPublicAgent(updated));
+          return json(200, { ...toPublicAgent(updated), teardown: teardown.steps });
         } catch (error) {
           if (isConditionalCheckFailed(error)) {
             return json(404, { message: "Agent not found" });
@@ -8714,6 +8739,32 @@ async function notifyCrmFollowUp({ workspaceId, callId }) {
   } catch (error) {
     console.warn("CRM follow-up sync not requested", { name: error?.name });
   }
+}
+
+let integrationsLambdaPromise;
+
+// Synchronous invokes of the calendar (oauth) and CRM Lambdas, which own
+// those tokens. Each returns { status: "done" | "none" | "failed", ... }.
+async function defaultDisconnectIntegrations() {
+  integrationsLambdaPromise ??= import("@aws-sdk/client-lambda")
+    .then((lambda) => ({ lambda, client: new lambda.LambdaClient({}) }));
+  const { lambda, client } = await integrationsLambdaPromise;
+  async function invoke(functionName, payload) {
+    if (!functionName) return { status: "none" };
+    const result = await client.send(new lambda.InvokeCommand({
+      FunctionName: functionName,
+      Payload: new TextEncoder().encode(JSON.stringify(payload)),
+    }));
+    if (result.FunctionError) throw new Error(`Integration function failed: ${result.FunctionError}`);
+    const text = new TextDecoder().decode(result.Payload ?? new Uint8Array());
+    return text ? JSON.parse(text) : { status: "failed", code: "empty_response" };
+  }
+  return {
+    disconnectCalendar: ({ workspaceId, agentId }) =>
+      invoke(process.env.OAUTH_FUNCTION_NAME, { action: "disconnect-calendar", workspaceId, agentId }),
+    disconnectCrm: ({ workspaceId, agentId }) =>
+      invoke(process.env.CRM_LOOKUP_FUNCTION_NAME, { action: "disconnect-agent", workspaceId, agentId }),
+  };
 }
 
 // "Send me a test" runs the real digest code path synchronously, so the admin

@@ -1072,6 +1072,137 @@ test("DELETE agent is refused for a non-admin", async () => {
   assert.equal(response.statusCode, 403);
 });
 
+const noIntegrations = async () => ({
+  disconnectCalendar: async () => ({ status: "none" }),
+  disconnectCrm: async () => ({ status: "none" }),
+});
+
+function deletableAgentFixture({ retell = {}, telnyx = {}, calendar, crm, deletion } = {}) {
+  const calls = [];
+  const updates = [];
+  let agent = {
+    workspaceId: "user-123", agentId: "agent-123", id: "agent-123", name: "Maya", status: "active",
+    retellAgentId: "retell-agent-1", configuration: { knowledgeBaseIds: [] }, ...(deletion ? { deletion } : {}),
+  };
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return agent; },
+    async getPhoneNumberForAgent() {
+      return { phoneNumberId: "phone-1", retellPhoneNumberId: "+17035550133", telnyxNumberId: "telnyx-num-1", telnyxPhoneNumber: "+17035550199" };
+    },
+    async listCalls() { return []; },
+    async listAgents() { return [agent]; },
+    async deletePhoneNumberRecord(workspaceId, id) { calls.push(["deletePhoneNumberRecord", id]); },
+    async updateAgentRuntime(workspaceId, agentId, next) {
+      updates.push(next);
+      agent = { ...agent, ...next };
+      return agent;
+    },
+  };
+  const providers = {
+    retell: {
+      deleteAgentAndLlm: retell.deleteAgentAndLlm ?? (async (id) => { calls.push(["deleteAgentAndLlm", id]); }),
+      deletePhoneNumber: retell.deletePhoneNumber ?? (async (id) => { calls.push(["deletePhoneNumber", id]); }),
+    },
+    telnyx: {
+      releaseNumber: telnyx.releaseNumber ?? (async (id) => { calls.push(["releaseNumber", id]); }),
+    },
+  };
+  const integrations = async () => ({
+    disconnectCalendar: calendar ?? (async () => ({ status: "done", provider: "google-calendar", accountEmail: "dana@arcdental.com" })),
+    disconnectCrm: crm ?? (async () => ({ status: "done", accountName: "Arc Dental" })),
+  });
+  return { store, providers, integrations, calls, updates, getAgent: () => agent };
+}
+
+async function deleteWith(fixture) {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => fixture.store,
+    getProviders: async () => fixture.providers,
+    disconnectIntegrations: fixture.integrations,
+  });
+  return handler(authenticatedEvent("DELETE", "/workspaces/me/agents/agent-123"));
+}
+
+test("DELETE agent disconnects the calendar and Monday first, then Retell and Telnyx, and returns the verified checklist", async () => {
+  const order = [];
+  const fixture = deletableAgentFixture({
+    calendar: async (input) => { order.push(["calendar", input.agentId]); return { status: "done", provider: "google-calendar", accountEmail: "dana@arcdental.com" }; },
+    crm: async (input) => { order.push(["crm", input.agentId]); return { status: "done", accountName: "Arc Dental" }; },
+  });
+  const response = await deleteWith(fixture);
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body);
+  assert.equal(body.status, "deleted");
+  assert.deepEqual(body.teardown.map((step) => [step.id, step.status]), [
+    ["calendar", "done"], ["crm", "done"], ["retell_agent", "done"], ["retell_number", "done"], ["telnyx_number", "done"],
+  ]);
+  assert.equal(body.teardown[0].accountEmail, "dana@arcdental.com");
+  assert.equal(body.teardown[1].accountName, "Arc Dental");
+  assert.equal(body.teardown[4].phoneNumber, "+17035550199");
+  assert.deepEqual(order, [["calendar", "agent-123"], ["crm", "agent-123"]]);
+});
+
+test("DELETE agent: if Telnyx fails, the agent is NOT deleted; the reason and fix are saved, and a retry finishes only what's left", async () => {
+  let telnyxUp = false;
+  const fixture = deletableAgentFixture({
+    telnyx: {
+      releaseNumber: async (id) => {
+        if (!telnyxUp) throw Object.assign(new Error("down"), { providerStatus: 503 });
+        fixture.calls.push(["releaseNumber", id]);
+      },
+    },
+  });
+  const first = await deleteWith(fixture);
+  assert.equal(first.statusCode, 409);
+  const body = JSON.parse(first.body);
+  assert.equal(body.code, "deletion_incomplete");
+  const telnyx = body.deletion.steps.find((step) => step.id === "telnyx_number");
+  assert.equal(telnyx.status, "failed");
+  assert.match(telnyx.reason, /Telnyx didn't respond/);
+  assert.match(telnyx.fix, /Retry Deletion/);
+  assert.notEqual(fixture.getAgent().status, "deleted");
+  assert.equal(fixture.calls.filter(([name]) => name === "deletePhoneNumberRecord").length, 0, "phone record kept");
+
+  telnyxUp = true;
+  fixture.calls.length = 0;
+  const retry = await deleteWith(fixture);
+  assert.equal(retry.statusCode, 200);
+  assert.deepEqual(fixture.calls.map(([name]) => name), ["releaseNumber", "deletePhoneNumberRecord"], "finished steps are not repeated");
+  assert.equal(JSON.parse(retry.body).status, "deleted");
+});
+
+test("DELETE agent: already-gone resources (404) count as done, and a rejected request asks for support", async () => {
+  const gone = deletableAgentFixture({
+    retell: { deleteAgentAndLlm: async () => { throw Object.assign(new Error("gone"), { providerStatus: 404 }); } },
+    calendar: async () => ({ status: "none" }),
+    crm: async () => ({ status: "none" }),
+  });
+  assert.equal((await deleteWith(gone)).statusCode, 200);
+
+  const rejected = deletableAgentFixture({
+    retell: { deleteAgentAndLlm: async () => { throw Object.assign(new Error("no"), { providerStatus: 401 }); } },
+  });
+  const response = await deleteWith(rejected);
+  assert.equal(response.statusCode, 409);
+  const step = JSON.parse(response.body).deletion.steps.find((item) => item.id === "retell_agent");
+  assert.match(step.reason, /Retell rejected the request \(401\)/);
+  assert.match(step.fix, /Contact support and mention reference agent-123/);
+  const later = JSON.parse(response.body).deletion.steps.find((item) => item.id === "telnyx_number");
+  assert.equal(later.status, "pending", "nothing after a failure is touched");
+});
+
+test("DELETE agent: a calendar provider that's down stops the deletion before anything else is removed", async () => {
+  const fixture = deletableAgentFixture({
+    calendar: async () => ({ status: "failed", provider: "google-calendar", code: "provider_unavailable" }),
+  });
+  const response = await deleteWith(fixture);
+  assert.equal(response.statusCode, 409);
+  assert.equal(fixture.calls.length, 0, "Monday, Retell and Telnyx untouched");
+  assert.match(JSON.parse(response.body).deletion.steps[0].reason, /Google didn't respond/);
+});
+
 test("DELETE agent tears down the Retell agent/LLM and the Telnyx number, only unassigns its Library items, and records a history summary", async () => {
   const providerCalls = [];
   const storeCalls = [];
@@ -1133,7 +1264,7 @@ test("DELETE agent tears down the Retell agent/LLM and the Telnyx number, only u
     },
   };
   const { createHandler } = await loadBff();
-  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers, disconnectIntegrations: noIntegrations });
 
   const response = await handler(companyAdminEvent("DELETE", "/workspaces/me/agents/agent-123"));
 
@@ -1182,7 +1313,7 @@ test("DELETE agent leaves deletedPhoneNumber unset when the agent never had a ph
   };
   const providers = { retell: {}, telnyx: {} };
   const { createHandler } = await loadBff();
-  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers });
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers, disconnectIntegrations: noIntegrations });
 
   const response = await handler(companyAdminEvent("DELETE", "/workspaces/me/agents/agent-draft-1"));
 
