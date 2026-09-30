@@ -168,7 +168,13 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
         // First connection: no mapping yet.
         if (!saved.mappingStatus) {
           return update(connections, { workspaceId, provider }, {
-            set: { mappingStatus: saved.mapping ? "unchecked" : "unconfigured", createdAt: saved.createdAt ?? timestamp },
+            // A brand-new connection logs to its calls board only; syncing
+            // to one of the customer's own boards is opt-in.
+            set: {
+              mappingStatus: saved.mapping ? "unchecked" : "unconfigured",
+              boardSyncEnabled: Boolean(saved.mapping),
+              createdAt: saved.createdAt ?? timestamp,
+            },
           });
         }
         return saved;
@@ -286,7 +292,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
           .filter((row) => row.crmProvider === provider);
         await Promise.all(rows.map((row) => update(tables.calls, { workspaceId, callId: row.callId }, {
           remove: [
-            "crmProvider", "crmStatus", "crmItemId", "crmItemUrl", "crmActivityId",
+            "crmProvider", "crmStatus", "crmItemId", "crmItemUrl", "crmActivityId", "crmCallsItemId",
             "crmCreated", "crmQueuedAt", "crmUpdatedAt", "crmLastErrorCode", "crmLastErrorAt",
           ],
           condition: "attribute_exists(workspaceId)",
@@ -349,6 +355,22 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
         conditional: true,
       });
       return Boolean(saved);
+    },
+
+    saveCallsBoard(workspaceId, provider, callsBoard) {
+      return update(connections, { workspaceId, provider }, {
+        set: { callsBoard },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
+    setBoardSyncEnabled(workspaceId, provider, enabled) {
+      return update(connections, { workspaceId, provider }, {
+        set: { boardSyncEnabled: Boolean(enabled), updatedAt: iso() },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
     },
 
     markAutoRequeued(workspaceId, provider) {

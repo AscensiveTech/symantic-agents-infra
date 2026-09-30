@@ -402,6 +402,7 @@ locals {
     "POST /crm/monday/start",
     "GET /crm/monday/boards",
     "PUT /crm/mapping",
+    "PUT /crm/board-sync",
     "POST /crm/sync/retry",
   ])
 

@@ -1,5 +1,6 @@
 import { CRM_ERROR, CrmError } from "../errors.mjs";
 import { countryForE164, nationalNumber, toE164 } from "../phone.mjs";
+import { CALLS_BOARD_COLUMNS } from "./calls-board.mjs";
 
 const MONDAY_PROVIDER_ID = "monday";
 
@@ -363,6 +364,77 @@ export function createMondayCrmAdapter({ graphql }) {
       const col = data?.create_column;
       if (!col?.id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the created column");
       return { id: col.id, title: col.title, type: col.type };
+    },
+
+    // ---- the auto-created calls board ----
+
+    // Creates the board in the account's Main Workspace as a Main (team
+    // visible) board, then its fixed columns. If a column can't be created
+    // the half-built board is archived, so a retry never leaves duplicates.
+    async createCallsBoard(session, { name }) {
+      const created = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "create_board",
+        query: `mutation ($name: String!) { create_board(board_name: $name, board_kind: public) { id } }`,
+        variables: { name },
+      });
+      const boardId = created?.create_board?.id ? String(created.create_board.id) : null;
+      if (!boardId) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the created board");
+      const columns = {};
+      try {
+        for (const column of CALLS_BOARD_COLUMNS) {
+          const defaults = column.labels
+            ? JSON.stringify({ labels: Object.fromEntries(column.labels.map((label, index) => [String(index + 1), label])) })
+            : undefined;
+          const data = await graphql.request({
+            accessToken: session.accessToken,
+            operation: "create_column",
+            query: `mutation ($board: ID!, $title: String!, $type: ColumnType!, $defaults: JSON) {
+              create_column(board_id: $board, title: $title, column_type: $type, defaults: $defaults) { id }
+            }`,
+            variables: { board: boardId, title: column.title, type: column.type, defaults },
+          });
+          const id = data?.create_column?.id;
+          if (!id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the created column");
+          columns[column.key] = String(id);
+        }
+      } catch (error) {
+        await graphql.request({
+          accessToken: session.accessToken,
+          operation: "archive_board",
+          query: `mutation ($board: ID!) { archive_board(board_id: $board) { id } }`,
+          variables: { board: boardId },
+        }).catch(() => {});
+        throw error;
+      }
+      return { boardId, columns };
+    },
+
+    async createCallsRow(session, boardId, { name, values }, { idempotencyKey } = {}) {
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "create_calls_row",
+        idempotencyKey,
+        query: `mutation ($board: ID!, $name: String!, $values: JSON!) {
+          create_item(board_id: $board, item_name: $name, column_values: $values, create_labels_if_missing: false) { id }
+        }`,
+        variables: { board: String(boardId), name, values: JSON.stringify(values) },
+      });
+      const id = data?.create_item?.id;
+      if (!id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the created row");
+      return String(id);
+    },
+
+    async updateCallsRow(session, boardId, itemId, values) {
+      if (!Object.keys(values).length) return;
+      await graphql.request({
+        accessToken: session.accessToken,
+        operation: "update_fields",
+        query: `mutation ($board: ID!, $item: ID!, $values: JSON!) {
+          change_multiple_column_values(board_id: $board, item_id: $item, column_values: $values, create_labels_if_missing: false) { id }
+        }`,
+        variables: { board: String(boardId), item: String(itemId), values: JSON.stringify(values) },
+      });
     },
 
     suggestMapping,

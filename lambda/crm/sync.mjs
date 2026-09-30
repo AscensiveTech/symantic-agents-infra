@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { buildCallActivity } from "./activity.mjs";
-import { deriveCallFacts, localDatePlusDays } from "./facts.mjs";
+import { createCallsLog } from "./calls-log.mjs";
+import { deriveCallFacts, followUpText, localDatePlusDays, transcriptText } from "./facts.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone } from "./phone.mjs";
 import { connectionKeyFor, isConnectionPaused, isConnectionUsable, providerIdOf } from "./provider.mjs";
@@ -41,6 +42,8 @@ export function createCrmSync({
   now = Date.now,
   log = console,
 }) {
+  const callsLog = createCallsLog({ store, providers, appUrl, metrics, log, now });
+
   async function finish(call, status, fields = {}) {
     await store.updateCallSync(call.workspaceId, call.callId, {
       crmStatus: status,
@@ -78,9 +81,6 @@ export function createCrmSync({
     if (connection.connectionState === "reauth_required") {
       return failPermanently(call, connection, new CrmError(CRM_ERROR.REAUTH_REQUIRED, "Reconnect Monday"));
     }
-    if (!isConnectionUsable(connection)) {
-      return failPermanently(call, connection, new CrmError(CRM_ERROR.MAPPING_INVALID, "Field mapping needs attention"));
-    }
     if (isConnectionPaused(connection, Number(now()))) {
       throw new CrmError(CRM_ERROR.DAILY_LIMIT, "CRM sync is paused", {
         retryAfterSeconds: Math.ceil((Number(connection.pausedUntil) - Number(now())) / 1000),
@@ -97,6 +97,38 @@ export function createCrmSync({
       return { status: "skipped", reason };
     }
     facts.companyName = await store.getContactCompany?.(workspaceId, facts.phoneE164).catch(() => null) ?? null;
+
+    // 1. The auto-created calls board: one row per call, written once.
+    if (!call.crmCallsItemId) {
+      try {
+        const rowId = await sessions.withSession(connection, (session) =>
+          callsLog.logCall(session, connection, call, facts, { idempotencyKey: `${idempotencyBaseFor(workspaceId, callId)}-calls` })
+        );
+        if (rowId) {
+          call.crmCallsItemId = rowId;
+          await store.updateCallSync(workspaceId, callId, { crmCallsItemId: rowId, crmProvider: connectionKey });
+        }
+      } catch (error) {
+        log.warn?.("CRM calls board write failed", { workspaceId, callId, attempt, ...describeError(error) });
+        return handleFailure({ error, call, connection, finalAttempt });
+      }
+    }
+
+    // 2. The customer's own board, only when that sync is switched on.
+    if (connection.boardSyncEnabled === false || !connection.mapping) {
+      await finish(call, "synced", {
+        crmProvider: connectionKey,
+        crmSyncedAt: new Date(Number(now())).toISOString(),
+        crmLastErrorCode: null,
+        crmLastErrorAt: null,
+      });
+      await store.recordSyncResult(workspaceId, connectionKey, { status: "synced" }).catch(() => {});
+      metrics?.count("SyncSucceeded", { Provider: providerId, Outcome: "calls_board" });
+      return { status: "synced", callsItemId: call.crmCallsItemId ?? null };
+    }
+    if (!isConnectionUsable(connection)) {
+      return failPermanently(call, connection, new CrmError(CRM_ERROR.MAPPING_INVALID, "Field mapping needs attention"));
+    }
 
     const linkKey = linkKeyFor(connectionKey, facts.phoneE164);
     // Unique per attempt, not per call: two deliveries of the same message
@@ -227,7 +259,7 @@ export function createCrmSync({
     const { workspaceId, callId } = call;
     const boardKey = connection.mapping?.boardId ?? null;
     // Stable per call and bounded in length (Monday documents no key limit).
-    const idempotencyBase = `sym-${createHash("sha256").update(`${workspaceId}\0${callId}`).digest("hex").slice(0, 32)}`;
+    const idempotencyBase = idempotencyBaseFor(workspaceId, callId);
 
     // 1. Which CRM record is this caller?
     let externalId = call.crmItemId ?? null;
@@ -369,21 +401,26 @@ export function createCrmSync({
   // effort: only the mapped Follow-Up column, on the row the call went to.
   async function syncFollowUp({ workspaceId, callId }) {
     const call = await store.getCall(workspaceId, callId);
-    if (!call?.crmItemId || call.crmStatus !== "synced") return { status: "skipped", reason: "not_synced" };
+    if (call?.crmStatus !== "synced" || (!call.crmItemId && !call.crmCallsItemId)) {
+      return { status: "skipped", reason: "not_synced" };
+    }
     const connectionKey = connectionKeyOfCall(call);
     const providerId = providerIdOf(connectionKey ?? "monday");
     const connection = connectionKey ? await store.getConnection(workspaceId, connectionKey) : null;
-    if (!isConnectionUsable(connection) || !connection.mapping?.columns?.followUp?.id) {
-      return { status: "skipped", reason: "no_follow_up_column" };
-    }
+    if (connection?.connectionState !== "connected") return { status: "skipped", reason: "not_connected" };
     const provider = providers.get(providerId);
-    if (!provider?.updateFields) return { status: "skipped", reason: "unsupported" };
+    const userBoard = Boolean(call.crmItemId && isConnectionUsable(connection) &&
+      connection.mapping?.columns?.followUp?.id && provider?.updateFields);
+    const callsBoard = Boolean(call.crmCallsItemId && connection.callsBoard?.status === "active" &&
+      connection.callsBoard.columns?.followUp);
+    if (!userBoard && !callsBoard) return { status: "skipped", reason: "no_follow_up_column" };
     try {
-      await sessions.withSession(connection, (session) =>
-        provider.updateFields(session, call.crmItemId, { followUp: followUpText(call.followUp) })
-      );
+      await sessions.withSession(connection, async (session) => {
+        if (callsBoard) await callsLog.updateFollowUp(session, connection, call);
+        if (userBoard) await provider.updateFields(session, call.crmItemId, { followUp: followUpText(call.followUp) });
+      });
       metrics?.count("FollowUpSynced", { Provider: providerId });
-      return { status: "synced" };
+      return { status: "synced", callsBoard, userBoard };
     } catch (error) {
       log.warn?.("CRM follow-up not synced", { workspaceId, callId, ...describeError(error) });
       return { status: "failed", code: error instanceof CrmError ? error.code : "unexpected" };
@@ -391,6 +428,11 @@ export function createCrmSync({
   }
 
   return { syncCall, syncFollowUp };
+}
+
+// Stable per call and bounded in length (Monday documents no key limit).
+function idempotencyBaseFor(workspaceId, callId) {
+  return `sym-${createHash("sha256").update(`${workspaceId}\0${callId}`).digest("hex").slice(0, 32)}`;
 }
 
 // The connection a call syncs through: its agent's. Calls queued before
@@ -445,28 +487,6 @@ function fieldPatch(facts, { isNew, link, call, appUrl }) {
   patch.direction = "Inbound";
   if (facts.appointment) patch.appointment = facts.appointment.kind === "booked" || facts.appointment.kind === "rescheduled";
   return patch;
-}
-
-function transcriptText(transcript) {
-  if (typeof transcript === "string") return transcript.trim() || null;
-  if (!Array.isArray(transcript)) return null;
-  const text = transcript
-    .filter((line) => typeof line?.text === "string" && line.text.trim())
-    .map((line) => `${line.speaker ?? "Caller"}: ${line.text.trim()}`)
-    .join("\n");
-  return text || null;
-}
-
-const FOLLOW_UP_STATUS_LABELS = { not_started: "Not started", in_progress: "In progress", resolved: "Resolved" };
-
-function followUpText(followUp) {
-  if (!followUp || typeof followUp !== "object") return null;
-  const parts = [
-    FOLLOW_UP_STATUS_LABELS[followUp.status],
-    followUp.assigneeName ? `Assigned to ${followUp.assigneeName}` : null,
-    typeof followUp.comment === "string" && followUp.comment.trim() ? followUp.comment.trim() : null,
-  ].filter(Boolean);
-  return parts.length ? parts.join(" - ") : null;
 }
 
 // Remembers which appointment date we last wrote, so a later cancellation

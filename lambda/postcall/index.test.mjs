@@ -1092,6 +1092,12 @@ test("call_analyzed enqueues a CRM sync under the answering agent's own connecti
   assert.deepEqual(marked, [{ workspaceId: "workspace-123", callId: sent[0].callId, connectionKey: "monday#agent-123" }]);
 });
 
+test("a connected agent with no board mapped still enqueues (its calls board logs every call)", async () => {
+  const { handler, sent } = crmHarness({ status: { connectionState: "connected", mappingStatus: "unconfigured" } });
+  await handler(callAnalyzedEvent(crmCall()));
+  assert.equal(sent.length, 1);
+});
+
 test("CRM sync is only enqueued on call_analyzed, not call_started or call_ended", async () => {
   const { handler, sent } = crmHarness();
   await handler(callStartedEvent(crmCall()));
@@ -1106,7 +1112,6 @@ test("no CRM sync for test calls, spam, anonymous callers, or unconfigured CRMs"
     ["anonymous", crmHarness(), crmCall({ from_number: undefined })],
     ["not connected", crmHarness({ status: null }), crmCall()],
     ["reauth", crmHarness({ status: { connectionState: "reauth_required", mappingStatus: "valid" } }), crmCall()],
-    ["unmapped", crmHarness({ status: { connectionState: "connected", mappingStatus: "unconfigured" } }), crmCall()],
     ["already synced", crmHarness({ alreadySynced: true }), crmCall()],
     ["another agent's CRM only", crmHarness(), crmCall({ metadata: { workspaceId: "workspace-123", agentId: "agent-999" } })],
   ]) {

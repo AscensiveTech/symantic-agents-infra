@@ -3,6 +3,7 @@ import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { FIELD_TYPES, suggestMapping } from "./monday/adapter.mjs";
 import { buildAuthorizeUrl, buildInstallUrl, createPkcePair, verifyMondayJwt } from "./monday/oauth.mjs";
 import { agentIdOf, connectionKeyFor, isConnectionUsable, providerIdOf } from "./provider.mjs";
+import { createCallsLog } from "./calls-log.mjs";
 import { createRequeuer } from "./requeue.mjs";
 
 const PROVIDER = "monday";
@@ -87,6 +88,19 @@ export function createCrmApi({
   // Re-send every recently failed call once the admin has fixed whatever
   // made it fail (reconnected, or corrected the mapping).
   const requeueFailed = createRequeuer({ store, enqueue, metrics, now });
+  const callsLog = createCallsLog({ store, providers: { get: () => adapter }, appUrl, metrics, log, now });
+
+  // The "Symantic AI Calls" board is created as soon as an agent connects.
+  // Never fatal: a refusal is saved on the connection and shown in settings,
+  // and the first synced call tries again.
+  async function ensureCallsBoard(connection) {
+    try {
+      await sessions.withSession(connection, (session) => callsLog.ensureBoard(session, connection));
+    } catch (error) {
+      log.warn?.("Calls board not created at connect", { workspaceId: connection.workspaceId, ...describeError(error) });
+    }
+    return await store.getConnection(connection.workspaceId, connection.provider) ?? connection;
+  }
 
   async function revalidate(workspaceId, connection) {
     if (!connection?.mapping) return connection;
@@ -200,7 +214,8 @@ export function createCrmApi({
           refreshTokenExpiresAt: tokens.refreshTokenExpiresAt,
         });
         connection = await revalidate(workspaceId, connection);
-        if (isConnectionUsable(connection)) await requeueFailed(workspaceId, key);
+        connection = await ensureCallsBoard(connection);
+        if (connection.connectionState === "connected") await requeueFailed(workspaceId, key);
         metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "connected" });
         log.info?.("CRM connected", { workspaceId, agentId: stateRecord.agentId, accountId: account.accountId });
         return back(stateRecord.returnTo, { crm: "connected" });
@@ -243,8 +258,11 @@ export function createCrmApi({
         boards: await adapter.listBoards(session),
         users: await adapter.listUsers(session),
       }));
+      const connection = await store.getConnection(identity.workspaceId, key);
+      const callsBoardId = connection?.callsBoard?.id ? String(connection.callsBoard.id) : null;
       return json(200, {
-        boards: boards.map((board) => ({
+        // The agent's own calls board is ours - never offered for mapping.
+        boards: boards.filter((board) => String(board.id) !== callsBoardId).map((board) => ({
           ...board,
           hasPhoneColumn: board.columns.some((column) => column.type === "phone"),
           suggestion: suggestMapping(board),
@@ -293,10 +311,28 @@ export function createCrmApi({
           return [field, { id, type: column.type, title: column.title }];
         })),
       };
-      const saved = await store.saveMapping(identity.workspaceId, key, mapping, { status: "valid", problems: [] });
+      await store.saveMapping(identity.workspaceId, key, mapping, { status: "valid", problems: [] });
+      // Saving a board mapping is choosing to sync to that board.
+      const saved = await store.setBoardSyncEnabled(identity.workspaceId, key, true);
       const requeued = await requeueFailed(identity.workspaceId, key);
       log.info?.("CRM mapping saved", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), requeued });
       return json(200, { ...toPublicConnection(saved, now), requeued });
+    },
+
+    // Turn syncing to one of the customer's own boards on or off. The calls
+    // board always logs; the saved mapping is kept either way.
+    async "PUT /crm/board-sync"(event) {
+      const identity = await requireIdentity(event, { admin: true });
+      const key = await requireAgentKey(identity, event);
+      const enabled = readBody(event)?.enabled;
+      if (typeof enabled !== "boolean") throw new ApiError(400, "invalid_request", "enabled must be true or false.");
+      const connection = await store.getConnection(identity.workspaceId, key);
+      if (!connection || connection.connectionState === "disconnected") {
+        throw new ApiError(409, "not_connected", "Connect Monday first.");
+      }
+      const saved = await store.setBoardSyncEnabled(identity.workspaceId, key, enabled);
+      log.info?.("CRM board sync toggled", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), enabled });
+      return json(200, toPublicConnection(saved, now));
     },
 
     async "POST /crm/sync/retry"(event) {
@@ -358,6 +394,26 @@ export function createCrmApi({
   };
 }
 
+// Plain-language status of the auto-created calls board.
+const CALLS_BOARD_MESSAGES = {
+  forbidden: "Your Monday user isn't allowed to create boards. Ask your Monday.com account administrator for permission, then reconnect.",
+  board_limit: "Your Monday plan has reached its board limit. Free up a board or upgrade your Monday plan, then reconnect.",
+  unavailable: "Monday was unavailable when we tried to create the call log board. It will be created with the next call.",
+  failed: "We couldn't create the call log board. It will be tried again with the next call.",
+};
+
+function publicCallsBoard(connection) {
+  const board = connection.callsBoard;
+  if (!board) return null;
+  const active = board.status === "active" && board.id;
+  return {
+    id: active ? String(board.id) : null,
+    status: active ? "active" : "failed",
+    url: active && connection.accountSlug ? `https://${connection.accountSlug}.monday.com/boards/${board.id}` : null,
+    message: active ? null : CALLS_BOARD_MESSAGES[board.errorCode] ?? CALLS_BOARD_MESSAGES.failed,
+  };
+}
+
 function toPublicConnection(connection, now = Date.now) {
   if (!connection) return null;
   const refreshExpiry = Number(connection.refreshTokenExpiresAt);
@@ -376,6 +432,8 @@ function toPublicConnection(connection, now = Date.now) {
       : null,
     reauthReason: connection.reauthReason ?? null,
     mappingStatus: connection.mappingStatus ?? "unconfigured",
+    boardSyncEnabled: connection.boardSyncEnabled !== false,
+    callsBoard: publicCallsBoard(connection),
     mapping: connection.mapping ?? null,
     mappingProblems: connection.mappingProblems ?? [],
     pausedUntil: paused ? new Date(Number(connection.pausedUntil)).toISOString() : null,

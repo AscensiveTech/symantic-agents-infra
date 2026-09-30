@@ -361,7 +361,9 @@ async function enqueueCrmSync({ getCrmSync, call, record }) {
   if (!record.agentId) return;
   const connectionKey = `${CRM_PROVIDER}#${record.agentId}`;
   const status = await crm.getConnectionStatus(record.workspaceId, connectionKey);
-  if (status?.connectionState !== "connected" || status?.mappingStatus !== "valid") return;
+  // Connected is enough: every call goes to the agent's calls board, and to
+  // the customer's own board too when that sync is on and mapped.
+  if (status?.connectionState !== "connected") return;
   if (!await crm.markQueued(record.workspaceId, record.callId, connectionKey)) return;
   await crm.send({ workspaceId: record.workspaceId, callId: record.callId, provider: connectionKey });
 }
