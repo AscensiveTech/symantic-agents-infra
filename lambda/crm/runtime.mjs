@@ -88,6 +88,8 @@ export function composeRuntime({
 
 let runtimePromise;
 
+// One runtime per Lambda container. A failed start is forgotten so the next
+// invocation tries again.
 export function getRuntime() {
   runtimePromise ??= createAwsRuntime().catch((error) => {
     runtimePromise = undefined;
@@ -96,6 +98,9 @@ export function getRuntime() {
   return runtimePromise;
 }
 
+// Wires the real AWS clients (DynamoDB, KMS, Secrets Manager, SQS, SES) into
+// the store, sessions, sync and keeper. The SDKs load lazily to keep cold
+// starts small.
 async function createAwsRuntime() {
   const [dynamodb, kms, secrets, sqs, sesv2] = await Promise.all([
     import("@aws-sdk/client-dynamodb"),
@@ -119,6 +124,8 @@ async function createAwsRuntime() {
 
   const kmsClient = new kms.KMSClient({});
   const tokenCrypto = {
+    // Tokens are encrypted with KMS and bound to their workspace and
+    // connection, so a token copied to another record won't decrypt.
     async encrypt({ plaintext, workspaceId, provider, purpose }) {
       if (!env.CRM_TOKENS_KMS_KEY_ID) throw new Error("CRM_TOKENS_KMS_KEY_ID is required");
       const result = await kmsClient.send(new kms.EncryptCommand({
@@ -128,6 +135,7 @@ async function createAwsRuntime() {
       }));
       return Buffer.from(result.CiphertextBlob).toString("base64");
     },
+    // Reverse of encrypt; fails if the encryption context doesn't match.
     async decrypt({ ciphertext, workspaceId, provider, purpose }) {
       const result = await kmsClient.send(new kms.DecryptCommand({
         CiphertextBlob: Buffer.from(ciphertext, "base64"),
@@ -139,6 +147,8 @@ async function createAwsRuntime() {
 
   const secretsClient = new secrets.SecretsManagerClient({});
   let cachedSecret;
+  // Monday app credentials, cached briefly so every request doesn't hit
+  // Secrets Manager.
   const getAppSecret = async () => {
     if (cachedSecret && cachedSecret.expiresAt > Date.now()) return cachedSecret.value;
     if (!env.MONDAY_OAUTH_SECRET_ARN) throw new Error("MONDAY_OAUTH_SECRET_ARN is required");

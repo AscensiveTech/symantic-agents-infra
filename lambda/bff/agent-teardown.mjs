@@ -15,8 +15,12 @@ export const TEARDOWN_STEPS = Object.freeze([
 const FINISHED = new Set(["done", "none"]);
 
 const RETRY_FIX = "Nothing else is needed from you. Click Retry Deletion in a few minutes. If it keeps failing, contact support.";
+// Next step for failures only our team can fix; the agent id lets support
+// find it.
 const supportFix = (agentId) => `This needs our team. Contact support and mention reference ${agentId}.`;
 
+// Reason and next step for a provider error: outages say retry, auth or
+// config problems say contact support.
 function providerFailure(vendor, what, error, agentId) {
   const status = Number(error?.providerStatus);
   if (!Number.isFinite(status) || status >= 500 || status === 429 || status === 408) {
@@ -28,6 +32,7 @@ function providerFailure(vendor, what, error, agentId) {
   return { reason: `${vendor} returned an error (${status}), so ${what} hasn't happened yet.`, fix: supportFix(agentId) };
 }
 
+// Already deleted at the provider counts as done, so retries are safe.
 const isGone = (error) => Number(error?.providerStatus) === 404;
 
 /**
@@ -48,6 +53,8 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
   let failed = false;
 
   const runners = {
+    // Disconnects this agent's calendar via the oauth Lambda; nothing
+    // connected is "none".
     async calendar() {
       let result;
       try {
@@ -63,6 +70,8 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
         : { status: "failed", provider: result?.provider ?? null, reason: "We couldn't disconnect the calendar.", fix: supportFix(agentId) };
     },
 
+    // Disconnects this agent's Monday via the CRM Lambda; the calls board
+    // stays in Monday.
     async crm() {
       let result;
       try {
@@ -75,6 +84,7 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
       return { status: "failed", reason: "We couldn't disconnect Monday.", fix: supportFix(agentId) };
     },
 
+    // Deletes the Retell agent and its LLM. Never published means "none".
     async retell_agent() {
       if (!agent.retellAgentId) return { status: "none" };
       try {
@@ -85,6 +95,7 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
       return { status: "done" };
     },
 
+    // Removes the number from Retell.
     async retell_number() {
       if (!phoneNumber?.retellPhoneNumberId) return { status: "none" };
       try {
@@ -95,6 +106,7 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
       return { status: "done", phoneNumber: phoneNumber.telnyxPhoneNumber ?? null };
     },
 
+    // Releases the number at Telnyx so it stops billing.
     async telnyx_number() {
       if (!phoneNumber?.telnyxNumberId) return { status: "none" };
       try {

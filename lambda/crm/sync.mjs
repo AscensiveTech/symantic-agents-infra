@@ -47,6 +47,7 @@ export function createCrmSync({
 }) {
   const callsLog = createCallsLog({ store, providers, appUrl, metrics, log, now });
 
+  // Records the call's final sync status (plus any ids) on the call row.
   async function finish(call, status, fields = {}) {
     await store.updateCallSync(call.workspaceId, call.callId, {
       crmStatus: status,
@@ -54,6 +55,9 @@ export function createCrmSync({
     });
   }
 
+  // Gives up on a call: marks it failed with the error code, records it on
+  // the connection for the card, and counts it. The keeper's outage replay
+  // may retry outage-type failures later.
   async function failPermanently(call, connection, error) {
     const code = error instanceof CrmError ? error.code : "unexpected";
     await finish(call, "failed", { crmLastErrorCode: code, crmLastErrorAt: new Date(Number(now())).toISOString() });
@@ -65,6 +69,11 @@ export function createCrmSync({
     return { status: "failed", code };
   }
 
+  // Syncs one finished call to Monday, the SQS worker's main job. Writes the
+  // calls-board row first, then the customer's own board when that's switched
+  // on. Safe to run twice: each destination keeps its own item id on the
+  // call. verifyExisting checks the board by Call ID first (catch-up after
+  // reconnect).
   async function syncCall({ workspaceId, callId, attempt = 1, finalAttempt = false, verifyExisting = false }) {
     const started = Number(now());
     const call = await store.getCall(workspaceId, callId);
@@ -199,6 +208,9 @@ export function createCrmSync({
     }
   }
 
+  // Decides what a failed sync attempt means: retry (SQS redelivers), pause
+  // the connection (rate or daily limits), mark reconnect-needed, or fail
+  // permanently on the last attempt.
   async function handleFailure({ error, call, connection, finalAttempt }) {
     const { workspaceId, callId } = call;
     if (!(error instanceof CrmError)) {
@@ -277,6 +289,9 @@ export function createCrmSync({
     throw error;
   }
 
+  // The customer's own board: find the caller's row (by the saved link, then
+  // phone, then email), create a lead if there is none, then log this call on
+  // it. Idempotency keys stop duplicates when Monday times out after writing.
   async function runSync({ session, provider, call, facts, link, linkKey, connection }) {
     const { workspaceId, callId } = call;
     const boardKey = connection.mapping?.boardId ?? null;
@@ -292,6 +307,9 @@ export function createCrmSync({
       externalId = link.externalId;
     }
 
+    // Look the caller up in Monday. A recent "not found" for this number is
+    // trusted for a while to save API calls; several matches is an error the
+    // admin must fix (we never guess).
     const resolve = async () => {
       const recentlyNotFound = linkUsable && link.state === "none" &&
         Number(now()) - Date.parse(link.checkedAt ?? 0) < NEGATIVE_LOOKUP_TTL_MS;
@@ -589,6 +607,8 @@ export function connectionKeyOfCall(call) {
   return call?.agentId ? connectionKeyFor(recorded || "monday", call.agentId) : null;
 }
 
+// True when this call is the newest one applied to the caller's row, so an
+// older call replayed late never overwrites newer fields.
 function isNewest(facts, link, linkUsable) {
   if (!facts.endedAt) return false;
   if (!linkUsable || !link.lastAppliedEndedAt) return true;
@@ -646,6 +666,8 @@ function appointmentMarker(facts, link) {
   return { appointmentAt: appointment.startTimeUtc };
 }
 
+// When Monday's daily API limit resets (just after 00:00 UTC); the connection
+// is paused until then.
 function nextUtcMidnight(nowMs) {
   const date = new Date(nowMs);
   return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, 0, 5);

@@ -12,6 +12,8 @@ const ADMIN_ROLES = new Set(["company-admin", "super-admin"]);
 const DEFAULT_RETURN_TO = "/integrations";
 
 class ApiError extends Error {
+  // statusCode and code go to the client as-is; extra adds fields such as
+  // per-field mapping problems.
   constructor(statusCode, code, message, extra = {}) {
     super(message);
     this.statusCode = statusCode;
@@ -39,8 +41,12 @@ export function createCrmApi({
   randomState = () => randomBytes(32).toString("base64url"),
   log = console,
 }) {
+  // The OAuth redirect URI registered with Monday; it must match exactly on
+  // both legs of the flow.
   const callbackUri = () => `${String(apiBaseUrl).replace(/\/+$/, "")}/crm/oauth/monday/callback`;
 
+  // The signed-in user and their workspace, or 401. admin: true also requires
+  // a workspace admin (403 otherwise).
   async function requireIdentity(event, { admin = false } = {}) {
     const identity = await resolveIdentity(event, store);
     if (!identity) throw new ApiError(401, "unauthorized", "Unauthorized");
@@ -61,6 +67,8 @@ export function createCrmApi({
     return connectionKeyFor(PROVIDER, agentId);
   }
 
+  // Runs a Monday request with this agent's connection, turning an expired
+  // grant or an inactive account into the right 409 for the card.
   async function requireUsableSession(workspaceId, key, operation) {
     const connection = await store.getConnection(workspaceId, key);
     if (!connection || connection.connectionState === "disconnected") {
@@ -107,6 +115,8 @@ export function createCrmApi({
     }
   }
 
+  // Re-checks the saved mapping against the board as it is in Monday now
+  // (columns can be deleted there) and saves the result.
   async function revalidate(workspaceId, connection) {
     if (!connection?.mapping) return connection;
     try {
@@ -210,6 +220,8 @@ export function createCrmApi({
 
     async "GET /crm/oauth/monday/callback"(event) {
       const query = event?.queryStringParameters ?? {};
+      // Sends the browser back to the app page it started from, with the
+      // outcome in the query string.
       const back = (returnTo, params) => redirect(buildAppRedirect(appUrl, returnTo, params));
       const stateRecord = typeof query.state === "string" && query.state
         ? await store.consumeOAuthState(query.state)
@@ -482,6 +494,8 @@ export function createCrmApi({
     },
   };
 
+  // Routes an API Gateway request to its handler. ApiError becomes its own
+  // status; anything else is logged and returned as a plain 500.
   async function handleApi(event) {
     const method = event?.requestContext?.http?.method;
     const path = event?.rawPath ?? event?.requestContext?.http?.path ?? "";
@@ -509,6 +523,8 @@ const CALLS_BOARD_MESSAGES = {
   failed: "We couldn't create the call log board. It will be tried again with the next call.",
 };
 
+// The calls board as the card sees it: link, status, and a plain-language
+// message when it failed or was deleted.
 function publicCallsBoard(connection) {
   const board = connection.callsBoard;
   if (!board) return null;
@@ -530,6 +546,8 @@ function publicCallsBoard(connection) {
   };
 }
 
+// The browser-safe view of a connection: status, mapping and sync health
+// only, never tokens.
 function toPublicConnection(connection, now = Date.now) {
   if (!connection) return null;
   const refreshExpiry = Number(connection.refreshTokenExpiresAt);
@@ -564,6 +582,8 @@ function toPublicConnection(connection, now = Date.now) {
   };
 }
 
+// Validates and trims a mapping sent from the browser: numeric ids only,
+// known fields only, bounded labels.
 function normalizeMappingInput(value) {
   if (!value || typeof value !== "object") {
     throw new ApiError(400, "invalid_request", "A mapping is required");
@@ -577,6 +597,7 @@ function normalizeMappingInput(value) {
     const id = value.columns?.[field]?.id ?? value.columns?.[field];
     if (typeof id === "string" && /^[A-Za-z0-9_]{1,64}$/.test(id)) columns[field] = { id };
   }
+  // A status label, trimmed and capped, or null.
   const label = (text) => (typeof text === "string" && text.trim() ? text.trim().slice(0, 100) : null);
   const owner = value.defaultOwnerId === null || value.defaultOwnerId === undefined || value.defaultOwnerId === ""
     ? null
@@ -590,6 +611,8 @@ function normalizeMappingInput(value) {
   };
 }
 
+// Who is calling, from the Cognito JWT claims, plus their workspace
+// membership. Null when not signed in or not an active member.
 async function resolveIdentity(event, store) {
   const claims = event?.requestContext?.authorizer?.jwt?.claims;
   const sub = claims?.sub;
@@ -619,6 +642,8 @@ function claimGroups(value) {
     .filter(Boolean);
 }
 
+// Monday app credentials from Secrets Manager; 503 when the integration isn't
+// configured yet.
 async function loadAppSecret(getAppSecret) {
   const secret = await getAppSecret();
   const clientId = secret?.clientId ?? secret?.client_id;
@@ -629,6 +654,8 @@ async function loadAppSecret(getAppSecret) {
   return { clientId, clientSecret, appId: secret?.appId ?? secret?.app_id };
 }
 
+// Only same-site paths are allowed after OAuth (no //host or backslash
+// tricks), so the callback can't become an open redirect.
 function sanitizeReturnTo(value) {
   if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//") || value.includes("\\")) {
     return DEFAULT_RETURN_TO;
@@ -636,6 +663,7 @@ function sanitizeReturnTo(value) {
   return value.slice(0, 500);
 }
 
+// Full app URL for a safe return path with the given query parameters.
 function buildAppRedirect(appUrl, returnTo, params) {
   const url = new URL(sanitizeReturnTo(returnTo), appUrl);
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
@@ -644,6 +672,7 @@ function buildAppRedirect(appUrl, returnTo, params) {
 
 const AGENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
+// The agentId from the query string or JSON body, if it's well-formed.
 function readAgentId(event) {
   const fromQuery = event?.queryStringParameters?.agentId;
   const fromBody = readBody(event)?.agentId;
@@ -651,6 +680,7 @@ function readAgentId(event) {
   return typeof value === "string" && AGENT_ID_PATTERN.test(value) ? value : null;
 }
 
+// Parses the JSON body (base64 or plain); null when missing or invalid.
 function readBody(event) {
   if (typeof event?.body !== "string" || !event.body) return null;
   try {
@@ -662,12 +692,14 @@ function readBody(event) {
   }
 }
 
+// Case-insensitive header lookup.
 function readHeader(headers, name) {
   if (!headers || typeof headers !== "object") return null;
   const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name);
   return typeof entry?.[1] === "string" ? entry[1] : null;
 }
 
+// JSON response that is never cached.
 function json(statusCode, body) {
   return {
     statusCode,
@@ -676,6 +708,7 @@ function json(statusCode, body) {
   };
 }
 
+// 302 redirect that is never cached.
 function redirect(location) {
   return { statusCode: 302, headers: { location, "cache-control": "no-store" }, body: "" };
 }

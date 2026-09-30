@@ -8,6 +8,7 @@ const DAY_MS = 86_400_000;
 const BOARD_REMINDER_AFTER_MS = 3 * DAY_MS;
 const STAGES = ["14d", "3d", "expired"];
 
+// Which reconnect reminder a connection is due: 14d, 3d, expired, or none.
 export function reminderStage(connection, nowMs) {
   if (connection?.connectionState === "reauth_required") return "expired";
   if (connection?.connectionState !== "connected") return null;
@@ -19,10 +20,16 @@ export function reminderStage(connection, nowMs) {
   return null;
 }
 
+// True when stage comes later than the one already sent, so each stage is
+// emailed once.
 function isNewerStage(stage, sent) {
   return STAGES.indexOf(stage) > STAGES.indexOf(sent ?? "");
 }
 
+// Sends the Monday emails the keeper triggers: reconnect reminders (14 days,
+// 3 days, expired), account inactive, and calls board deleted (right away,
+// then once more after 3 days). Each is recorded on the connection so it's
+// sent only once.
 export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now, log = console }) {
   // The admin who connected this agent's Monday (or, if they've left, every
   // active company admin) plus the people on the workspace's "Monday
@@ -115,6 +122,8 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
   };
 }
 
+// Subject, text and HTML for a reconnect reminder. The button opens that
+// agent's Monday card ready to renew.
 export function renderReauthEmail({ stage, connection, appUrl, agentId = null, agentName = null }) {
   const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
   const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}&crm=renew` : `${base}?crm=renew`;
@@ -145,6 +154,8 @@ export function renderReauthEmail({ stage, connection, appUrl, agentId = null, a
   return { subject, text, html };
 }
 
+// Subject, text and HTML for "your calls board was deleted". The button opens
+// that agent's Monday card, where Recreate Board is.
 export function renderBoardDeletedEmail({ connection, appUrl, agentId = null, agentName = null, reminder = false }) {
   const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
   const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}&crm=board` : base;
@@ -165,6 +176,7 @@ export function renderBoardDeletedEmail({ connection, appUrl, agentId = null, ag
   };
 }
 
+// Subject, text and HTML for "your Monday account is inactive".
 export function renderInactiveEmail({ connection, appUrl, agentId = null, agentName = null }) {
   const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
   const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}` : base;
@@ -182,6 +194,7 @@ export function renderInactiveEmail({ connection, appUrl, agentId = null, agentN
   return { subject: "Monday account inactive: calls aren't being logged", text, html };
 }
 
+// Escapes text for the HTML email body.
 function escapeHtml(value) {
   return String(value)
     .replace(/&/g, "&amp;")

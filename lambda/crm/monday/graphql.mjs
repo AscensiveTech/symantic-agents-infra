@@ -39,6 +39,9 @@ const CODE_MAP = new Map([
   ["Unauthorized", CRM_ERROR.UNAUTHORIZED],
 ]);
 
+// Thin Monday GraphQL client: sets the API version, timeout and idempotency
+// key, and turns every failure into a CrmError the sync understands (rate
+// limit, reauth, not found, inactive account, outage).
 export function createMondayGraphqlClient({
   fetchImpl = globalThis.fetch,
   apiVersion = DEFAULT_MONDAY_API_VERSION,
@@ -132,6 +135,7 @@ export function createMondayGraphqlClient({
   return { request, apiVersion };
 }
 
+// CrmError for a non-2xx HTTP response.
 function classifyHttp(status, body, retryAfter, operation) {
   const first = Array.isArray(body?.errors) ? body.errors[0] : null;
   const providerCode = first?.extensions?.code ?? body?.error_code;
@@ -173,6 +177,7 @@ function classifyHttp(status, body, retryAfter, operation) {
   });
 }
 
+// CrmError for one GraphQL error in a 200 response.
 function classifyGraphqlError(error, retryAfter, operation, statusCode) {
   const providerCode = error?.extensions?.code ?? error?.extensions?.error_code ?? null;
   if (looksLikeInactiveAccount(error?.message, providerCode)) {
@@ -217,12 +222,14 @@ const SEVERITY = [
   CRM_ERROR.PROVIDER_ERROR,
 ];
 
+// When Monday returns several errors, act on the most serious one.
 function mostSevere(errors) {
   return [...errors].sort(
     (a, b) => SEVERITY.indexOf(a.code) - SEVERITY.indexOf(b.code),
   )[0];
 }
 
+// How long Monday asked us to wait, from the header or the body.
 function retryAfterSeconds(response, body) {
   const header = Number(response?.headers?.get?.("retry-after"));
   if (Number.isFinite(header) && header > 0) return header;
@@ -230,6 +237,7 @@ function retryAfterSeconds(response, body) {
   return Number.isFinite(field) && field > 0 ? field : undefined;
 }
 
+// Response body as JSON; null when it isn't JSON.
 async function readJson(response) {
   try {
     return await response.json();

@@ -34,6 +34,8 @@ export function callLink(appUrl, callId) {
   return `${String(appUrl).replace(/\/+$/, "")}/call-history?call=${encodeURIComponent(callId)}`;
 }
 
+// "Symantic AI Calls - <agent>", or the base name when the agent's name isn't
+// known.
 export function callsBoardName(agentName) {
   const suffix = typeof agentName === "string" && agentName.trim() ? ` - ${agentName.trim().slice(0, 60)}` : "";
   return `${CALLS_BOARD_BASE_NAME}${suffix}`;
@@ -51,10 +53,13 @@ export function directionLabel(direction) {
  */
 export function buildCallsRow({ facts, call, columns, appUrl, transcript, followUp }) {
   const values = {};
+  // Adds a value only when the board has that column and there's something to
+  // write.
   const set = (key, value) => {
     const id = columns?.[key];
     if (id && value !== undefined && value !== null && value !== "") values[id] = value;
   };
+  // Trimmed, length-capped text, or undefined when empty.
   const text = (value, max) => (typeof value === "string" && value.trim() ? truncate(value.trim(), max) : undefined);
 
   if (facts.phoneE164) {
@@ -86,10 +91,12 @@ export function buildCallsRow({ facts, call, columns, appUrl, transcript, follow
   return values;
 }
 
+// Row name: the caller's name, else their number.
 export function callsRowName(facts) {
   return truncate(facts.name || facts.phoneE164 || "Caller", 255);
 }
 
+// Caps text to Monday's length limits, with an ellipsis.
 function truncate(value, max) {
   const string = String(value);
   return string.length > max ? `${string.slice(0, max - 1)}…` : string;

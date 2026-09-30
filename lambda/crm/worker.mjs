@@ -114,6 +114,8 @@ export function createWorker({
 
 let workerPromise;
 
+// Lambda entry point: builds the runtime once per container, then processes
+// the SQS batch.
 export async function handler(event) {
   workerPromise ??= getRuntime().then((runtime) => createWorker({
     sync: runtime.sync,

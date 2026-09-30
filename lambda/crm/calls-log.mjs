@@ -23,9 +23,16 @@ const CLAIM_STALE_MS = 3 * 60 * 1000;
 // Monday's "this board doesn't exist any more" answers.
 const BOARD_GONE_STATES = new Set(["deleted", "archived", "missing"]);
 
+// Everything about an agent's auto-created "Symantic AI Calls" board: create
+// or reuse it, write one row per call, notice when it's deleted in Monday (or
+// restored), and keep the Follow-Up column current. Used by sync.mjs; never
+// throws a board problem up into the call sync itself.
 export function createCallsLog({ store, providers, appUrl, metrics, log = console, now = Date.now }) {
+  // Current time as ISO text, from the injectable clock (tests control it).
   const stamp = () => new Date(Number(now())).toISOString();
 
+  // The agent's name, used to name the board "Symantic AI Calls - <agent>".
+  // Null when unknown; the board is then named without it.
   async function agentName(connection) {
     const agentId = connection.agentId ?? agentIdOf(connection.provider);
     if (!agentId || !store.getAgent) return null;
@@ -33,6 +40,8 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     return agent?.name ?? null;
   }
 
+  // Persists the board record and updates the in-memory connection so later
+  // steps in the same run see it.
   async function save(connection, record) {
     await store.saveCallsBoard(connection.workspaceId, connection.provider, record);
     connection.callsBoard = record;
@@ -93,6 +102,7 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     }
   }
 
+  // The Monday row (item name plus column values) for one call on this board.
   function rowFor(connection, call, facts) {
     return {
       name: callsRowName(facts),
@@ -182,6 +192,9 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     return null;
   }
 
+  // A follow-up edited in Call History after the call: rewrite the Follow-Up
+  // cell on that call's row. Skipped when the row is on an older board (it
+  // was recreated since) or the board isn't active.
   async function updateFollowUp(session, connection, call) {
     const provider = providers.get(connection.provider);
     const board = connection.callsBoard;
@@ -209,6 +222,9 @@ function isBoardRefusal(error) {
   return error instanceof CrmError && !error.retryable;
 }
 
+// Maps a board creation failure to the code the card explains: forbidden (no
+// permission), board_limit (plan limit), unavailable (Monday down, retried),
+// or failed.
 export function boardErrorCode(error) {
   if (error instanceof CrmError) {
     if (error.code === CRM_ERROR.FORBIDDEN) return "forbidden";
