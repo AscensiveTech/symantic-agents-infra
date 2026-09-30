@@ -97,7 +97,9 @@ export function isConnectionUsable(connection) {
   return connection?.connectionState === "connected" &&
     connection?.boardSyncEnabled !== false &&
     connection?.mappingStatus === "valid" &&
-    Boolean(connection?.mapping);
+    Boolean(connection?.mapping) &&
+    // Never sync "your board" into this agent's own calls board.
+    String(connection.mapping.boardId) !== String(connection.callsBoard?.id ?? "");
 }
 
 export function isConnectionPaused(connection, nowMs) {

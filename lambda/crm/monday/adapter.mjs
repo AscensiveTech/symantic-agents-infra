@@ -454,17 +454,13 @@ export function createMondayCrmAdapter({ graphql }) {
       return id ? String(id) : null;
     },
 
-    // Our saved board, with any of our columns that went missing (deleted by
-    // the customer, or added in a later version) created again.
-    async repairCallsBoard(session, boardId) {
+    // Our saved board with its columns checked against what's in Monday now
+    // (see resolveCallsColumns): renamed columns are kept, deleted or
+    // retyped ones are replaced. Null when the board is gone.
+    async repairCallsBoard(session, boardId, saved = {}) {
       const [board] = await queryBoards(session, [String(boardId)]);
       if (!board) return null;
-      const columns = {};
-      for (const column of CALLS_BOARD_COLUMNS) {
-        const existing = board.columns.find((candidate) => candidate.title === column.title);
-        columns[column.key] = existing ? existing.id : await createCallsColumn(session, board.id, column);
-      }
-      return { boardId: board.id, columns };
+      return { boardId: board.id, columns: await resolveCallsColumns(session, board, saved) };
     },
 
     // Find a calls board we already created for this agent (same name), so
@@ -474,12 +470,7 @@ export function createMondayCrmAdapter({ graphql }) {
       const board = (await queryBoards(session, null))
         .find((candidate) => candidate.name === name && candidate.id !== String(excludeId ?? ""));
       if (!board) return null;
-      const columns = {};
-      for (const column of CALLS_BOARD_COLUMNS) {
-        const existing = board.columns.find((candidate) => candidate.title === column.title);
-        columns[column.key] = existing ? existing.id : await createCallsColumn(session, board.id, column);
-      }
-      return { boardId: board.id, columns };
+      return { boardId: board.id, columns: await resolveCallsColumns(session, board) };
     },
 
     // Writes one call as a new row on the calls board. The idempotency key
@@ -535,6 +526,32 @@ export function createMondayCrmAdapter({ graphql }) {
   }
 
   // Board details with columns, for the picker or for checking one board.
+  // Our columns on a calls board, by key. A column we saved is kept while it
+  // exists with its original type, whatever it has been renamed to in Monday
+  // (we write by column id, so a rename is harmless and never adds a
+  // duplicate). A column that was deleted, or changed to another type, is
+  // matched by title among same-type columns, else created again.
+  async function resolveCallsColumns(session, board, saved = {}) {
+    const byId = new Map(board.columns.map((column) => [String(column.id), column]));
+    const columns = {};
+    const taken = new Set();
+    for (const column of CALLS_BOARD_COLUMNS) {
+      const kept = byId.get(String(saved?.[column.key] ?? ""));
+      if (kept && kept.type === column.type) {
+        columns[column.key] = kept.id;
+        taken.add(String(kept.id));
+      }
+    }
+    for (const column of CALLS_BOARD_COLUMNS) {
+      if (columns[column.key]) continue;
+      const match = board.columns.find((candidate) =>
+        candidate.title === column.title && candidate.type === column.type && !taken.has(String(candidate.id)));
+      columns[column.key] = match ? match.id : await createCallsColumn(session, board.id, column);
+      taken.add(String(columns[column.key]));
+    }
+    return columns;
+  }
+
   async function queryBoards(session, ids) {
     // One board by id (validation) or the account's most recently used ones
     // (the mapping picker). `ids` is left out entirely rather than sent null.

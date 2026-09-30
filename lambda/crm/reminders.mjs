@@ -91,6 +91,28 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
     return true;
   }
 
+  // The customer's own board mapping broke in Monday (a mapped column or the
+  // board was deleted or changed): email once per breakage. A valid mapping
+  // re-arms it. Calls keep logging to the calls board meanwhile.
+  async function notifyMappingInvalid(connection) {
+    if (connection.mappingInvalidNoticeAt) return false;
+    const settings = await store.getCrmReminderSettings?.(connection.workspaceId).catch(() => null);
+    const to = await recipients(connection, settings);
+    if (!to.length) return false;
+    if (!await store.markCallsBoardNotice(connection.workspaceId, connection.provider, "mappingInvalidNoticeAt")) return false;
+    const agentId = connection.agentId ?? agentIdOf(connection.provider);
+    const agent = agentId ? await store.getAgent(connection.workspaceId, agentId).catch(() => null) : null;
+    const message = renderMappingInvalidEmail({ connection, appUrl, agentId, agentName: agent?.name ?? null });
+    for (const address of to) {
+      try {
+        await sendEmail({ to: address, ...message });
+      } catch (error) {
+        log.warn?.("Board-sync notice not sent", { workspaceId: connection.workspaceId, name: error?.name });
+      }
+    }
+    return true;
+  }
+
   return async function remind(connection) {
     if (!sendEmail) return false;
     if (connection.pauseReason === "account_inactive" && Number(connection.pausedUntil) > Number(now())) {
@@ -98,6 +120,10 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
     }
     if (connection.callsBoardEnabled !== false && connection.callsBoard?.status === "deleted" &&
       await notifyBoardDeleted(connection)) {
+      return true;
+    }
+    if (connection.connectionState === "connected" && connection.boardSyncEnabled !== false && connection.mapping &&
+      connection.mappingStatus === "invalid" && await notifyMappingInvalid(connection)) {
       return true;
     }
     const stage = reminderStage(connection, Number(now()));
@@ -174,6 +200,27 @@ export function renderBoardDeletedEmail({ connection, appUrl, agentId = null, ag
     text,
     html,
   };
+}
+
+// Subject, text and HTML for "board sync needs attention": what broke on the
+// customer's own board, and a button to that agent's Board Sync Settings.
+export function renderMappingInvalidEmail({ connection, appUrl, agentId = null, agentName = null }) {
+  const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
+  const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}&crm=mapping` : base;
+  const forAgent = agentName ? ` for your "${agentName}" agent` : "";
+  const board = connection.mapping?.boardName ? `"${connection.mapping.boardName}"` : "your Monday board";
+  const problems = (connection.mappingProblems ?? []).map((problem) => problem.message).filter(Boolean).slice(0, 5);
+  const lines = [
+    `Calls${forAgent} can't be synced to ${board} any more: something it uses was changed or deleted in Monday.`,
+    ...problems.map((problem) => `- ${problem}`),
+    "Calls are still answered and still logged to the Symantic AI Calls board. Open Board Sync Settings to fix the mapping (or undo the change in Monday); calls that couldn't sync are then sent automatically.",
+  ];
+  const text = [...lines, "", `Fix Board Sync: ${link}`].join("\n");
+  const html = [
+    ...lines.map((line) => `<p style="margin:0 0 14px;font-size:14px;line-height:1.5;">${escapeHtml(line)}</p>`),
+    `<p style="margin:20px 0;"><a href="${escapeHtml(link)}" style="display:inline-block;padding:10px 18px;border-radius:8px;background:#1c1c17;color:#ffffff;text-decoration:none;font-weight:600;">Fix Board Sync</a></p>`,
+  ].join("");
+  return { subject: "Monday board sync needs attention", text, html };
 }
 
 // Subject, text and HTML for "your Monday account is inactive".

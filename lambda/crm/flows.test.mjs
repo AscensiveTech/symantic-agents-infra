@@ -1577,3 +1577,137 @@ test("Listen links go to Call History's pop-up for that call, and old links can 
   assert.equal(result.updated, 1);
   assert.equal(rowsOn(h, board.id).length, 1, "updated in place");
 });
+
+// =============================================== calls-board guards ====
+
+const HOUR = 60 * 60 * 1000;
+const conn = (h) => h.store.connections.get("ws-a\0monday#agent-a");
+
+test("no Symantic AI Calls board is ever offered for mapping: any agent's, renamed, or found by name", async () => {
+  const h = createHarness();
+  await h.connect();
+  const own = callsBoardOf(h).board;
+  own.name = "Our call log (renamed)";
+  const other = h.monday.addBoard({ name: "Board of another agent" });
+  h.store.seedConnection({ workspaceId: "ws-a", provider: "monday#agent-x", agentId: "agent-x", connectionState: "connected",
+    callsBoard: { id: other.id, status: "active", columns: {} } });
+  const leftover = h.monday.addBoard({ name: "Symantic AI Calls - Old Agent" });
+  const plain = h.monday.addBoard({ name: "Symantic AI Calls" });
+  const listed = JSON.parse((await h.api("GET", "/crm/monday/boards", { sub: "sub-admin-a" })).body).boards.map((b) => b.id);
+  for (const hidden of [own, other, leftover, plain]) assert.ok(!listed.includes(hidden.id), `${hidden.name} is hidden`);
+  assert.ok(listed.includes(h.board.id), "the customer's own boards are still listed");
+});
+
+test("saving a mapping to a calls board is refused, even when the request names it directly", async () => {
+  const h = createHarness();
+  await h.connect();
+  const own = callsBoardOf(h).board;
+  const refused = await h.api("PUT", "/crm/mapping", { sub: "sub-admin-a", body: { mapping: {
+    boardId: own.id, columns: { phone: { id: own.columns.find((c) => c.type === "phone").id } },
+    labels: { newLead: null, followUp: null }, defaultOwnerId: null } } });
+  assert.equal(refused.statusCode, 422);
+  assert.equal(JSON.parse(refused.body).problems[0].code, "calls_board");
+  const byName = h.monday.addBoard({ name: "Symantic AI Calls - Someone" });
+  const refusedByName = await h.api("PUT", "/crm/mapping", { sub: "sub-admin-a", body: { mapping: {
+    boardId: byName.id, columns: { phone: { id: byName.columns.find((c) => c.type === "phone").id } },
+    labels: { newLead: null, followUp: null }, defaultOwnerId: null } } });
+  assert.equal(refusedByName.statusCode, 422);
+});
+
+test("an existing mapping that points at a calls board is flagged by the hourly check and never synced to", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  // Someone else's calls board ends up being the mapped board (e.g. it was
+  // mapped before these guards, or its record appeared later).
+  h.store.seedConnection({ workspaceId: "ws-a", provider: "monday#agent-x", agentId: "agent-x", connectionState: "connected",
+    callsBoard: { id: h.board.id, status: "active", columns: {} } });
+  h.clock.advance(HOUR + 1000);
+  await h.runtime.refreshTokens();
+  assert.equal(conn(h).mappingStatus, "invalid");
+  assert.ok(conn(h).mappingProblems.some((problem) => problem.code === "calls_board"));
+});
+
+test("calls board: a renamed column is kept (no duplicate) when another column is repaired", async () => {
+  const h = createHarness();
+  await h.connect();
+  const { board, connection } = callsBoardOf(h);
+  const company = board.columns.find((c) => c.id === connection.callsBoard.columns.companyName);
+  company.title = "Company";
+  h.monday.removeColumn(board.id, connection.callsBoard.columns.callId);
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const after = callsBoardOf(h);
+  assert.ok(h.store.callRows.get(`ws-a\0${call.callId}`).crmCallsItemId, "the row was written");
+  assert.equal(after.connection.callsBoard.columns.companyName, company.id, "renamed column kept");
+  assert.equal(after.board.columns.filter((c) => c.title === "Company Name").length, 0, "no duplicate Company Name column");
+  assert.equal(after.board.columns.filter((c) => c.title === "Call ID").length, 1, "the deleted column is back once");
+});
+
+test("calls board: a column changed to another type in Monday is replaced and the call still logs", async () => {
+  const h = createHarness();
+  await h.connect();
+  const { board, connection } = callsBoardOf(h);
+  const outcome = board.columns.find((c) => c.id === connection.callsBoard.columns.outcome);
+  outcome.type = "status";
+  outcome.labels = [];
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const after = callsBoardOf(h);
+  assert.ok(h.store.callRows.get(`ws-a\0${call.callId}`).crmCallsItemId, "the row was written");
+  assert.notEqual(after.connection.callsBoard.columns.outcome, outcome.id, "a new text Outcome column is used");
+  assert.equal(after.board.columns.find((c) => c.id === after.connection.callsBoard.columns.outcome).type, "text");
+});
+
+test("your own board: a mapped column deleted in Monday is flagged within the hour; restoring it re-sends the calls it missed", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const removed = h.board.columns.find((c) => c.id === "text_outcome");
+  h.monday.removeColumn(h.board.id, "text_outcome");
+  h.clock.advance(HOUR + 1000);
+  await h.runtime.refreshTokens();
+  assert.equal(conn(h).mappingStatus, "invalid", "found with no call needed");
+  assert.ok(conn(h).mappingProblems.length > 0);
+
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const row = () => h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.ok(row().crmCallsItemId, "still logged to the calls board");
+  assert.equal(row().crmLastErrorCode, "mapping_invalid");
+
+  h.board.columns.push(removed);
+  h.clock.advance(HOUR + 1000);
+  await h.runtime.refreshTokens();
+  assert.equal(conn(h).mappingStatus, "valid");
+  await h.drain();
+  assert.equal(row().crmStatus, "synced", "the missed call went to your board after the fix");
+});
+
+test("board-sync-needs-attention email: once per breakage, re-armed when the mapping is valid again", async () => {
+  const { createReauthReminders, renderMappingInvalidEmail } = await import("./reminders.mjs");
+  const { createMemoryCrmStore } = await import("./test-support/fakes.mjs");
+  const now = Date.parse("2026-09-01T00:00:00Z");
+  const store = createMemoryCrmStore({
+    now: () => now,
+    memberships: { "user-dana": { workspaceId: "ws", status: "active", role: "company-admin", email: "dana@example.com" } },
+    agents: { "ws\0agent-1": { name: "Front Desk", status: "active" } },
+  });
+  const mapping = { boardId: "5", boardName: "Leads", columns: {}, labels: {} };
+  store.seedConnection({ workspaceId: "ws", provider: "monday#agent-1", agentId: "agent-1", connectionState: "connected", authorizedBy: "user-dana",
+    refreshTokenExpiresAt: now + 90 * 86_400_000, mapping, mappingStatus: "invalid",
+    mappingProblems: [{ field: "outcome", code: "column_missing", message: "The Outcome column was deleted." }] });
+  const sent = [];
+  const remind = createReauthReminders({ store, sendEmail: async (m) => { sent.push(m); }, appUrl: "https://app.test", now: () => now });
+  const current = () => store.getConnection("ws", "monday#agent-1");
+  assert.equal(await remind(await current()), true);
+  assert.equal(await remind(await current()), false, "not twice");
+  assert.equal(sent[0].subject, "Monday board sync needs attention");
+  assert.match(sent[0].text, /The Outcome column was deleted\./);
+  assert.match(sent[0].html, /agentId=agent-1&amp;crm=mapping/);
+  await store.saveMapping("ws", "monday#agent-1", mapping, { status: "valid", problems: [] });
+  await store.markMappingInvalid("ws", "monday#agent-1", [{ field: "board", code: "board_missing", message: "The board was deleted." }]);
+  assert.equal(await remind(await current()), true, "a new breakage emails again");
+  assert.equal(renderMappingInvalidEmail({ connection: { mapping }, appUrl: "https://x" }).subject, "Monday board sync needs attention");
+});

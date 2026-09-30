@@ -1,3 +1,4 @@
+import { CALLS_BOARD_MAPPING_PROBLEM, callsBoardIdsOf, checkMapping, isCallsBoard } from "./calls-log.mjs";
 import { randomBytes } from "node:crypto";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { FIELD_TYPES, suggestMapping } from "./monday/adapter.mjs";
@@ -120,8 +121,9 @@ export function createCrmApi({
   async function revalidate(workspaceId, connection) {
     if (!connection?.mapping) return connection;
     try {
+      const ours = await callsBoardIdsOf(store, workspaceId);
       const outcome = await sessions.withSession(connection, (session) =>
-        adapter.validateMapping(session, connection.mapping)
+        checkMapping(adapter, session, connection.mapping, ours)
       );
       return await store.saveMapping(workspaceId, connection.provider, connection.mapping, {
         status: outcome.ok ? "valid" : "invalid",
@@ -328,11 +330,11 @@ export function createCrmApi({
         boards: await adapter.listBoards(session),
         users: await adapter.listUsers(session),
       }));
-      const connection = await store.getConnection(identity.workspaceId, key);
-      const callsBoardId = connection?.callsBoard?.id ? String(connection.callsBoard.id) : null;
+      // Every Symantic AI Calls board (any agent's, by id or name) is ours -
+      // never offered for mapping.
+      const ours = await callsBoardIdsOf(store, identity.workspaceId);
       return json(200, {
-        // The agent's own calls board is ours - never offered for mapping.
-        boards: boards.filter((board) => String(board.id) !== callsBoardId).map((board) => ({
+        boards: boards.filter((board) => !isCallsBoard(board, ours)).map((board) => ({
           ...board,
           hasPhoneColumn: board.columns.some((column) => column.type === "phone"),
           suggestion: suggestMapping(board),
@@ -365,9 +367,17 @@ export function createCrmApi({
       const identity = await requireIdentity(event, { admin: true });
       const requested = normalizeMappingInput(readBody(event)?.mapping);
       const key = await requireAgentKey(identity, event);
+      // A calls board can't be mapped even if a request names it directly.
+      const ours = await callsBoardIdsOf(store, identity.workspaceId);
+      if (ours.has(String(requested.boardId))) {
+        return json(422, { error: "mapping_invalid", message: "The mapping needs changes.", problems: [CALLS_BOARD_MAPPING_PROBLEM] });
+      }
       const outcome = await requireUsableSession(identity.workspaceId, key, (session) =>
         adapter.validateMapping(session, requested)
       );
+      if (outcome.ok && isCallsBoard(outcome.board, ours)) {
+        return json(422, { error: "mapping_invalid", message: "The mapping needs changes.", problems: [CALLS_BOARD_MAPPING_PROBLEM] });
+      }
       if (!outcome.ok) {
         return json(422, { error: "mapping_invalid", message: "The mapping needs changes.", problems: outcome.problems });
       }
