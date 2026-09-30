@@ -1841,3 +1841,14 @@ test("the card and board picker say which other agents share the Monday account 
   await solo.connect();
   assert.deepEqual(JSON.parse((await solo.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).sharedWith, []);
 });
+
+test("rewriting a Listen link on a row deleted in Monday is skipped, not retried forever", async () => {
+  const h = createHarness();
+  await h.connect();
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  h.monday.deleteItem(h.store.callRows.get(`ws-a\0${call.callId}`).crmCallsItemId);
+  const result = await h.runtime.sync.rewriteCallLinks({ workspaceId: "ws-a", callId: call.callId, provider: "monday#agent-a" });
+  assert.deepEqual({ status: result.status, updated: result.updated, gone: result.gone }, { status: "done", updated: 0, gone: 1 });
+});
