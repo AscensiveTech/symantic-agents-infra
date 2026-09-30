@@ -61,6 +61,9 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
         .filter((row) => row.connectionState === "connected" || row.connectionState === "reauth_required")
         .map((row) => ({ workspaceId: row.workspaceId, provider: row.provider, connectionState: row.connectionState }));
     },
+    async listWorkspaceConnections(workspaceId) {
+      return [...connections.values()].filter((row) => row.workspaceId === workspaceId).map(clone);
+    },
     async listConnectionsByAccount(provider, accountId) {
       return [...connections.values()]
         .filter((row) => String(row.provider).startsWith(`${provider}#`) && row.accountId === String(accountId))
@@ -147,6 +150,8 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       row.mapping = structuredClone(mapping);
       row.mappingStatus = status;
       row.mappingProblems = problems ?? [];
+      row.mappingCheckedAt = iso();
+      if (status === "valid") delete row.mappingInvalidNoticeAt;
       return clone(row);
     },
     async markMappingInvalid(workspaceId, provider, problems) {
@@ -391,6 +396,7 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
   // Tests set boardCreation.refuse = "UserUnauthorizedException" (etc).
   const boardCreation = { refuse: null };
 
+  let columnSerial = 0;
   function addBoard({ name = "Leads", columns, kind = "public", type = "board" } = {}) {
     const board = {
       id: id(),
@@ -623,7 +629,8 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
         if (!board || board.deleted) return errorBody("InvalidBoardIdException", "Board not found");
         const defaults = v.defaults ? JSON.parse(v.defaults) : {};
         const column = {
-          id: `${v.type}_${board.columns.length}`,
+          // Monday never reuses a column id, even after one is deleted.
+          id: `${v.type}_${board.columns.length}_${++columnSerial}`,
           title: v.title,
           type: v.type,
           ...(v.type === "status" ? { labels: Object.values(defaults.labels ?? {}) } : {}),

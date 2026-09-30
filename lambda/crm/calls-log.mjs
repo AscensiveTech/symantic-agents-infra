@@ -23,6 +23,49 @@ const CLAIM_STALE_MS = 3 * 60 * 1000;
 // Monday's "this board doesn't exist any more" answers.
 const BOARD_GONE_STATES = new Set(["deleted", "archived", "missing"]);
 
+// Write errors worth a board repair: a missing column or board, or a value
+// rejected because the column's type was changed in Monday.
+const REPAIRABLE_ERRORS = new Set([CRM_ERROR.MAPPING_INVALID, CRM_ERROR.NOT_FOUND, CRM_ERROR.INVALID_VALUE]);
+
+// Any "Symantic AI Calls" board - this agent's, another agent's, or a
+// leftover one - is filled in by us and is never offered as, or allowed to
+// be, the customer's own mapped board: mapping it would sync calls into our
+// own log and let edits there fight ours. Matched by the ids we saved (so a
+// renamed board is still caught) and by name (so a board whose record we
+// lost is too). Private/public doesn't matter: boards are hidden either way.
+export const CALLS_BOARD_NAME_PATTERN = /^Symantic AI Calls(\s+-\s+.*)?$/i;
+
+export const CALLS_BOARD_MAPPING_PROBLEM = Object.freeze({
+  field: "board",
+  code: "calls_board",
+  message: "This is a Symantic AI Calls board, which Symantic AI fills in on its own. Choose one of your own boards, such as your Contacts or Leads board.",
+});
+
+// Ids of every calls board in the workspace, across all agents, including
+// deleted ones (they can be restored from Monday's trash).
+export async function callsBoardIdsOf(store, workspaceId) {
+  const connections = await store.listWorkspaceConnections(workspaceId).catch(() => []);
+  return new Set(connections.map((row) => row.callsBoard?.id).filter(Boolean).map(String));
+}
+
+// Checks a customer-board mapping against the board as it is in Monday now
+// (board deleted, mapped column deleted or changed to another type), and
+// flags a mapping that points at one of our calls boards. Renamed columns are
+// fine: we write by column id.
+export async function checkMapping(adapter, session, mapping, ours) {
+  const outcome = await adapter.validateMapping(session, mapping);
+  const problems = [...(outcome.problems ?? [])];
+  const board = outcome.board ?? { id: mapping.boardId, name: mapping.boardName };
+  if (isCallsBoard(board, ours)) problems.push(CALLS_BOARD_MAPPING_PROBLEM);
+  return { ok: problems.length === 0, problems };
+}
+
+// True when a board is one of ours (see CALLS_BOARD_NAME_PATTERN).
+export function isCallsBoard(board, ids) {
+  if (!board) return false;
+  return ids.has(String(board.id)) || CALLS_BOARD_NAME_PATTERN.test(String(board.name ?? "").trim());
+}
+
 // Everything about an agent's auto-created "Symantic AI Calls" board: create
 // or reuse it, write one row per call, notice when it's deleted in Monday (or
 // restored), and keep the Follow-Up column current. Used by sync.mjs; never
@@ -77,7 +120,7 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     if (existing?.status === "active" && existing.id) {
       const missing = CALLS_BOARD_COLUMNS.some((column) => !existing.columns?.[column.key]);
       if (!missing || !provider.repairCallsBoard) return existing;
-      const repaired = await provider.repairCallsBoard(session, existing.id);
+      const repaired = await provider.repairCallsBoard(session, existing.id, existing.columns);
       return repaired ? save(connection, { ...existing, columns: repaired.columns }) : existing;
     }
     if (existing?.status === "deleted" && !recreate) {
@@ -151,16 +194,18 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
       });
       return { status: "written", itemId, boardId: board.id };
     } catch (error) {
-      if (!(error instanceof CrmError) || (error.code !== CRM_ERROR.MAPPING_INVALID && error.code !== CRM_ERROR.NOT_FOUND)) throw error;
-      // Board or column gone. A deleted board waits for the admin; a
-      // removed column is added back and the write tried once more.
+      if (!(error instanceof CrmError) || !REPAIRABLE_ERRORS.has(error.code)) throw error;
+      // Board or column gone, or a column changed to another type in Monday
+      // (its value is then rejected). A deleted board waits for the admin; a
+      // removed or retyped column is replaced and the write tried once more.
       const state = await provider.callsBoardState?.(session, board.id).catch(() => "unknown");
       if (BOARD_GONE_STATES.has(state)) {
         await markDeleted(connection);
         return { status: "held" };
       }
-      const repaired = await provider.repairCallsBoard?.(session, board.id);
-      if (!repaired) throw error;
+      const repaired = await provider.repairCallsBoard?.(session, board.id, board.columns);
+      // Nothing changed on the board: the value itself was bad, not a column.
+      if (!repaired || JSON.stringify(repaired.columns) === JSON.stringify(board.columns)) throw error;
       await save(connection, { ...board, columns: repaired.columns });
       const itemId = await provider.createCallsRow(session, board.id, rowFor(connection, call, facts), {
         idempotencyKey: `${idempotencyKey}-${board.id}-r`,

@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { buildCallActivity } from "./activity.mjs";
-import { callsRowIsCurrent, createCallsLog } from "./calls-log.mjs";
+import { callsBoardIdsOf, callsRowIsCurrent, checkMapping, createCallsLog } from "./calls-log.mjs";
+import { createRequeuer } from "./requeue.mjs";
 import { callLink } from "./monday/calls-board.mjs";
 import { deriveCallFacts, followUpText, localDatePlusDays, transcriptText } from "./facts.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
@@ -21,6 +22,10 @@ const PROVIDER_IDEMPOTENCY_WINDOW_MS = 25 * 60 * 1000;
 const NEGATIVE_LOOKUP_TTL_MS = 15 * 60 * 1000;
 const FOLLOW_UP_DAYS = 1;
 export const ACCOUNT_INACTIVE_PAUSE_MS = 24 * 60 * 60 * 1000;
+// How often the keeper re-checks a customer-board mapping against Monday.
+export const MAPPING_RECHECK_MS = 60 * 60 * 1000;
+// Failures fixed by repairing the mapping: replayed once it's valid again.
+const MAPPING_FAILURE_CODES = new Set([CRM_ERROR.MAPPING_INVALID]);
 const LEAD_SOURCE = "AI Receptionist";
 
 /**
@@ -45,6 +50,8 @@ export function createCrmSync({
   now = Date.now,
   log = console,
 }) {
+  // Re-sends calls that failed for a reason that has since been fixed.
+  const requeueFailed = createRequeuer({ store, enqueue, metrics, now });
   const callsLog = createCallsLog({ store, providers, appUrl, metrics, log, now });
 
   // Records the call's final sync status (plus any ids) on the call row.
@@ -585,10 +592,39 @@ export function createCrmSync({
 
   // The keeper's 10-minute check of an agent's calls board. A board back
   // from Monday's trash gets every call it missed meanwhile.
+  // The keeper's 10-minute check for one connection: is the calls board still
+  // there (or back from Monday's trash), and - hourly - does the customer's
+  // own board mapping still match Monday.
   async function checkCallsBoard(connection) {
     const result = await sessions.withSession(connection, (session) => callsLog.checkBoard(session, connection));
     if (result === "restored") await rebuildCallsBoard({ workspaceId: connection.workspaceId, provider: connection.provider });
+    await recheckMapping(connection).catch((error) => {
+      log.warn?.("CRM mapping re-check failed", { workspaceId: connection.workspaceId, ...describeError(error) });
+    });
     return result;
+  }
+
+  // A column deleted or retyped in Monday (or the whole board deleted) is
+  // flagged within the hour, even with no calls coming in: the card shows
+  // what to fix, and the keeper's reminders email the admins once. When a
+  // fix made in Monday (e.g. restoring the column) makes it valid again,
+  // calls that failed because of it are sent again.
+  async function recheckMapping(connection) {
+    if (connection.boardSyncEnabled === false || !connection.mapping) return null;
+    if (Number(now()) - Date.parse(connection.mappingCheckedAt ?? 0) < MAPPING_RECHECK_MS) return null;
+    const provider = providers.get(connection.provider);
+    if (!provider?.validateMapping) return null;
+    const ours = await callsBoardIdsOf(store, connection.workspaceId);
+    const outcome = await sessions.withSession(connection, (session) => checkMapping(provider, session, connection.mapping, ours));
+    const status = outcome.ok ? "valid" : "invalid";
+    const wasValid = connection.mappingStatus === "valid";
+    await store.saveMapping(connection.workspaceId, connection.provider, connection.mapping, { status, problems: outcome.problems });
+    connection.mappingStatus = status;
+    connection.mappingProblems = outcome.problems;
+    if (status === "valid" && !wasValid) {
+      await requeueFailed(connection.workspaceId, connection.provider, { onlyCodes: MAPPING_FAILURE_CODES });
+    }
+    return status;
   }
 
   return { syncCall, syncFollowUp, ensureCallsBoard, checkCallsBoard, rebuildCallsBoard, syncCallsBoardRow, catchUpAfterReconnect, rewriteCallLinks };

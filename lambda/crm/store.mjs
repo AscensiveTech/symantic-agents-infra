@@ -119,6 +119,25 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
 
     // Every connection for one Monday account, via the account index. The
     // uninstall webhook uses it to disconnect them all.
+    // Every connection (one per agent) in a workspace, used to find all of its
+    // calls boards so none is ever offered for mapping.
+    async listWorkspaceConnections(workspaceId) {
+      requireTable(connections);
+      const items = [];
+      let startKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: connections,
+          KeyConditionExpression: "workspaceId = :w",
+          ExpressionAttributeValues: marshall({ ":w": workspaceId }),
+          ExclusiveStartKey: startKey,
+        }));
+        items.push(...(result.Items ?? []).map(unmarshall));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+      return items;
+    },
+
     async listConnectionsByAccount(provider, accountId) {
       requireTable(connections);
       const items = [];
@@ -332,7 +351,11 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
     // problems.
     saveMapping(workspaceId, provider, mapping, { status, problems }) {
       return update(connections, { workspaceId, provider }, {
-        set: { mapping, mappingStatus: status, mappingProblems: problems ?? [], mappingCheckedAt: iso(), updatedAt: iso() },
+        // A valid mapping re-arms the "board sync needs attention" email.
+        set: {
+          mapping, mappingStatus: status, mappingProblems: problems ?? [], mappingCheckedAt: iso(), updatedAt: iso(),
+          ...(status === "valid" ? { mappingInvalidNoticeAt: null } : {}),
+        },
         condition: "attribute_exists(workspaceId)",
         conditional: true,
       });
