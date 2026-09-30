@@ -8,7 +8,7 @@ import { deriveCallFacts, followUpText, localDatePlusDays, transcriptText } from
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone } from "./phone.mjs";
 import { connectionKeyFor, isConnectionPaused, isConnectionUsable, providerIdOf } from "./provider.mjs";
-import { linkKeyFor } from "./store.mjs";
+import { boardLinkKeyFor, linkKeyFor } from "./store.mjs";
 
 // Longer than the worker's 60s timeout, so a lease never expires under a
 // sync that is still running.
@@ -159,7 +159,10 @@ export function createCrmSync({
       return failPermanently(call, connection, new CrmError(CRM_ERROR.MAPPING_INVALID, "Field mapping needs attention"));
     }
 
-    const linkKey = linkKeyFor(connectionKey, facts.phoneE164);
+    // Locked per board + caller, so agents sharing a board take turns on the
+    // same caller (see boardLinkKeyFor).
+    const boardId = connection.mapping?.boardId ?? null;
+    const linkKey = boardId ? boardLinkKeyFor(connectionKey, boardId, facts.phoneE164) : linkKeyFor(connectionKey, facts.phoneE164);
     // Unique per attempt, not per call: two deliveries of the same message
     // must serialize too, not share the lease.
     const leaseOwner = `${callId}:${randomUUID()}`;
@@ -177,8 +180,14 @@ export function createCrmSync({
         crmProvider: connectionKey,
         crmAttempts: attempt,
       });
+      // Links saved before they were per board live under the agent's key:
+      // read that once, so a known caller isn't searched for or recreated.
+      const link = lease.state || !boardId ? lease : {
+        ...(await store.getLink(workspaceId, linkKeyFor(connectionKey, facts.phoneE164)).catch(() => null) ?? {}),
+        ...lease,
+      };
       const result = await sessions.withSession(connection, (session) =>
-        runSync({ session, provider, call, facts, link: lease, linkKey, connection })
+        runSync({ session, provider, call, facts, link, linkKey, connection })
       );
       await finish(call, "synced", {
         crmItemId: result.externalId,

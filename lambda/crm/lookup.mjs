@@ -2,7 +2,7 @@ import { buildCallerContext, NO_CRM_CONTEXT } from "./context.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone, toE164 } from "./phone.mjs";
 import { connectionKeyFor, isConnectionPaused, isConnectionUsable } from "./provider.mjs";
-import { linkKeyFor } from "./store.mjs";
+import { boardLinkKeyFor, linkKeyFor } from "./store.mjs";
 
 // Monday calls inside the lookup get this long each. The BFF separately caps
 // the whole lookup (including Lambda invoke) - see handleInboundLookup.
@@ -43,9 +43,12 @@ export function createCrmLookup({
       const provider = providers.get(providerId);
       if (!provider) return result("skipped", { reason: "unknown_provider" });
 
-      const linkKey = linkKeyFor(connectionKey, phoneE164);
       const boardId = connection.mapping?.boardId ?? null;
-      const link = await store.getLink(workspaceId, linkKey);
+      // The shared per-board link, falling back to one saved per agent before
+      // links were keyed by board.
+      const linkKey = boardId ? boardLinkKeyFor(connectionKey, boardId, phoneE164) : linkKeyFor(connectionKey, phoneE164);
+      const link = await store.getLink(workspaceId, linkKey) ??
+        (boardId ? await store.getLink(workspaceId, linkKeyFor(connectionKey, phoneE164)) : null);
       const knownId = link?.state === "linked" && link.boardId === boardId ? link.externalId : null;
 
       // No refresh-lock waiting on the live path: if another container is

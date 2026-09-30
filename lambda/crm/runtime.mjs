@@ -7,7 +7,7 @@ import { createMondayGraphqlClient } from "./monday/graphql.mjs";
 import { createMondayOAuthClient } from "./monday/oauth.mjs";
 import { createMondaySessionFactory } from "./monday/session.mjs";
 import { createProviderRegistry } from "./provider.mjs";
-import { createReauthReminders } from "./reminders.mjs";
+import { createDisconnectNotifier, createReauthReminders } from "./reminders.mjs";
 import { createRequeuer } from "./requeue.mjs";
 import { createDynamoCrmStore } from "./store.mjs";
 import { createCrmSync } from "./sync.mjs";
@@ -58,6 +58,7 @@ export function composeRuntime({
     metrics,
     appUrl,
     apiBaseUrl,
+    notifyDisconnected: createDisconnectNotifier({ store, sendEmail, appUrl, now, log }),
     now,
     log,
   });

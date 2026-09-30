@@ -40,6 +40,7 @@ export function createCrmApi({
   apiBaseUrl,
   now = Date.now,
   randomState = () => randomBytes(32).toString("base64url"),
+  notifyDisconnected = null,
   log = console,
 }) {
   // The OAuth redirect URI registered with Monday; it must match exactly on
@@ -135,10 +136,21 @@ export function createCrmApi({
     }
   }
 
-  // Revoke at Monday (best effort - the grant dies with our copy either way)
-  // and delete our tokens.
-  async function disconnectConnection(connection, reason) {
-    if (connection.encryptedRefreshToken) {
+  // Disconnects ONE agent: revoke at Monday (best effort - the grant dies with
+  // our copy either way), delete this agent's tokens, and email the admins.
+  // Other agents are never touched. When another agent is connected through
+  // the same Monday account and user, the revoke is skipped: Monday may treat
+  // the grants as one, and revoking would cut that agent off too.
+  async function disconnectConnection(connection, reason, { byName = null } = {}) {
+    const sharing = connection.accountId
+      ? (await store.listConnectionsByAccount(PROVIDER, connection.accountId).catch(() => []))
+        .filter((row) => !(row.workspaceId === connection.workspaceId && row.provider === connection.provider) &&
+          row.connectionState === "connected" &&
+          String(row.mondayUserId ?? "") === String(connection.mondayUserId ?? ""))
+      : [];
+    if (sharing.length) {
+      log.info?.("Monday revoke skipped: grant shared with another agent", { workspaceId: connection.workspaceId, sharedWith: sharing.length });
+    } else if (connection.encryptedRefreshToken) {
       try {
         const refreshToken = await tokenCrypto.decrypt({
           ciphertext: connection.encryptedRefreshToken,
@@ -151,7 +163,9 @@ export function createCrmApi({
         log.warn?.("Monday token revoke failed; deleting local tokens anyway", describeError(error));
       }
     }
-    return store.disconnect(connection.workspaceId, connection.provider, reason);
+    const saved = await store.disconnect(connection.workspaceId, connection.provider, reason);
+    await notifyDisconnected?.(connection, { reason, byName });
+    return saved;
   }
 
   // Called (direct invoke) while an agent is being deleted. Never throws;
@@ -177,12 +191,39 @@ export function createCrmApi({
     }
   }
 
+  // The workspace's other agents connected to Monday, with their account and
+  // mapped board, so the card can say "Also Connected To" and the board
+  // picker "Also Synced By". Informational only - sharing is allowed.
+  async function otherAgentsOnMonday(workspaceId, exceptKey) {
+    const rows = (await store.listWorkspaceConnections(workspaceId).catch(() => []))
+      .filter((row) => row.provider !== exceptKey && row.connectionState === "connected");
+    return Promise.all(rows.map(async (row) => {
+      const agentId = row.agentId ?? agentIdOf(row.provider);
+      const agent = agentId ? await store.getAgent(workspaceId, agentId).catch(() => null) : null;
+      if (!agent || agent.status === "deleted") return null;
+      return {
+        agentId,
+        agentName: agent.name ?? agentId,
+        accountId: row.accountId ? String(row.accountId) : null,
+        boardId: row.boardSyncEnabled !== false && row.mapping?.boardId ? String(row.mapping.boardId) : null,
+      };
+    })).then((list) => list.filter(Boolean));
+  }
+
   const routes = {
     async "GET /crm/connection"(event) {
       const identity = await requireIdentity(event);
       const key = await requireAgentKey(identity, event);
       const connection = await store.getConnection(identity.workspaceId, key);
-      return json(200, toPublicConnection(connection, now));
+      const view = toPublicConnection(connection, now);
+      if (!view || connection.connectionState !== "connected" || !connection.accountId) return json(200, view);
+      const others = await otherAgentsOnMonday(identity.workspaceId, key);
+      return json(200, {
+        ...view,
+        sharedWith: others
+          .filter((other) => other.accountId === String(connection.accountId))
+          .map(({ agentId, agentName }) => ({ agentId, agentName })),
+      });
     },
 
     async "GET /crm/monday/setup"(event) {
@@ -318,7 +359,7 @@ export function createCrmApi({
       const key = await requireAgentKey(identity, event);
       const connection = await store.getConnection(identity.workspaceId, key);
       if (!connection) return json(200, null);
-      const saved = await disconnectConnection(connection, "user_disconnected");
+      const saved = await disconnectConnection(connection, "user_disconnected", { byName: identity.displayName });
       log.info?.("CRM disconnected", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), by: identity.userId });
       return json(200, toPublicConnection(saved, now));
     },
@@ -333,9 +374,12 @@ export function createCrmApi({
       // Every Symantic AI Calls board (any agent's, by id or name) is ours -
       // never offered for mapping.
       const ours = await callsBoardIdsOf(store, identity.workspaceId);
+      const others = await otherAgentsOnMonday(identity.workspaceId, key);
       return json(200, {
         boards: boards.filter((board) => !isCallsBoard(board, ours)).map((board) => ({
           ...board,
+          // Other agents already syncing to this board (allowed; shown as a hint).
+          syncedBy: others.filter((other) => other.boardId === String(board.id)).map((other) => other.agentName),
           hasPhoneColumn: board.columns.some((column) => column.type === "phone"),
           suggestion: suggestMapping(board),
         })),
@@ -496,7 +540,11 @@ export function createCrmApi({
       if (body.type === "uninstall") {
         const connections = await store.listConnectionsByAccount(PROVIDER, accountId);
         for (const connection of connections) {
-          await store.purgeProviderData(connection.workspaceId, connection.provider);
+          // Tell the admins before the record (and who connected it) is gone.
+          if (connection.connectionState === "connected") await notifyDisconnected?.(connection, { reason: "uninstalled" });
+          await store.purgeProviderData(connection.workspaceId, connection.provider, {
+            boardIds: connection.mapping?.boardId ? [String(connection.mapping.boardId)] : [],
+          });
         }
         log.info?.("Monday app uninstalled", { accountId, purged: connections.length });
       }
