@@ -65,7 +65,7 @@ export function createTokenKeeper({
       if (!Number.isFinite(lastError) || Number(now()) - lastError > AUTO_REQUEUE_WINDOW_MS) return;
       if (Number(now()) - Number(connection.autoRequeuedAt ?? 0) < AUTO_REQUEUE_EVERY_MS) return;
       await store.markAutoRequeued(connection.workspaceId, connection.provider);
-      counts.requeued += await requeueFailed(connection.workspaceId, { onlyCodes: OUTAGE_ERROR_CODES, limit: 100 });
+      counts.requeued += await requeueFailed(connection.workspaceId, connection.provider, { onlyCodes: OUTAGE_ERROR_CODES, limit: 100 });
     }
 
     async function lane() {

@@ -117,9 +117,10 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
           TableName: connections,
           IndexName: "accountId-index",
           KeyConditionExpression: "accountId = :accountId",
-          FilterExpression: "#provider = :provider",
+          // Rows are keyed "<provider>#<agentId>": every agent on the account.
+          FilterExpression: "begins_with(#provider, :provider)",
           ExpressionAttributeNames: { "#provider": "provider" },
-          ExpressionAttributeValues: marshall({ ":accountId": String(accountId), ":provider": provider }),
+          ExpressionAttributeValues: marshall({ ":accountId": String(accountId), ":provider": `${provider}#` }),
           ...(startKey ? { ExclusiveStartKey: startKey } : {}),
         }));
         items.push(...(result.Items ?? []).map(unmarshall));
@@ -432,7 +433,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
           TableName: tables.calls,
           KeyConditionExpression: "workspaceId = :workspaceId",
           FilterExpression: "crmStatus = :failed AND analyzedAt >= :since",
-          ProjectionExpression: "callId, crmStatus, crmLastErrorCode, analyzedAt",
+          ProjectionExpression: "callId, agentId, crmProvider, crmStatus, crmLastErrorCode, analyzedAt",
           ExpressionAttributeValues: marshall({
             ":workspaceId": workspaceId,
             ":failed": "failed",
@@ -476,6 +477,12 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return items
         .filter((member) => member.status === "active" && (member.role === "company-admin" || (member.roles ?? []).includes?.("company-admin")))
         .map((member) => ({ userId: member.userId, email: member.email ?? null, name: member.name ?? null }));
+    },
+
+    // The agent a CRM connection belongs to; used to check an agentId from a
+    // request is really in the caller's workspace.
+    getAgent(workspaceId, agentId) {
+      return get(tables.agents, { workspaceId, agentId }, ["agentId", "workspaceId", "name", "status"]);
     },
 
     getMembership(userId) {

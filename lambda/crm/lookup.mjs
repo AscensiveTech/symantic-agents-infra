@@ -1,7 +1,7 @@
 import { buildCallerContext, NO_CRM_CONTEXT } from "./context.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone, toE164 } from "./phone.mjs";
-import { isConnectionPaused, isConnectionUsable } from "./provider.mjs";
+import { connectionKeyFor, isConnectionPaused, isConnectionUsable } from "./provider.mjs";
 import { linkKeyFor } from "./store.mjs";
 
 // Monday calls inside the lookup get this long each. The BFF separately caps
@@ -23,7 +23,7 @@ export function createCrmLookup({
   now = Date.now,
   log = console,
 }) {
-  return async function lookup({ workspaceId, callerNumber, provider: providerId = "monday" }) {
+  return async function lookup({ workspaceId, agentId, callerNumber, provider: providerId = "monday" }) {
     const started = Number(now());
     const result = (status, extra = {}) => {
       metrics?.emit("LookupLatency", Number(now()) - started, { Provider: providerId, Outcome: status });
@@ -33,15 +33,17 @@ export function createCrmLookup({
 
     const phoneE164 = toE164(callerNumber ?? "", "US");
     if (!workspaceId || !phoneE164) return result("skipped", { reason: "no_caller_number" });
+    if (!agentId) return result("skipped", { reason: "no_agent" });
+    const connectionKey = connectionKeyFor(providerId, agentId);
 
     try {
-      const connection = await store.getConnection(workspaceId, providerId);
+      const connection = await store.getConnection(workspaceId, connectionKey);
       if (!isConnectionUsable(connection)) return result("skipped", { reason: "not_connected" });
       if (isConnectionPaused(connection, Number(now()))) return result("skipped", { reason: "paused" });
       const provider = providers.get(providerId);
       if (!provider) return result("skipped", { reason: "unknown_provider" });
 
-      const linkKey = linkKeyFor(providerId, phoneE164);
+      const linkKey = linkKeyFor(connectionKey, phoneE164);
       const boardId = connection.mapping?.boardId ?? null;
       const link = await store.getLink(workspaceId, linkKey);
       const knownId = link?.state === "linked" && link.boardId === boardId ? link.externalId : null;
@@ -101,7 +103,7 @@ export function createCrmLookup({
     } catch (error) {
       const info = describeError(error);
       if (error instanceof CrmError && error.code === CRM_ERROR.DAILY_LIMIT) {
-        await store.pause(workspaceId, providerId, nextUtcMidnight(Number(now())), "daily_limit").catch(() => {});
+        await store.pause(workspaceId, connectionKey, nextUtcMidnight(Number(now())), "daily_limit").catch(() => {});
       }
       log.warn?.("CRM lookup failed; call continues without CRM context", {
         workspaceId,

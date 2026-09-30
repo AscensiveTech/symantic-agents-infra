@@ -8,7 +8,7 @@ import { createHmac } from "node:crypto";
 // ---------------------------------------------------------------------------
 // In-memory CRM store with the same conditional semantics as store.mjs.
 // ---------------------------------------------------------------------------
-export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {}, contacts = {} } = {}) {
+export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {}, contacts = {}, agents = {} } = {}) {
   const connections = new Map();
   const links = new Map();
   const callRows = new Map(calls.map((call) => [`${call.workspaceId}\0${call.callId}`, structuredClone(call)]));
@@ -63,7 +63,7 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     },
     async listConnectionsByAccount(provider, accountId) {
       return [...connections.values()]
-        .filter((row) => row.provider === provider && row.accountId === String(accountId))
+        .filter((row) => String(row.provider).startsWith(`${provider}#`) && row.accountId === String(accountId))
         .map(clone);
     },
     async saveAuthorization(workspaceId, provider, record) {
@@ -240,13 +240,20 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     async listFailedCalls(workspaceId, sinceIso) {
       return [...callRows.values()]
         .filter((row) => row.workspaceId === workspaceId && row.crmStatus === "failed" && (row.analyzedAt ?? "") >= sinceIso)
-        .map((row) => ({ callId: row.callId, crmStatus: row.crmStatus, crmLastErrorCode: row.crmLastErrorCode, analyzedAt: row.analyzedAt }));
+        .map((row) => ({ callId: row.callId, agentId: row.agentId, crmProvider: row.crmProvider, crmStatus: row.crmStatus, crmLastErrorCode: row.crmLastErrorCode, analyzedAt: row.analyzedAt }));
     },
     async getProfileTimezone(workspaceId) {
       return profiles[workspaceId]?.timezone ?? null;
     },
     async getContactCompany(workspaceId, phoneNumber) {
       return contacts[key(workspaceId, phoneNumber)]?.companyName ?? null;
+    },
+    async getAgent(workspaceId, agentId) {
+      const agent = agents[key(workspaceId, agentId)];
+      return agent ? clone({ workspaceId, agentId, ...agent }) : null;
+    },
+    seedAgent(workspaceId, agentId, agent = {}) {
+      agents[key(workspaceId, agentId)] = { name: agentId, status: "active", ...agent };
     },
     async getMembership(userId) {
       return clone(memberships[userId]);

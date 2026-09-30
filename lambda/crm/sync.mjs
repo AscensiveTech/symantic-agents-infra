@@ -4,7 +4,7 @@ import { buildCallActivity } from "./activity.mjs";
 import { deriveCallFacts, localDatePlusDays } from "./facts.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone } from "./phone.mjs";
-import { isConnectionPaused, isConnectionUsable } from "./provider.mjs";
+import { connectionKeyFor, isConnectionPaused, isConnectionUsable, providerIdOf } from "./provider.mjs";
 import { linkKeyFor } from "./store.mjs";
 
 // Longer than the worker's 60s timeout, so a lease never expires under a
@@ -55,7 +55,7 @@ export function createCrmSync({
       await store.recordSyncResult(call.workspaceId, connection.provider, { status: "failed", errorCode: code })
         .catch(() => {});
     }
-    metrics?.count("SyncFailed", { Provider: connection?.provider ?? "unknown", Outcome: code });
+    metrics?.count("SyncFailed", { Provider: providerIdOf(connection?.provider) || "unknown", Outcome: code });
     return { status: "failed", code };
   }
 
@@ -64,12 +64,13 @@ export function createCrmSync({
     const call = await store.getCall(workspaceId, callId);
     if (!call) return { status: "skipped", reason: "call_not_found" };
     if (call.crmStatus === "synced") {
-      metrics?.count("SyncDuplicate", { Provider: call.crmProvider ?? "unknown" });
+      metrics?.count("SyncDuplicate", { Provider: providerIdOf(call.crmProvider) || "unknown" });
       return { status: "duplicate" };
     }
 
-    const providerId = call.crmProvider ?? "monday";
-    const connection = await store.getConnection(workspaceId, providerId);
+    const connectionKey = connectionKeyOfCall(call);
+    const providerId = providerIdOf(connectionKey ?? call.crmProvider ?? "monday");
+    const connection = connectionKey ? await store.getConnection(workspaceId, connectionKey) : null;
     if (!connection || connection.connectionState === "disconnected") {
       await finish(call, "skipped", { crmLastErrorCode: CRM_ERROR.NOT_CONNECTED });
       return { status: "skipped", reason: CRM_ERROR.NOT_CONNECTED };
@@ -97,7 +98,7 @@ export function createCrmSync({
     }
     facts.companyName = await store.getContactCompany?.(workspaceId, facts.phoneE164).catch(() => null) ?? null;
 
-    const linkKey = linkKeyFor(providerId, facts.phoneE164);
+    const linkKey = linkKeyFor(connectionKey, facts.phoneE164);
     // Unique per attempt, not per call: two deliveries of the same message
     // must serialize too, not share the lease.
     const leaseOwner = `${callId}:${randomUUID()}`;
@@ -112,7 +113,7 @@ export function createCrmSync({
     try {
       await store.updateCallSync(workspaceId, callId, {
         crmStatus: "in_progress",
-        crmProvider: providerId,
+        crmProvider: connectionKey,
         crmAttempts: attempt,
       });
       const result = await sessions.withSession(connection, (session) =>
@@ -127,7 +128,7 @@ export function createCrmSync({
         crmLastErrorCode: null,
         crmLastErrorAt: null,
       });
-      await store.recordSyncResult(workspaceId, providerId, { status: "synced" }).catch(() => {});
+      await store.recordSyncResult(workspaceId, connectionKey, { status: "synced" }).catch(() => {});
       metrics?.count("SyncSucceeded", { Provider: providerId, Outcome: result.created ? "created" : "updated" });
       metrics?.emit("SyncDuration", Number(now()) - started, { Provider: providerId });
       log.info?.("CRM sync complete", {
@@ -164,7 +165,7 @@ export function createCrmSync({
           crmLastErrorCode: "unexpected",
           crmLastErrorAt: new Date(Number(now())).toISOString(),
         }).catch(() => {});
-        metrics?.count("SyncRetried", { Provider: connection.provider, Outcome: "unexpected" });
+        metrics?.count("SyncRetried", { Provider: providerIdOf(connection.provider), Outcome: "unexpected" });
       }
       throw error;
     }
@@ -197,12 +198,12 @@ export function createCrmSync({
       case CRM_ERROR.DAILY_LIMIT: {
         const resetAt = nextUtcMidnight(Number(now()));
         await store.pause(workspaceId, connection.provider, resetAt, "daily_limit").catch(() => {});
-        metrics?.count("RateLimited", { Provider: connection.provider, Outcome: "daily_limit" });
+        metrics?.count("RateLimited", { Provider: providerIdOf(connection.provider), Outcome: "daily_limit" });
         error.retryAfterSeconds = Math.ceil((resetAt - Number(now())) / 1000);
         break;
       }
       case CRM_ERROR.RATE_LIMITED:
-        metrics?.count("RateLimited", { Provider: connection.provider, Outcome: "rate_limited" });
+        metrics?.count("RateLimited", { Provider: providerIdOf(connection.provider), Outcome: "rate_limited" });
         break;
       default:
         break;
@@ -213,11 +214,11 @@ export function createCrmSync({
       crmLastErrorAt: new Date(Number(now())).toISOString(),
     }).catch(() => {});
     if (finalAttempt) {
-      metrics?.count("SyncFailed", { Provider: connection.provider, Outcome: `exhausted_${error.code}` });
+      metrics?.count("SyncFailed", { Provider: providerIdOf(connection.provider), Outcome: `exhausted_${error.code}` });
       await store.recordSyncResult(workspaceId, connection.provider, { status: "failed", errorCode: error.code })
         .catch(() => {});
     } else {
-      metrics?.count("SyncRetried", { Provider: connection.provider, Outcome: error.code });
+      metrics?.count("SyncRetried", { Provider: providerIdOf(connection.provider), Outcome: error.code });
     }
     throw error;
   }
@@ -369,8 +370,9 @@ export function createCrmSync({
   async function syncFollowUp({ workspaceId, callId }) {
     const call = await store.getCall(workspaceId, callId);
     if (!call?.crmItemId || call.crmStatus !== "synced") return { status: "skipped", reason: "not_synced" };
-    const providerId = call.crmProvider ?? "monday";
-    const connection = await store.getConnection(workspaceId, providerId);
+    const connectionKey = connectionKeyOfCall(call);
+    const providerId = providerIdOf(connectionKey ?? "monday");
+    const connection = connectionKey ? await store.getConnection(workspaceId, connectionKey) : null;
     if (!isConnectionUsable(connection) || !connection.mapping?.columns?.followUp?.id) {
       return { status: "skipped", reason: "no_follow_up_column" };
     }
@@ -389,6 +391,14 @@ export function createCrmSync({
   }
 
   return { syncCall, syncFollowUp };
+}
+
+// The connection a call syncs through: its agent's. Calls queued before
+// connections were per agent carry the bare provider id.
+export function connectionKeyOfCall(call) {
+  const recorded = String(call?.crmProvider ?? "");
+  if (recorded.includes("#")) return recorded;
+  return call?.agentId ? connectionKeyFor(recorded || "monday", call.agentId) : null;
 }
 
 function isNewest(facts, link, linkUsable) {

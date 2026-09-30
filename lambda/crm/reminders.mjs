@@ -2,6 +2,8 @@
 // hard-expire six months after consent and cannot be extended, so the only
 // fix is a reconnect; these make sure someone knows to do it.
 
+import { agentIdOf } from "./provider.mjs";
+
 const DAY_MS = 86_400_000;
 const STAGES = ["14d", "3d", "expired"];
 
@@ -38,7 +40,9 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
     // Claim the stage first: a crash after sending must not email twice.
     const claimed = await store.markReauthReminder(connection.workspaceId, connection.provider, stage, connection.reauthReminderStage ?? null);
     if (!claimed) return false;
-    const message = renderReauthEmail({ stage, connection, appUrl });
+    const agentId = connection.agentId ?? agentIdOf(connection.provider);
+    const agent = agentId ? await store.getAgent(connection.workspaceId, agentId).catch(() => null) : null;
+    const message = renderReauthEmail({ stage, connection, appUrl, agentId, agentName: agent?.name ?? null });
     for (const address of to) {
       try {
         await sendEmail({ to: address, ...message });
@@ -50,9 +54,11 @@ export function createReauthReminders({ store, sendEmail, appUrl, now = Date.now
   };
 }
 
-export function renderReauthEmail({ stage, connection, appUrl }) {
-  const link = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
+export function renderReauthEmail({ stage, connection, appUrl, agentId = null, agentName = null }) {
+  const base = `${String(appUrl ?? "").replace(/\/+$/, "")}/integrations`;
+  const link = agentId ? `${base}?agentId=${encodeURIComponent(agentId)}` : base;
   const account = connection.accountName ? ` (${connection.accountName})` : "";
+  const forAgent = agentName ? ` for your "${agentName}" agent` : "";
   const expiry = Number(connection.refreshTokenExpiresAt);
   const when = Number.isFinite(expiry) && expiry > 0
     ? new Date(expiry).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" })
@@ -63,11 +69,11 @@ export function renderReauthEmail({ stage, connection, appUrl }) {
     : `Reconnect Monday before ${when ?? "it expires"} to keep calls logging`;
   const lines = expired
     ? [
-      `The AI Receptionist's connection to Monday${account} has ended, so new calls are no longer being logged to Monday.`,
+      `The AI Receptionist's connection to Monday${account}${forAgent} has ended, so new calls are no longer being logged to Monday.`,
       "Calls are still answered normally. Reconnect Monday and the calls that were missed in the meantime are logged automatically.",
     ]
     : [
-      `Monday requires the AI Receptionist's connection${account} to be renewed every six months. It ends on ${when}.`,
+      `Monday requires the AI Receptionist's connection${account}${forAgent} to be renewed every six months. It ends on ${when}.`,
       "Reconnecting takes one click and keeps your field mapping. If it lapses, calls are still answered but stop being logged to Monday until you reconnect.",
     ];
   const text = [...lines, "", `Reconnect Monday: ${link}`].join("\n");

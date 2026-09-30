@@ -37,7 +37,7 @@ export function createMondaySessionFactory({
 
   async function reauth(connection, reason) {
     metrics?.count("TokenFailure", { Provider: PROVIDER, Outcome: reason });
-    await connectionStore.markReauthRequired(connection.workspaceId, PROVIDER, reason)
+    await connectionStore.markReauthRequired(connection.workspaceId, connection.provider, reason)
       .catch(() => {});
     return new CrmError(CRM_ERROR.REAUTH_REQUIRED, "Monday authorization must be renewed");
   }
@@ -55,7 +55,7 @@ export function createMondaySessionFactory({
     const nowMs = Number(now());
     const locked = await connectionStore.acquireRefreshLock(
       connection.workspaceId,
-      PROVIDER,
+      connection.provider,
       connection.tokenVersion,
       nowMs + REFRESH_LOCK_MS,
     );
@@ -65,7 +65,7 @@ export function createMondaySessionFactory({
       const deadline = nowMs + waitMs;
       while (Number(now()) < deadline) {
         await sleep(250);
-        const latest = await connectionStore.getConnection(connection.workspaceId, PROVIDER);
+        const latest = await connectionStore.getConnection(connection.workspaceId, connection.provider);
         if (!latest || latest.connectionState !== "connected") {
           throw new CrmError(CRM_ERROR.REAUTH_REQUIRED, "Monday authorization must be renewed");
         }
@@ -90,11 +90,11 @@ export function createMondaySessionFactory({
         authorizedAt: connection.authorizedAt ? Date.parse(connection.authorizedAt) : Number(now()),
       });
     } catch (error) {
-      await connectionStore.releaseRefreshLock(connection.workspaceId, PROVIDER).catch(() => {});
+      await connectionStore.releaseRefreshLock(connection.workspaceId, connection.provider).catch(() => {});
       if (error instanceof CrmError && error.code === CRM_ERROR.REAUTH_REQUIRED) {
         // A container that won an earlier race may have rotated the token
         // after we read the row - that is not a revocation.
-        const latest = await connectionStore.getConnection(connection.workspaceId, PROVIDER);
+        const latest = await connectionStore.getConnection(connection.workspaceId, connection.provider);
         if (latest?.connectionState === "connected" && latest.tokenVersion !== connection.tokenVersion) {
           return useStored(latest);
         }
@@ -120,7 +120,7 @@ export function createMondaySessionFactory({
     ]);
     const saved = await connectionStore.saveRefreshedTokens({
       workspaceId: connection.workspaceId,
-      provider: PROVIDER,
+      provider: connection.provider,
       expectedVersion: connection.tokenVersion,
       encryptedAccessToken,
       encryptedRefreshToken,
@@ -129,7 +129,7 @@ export function createMondaySessionFactory({
     });
     metrics?.count("TokenRefresh", { Provider: PROVIDER, Outcome: saved ? "ok" : "lost_race" });
     if (!saved) {
-      const latest = await connectionStore.getConnection(connection.workspaceId, PROVIDER);
+      const latest = await connectionStore.getConnection(connection.workspaceId, connection.provider);
       if (latest?.connectionState === "connected") return useStored(latest);
       throw new CrmError(CRM_ERROR.REAUTH_REQUIRED, "Monday authorization must be renewed");
     }
@@ -185,7 +185,7 @@ export function createMondaySessionFactory({
       } catch (error) {
         if (!(error instanceof CrmError) || error.code !== CRM_ERROR.UNAUTHORIZED) throw error;
       }
-      const latest = await connectionStore.getConnection(connection.workspaceId, PROVIDER) ?? connection;
+      const latest = await connectionStore.getConnection(connection.workspaceId, connection.provider) ?? connection;
       // If someone else rotated the token since we read the row, their new
       // access token is the one to try - refreshing again would be wasted.
       accessToken = await accessTokenFor(latest, {

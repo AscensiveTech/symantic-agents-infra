@@ -5684,6 +5684,7 @@ async function handleInboundLookup(event, {
   // can only ever mean "no caller context", never a delayed or failed call.
   const crmContextPromise = lookupCrmContext({
     workspaceId: phoneNumber.workspaceId,
+    agentId: phoneNumber.agentId,
     callerNumber: input.call_inbound.from_number,
   }).catch(() => CRM_CONTEXT_UNAVAILABLE);
   // We never decline a call just because the account is past its plan
@@ -8564,7 +8565,7 @@ export function createCrmContextLookup({
   now = Date.now,
   log = console,
 }) {
-  return async function lookupCrmContext({ workspaceId, callerNumber }) {
+  return async function lookupCrmContext({ workspaceId, agentId, callerNumber }) {
     const started = Number(now());
     let outcome = "skipped";
     const controller = new AbortController();
@@ -8577,8 +8578,8 @@ export function createCrmContextLookup({
       }, budgetMs);
     });
     const work = (async () => {
-      if (!workspaceId || typeof callerNumber !== "string" || !callerNumber) return CRM_CONTEXT_UNAVAILABLE;
-      const status = await getConnectionStatus(workspaceId);
+      if (!workspaceId || !agentId || typeof callerNumber !== "string" || !callerNumber) return CRM_CONTEXT_UNAVAILABLE;
+      const status = await getConnectionStatus(workspaceId, agentId);
       if (
         status?.connectionState !== "connected" ||
         status?.mappingStatus !== "valid" ||
@@ -8586,7 +8587,7 @@ export function createCrmContextLookup({
       ) {
         return CRM_CONTEXT_UNAVAILABLE;
       }
-      const result = await invoke({ action: "lookup", workspaceId, callerNumber }, controller.signal);
+      const result = await invoke({ action: "lookup", workspaceId, agentId, callerNumber }, controller.signal);
       outcome = typeof result?.status === "string" ? result.status : "error";
       return typeof result?.context === "string" && result.context ? result.context : CRM_CONTEXT_UNAVAILABLE;
     })().catch((error) => {
@@ -8629,16 +8630,17 @@ async function defaultLookupCrmContext(input) {
     const dynamoClient = new dynamodb.DynamoDBClient({});
     const lambdaClient = new lambda.LambdaClient({});
     return createCrmContextLookup({
-      async getConnectionStatus(workspaceId) {
+      // One Monday connection per agent, keyed "monday#<agentId>".
+      async getConnectionStatus(workspaceId, agentId) {
         const result = await dynamoClient.send(new dynamodb.GetItemCommand({
           TableName: table,
-          Key: { workspaceId: { S: workspaceId }, provider: { S: "monday" } },
-          ProjectionExpression: "connectionState, mappingStatus, pausedUntil",
+          Key: { workspaceId: { S: workspaceId }, provider: { S: `monday#${agentId}` } },
+          ProjectionExpression: "connectionState, mappingStatus, pausedUntil, boardSyncEnabled",
         }));
         const item = result.Item ?? {};
         return {
           connectionState: item.connectionState?.S,
-          mappingStatus: item.mappingStatus?.S,
+          mappingStatus: item.boardSyncEnabled?.BOOL === false ? "off" : item.mappingStatus?.S,
           pausedUntil: item.pausedUntil?.N ? Number(item.pausedUntil.N) : undefined,
         };
       },

@@ -18,7 +18,7 @@ test("connect: OAuth round trip stores encrypted tokens and never exposes them",
   assert.equal(callback.statusCode, 302);
   assert.equal(callback.headers.location, `${APP_URL}/integrations?crm=connected`);
 
-  const row = h.store.connections.get("ws-a\0monday");
+  const row = h.store.connections.get("ws-a\0monday#agent-a");
   assert.equal(row.connectionState, "connected");
   assert.equal(row.accountId, "5550001");
   assert.equal(row.mappingStatus, "unconfigured");
@@ -109,7 +109,7 @@ test("mapping: boards come with a suggestion; a valid mapping saves with live co
     overrides: { columns: { ...leads.suggestion.columns, phone: { id: "phone_mkx1", type: "text" } } },
   });
   assert.equal(saved.statusCode, 200);
-  const row = h.store.connections.get("ws-a\0monday");
+  const row = h.store.connections.get("ws-a\0monday#agent-a");
   assert.equal(row.mappingStatus, "valid");
   assert.equal(row.mapping.columns.phone.type, "phone", "a client-supplied type is replaced by Monday's");
   assert.equal(row.mapping.boardName, "Leads");
@@ -125,7 +125,7 @@ test("mapping: invalid mappings are rejected with specific problems and not save
   assert.equal(body(badLabel).problems[0].field, "labels.newLead");
   const badInput = await h.api("PUT", "/crm/mapping", { sub: "sub-admin-a", body: { mapping: { boardId: "not-a-number" } } });
   assert.equal(badInput.statusCode, 400);
-  assert.equal(h.store.connections.get("ws-a\0monday").mappingStatus, "unconfigured");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").mappingStatus, "unconfigured");
 });
 
 test("disconnect: revokes at Monday, deletes our tokens, keeps the mapping for reconnect", async () => {
@@ -135,13 +135,13 @@ test("disconnect: revokes at Monday, deletes our tokens, keeps the mapping for r
   assert.equal(response.statusCode, 200);
   assert.equal(body(response).connectionState, "disconnected");
   assert.equal(h.monday.revoked.length, 1);
-  const row = h.store.connections.get("ws-a\0monday");
+  const row = h.store.connections.get("ws-a\0monday#agent-a");
   assert.equal(row.encryptedAccessToken, undefined);
   assert.equal(row.encryptedRefreshToken, undefined);
   assert.ok(row.mapping);
 
   h.monday.reset();
-  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(lookup.status, "skipped");
   assert.equal(h.monday.graphqlCount(), 0, "a disconnected CRM costs zero Monday calls");
 });
@@ -153,7 +153,7 @@ test("disconnect still succeeds when Monday's revoke endpoint is down", async ()
   const response = await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
   assert.equal(body(response).connectionState, "disconnected");
   assert.equal(h.monday.revoked.length, 0);
-  assert.equal(h.store.connections.get("ws-a\0monday").encryptedRefreshToken, undefined);
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").encryptedRefreshToken, undefined);
 });
 
 test("reconnect after re-authorization keeps the mapping, revalidates it, and retries failed syncs", async () => {
@@ -164,7 +164,7 @@ test("reconnect after re-authorization keeps the mapping, revalidates it, and re
   h.monday.expireAccessTokens();
   h.enqueueCall(call);
   await h.drain();
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "reauth_required");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "reauth_required");
   assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "failed");
   assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmLastErrorCode, "reauth_required");
 
@@ -174,7 +174,7 @@ test("reconnect after re-authorization keeps the mapping, revalidates it, and re
 
   const { callback } = await h.connect();
   assert.match(callback.headers.location, /crm=connected/);
-  const row = h.store.connections.get("ws-a\0monday");
+  const row = h.store.connections.get("ws-a\0monday#agent-a");
   assert.equal(row.connectionState, "connected");
   assert.equal(row.mappingStatus, "valid");
   assert.equal(h.queue.messages.length, 1, "the failed call was re-queued");
@@ -188,14 +188,14 @@ test("lookup: an existing caller gets CRM context in one Monday call", async () 
   const h = createHarness();
   await h.connectAndMap();
   const jane = h.monday.addItem(h.board.id, { name: "Jane Doe", phone: "2025550198", status: "Qualified", owner: "Sam Lee" });
-  const result = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const result = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(result.status, "found");
   assert.match(result.context, /name on file: Jane Doe; status: Qualified; account owner: Sam Lee/);
   assert.equal(h.monday.graphqlCount(), 1);
-  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`).externalId, jane.id);
+  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`).externalId, jane.id);
 
   h.monday.reset();
-  const again = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const again = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(again.status, "found");
   assert.deepEqual(h.monday.requests.map((r) => r.operation), ["get_item"], "a known caller is fetched by id");
   assert.ok(h.metrics.points.some((p) => p.name === "LookupLatency" && p.Outcome === "found"));
@@ -204,10 +204,10 @@ test("lookup: an existing caller gets CRM context in one Monday call", async () 
 test("lookup: an unknown caller gets no context and a remembered negative answer", async () => {
   const h = createHarness();
   await h.connectAndMap();
-  const result = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550111" });
+  const result = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550111" });
   assert.equal(result.status, "not_found");
   assert.equal(result.context, NO_CRM_CONTEXT);
-  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550111")}`).state, "none");
+  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550111")}`).state, "none");
 });
 
 test("lookup: duplicate phone matches provide no context and cache no arbitrary record", async () => {
@@ -216,12 +216,12 @@ test("lookup: duplicate phone matches provide no context and cache no arbitrary 
   h.monday.addItem(h.board.id, { name: "Jane One", phone: "+12025550198" });
   h.monday.addItem(h.board.id, { name: "Jane Two", phone: "+12025550198" });
 
-  const result = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const result = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
 
   assert.equal(result.status, "ambiguous");
   assert.equal(result.reason, "duplicate_phone");
   assert.equal(result.context, NO_CRM_CONTEXT);
-  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`);
+  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`);
   assert.notEqual(link?.state, "linked");
   assert.equal(link?.externalId, undefined);
   assert.equal(h.metrics.sum("AmbiguousMatch", { Provider: "monday" }), 1);
@@ -231,12 +231,12 @@ test("lookup: a linked record deleted in Monday falls back to a phone search", a
   const h = createHarness();
   await h.connectAndMap();
   const old = h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
-  await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   h.monday.deleteItem(old.id);
   const replacement = h.monday.addItem(h.board.id, { name: "Jane (new)", phone: "+12025550198" });
-  const result = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const result = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.match(result.context, /Jane \(new\)/);
-  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`).externalId, replacement.id);
+  assert.equal(h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`).externalId, replacement.id);
 });
 
 test("lookup: Monday slow, down, rate-limited or rejecting never throws and never blocks past the budget", async () => {
@@ -245,7 +245,7 @@ test("lookup: Monday slow, down, rate-limited or rejecting never throws and neve
 
   h.monday.delay("search", 3000);
   const started = Date.now();
-  const slow = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const slow = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   const elapsed = Date.now() - started;
   h.monday.delay("search", 0);
   assert.equal(slow.status, "timeout");
@@ -253,13 +253,13 @@ test("lookup: Monday slow, down, rate-limited or rejecting never throws and neve
   assert.ok(elapsed < 1500, `lookup gave up after ${elapsed}ms`);
 
   h.monday.failNext("search", { status: 500, body: {} });
-  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).status, "error");
+  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).status, "error");
 
   h.monday.failNext("search", { status: 429, body: h.monday.errorBody("Rate Limit Exceeded"), headers: { "retry-after": "30" } });
-  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).status, "error");
+  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).status, "error");
 
   h.monday.failNext("search", { status: 200, body: h.monday.errorBody("InvalidColumnIdException") });
-  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).status, "error");
+  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).status, "error");
   assert.ok(h.logs.every((entry) => !JSON.stringify(entry).includes("2025550198")), "logs never hold the full number");
 });
 
@@ -267,15 +267,15 @@ test("lookup: hitting the daily API cap pauses the connection until the next UTC
   const h = createHarness();
   await h.connectAndMap();
   h.monday.failNext("search", { status: 429, body: h.monday.errorBody("DAILY_LIMIT_EXCEEDED") });
-  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).status, "error");
-  const pausedUntil = h.store.connections.get("ws-a\0monday").pausedUntil;
+  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).status, "error");
+  const pausedUntil = h.store.connections.get("ws-a\0monday#agent-a").pausedUntil;
   assert.equal(new Date(pausedUntil).toISOString(), "2026-09-26T00:05:00.000Z");
   h.monday.reset();
-  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).reason, "paused");
+  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).reason, "paused");
   assert.equal(h.monday.graphqlCount(), 0, "no calls are spent while paused");
   h.clock.set(pausedUntil + 1000);
   h.monday.expireAccessTokens();
-  assert.notEqual((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).reason, "paused");
+  assert.notEqual((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).reason, "paused");
 });
 
 test("lookup: an expired access token is refreshed transparently; a revoked grant flips to reauth", async () => {
@@ -283,26 +283,26 @@ test("lookup: an expired access token is refreshed transparently; a revoked gran
   await h.connectAndMap();
   h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
   h.clock.advance(2 * 60 * 60 * 1000);
-  const refreshed = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const refreshed = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(refreshed.status, "found");
   assert.equal(h.monday.count("oauth_refresh_token"), 1);
-  assert.equal(h.store.connections.get("ws-a\0monday").tokenVersion, 2);
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").tokenVersion, 2);
 
   h.monday.revokeAll();
   h.clock.advance(2 * 60 * 60 * 1000);
-  const revoked = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const revoked = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(revoked.status, "error");
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "reauth_required");
-  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).reason, "not_connected");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "reauth_required");
+  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).reason, "not_connected");
 });
 
 test("lookup: authorization past its six-month ceiling needs reconnecting", async () => {
   const h = createHarness();
   await h.connectAndMap();
   h.clock.advance(181 * 86_400_000);
-  const result = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const result = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(result.context, NO_CRM_CONTEXT);
-  assert.equal(h.store.connections.get("ws-a\0monday").reauthReason, "authorization_expired");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").reauthReason, "authorization_expired");
 });
 
 test("lookup via the Lambda handler (BFF invoke path) returns context and never throws", async () => {
@@ -310,7 +310,7 @@ test("lookup via the Lambda handler (BFF invoke path) returns context and never 
   await h.connectAndMap();
   h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
   const handler = createHandler({ getRuntime: async () => h.runtime });
-  const result = await handler({ action: "lookup", workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const result = await handler({ action: "lookup", workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(result.status, "found");
   const broken = createHandler({ getRuntime: async () => { throw new Error("no env"); } });
   assert.deepEqual(await broken({ action: "lookup", workspaceId: "ws-a" }), { status: "error", context: NO_CRM_CONTEXT });
@@ -347,7 +347,7 @@ test("sync: an unknown caller becomes a new lead with a call note (3 Monday call
 test("sync: when the call-time lookup just said 'not found', the worker skips the repeat search", async () => {
   const h = createHarness();
   await h.connectAndMap();
-  await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   h.monday.reset();
   const call = h.seedCall();
   h.enqueueCall(call);
@@ -359,7 +359,7 @@ test("sync: an existing caller gets one combined request - note plus our fields"
   const h = createHarness();
   await h.connectAndMap();
   const jane = h.monday.addItem(h.board.id, { name: "Jane Doe", phone: "+12025550198", status: "Qualified", owner: "Sam Lee" });
-  await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   h.monday.reset();
 
   const call = h.seedCall({
@@ -463,7 +463,7 @@ test("duplicates: sync refuses to update an arbitrary phone match", async () => 
   assert.equal(row.crmLastErrorCode, "ambiguous_match");
   assert.equal(first.updates.length, 0);
   assert.equal(second.updates.length, 0);
-  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`);
+  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`);
   assert.notEqual(link?.state, "linked");
   assert.equal(link?.externalId, undefined);
   assert.equal(h.metrics.sum("AmbiguousMatch", { Provider: "monday" }), 1);
@@ -536,7 +536,7 @@ test("a failure writing the in-progress marker still releases the phone lease", 
   const call = h.seedCall();
   h.store.failNext("updateCallSync", Object.assign(new Error("throttled"), { name: "ThrottlingException" }));
   await assert.rejects(h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: call.callId }));
-  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday", "+12025550198")}`);
+  const link = h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`);
   assert.equal(link.leaseOwner, undefined, "lease released");
   h.enqueueCall(call);
   await h.drain();
@@ -671,7 +671,7 @@ test("DLQ: a call that keeps failing is marked failed and dead-lettered after 8 
   assert.equal(row.crmStatus, "failed");
   assert.equal(row.crmLastErrorCode, "transient");
   assert.equal(h.metrics.sum("DeadLettered"), 1);
-  assert.equal(h.store.connections.get("ws-a\0monday").lastSyncStatus, "failed");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").lastSyncStatus, "failed");
 
   // Redrive after the outage: the same message is safe to replay.
   h.monday.clearFailures();
@@ -717,7 +717,7 @@ test("drift: a deleted board fails the sync permanently and flags the mapping", 
   assert.equal(view.mappingStatus, "invalid");
   assert.equal(view.mappingProblems[0].field, "board");
   h.monday.reset();
-  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" })).status, "skipped");
+  assert.equal((await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" })).status, "skipped");
   assert.equal(h.monday.graphqlCount(), 0);
 });
 
@@ -731,13 +731,13 @@ test("drift: a removed column still records the note, flags the mapping, and fix
   await h.drain();
   assert.equal(jane.updates.length, 1, "the note landed");
   assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "synced");
-  assert.equal(h.store.connections.get("ws-a\0monday").mappingStatus, "invalid");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").mappingStatus, "invalid");
 
   const fixed = await h.configureMapping({
-    overrides: { columns: { ...h.store.connections.get("ws-a\0monday").mapping.columns, outcome: undefined } },
+    overrides: { columns: { ...h.store.connections.get("ws-a\0monday#agent-a").mapping.columns, outcome: undefined } },
   });
   assert.equal(fixed.statusCode, 200);
-  assert.equal(h.store.connections.get("ws-a\0monday").mappingStatus, "valid");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").mappingStatus, "valid");
 });
 
 test("drift: a status label deleted in Monday is an invalid value, not an endless retry", async () => {
@@ -755,7 +755,7 @@ test("drift: a linked record deleted in Monday is re-resolved and a new lead is 
   const h = createHarness();
   await h.connectAndMap();
   const jane = h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
-  await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   h.monday.deleteItem(jane.id);
   const call = h.seedCall();
   h.enqueueCall(call);
@@ -788,14 +788,14 @@ test("tokens: concurrent refreshes in two containers rotate the refresh token ex
   const h = createHarness();
   await h.connectAndMap();
   h.clock.advance(2 * 60 * 60 * 1000);
-  const connection = h.store.connections.get("ws-a\0monday");
+  const connection = h.store.connections.get("ws-a\0monday#agent-a");
   const [a, b] = await Promise.all([
     h.runtime.sessions.accessTokenFor(structuredClone(connection)),
     h.runtime.sessions.accessTokenFor(structuredClone(connection)),
   ]);
   assert.equal(a, b);
   assert.equal(h.monday.count("oauth_refresh_token"), 1);
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "connected");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "connected");
 });
 
 test("tokens: a 401 mid-sync triggers one refresh and the sync completes", async () => {
@@ -812,7 +812,7 @@ test("tokens: a 401 mid-sync triggers one refresh and the sync completes", async
 test("tokens: ciphertext is bound to its workspace", async () => {
   const h = createHarness();
   await h.connectAndMap();
-  const row = h.store.connections.get("ws-a\0monday");
+  const row = h.store.connections.get("ws-a\0monday#agent-a");
   await assert.rejects(h.tokenCrypto.decrypt({ ciphertext: row.encryptedRefreshToken, workspaceId: "ws-b", provider: "monday", purpose: "refresh" }));
   await assert.rejects(h.tokenCrypto.decrypt({ ciphertext: row.encryptedRefreshToken, workspaceId: "ws-a", provider: "monday", purpose: "access" }));
 });
@@ -830,22 +830,22 @@ function lifecycle(h, { type = "uninstall", accountId = "5550001", secret = TEST
 test("webhook: a verified uninstall purges provider data for that Monday account only", async () => {
   const h = createHarness();
   await h.connectAndMap();
-  h.store.seedConnection({ workspaceId: "ws-b", provider: "monday", accountId: "999", connectionState: "connected" });
+  h.store.seedConnection({ workspaceId: "ws-b", provider: "monday#agent-b", accountId: "999", connectionState: "connected" });
   const call = h.seedCall({
     crmStatus: "synced",
     crmItemId: "123",
     crmItemUrl: "https://example.monday.com/boards/1/pulses/123",
     crmActivityId: "456",
   });
-  await h.store.saveLink("ws-a", linkKeyFor("monday", call.callerNumber), {
+  await h.store.saveLink("ws-a", linkKeyFor("monday#agent-a", call.callerNumber), {
     provider: "monday",
     state: "linked",
     externalId: "123",
   });
   const response = await lifecycle(h);
   assert.equal(response.statusCode, 200);
-  assert.equal(h.store.connections.has("ws-a\0monday"), false);
-  assert.equal(h.store.links.has(`ws-a\0${linkKeyFor("monday", call.callerNumber)}`), false);
+  assert.equal(h.store.connections.has("ws-a\0monday#agent-a"), false);
+  assert.equal(h.store.links.has(`ws-a\0${linkKeyFor("monday#agent-a", call.callerNumber)}`), false);
   const retainedCall = h.store.callRows.get(`ws-a\0${call.callId}`);
   assert.equal(retainedCall.callSummary, call.callSummary, "independent call history is retained");
   assert.equal(retainedCall.crmProvider, undefined);
@@ -853,7 +853,7 @@ test("webhook: a verified uninstall purges provider data for that Monday account
   assert.equal(retainedCall.crmItemUrl, undefined);
   assert.equal(retainedCall.crmActivityId, undefined);
   assert.equal(retainedCall.crmStatus, undefined);
-  assert.equal(h.store.connections.get("ws-b\0monday").connectionState, "connected");
+  assert.equal(h.store.connections.get("ws-b\0monday#agent-b").connectionState, "connected");
   assert.equal((await lifecycle(h)).statusCode, 200, "duplicate delivery is harmless");
 });
 
@@ -867,7 +867,7 @@ test("webhook: forged, expired, cross-account and cross-app requests are rejecte
   assert.equal((await lifecycle(h, { claims: { accountId: 5550001, appId: 1, exp: h.clock() / 1000 + 60 } })).statusCode, 401);
   const noHeader = await h.api("POST", "/crm/monday/lifecycle", { body: { type: "uninstall", data: { account_id: 5550001 } } });
   assert.equal(noHeader.statusCode, 401);
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "connected");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "connected");
   assert.equal(h.metrics.sum("Webhook", { Outcome: "rejected" }), 6);
 });
 
@@ -875,7 +875,7 @@ test("webhook: other lifecycle events are acknowledged without side effects", as
   const h = createHarness();
   await h.connectAndMap();
   assert.equal((await lifecycle(h, { type: "install" })).statusCode, 200);
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "connected");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "connected");
 });
 
 // ====================================================== tenant isolation ====
@@ -886,9 +886,9 @@ test("isolation: each workspace sees and configures only its own connection", as
   const other = await h.api("GET", "/crm/connection", { sub: "sub-admin-b" });
   assert.equal(other.body, "null");
   assert.equal((await h.api("DELETE", "/crm/connection", { sub: "sub-admin-b" })).body, "null");
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "connected");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "connected");
   assert.equal((await h.api("GET", "/crm/monday/boards", { sub: "sub-admin-b" })).statusCode, 409);
-  const lookup = await h.runtime.lookup({ workspaceId: "ws-b", callerNumber: "+12025550198" });
+  const lookup = await h.runtime.lookup({ workspaceId: "ws-b", agentId: "agent-b", callerNumber: "+12025550198" });
   assert.equal(lookup.status, "skipped");
 });
 
@@ -923,7 +923,7 @@ test("keeper: refreshes tokens nearing expiry so the call-time lookup never has 
 
   h.clock.advance(30 * 60 * 1000);
   h.monday.reset();
-  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", callerNumber: "+12025550198" });
+  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
   assert.equal(lookup.status, "found");
   assert.equal(h.monday.count("oauth_refresh_token"), 0, "no refresh on the live path");
 });
@@ -935,7 +935,7 @@ test("keeper: a revoked grant is flagged before the next call arrives", async ()
   h.clock.advance(40 * 60 * 1000);
   const result = await h.runtime.refreshTokens();
   assert.equal(result.failed, 1);
-  assert.equal(h.store.connections.get("ws-a\0monday").connectionState, "reauth_required");
+  assert.equal(h.store.connections.get("ws-a\0monday#agent-a").connectionState, "reauth_required");
   assert.equal(h.metrics.sum("KeeperFailed"), 1);
 });
 
@@ -983,7 +983,7 @@ test("the Lambda handler routes the scheduled keeper event", async () => {
 test("keeper: refreshes many tenants in parallel and defers what doesn't fit its time budget", async () => {
   const { createTokenKeeper } = await import("./keeper.mjs");
   let clock = 0;
-  const rows = Array.from({ length: 12 }, (_, i) => ({ workspaceId: `ws-${i}`, provider: "monday" }));
+  const rows = Array.from({ length: 12 }, (_, i) => ({ workspaceId: `ws-${i}`, provider: "monday#agent-a" }));
   let inFlight = 0;
   let peak = 0;
   const keeper = createTokenKeeper({
@@ -1117,4 +1117,48 @@ test("boards: private, subitem and document boards are left out of the picker, b
   assert.equal(reconnect.callback.statusCode, 302);
   const connection = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
   assert.equal(connection.mappingStatus, "valid", "making the mapped board private later doesn't break syncing");
+});
+
+// ============================================================ per agent ====
+
+test("per agent: each agent has its own Monday connection; another agent's calls never use it", async () => {
+  const h = createHarness();
+  h.store.seedAgent("ws-a", "agent-a2", { name: "Spanish Line" });
+  await h.connectAndMap();
+  const connection = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
+  assert.equal(connection.agentId, "agent-a");
+  assert.equal(connection.provider, "monday");
+  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a", agent: "agent-a2" })).body), null, "the second agent is not connected");
+
+  const other = h.seedCall({ agentId: "agent-a2", crmProvider: undefined });
+  h.enqueueCall(h.store.callRows.get(`ws-a\0${other.callId}`));
+  await h.drain();
+  const row = h.store.callRows.get(`ws-a\0${other.callId}`);
+  assert.equal(row.crmStatus, "skipped");
+  assert.equal(h.monday.count("create_item"), 0, "nothing written to agent-a's board");
+
+  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a2", callerNumber: "+12025550198" });
+  assert.equal(lookup.reason, "not_connected");
+});
+
+test("per agent: settings routes refuse a missing, unknown, deleted or other-workspace agent", async () => {
+  const h = createHarness();
+  h.store.seedAgent("ws-a", "agent-gone", { status: "deleted" });
+  const status = async (agent) => (await h.api("GET", "/crm/connection", { sub: "sub-admin-a", agent })).statusCode;
+  assert.equal(await status(null), 400);
+  assert.equal(await status("agent-nope"), 404);
+  assert.equal(await status("agent-gone"), 404);
+  assert.equal(await status("agent-b"), 404, "ws-b's agent is invisible to ws-a");
+  assert.equal(await status("agent-a"), 200);
+});
+
+test("per agent: a call queued under the old workspace-level key still syncs through its agent", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall({ crmProvider: "monday" });
+  h.enqueueCall(call);
+  await h.drain();
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.equal(row.crmStatus, "synced");
+  assert.equal(row.crmProvider, "monday#agent-a");
 });

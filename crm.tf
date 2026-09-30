@@ -193,6 +193,7 @@ locals {
     CALLS_TABLE                 = aws_dynamodb_table.control_plane["calls"].name
     BUSINESS_PROFILES_TABLE     = aws_dynamodb_table.control_plane["business_profiles"].name
     CONTACTS_TABLE              = aws_dynamodb_table.control_plane["contacts"].name
+    AGENTS_TABLE                = aws_dynamodb_table.control_plane["agents"].name
     WORKSPACE_MEMBERSHIPS_TABLE = aws_dynamodb_table.workspace_memberships.name
     OAUTH_STATES_TABLE          = aws_dynamodb_table.oauth_states.name
     CRM_TOKENS_KMS_KEY_ID       = aws_kms_key.crm_tokens.arn
@@ -268,6 +269,14 @@ resource "aws_iam_role_policy" "crm_runtime" {
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem"]
         Resource = aws_dynamodb_table.workspace_memberships.arn
+      },
+      {
+        # Connections are per agent: check a requested agent is in the
+        # caller's workspace, and name it in reminder emails.
+        Sid      = "ReadAgents"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.control_plane["agents"].arn
       },
       {
         # Reconnect reminders fall back to every company admin.
