@@ -7,6 +7,8 @@ import { createMondayGraphqlClient } from "./monday/graphql.mjs";
 import { createMondayOAuthClient } from "./monday/oauth.mjs";
 import { createMondaySessionFactory } from "./monday/session.mjs";
 import { createProviderRegistry } from "./provider.mjs";
+import { createReauthReminders } from "./reminders.mjs";
+import { createRequeuer } from "./requeue.mjs";
 import { createDynamoCrmStore } from "./store.mjs";
 import { createCrmSync } from "./sync.mjs";
 
@@ -22,6 +24,7 @@ export function composeRuntime({
   tokenCrypto,
   enqueue,
   changeVisibility,
+  sendEmail,
   fetchImpl = globalThis.fetch,
   apiVersion,
   appUrl,
@@ -43,6 +46,7 @@ export function composeRuntime({
     sleep,
     metrics,
   });
+  const crmSync = createCrmSync({ store, providers, sessions, appUrl, metrics, now, log });
   return {
     store,
     adapter,
@@ -50,9 +54,18 @@ export function composeRuntime({
     sessions,
     metrics,
     changeVisibility,
-    sync: createCrmSync({ store, providers, sessions, appUrl, metrics, now, log }),
+    sync: crmSync,
+    syncFollowUp: crmSync.syncFollowUp,
     lookup: createCrmLookup({ store, providers, sessions, metrics, now, log }),
-    refreshTokens: createTokenKeeper({ store, sessions, metrics, now, log }),
+    refreshTokens: createTokenKeeper({
+      store,
+      sessions,
+      requeueFailed: createRequeuer({ store, enqueue, metrics, now }),
+      remindReauth: createReauthReminders({ store, sendEmail, appUrl, now, log }),
+      metrics,
+      now,
+      log,
+    }),
     api: createCrmApi({
       store,
       adapter,
@@ -81,11 +94,12 @@ export function getRuntime() {
 }
 
 async function createAwsRuntime() {
-  const [dynamodb, kms, secrets, sqs] = await Promise.all([
+  const [dynamodb, kms, secrets, sqs, sesv2] = await Promise.all([
     import("@aws-sdk/client-dynamodb"),
     import("@aws-sdk/client-kms"),
     import("@aws-sdk/client-secrets-manager"),
     import("@aws-sdk/client-sqs"),
+    import("@aws-sdk/client-sesv2"),
   ]);
   const env = process.env;
   const store = createDynamoCrmStore(new dynamodb.DynamoDBClient({}), dynamodb, {
@@ -93,6 +107,7 @@ async function createAwsRuntime() {
     links: env.CRM_LINKS_TABLE,
     calls: env.CALLS_TABLE,
     businessProfiles: env.BUSINESS_PROFILES_TABLE,
+    contacts: env.CONTACTS_TABLE,
     memberships: env.WORKSPACE_MEMBERSHIPS_TABLE,
     oauthStates: env.OAUTH_STATES_TABLE,
   });
@@ -145,6 +160,23 @@ async function createAwsRuntime() {
     return value;
   };
 
+  const sesClient = new sesv2.SESv2Client({});
+  const sendEmail = env.EMAIL_FROM
+    ? async ({ to, subject, html, text }) => {
+      await sesClient.send(new sesv2.SendEmailCommand({
+        FromEmailAddress: env.EMAIL_FROM,
+        Destination: { ToAddresses: [to] },
+        ...(env.EMAIL_CONFIGURATION_SET ? { ConfigurationSetName: env.EMAIL_CONFIGURATION_SET } : {}),
+        Content: {
+          Simple: {
+            Subject: { Data: String(subject).replace(/\s+/g, " ").slice(0, 250), Charset: "UTF-8" },
+            Body: { Html: { Data: html, Charset: "UTF-8" }, Text: { Data: text, Charset: "UTF-8" } },
+          },
+        },
+      }));
+    }
+    : undefined;
+
   const sqsClient = new sqs.SQSClient({});
   const queueUrl = env.CRM_SYNC_QUEUE_URL;
   return composeRuntime({
@@ -158,6 +190,7 @@ async function createAwsRuntime() {
         MessageBody: JSON.stringify({ v: 1, ...message }),
       }));
     },
+    sendEmail,
     changeVisibility: async (receiptHandle, seconds) => {
       await sqsClient.send(new sqs.ChangeMessageVisibilityCommand({
         QueueUrl: queueUrl,

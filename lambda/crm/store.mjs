@@ -137,10 +137,10 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       do {
         const result = await client.send(new commands.ScanCommand({
           TableName: connections,
-          FilterExpression: "connectionState = :connected",
-          ProjectionExpression: "workspaceId, #provider",
+          FilterExpression: "connectionState IN (:connected, :reauth)",
+          ProjectionExpression: "workspaceId, #provider, connectionState",
           ExpressionAttributeNames: { "#provider": "provider" },
-          ExpressionAttributeValues: marshall({ ":connected": "connected" }),
+          ExpressionAttributeValues: marshall({ ":connected": "connected", ":reauth": "reauth_required" }),
           ...(startKey ? { ExclusiveStartKey: startKey } : {}),
         }));
         items.push(...(result.Items ?? []).map(unmarshall));
@@ -162,7 +162,7 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
           createdAt: undefined,
           updatedAt: timestamp,
         },
-        remove: ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason"],
+        remove: ["refreshLockUntil", "pausedUntil", "pauseReason", "reauthReason", "disconnectedAt", "disconnectReason", "reauthReminderStage"],
       }).then(async (saved) => {
         // First connection: no mapping yet.
         if (!saved.mappingStatus) {
@@ -337,6 +337,27 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // Compare-and-set so two keeper runs never send the same reminder twice.
+    async markReauthReminder(workspaceId, provider, stage, previousStage) {
+      const saved = await update(connections, { workspaceId, provider }, {
+        set: { reauthReminderStage: stage },
+        condition: previousStage
+          ? "reauthReminderStage = :previous"
+          : "attribute_exists(workspaceId) AND attribute_not_exists(reauthReminderStage)",
+        conditionValues: previousStage ? { ":previous": previousStage } : {},
+        conditional: true,
+      });
+      return Boolean(saved);
+    },
+
+    markAutoRequeued(workspaceId, provider) {
+      return update(connections, { workspaceId, provider }, {
+        set: { autoRequeuedAt: Number(now()) },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
     // ---- links ----
     getLink(workspaceId, linkKey) {
       return get(links, { workspaceId, linkKey });
@@ -429,6 +450,32 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
     async getProfileTimezone(workspaceId) {
       const profile = await get(tables.businessProfiles, { workspaceId }, ["timezone"]);
       return typeof profile?.timezone === "string" ? profile.timezone : null;
+    },
+
+    async getContactCompany(workspaceId, phoneNumber) {
+      if (!tables.contacts || !phoneNumber) return null;
+      const contact = await get(tables.contacts, { workspaceId, phoneNumber }, ["companyName"]);
+      return typeof contact?.companyName === "string" && contact.companyName.trim() ? contact.companyName.trim() : null;
+    },
+
+    async listWorkspaceAdmins(workspaceId) {
+      requireTable(tables.memberships);
+      const items = [];
+      let startKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tables.memberships,
+          IndexName: "workspaceId-index",
+          KeyConditionExpression: "workspaceId = :workspaceId",
+          ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+        items.push(...(result.Items ?? []).map(unmarshall));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+      return items
+        .filter((member) => member.status === "active" && (member.role === "company-admin" || (member.roles ?? []).includes?.("company-admin")))
+        .map((member) => ({ userId: member.userId, email: member.email ?? null, name: member.name ?? null }));
     },
 
     getMembership(userId) {
