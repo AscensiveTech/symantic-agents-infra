@@ -155,3 +155,25 @@ function validTimezone(value) {
     return null;
   }
 }
+
+export function transcriptText(transcript) {
+  if (typeof transcript === "string") return transcript.trim() || null;
+  if (!Array.isArray(transcript)) return null;
+  const text = transcript
+    .filter((line) => typeof line?.text === "string" && line.text.trim())
+    .map((line) => `${line.speaker ?? "Caller"}: ${line.text.trim()}`)
+    .join("\n");
+  return text || null;
+}
+
+const FOLLOW_UP_STATUS_LABELS = { not_started: "Not started", in_progress: "In progress", resolved: "Resolved" };
+
+export function followUpText(followUp) {
+  if (!followUp || typeof followUp !== "object") return null;
+  const parts = [
+    FOLLOW_UP_STATUS_LABELS[followUp.status],
+    followUp.assigneeName ? `Assigned to ${followUp.assigneeName}` : null,
+    typeof followUp.comment === "string" && followUp.comment.trim() ? followUp.comment.trim() : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(" - ") : null;
+}

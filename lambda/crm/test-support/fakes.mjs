@@ -75,7 +75,10 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       row.connectionState = "connected";
       row.tokenVersion = (row.tokenVersion ?? 0) + 1;
       row.updatedAt = iso();
-      row.mappingStatus ??= row.mapping ? "unchecked" : "unconfigured";
+      if (!row.mappingStatus) {
+        row.mappingStatus = row.mapping ? "unchecked" : "unconfigured";
+        row.boardSyncEnabled = Boolean(row.mapping);
+      }
       connections.set(key(workspaceId, provider), row);
       return clone(row);
     },
@@ -130,7 +133,7 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       for (const row of callRows.values()) {
         if (row.workspaceId !== workspaceId || row.crmProvider !== provider) continue;
         for (const field of [
-          "crmProvider", "crmStatus", "crmItemId", "crmItemUrl", "crmActivityId",
+          "crmProvider", "crmStatus", "crmItemId", "crmItemUrl", "crmActivityId", "crmCallsItemId",
           "crmCreated", "crmQueuedAt", "crmUpdatedAt", "crmLastErrorCode", "crmLastErrorAt",
         ]) delete row[field];
         scrubbedCalls += 1;
@@ -170,6 +173,18 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       return Object.entries(memberships)
         .filter(([, m]) => m.workspaceId === workspaceId && m.status === "active" && m.role === "company-admin")
         .map(([userId, m]) => ({ userId, email: m.email ?? null, name: m.name ?? null }));
+    },
+    async saveCallsBoard(workspaceId, provider, callsBoard) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row) return null;
+      row.callsBoard = structuredClone(callsBoard);
+      return clone(row);
+    },
+    async setBoardSyncEnabled(workspaceId, provider, enabled) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row) return null;
+      row.boardSyncEnabled = Boolean(enabled);
+      return clone(row);
     },
     async markAutoRequeued(workspaceId, provider) {
       const row = connections.get(key(workspaceId, provider));
@@ -324,6 +339,10 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
   const revoked = [];
   let tokenCounter = 0;
 
+  const createdBoards = [];
+  // Tests set boardCreation.refuse = "UserUnauthorizedException" (etc).
+  const boardCreation = { refuse: null };
+
   function addBoard({ name = "Leads", columns, kind = "public", type = "board" } = {}) {
     const board = {
       id: id(),
@@ -386,6 +405,9 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
   });
 
   function classify(query) {
+    if (query.includes("create_board")) return "create_board";
+    if (query.includes("create_column")) return "create_column";
+    if (query.includes("archive_board")) return "archive_board";
     if (query.includes("items_page_by_column_values")) return "search";
     if (query.includes("create_item")) return "create_item";
     if (query.includes("create_update")) return query.includes("change_multiple_column_values") ? "log_call_and_fields" : "log_call";
@@ -463,7 +485,9 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
   async function handleGraphql(request, body) {
     const auth = request.headers.get("authorization") ?? "";
     const token = auth.replace(/^Bearer /, "");
-    const operation = classify(body.query);
+    let operation = classify(body.query);
+    // Rows on a calls board we created are the call log, not a lead.
+    if (operation === "create_item" && createdBoards.includes(String(body.variables?.board))) operation = "create_calls_row";
     const record = { operation, idempotencyKey: request.headers.get("idempotency-key"), apiVersion: request.headers.get("api-version"), token };
     requests.push(record);
 
@@ -537,6 +561,31 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
         const item = resolveItem(v.ids?.[0]);
         return { data: { items: item ? [{ id: item.id, updates: item.updates.map((u) => ({ id: u.id, text_body: u.text })) }] : [] } };
       }
+      case "create_board": {
+        if (boardCreation.refuse) return errorBody(boardCreation.refuse, "Board creation refused");
+        const board = addBoard({ name: v.name, columns: [{ id: "name", title: "Name", type: "name" }] });
+        createdBoards.push(board.id);
+        return { data: { create_board: { id: board.id } } };
+      }
+      case "create_column": {
+        const board = boards.get(String(v.board));
+        if (!board || board.deleted) return errorBody("InvalidBoardIdException", "Board not found");
+        const defaults = v.defaults ? JSON.parse(v.defaults) : {};
+        const column = {
+          id: `${v.type}_${board.columns.length}`,
+          title: v.title,
+          type: v.type,
+          ...(v.type === "status" ? { labels: Object.values(defaults.labels ?? {}) } : {}),
+        };
+        board.columns.push(column);
+        return { data: { create_column: { id: column.id } } };
+      }
+      case "archive_board": {
+        const board = boards.get(String(v.board));
+        if (board) board.deleted = true;
+        return { data: { archive_board: { id: v.board } } };
+      }
+      case "create_calls_row":
       case "create_item": {
         const board = boards.get(String(v.board));
         if (!board || board.deleted) return errorBody("InvalidBoardIdException", "Board not found");
@@ -697,6 +746,9 @@ export function createFakeMonday({ now = Date.now, accountId = "5550001" } = {})
     revoked,
     addBoard,
     addItem,
+    createdBoards,
+    boardCreation,
+    boardsById: boards,
     /** Pre-authorize: the user approved consent for this PKCE challenge. */
     issueCode({ redirectUri, challenge }) {
       const code = `code-${codes.size + 1}-${tokenCounter}`;

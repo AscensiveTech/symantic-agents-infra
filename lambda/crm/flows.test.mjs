@@ -319,7 +319,7 @@ test("lookup via the Lambda handler (BFF invoke path) returns context and never 
 
 // ================================================================== sync ====
 
-test("sync: an unknown caller becomes a new lead with a call note (3 Monday calls)", async () => {
+test("sync: an unknown caller gets a calls-board row, then a new lead with a call note", async () => {
   const h = createHarness();
   await h.connectAndMap();
   const call = h.seedCall({ outcome: "lead", toolLog: toolLogFor([{ name: "lead_capture", args: { name: "Jane Doe", email: "jane@example.com", interest: "Whitening" } }]) });
@@ -340,7 +340,7 @@ test("sync: an unknown caller becomes a new lead with a call note (3 Monday call
   assert.match(item.updates[0].text, /New lead captured - follow-up needed/);
   assert.match(item.updates[0].text, /Whitening/);
   assert.match(item.updates[0].text, new RegExp(`Ref: ${call.callId}`));
-  assert.deepEqual(h.monday.requests.map((r) => r.operation), ["search", "search", "create_item", "log_call"]);
+  assert.deepEqual(h.monday.requests.map((r) => r.operation), ["create_calls_row", "search", "search", "create_item", "log_call"]);
   assert.ok(h.metrics.sum("SyncSucceeded", { Outcome: "created" }) === 1);
 });
 
@@ -352,7 +352,7 @@ test("sync: when the call-time lookup just said 'not found', the worker skips th
   const call = h.seedCall();
   h.enqueueCall(call);
   await h.drain();
-  assert.deepEqual(h.monday.requests.map((r) => r.operation), ["create_item", "log_call"]);
+  assert.deepEqual(h.monday.requests.map((r) => r.operation), ["create_calls_row", "create_item", "log_call"]);
 });
 
 test("sync: an existing caller gets one combined request - note plus our fields", async () => {
@@ -368,7 +368,7 @@ test("sync: an existing caller gets one combined request - note plus our fields"
   });
   h.enqueueCall(call);
   await h.drain();
-  assert.deepEqual(h.monday.requests.map((r) => r.operation), ["log_call_and_fields"], "1 Monday call per returning caller");
+  assert.deepEqual(h.monday.requests.map((r) => r.operation), ["create_calls_row", "log_call_and_fields"], "calls-board row plus 1 call per returning caller");
   assert.equal(jane.values.date_appt.text, "2026-09-30 14:00:00");
   assert.equal(jane.values.text_outcome.text, "Appointment booked");
   assert.equal(jane.values.lead_status.text, "Qualified", "Monday-owned status untouched");
@@ -533,7 +533,8 @@ test("duplicates: the same message delivered to two workers at once yields one l
 test("a failure writing the in-progress marker still releases the phone lease", async () => {
   const h = createHarness();
   await h.connectAndMap();
-  const call = h.seedCall();
+  // Already on the calls board, so the next write is the in-progress marker.
+  const call = h.seedCall({ crmCallsItemId: "row-1" });
   h.store.failNext("updateCallSync", Object.assign(new Error("throttled"), { name: "ThrottlingException" }));
   await assert.rejects(h.runtime.sync.syncCall({ workspaceId: "ws-a", callId: call.callId }));
   const link = h.store.links.get(`ws-a\0${linkKeyFor("monday#agent-a", "+12025550198")}`);
@@ -650,7 +651,7 @@ test("retries: the daily cap pauses sync until after UTC midnight, then resumes"
   h.queue.settle(event, await h.worker(event));
   const resumeAt = Date.parse("2026-09-26T00:05:00.000Z");
   assert.ok(h.queue.messages.every((m) => m.visibleAt >= resumeAt), "both messages wait for the reset");
-  assert.equal(h.monday.graphqlCount(), 1, "the second message did not spend a call while paused");
+  assert.equal(h.monday.graphqlCount(), 2, "the first call's log row and search; the second message spent nothing while paused");
   h.clock.set(resumeAt + 60_000);
   h.monday.expireAccessTokens();
   await h.drain();
@@ -1080,7 +1081,7 @@ test("sync: a follow-up edited after the call synced updates the Monday row, and
   assert.equal(row.crmStatus, "synced");
 
   row.followUp = { status: "not_started", assigneeName: "Priya Shah", comment: "Send price list" };
-  assert.deepEqual(await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId }), { status: "synced" });
+  assert.deepEqual(await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId }), { status: "synced", callsBoard: true, userBoard: true });
   const item = h.monday.items.get(row.crmItemId);
   assert.equal(item.values.text_followup.text, "Not started - Assigned to Priya Shah - Send price list");
   assert.equal(item.updates.length, 1, "no extra call note");
@@ -1090,14 +1091,14 @@ test("sync: a follow-up edited after the call synced updates the Monday row, and
   assert.equal(item.values.text_followup?.text ?? "", "");
 });
 
-test("sync: follow-up updates are skipped for unsynced calls and when no Follow-Up column is mapped", async () => {
+test("sync: follow-up updates skip unsynced calls, and reach only the calls board when your board has no Follow-Up column", async () => {
   const h = createHarness();
   await h.connectAndMap();
   const call = h.seedCall();
   assert.equal((await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId })).reason, "not_synced");
   h.enqueueCall(call);
   await h.drain();
-  assert.equal((await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId })).reason, "no_follow_up_column");
+  assert.deepEqual(await h.runtime.syncFollowUp({ workspaceId: "ws-a", callId: call.callId }), { status: "synced", callsBoard: true, userBoard: false });
 });
 
 test("boards: private, subitem and document boards are left out of the picker, but an already-mapped board keeps validating", async () => {
@@ -1161,4 +1162,113 @@ test("per agent: a call queued under the old workspace-level key still syncs thr
   const row = h.store.callRows.get(`ws-a\0${call.callId}`);
   assert.equal(row.crmStatus, "synced");
   assert.equal(row.crmProvider, "monday#agent-a");
+});
+
+// ========================================================== calls board ====
+
+function callsBoardOf(h) {
+  const connection = h.store.connections.get("ws-a\0monday#agent-a");
+  return { connection, board: h.monday.boardsById.get(String(connection.callsBoard?.id)) };
+}
+
+test("calls board: connecting creates 'Symantic AI Calls - <agent>' with the fixed columns; reconnecting reuses it", async () => {
+  const h = createHarness();
+  await h.connect();
+  const { connection, board } = callsBoardOf(h);
+  assert.equal(connection.callsBoard.status, "active");
+  assert.equal(board.name, "Symantic AI Calls - Front Desk");
+  assert.deepEqual(board.columns.slice(1).map((c) => c.title), [
+    "Phone", "Company Name", "Date & Time", "Duration (Min)", "Direction", "Outcome", "Reason for Call",
+    "Summary", "Appointment Set", "Sentiment", "Follow-Up", "Email", "Recording", "Transcript",
+  ]);
+  assert.deepEqual(board.columns.find((c) => c.title === "Direction").labels, ["Inbound", "Outbound"]);
+  assert.equal(connection.boardSyncEnabled, false, "your own board is opt-in");
+  await h.connect();
+  assert.equal(h.monday.createdBoards.length, 1, "no second board on reconnect");
+  const listed = JSON.parse((await h.api("GET", "/crm/monday/boards", { sub: "sub-admin-a" })).body).boards;
+  assert.ok(!listed.some((b) => b.id === board.id), "the calls board is never offered for mapping");
+  const pub = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
+  assert.equal(pub.callsBoard.status, "active");
+  assert.match(pub.callsBoard.url, new RegExp(`/boards/${board.id}$`));
+});
+
+test("calls board: with no board of your own mapped, every call still gets exactly one row", async () => {
+  const h = createHarness();
+  await h.connect();
+  const call = h.seedCall({
+    direction: "inbound",
+    userSentiment: "Positive",
+    followUp: { status: "not_started", comment: "Call back" },
+    toolLog: toolLogFor([{ name: "calendar_create_booking", args: {}, output: { ok: true, startTimeUtc: "2026-10-01T14:00:00.000Z" } }]),
+  });
+  h.enqueueCall(call);
+  await h.drain();
+  h.enqueueCall(call);
+  await h.drain();
+  const row = h.store.callRows.get(`ws-a\0${call.callId}`);
+  assert.equal(row.crmStatus, "synced");
+  const { board } = callsBoardOf(h);
+  const rows = [...h.monday.items.values()].filter((item) => item.boardId === board.id);
+  assert.equal(rows.length, 1, "retries never add a second row");
+  const byTitle = Object.fromEntries(board.columns.map((c) => [c.title, rows[0].values[c.id]?.text]));
+  assert.equal(rows[0].name, "Jane Doe");
+  assert.equal(byTitle.Phone, "+12025550198");
+  assert.equal(byTitle.Direction, "Inbound");
+  assert.equal(byTitle["Appointment Set"], "Yes");
+  assert.equal(byTitle.Sentiment, "Positive");
+  assert.equal(byTitle["Duration (Min)"], "2");
+  assert.equal(byTitle.Summary, "Caller asked about whitening prices and hours.");
+  assert.equal(byTitle["Follow-Up"], "Not started - Call back");
+  assert.equal(h.monday.count("create_item"), 0, "no lead is created without your own board");
+});
+
+test("calls board: Monday refusing to create it never fails the connection, and the reason is shown", async () => {
+  const h = createHarness();
+  h.monday.boardCreation.refuse = "UserUnauthorizedException";
+  const { callback } = await h.connect();
+  assert.equal(callback.statusCode, 302);
+  assert.match(callback.headers.location, /crm=connected/);
+  const pub = JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body);
+  assert.equal(pub.callsBoard.status, "failed");
+  assert.match(pub.callsBoard.message, /administrator/);
+
+  // Mapping your own board still works, and calls still sync there.
+  h.monday.boardCreation.refuse = null;
+  await h.configureMapping();
+  h.monday.boardCreation.refuse = "UserUnauthorizedException";
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "synced");
+  assert.equal(h.monday.count("create_item"), 1, "the lead was created on your board");
+});
+
+test("calls board: deleted in Monday, it is rebuilt once and the call is logged there", async () => {
+  const h = createHarness();
+  await h.connect();
+  const first = callsBoardOf(h).board;
+  first.deleted = true;
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const { connection, board } = callsBoardOf(h);
+  assert.notEqual(board.id, first.id);
+  assert.equal(connection.callsBoard.status, "active");
+  assert.equal([...h.monday.items.values()].filter((item) => item.boardId === board.id).length, 1);
+});
+
+test("board sync toggle: off skips your board but keeps the mapping; on resumes it", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const off = await h.api("PUT", "/crm/board-sync", { sub: "sub-admin-a", body: { enabled: false } });
+  assert.equal(JSON.parse(off.body).boardSyncEnabled, false);
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  assert.equal(h.monday.count("create_item"), 0);
+  assert.equal(h.monday.count("create_calls_row"), 1);
+  assert.ok(h.store.connections.get("ws-a\0monday#agent-a").mapping, "mapping kept");
+  assert.equal((await h.api("PUT", "/crm/board-sync", { sub: "sub-member-a", groups: ["quotation-builder"], body: { enabled: true } })).statusCode, 403);
+  const on = await h.api("PUT", "/crm/board-sync", { sub: "sub-admin-a", body: { enabled: true } });
+  assert.equal(JSON.parse(on.body).boardSyncEnabled, true);
 });
