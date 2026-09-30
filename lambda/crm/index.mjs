@@ -6,7 +6,7 @@ import { getRuntime } from "./runtime.mjs";
  *  - API Gateway (HTTP API v2 events): connection settings, OAuth callback,
  *    Monday lifecycle webhook.
  *  - Direct invoke from the BFF during Retell's inbound-call webhook:
- *    { action: "lookup", workspaceId, callerNumber } -> caller context.
+ *    { action: "lookup", workspaceId, agentId, callerNumber } -> caller context.
  *  - Async invoke from the BFF: { action: "sync-follow-up", workspaceId, callId }
  *    -> push an edited follow-up to the Monday row.
  *  - EventBridge schedule: { action: "refresh-tokens" } -> token keeper.
@@ -23,6 +23,7 @@ export function createHandler({ getRuntime: loadRuntime = getRuntime } = {}) {
         const runtime = await loadRuntime();
         return await runtime.lookup({
           workspaceId: event.workspaceId,
+          agentId: event.agentId,
           callerNumber: event.callerNumber,
         });
       } catch (error) {

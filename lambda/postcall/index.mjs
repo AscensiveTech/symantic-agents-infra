@@ -357,10 +357,13 @@ async function enqueueCrmSync({ getCrmSync, call, record }) {
   if (call?.metadata?.kind === "test" || record.outcome === "spam" || !record.callerNumber) return;
   const crm = await getCrmSync();
   if (!crm) return;
-  const status = await crm.getConnectionStatus(record.workspaceId);
+  // Each agent has its own CRM connection, keyed "monday#<agentId>".
+  if (!record.agentId) return;
+  const connectionKey = `${CRM_PROVIDER}#${record.agentId}`;
+  const status = await crm.getConnectionStatus(record.workspaceId, connectionKey);
   if (status?.connectionState !== "connected" || status?.mappingStatus !== "valid") return;
-  if (!await crm.markQueued(record.workspaceId, record.callId)) return;
-  await crm.send({ workspaceId: record.workspaceId, callId: record.callId, provider: CRM_PROVIDER });
+  if (!await crm.markQueued(record.workspaceId, record.callId, connectionKey)) return;
+  await crm.send({ workspaceId: record.workspaceId, callId: record.callId, provider: connectionKey });
 }
 
 const CRM_PROVIDER = "monday";
@@ -1124,10 +1127,10 @@ let crmSyncPromise;
 
 export function createCrmSyncClient({ dynamodb, dynamoClient, sqs, sqsClient, connectionsTable, callsTable, queueUrl, now = () => new Date() }) {
   return {
-    async getConnectionStatus(workspaceId) {
+    async getConnectionStatus(workspaceId, connectionKey) {
       const result = await dynamoClient.send(new dynamodb.GetItemCommand({
         TableName: connectionsTable,
-        Key: marshall({ workspaceId, provider: CRM_PROVIDER }),
+        Key: marshall({ workspaceId, provider: connectionKey }),
         ProjectionExpression: "connectionState, mappingStatus",
         ConsistentRead: true,
       }));
@@ -1135,7 +1138,7 @@ export function createCrmSyncClient({ dynamodb, dynamoClient, sqs, sqsClient, co
     },
     // Arms the call for sync; false when it has already synced (a repeated
     // call_analyzed webhook), so nothing is enqueued twice for a done call.
-    async markQueued(workspaceId, callId) {
+    async markQueued(workspaceId, callId, connectionKey) {
       const timestamp = now().toISOString();
       try {
         await dynamoClient.send(new dynamodb.UpdateItemCommand({
@@ -1145,7 +1148,7 @@ export function createCrmSyncClient({ dynamodb, dynamoClient, sqs, sqsClient, co
           ConditionExpression: "attribute_exists(workspaceId) AND (attribute_not_exists(crmStatus) OR crmStatus <> :synced)",
           ExpressionAttributeValues: marshall({
             ":pending": "pending",
-            ":provider": CRM_PROVIDER,
+            ":provider": connectionKey,
             ":at": timestamp,
             ":synced": "synced",
           }),

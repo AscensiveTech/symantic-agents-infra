@@ -1042,11 +1042,11 @@ function crmHarness({ status = { connectionState: "connected", mappingStatus: "v
   const sent = [];
   const marked = [];
   const crm = {
-    async getConnectionStatus(workspaceId) {
-      return workspaceId === "workspace-123" ? status : null;
+    async getConnectionStatus(workspaceId, connectionKey) {
+      return workspaceId === "workspace-123" && connectionKey === "monday#agent-123" ? status : null;
     },
-    async markQueued(workspaceId, callId) {
-      marked.push({ workspaceId, callId });
+    async markQueued(workspaceId, callId, connectionKey) {
+      marked.push({ workspaceId, callId, connectionKey });
       return !alreadySynced;
     },
     async send(message) {
@@ -1081,15 +1081,15 @@ function crmCall(overrides = {}) {
   };
 }
 
-test("call_analyzed enqueues a CRM sync when the workspace has a mapped CRM", async () => {
+test("call_analyzed enqueues a CRM sync under the answering agent's own connection", async () => {
   const { handler, sent, marked } = crmHarness();
   const response = await handler(callAnalyzedEvent(crmCall()));
   assert.equal(response.statusCode, 204);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].workspaceId, "workspace-123");
   assert.match(sent[0].callId, /^call-/);
-  assert.equal(sent[0].provider, "monday");
-  assert.deepEqual(marked, [{ workspaceId: "workspace-123", callId: sent[0].callId }]);
+  assert.equal(sent[0].provider, "monday#agent-123");
+  assert.deepEqual(marked, [{ workspaceId: "workspace-123", callId: sent[0].callId, connectionKey: "monday#agent-123" }]);
 });
 
 test("CRM sync is only enqueued on call_analyzed, not call_started or call_ended", async () => {
@@ -1108,6 +1108,7 @@ test("no CRM sync for test calls, spam, anonymous callers, or unconfigured CRMs"
     ["reauth", crmHarness({ status: { connectionState: "reauth_required", mappingStatus: "valid" } }), crmCall()],
     ["unmapped", crmHarness({ status: { connectionState: "connected", mappingStatus: "unconfigured" } }), crmCall()],
     ["already synced", crmHarness({ alreadySynced: true }), crmCall()],
+    ["another agent's CRM only", crmHarness(), crmCall({ metadata: { workspaceId: "workspace-123", agentId: "agent-999" } })],
   ]) {
     const response = await harness.handler(callAnalyzedEvent(call));
     assert.equal(response.statusCode, 204, label);

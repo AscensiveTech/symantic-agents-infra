@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { FIELD_TYPES, suggestMapping } from "./monday/adapter.mjs";
 import { buildAuthorizeUrl, buildInstallUrl, createPkcePair, verifyMondayJwt } from "./monday/oauth.mjs";
-import { isConnectionUsable } from "./provider.mjs";
+import { agentIdOf, connectionKeyFor, isConnectionUsable, providerIdOf } from "./provider.mjs";
 import { createRequeuer } from "./requeue.mjs";
 
 const PROVIDER = "monday";
@@ -50,8 +50,19 @@ export function createCrmApi({
     return identity;
   }
 
-  async function requireUsableSession(workspaceId, operation) {
-    const connection = await store.getConnection(workspaceId, PROVIDER);
+  // Every CRM connection belongs to one agent. The agentId comes from the
+  // request, so it is only trusted after checking the agent is an active
+  // agent in the caller's own workspace.
+  async function requireAgentKey(identity, event) {
+    const agentId = readAgentId(event);
+    if (!agentId) throw new ApiError(400, "invalid_request", "Choose an agent first.");
+    const agent = await store.getAgent(identity.workspaceId, agentId);
+    if (!agent || agent.status === "deleted") throw new ApiError(404, "agent_not_found", "That agent no longer exists.");
+    return connectionKeyFor(PROVIDER, agentId);
+  }
+
+  async function requireUsableSession(workspaceId, key, operation) {
+    const connection = await store.getConnection(workspaceId, key);
     if (!connection || connection.connectionState === "disconnected") {
       throw new ApiError(409, "not_connected", "Connect Monday first.");
     }
@@ -75,7 +86,7 @@ export function createCrmApi({
 
   // Re-send every recently failed call once the admin has fixed whatever
   // made it fail (reconnected, or corrected the mapping).
-  const requeueFailed = createRequeuer({ store, enqueue, metrics, now, provider: PROVIDER });
+  const requeueFailed = createRequeuer({ store, enqueue, metrics, now });
 
   async function revalidate(workspaceId, connection) {
     if (!connection?.mapping) return connection;
@@ -83,7 +94,7 @@ export function createCrmApi({
       const outcome = await sessions.withSession(connection, (session) =>
         adapter.validateMapping(session, connection.mapping)
       );
-      return await store.saveMapping(workspaceId, PROVIDER, connection.mapping, {
+      return await store.saveMapping(workspaceId, connection.provider, connection.mapping, {
         status: outcome.ok ? "valid" : "invalid",
         problems: outcome.problems,
       }) ?? connection;
@@ -96,7 +107,8 @@ export function createCrmApi({
   const routes = {
     async "GET /crm/connection"(event) {
       const identity = await requireIdentity(event);
-      const connection = await store.getConnection(identity.workspaceId, PROVIDER);
+      const key = await requireAgentKey(identity, event);
+      const connection = await store.getConnection(identity.workspaceId, key);
       return json(200, toPublicConnection(connection, now));
     },
 
@@ -109,6 +121,7 @@ export function createCrmApi({
     async "POST /crm/monday/start"(event) {
       const identity = await requireIdentity(event, { admin: true });
       const body = readBody(event);
+      const key = await requireAgentKey(identity, event);
       const secret = await loadAppSecret(getAppSecret);
       const { verifier, challenge } = createPkcePair();
       const state = randomState();
@@ -116,6 +129,7 @@ export function createCrmApi({
         state,
         provider: OAUTH_STATE_PROVIDER,
         workspaceId: identity.workspaceId,
+        agentId: agentIdOf(key),
         userId: identity.userId,
         displayName: identity.displayName,
         codeVerifier: verifier,
@@ -143,7 +157,8 @@ export function createCrmApi({
         !stateRecord ||
         stateRecord.provider !== OAUTH_STATE_PROVIDER ||
         stateRecord.redirectUri !== callbackUri() ||
-        Number(stateRecord.expiresAt) * 1000 < Number(now())
+        Number(stateRecord.expiresAt) * 1000 < Number(now()) ||
+        !stateRecord.agentId
       ) {
         metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "invalid_state" });
         return back(DEFAULT_RETURN_TO, { crm: "error", reason: "invalid_state" });
@@ -156,6 +171,7 @@ export function createCrmApi({
         return back(stateRecord.returnTo, { crm: "error", reason: cancelled ? "authorization_denied" : "install_not_allowed" });
       }
       const { workspaceId } = stateRecord;
+      const key = connectionKeyFor(PROVIDER, stateRecord.agentId);
       try {
         const tokens = await oauthClient.exchangeCode({
           code: query.code,
@@ -167,7 +183,8 @@ export function createCrmApi({
           tokenCrypto.encrypt({ plaintext: tokens.accessToken, workspaceId, provider: PROVIDER, purpose: "access" }),
           tokenCrypto.encrypt({ plaintext: tokens.refreshToken, workspaceId, provider: PROVIDER, purpose: "refresh" }),
         ]);
-        let connection = await store.saveAuthorization(workspaceId, PROVIDER, {
+        let connection = await store.saveAuthorization(workspaceId, key, {
+          agentId: stateRecord.agentId,
           accountId: account.accountId,
           accountName: account.accountName,
           accountSlug: account.accountSlug,
@@ -183,9 +200,9 @@ export function createCrmApi({
           refreshTokenExpiresAt: tokens.refreshTokenExpiresAt,
         });
         connection = await revalidate(workspaceId, connection);
-        if (isConnectionUsable(connection)) await requeueFailed(workspaceId);
+        if (isConnectionUsable(connection)) await requeueFailed(workspaceId, key);
         metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "connected" });
-        log.info?.("CRM connected", { workspaceId, provider: PROVIDER, accountId: account.accountId });
+        log.info?.("CRM connected", { workspaceId, agentId: stateRecord.agentId, accountId: account.accountId });
         return back(stateRecord.returnTo, { crm: "connected" });
       } catch (error) {
         metrics?.count("OAuth", { Provider: PROVIDER, Outcome: "failed" });
@@ -196,7 +213,8 @@ export function createCrmApi({
 
     async "DELETE /crm/connection"(event) {
       const identity = await requireIdentity(event, { admin: true });
-      const connection = await store.getConnection(identity.workspaceId, PROVIDER);
+      const key = await requireAgentKey(identity, event);
+      const connection = await store.getConnection(identity.workspaceId, key);
       if (!connection) return json(200, null);
       // Best effort: revoke at Monday so the grant dies there too. Our copy is
       // deleted either way.
@@ -213,14 +231,15 @@ export function createCrmApi({
           log.warn?.("Monday token revoke failed; deleting local tokens anyway", describeError(error));
         }
       }
-      const saved = await store.disconnect(identity.workspaceId, PROVIDER, "user_disconnected");
-      log.info?.("CRM disconnected", { workspaceId: identity.workspaceId, provider: PROVIDER, by: identity.userId });
+      const saved = await store.disconnect(identity.workspaceId, key, "user_disconnected");
+      log.info?.("CRM disconnected", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), by: identity.userId });
       return json(200, toPublicConnection(saved, now));
     },
 
     async "GET /crm/monday/boards"(event) {
       const identity = await requireIdentity(event, { admin: true });
-      const { boards, users } = await requireUsableSession(identity.workspaceId, async (session) => ({
+      const key = await requireAgentKey(identity, event);
+      const { boards, users } = await requireUsableSession(identity.workspaceId, key, async (session) => ({
         boards: await adapter.listBoards(session),
         users: await adapter.listUsers(session),
       }));
@@ -246,7 +265,8 @@ export function createCrmApi({
       const columnType = typeof body?.columnType === "string" ? body.columnType : "";
       const allowed = new Set(["phone", "email", "status", "people", "date", "text", "long_text", "numbers", "link"]);
       if (!allowed.has(columnType)) throw new ApiError(400, "invalid_request", `Invalid column type: ${columnType}`);
-      const column = await requireUsableSession(identity.workspaceId, async (session) => {
+      const key = await requireAgentKey(identity, event);
+      const column = await requireUsableSession(identity.workspaceId, key, async (session) => {
         const data = await adapter.createColumn(session, boardId, title, columnType);
         return data;
       });
@@ -256,7 +276,8 @@ export function createCrmApi({
     async "PUT /crm/mapping"(event) {
       const identity = await requireIdentity(event, { admin: true });
       const requested = normalizeMappingInput(readBody(event)?.mapping);
-      const outcome = await requireUsableSession(identity.workspaceId, (session) =>
+      const key = await requireAgentKey(identity, event);
+      const outcome = await requireUsableSession(identity.workspaceId, key, (session) =>
         adapter.validateMapping(session, requested)
       );
       if (!outcome.ok) {
@@ -272,19 +293,20 @@ export function createCrmApi({
           return [field, { id, type: column.type, title: column.title }];
         })),
       };
-      const saved = await store.saveMapping(identity.workspaceId, PROVIDER, mapping, { status: "valid", problems: [] });
-      const requeued = await requeueFailed(identity.workspaceId);
-      log.info?.("CRM mapping saved", { workspaceId: identity.workspaceId, provider: PROVIDER, requeued });
+      const saved = await store.saveMapping(identity.workspaceId, key, mapping, { status: "valid", problems: [] });
+      const requeued = await requeueFailed(identity.workspaceId, key);
+      log.info?.("CRM mapping saved", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), requeued });
       return json(200, { ...toPublicConnection(saved, now), requeued });
     },
 
     async "POST /crm/sync/retry"(event) {
       const identity = await requireIdentity(event, { admin: true });
-      const connection = await store.getConnection(identity.workspaceId, PROVIDER);
+      const key = await requireAgentKey(identity, event);
+      const connection = await store.getConnection(identity.workspaceId, key);
       if (!isConnectionUsable(connection)) {
         throw new ApiError(409, "not_ready", "Finish connecting Monday before retrying.");
       }
-      return json(200, { requeued: await requeueFailed(identity.workspaceId) });
+      return json(200, { requeued: await requeueFailed(identity.workspaceId, key) });
     },
 
     async "POST /crm/monday/lifecycle"(event) {
@@ -311,7 +333,7 @@ export function createCrmApi({
       if (body.type === "uninstall") {
         const connections = await store.listConnectionsByAccount(PROVIDER, accountId);
         for (const connection of connections) {
-          await store.purgeProviderData(connection.workspaceId, PROVIDER);
+          await store.purgeProviderData(connection.workspaceId, connection.provider);
         }
         log.info?.("Monday app uninstalled", { accountId, purged: connections.length });
       }
@@ -341,7 +363,8 @@ function toPublicConnection(connection, now = Date.now) {
   const refreshExpiry = Number(connection.refreshTokenExpiresAt);
   const paused = Number(connection.pausedUntil) > Number(now());
   return {
-    provider: connection.provider,
+    provider: providerIdOf(connection.provider),
+    agentId: connection.agentId ?? agentIdOf(connection.provider),
     connectionState: connection.connectionState,
     accountName: connection.accountName ?? null,
     accountSlug: connection.accountSlug ?? null,
@@ -442,6 +465,15 @@ function buildAppRedirect(appUrl, returnTo, params) {
   const url = new URL(sanitizeReturnTo(returnTo), appUrl);
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
   return url.toString();
+}
+
+const AGENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+function readAgentId(event) {
+  const fromQuery = event?.queryStringParameters?.agentId;
+  const fromBody = readBody(event)?.agentId;
+  const value = typeof fromQuery === "string" && fromQuery ? fromQuery : fromBody;
+  return typeof value === "string" && AGENT_ID_PATTERN.test(value) ? value : null;
 }
 
 function readBody(event) {

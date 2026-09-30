@@ -60,8 +60,9 @@ export function createProviderRegistry(providers) {
     byId.set(provider.id, provider);
   }
   return {
+    // Accepts a provider id ("monday") or a connection key ("monday#agent-1").
     get(id) {
-      return byId.get(id) ?? null;
+      return byId.get(providerIdOf(id)) ?? null;
     },
     ids() {
       return [...byId.keys()];
@@ -69,10 +70,32 @@ export function createProviderRegistry(providers) {
   };
 }
 
-// A connection can be used for lookups and syncs only when it is authorized
-// AND its field mapping has been checked against the live CRM.
+// Each agent has its own CRM connection. Its row key (the connections
+// table's `provider` range key) is "<provider>#<agentId>".
+export function connectionKeyFor(providerId, agentId) {
+  if (!agentId) throw new Error("agentId is required for a CRM connection");
+  return `${providerId}#${agentId}`;
+}
+
+export function providerIdOf(key) {
+  return String(key ?? "").split("#")[0];
+}
+
+export function agentIdOf(key) {
+  const [, agentId] = String(key ?? "").split("#");
+  return agentId || null;
+}
+
+export function isConnected(connection) {
+  return connection?.connectionState === "connected";
+}
+
+// The customer's own board (lookups and the optional board sync) can be used
+// only when it's switched on AND its field mapping has been checked against
+// the live CRM. The auto-created calls board needs only isConnected.
 export function isConnectionUsable(connection) {
   return connection?.connectionState === "connected" &&
+    connection?.boardSyncEnabled !== false &&
     connection?.mappingStatus === "valid" &&
     Boolean(connection?.mapping);
 }

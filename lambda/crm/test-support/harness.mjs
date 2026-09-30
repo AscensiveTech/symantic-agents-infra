@@ -18,6 +18,10 @@ import {
 
 export const APP_URL = "https://agents.example.test";
 export const API_BASE = "https://api.example.test";
+// One agent per test workspace; its Monday connection key is "monday#<agentId>".
+export const AGENT_FOR_WORKSPACE = { "ws-a": "agent-a", "ws-b": "agent-b" };
+export const KEY_A = "monday#agent-a";
+export const KEY_B = "monday#agent-b";
 
 export function createHarness({ secret = TEST_APP_SECRET } = {}) {
   const clock = createClock();
@@ -31,6 +35,10 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
       "sub-member-a": { workspaceId: "ws-a", status: "active" },
       "sub-admin-b": { workspaceId: "ws-b", status: "active" },
       "sub-disabled": { workspaceId: "ws-a", status: "disabled" },
+    },
+    agents: {
+      "ws-a\0agent-a": { name: "Front Desk", status: "active" },
+      "ws-b\0agent-b": { name: "Reception", status: "active" },
     },
   });
   const tokenCrypto = createFakeTokenCrypto();
@@ -65,7 +73,14 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
     random: () => 0,
   });
 
-  function httpEvent(method, path, { sub, groups = ["company-admin"], body, query, headers } = {}) {
+  const WORKSPACE_OF_SUB = { "sub-admin-a": "ws-a", "sub-member-a": "ws-a", "sub-admin-b": "ws-b", "sub-disabled": "ws-a" };
+
+  // Settings routes are per agent: default to the caller's workspace agent
+  // unless a test passes `agent` (null = send none).
+  function httpEvent(method, path, { sub, groups = ["company-admin"], body, query, headers, agent } = {}) {
+    const perAgent = path.startsWith("/crm/") && !path.startsWith("/crm/oauth/") && path !== "/crm/monday/lifecycle";
+    const agentId = agent === undefined ? AGENT_FOR_WORKSPACE[WORKSPACE_OF_SUB[sub]] : agent;
+    if (perAgent && agentId && !query?.agentId) query = { ...(query ?? {}), agentId };
     return {
       rawPath: path,
       requestContext: {
@@ -133,15 +148,16 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
       callSummary: "Caller asked about whitening prices and hours.",
       toolLog: [],
       crmStatus: "pending",
-      crmProvider: "monday",
       ...overrides,
     };
+    call.agentId ??= AGENT_FOR_WORKSPACE[call.workspaceId];
+    call.crmProvider ??= `monday#${call.agentId}`;
     store.seedCall(call);
     return call;
   }
 
   function enqueueCall(call) {
-    queue.send({ v: 1, workspaceId: call.workspaceId, callId: call.callId, provider: "monday" });
+    queue.send({ v: 1, workspaceId: call.workspaceId, callId: call.callId, provider: call.crmProvider });
   }
 
   /** Deliver queued messages until the queue is idle (advancing the clock past backoffs). */
