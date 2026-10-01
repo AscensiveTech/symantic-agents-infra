@@ -1699,7 +1699,10 @@ test("a new caller: a row with just name and phone on the customer board, and th
   const customer = h.monday.items.get(row.crmItemId);
   assert.equal(customer.name, "Jane Doe");
   assert.deepEqual(Object.keys(customer.values), ["phone_mkx1"], "only the phone is written");
-  assert.equal(customer.updates.length, 0, "no call note on the customer board");
+  assert.equal(customer.updates.length, 1, "one short call summary as an Update");
+  assert.match(customer.updates[0].text, /AI receptionist call/);
+  assert.match(customer.updates[0].text, /Summary:/);
+  assert.match(customer.updates[0].text, /Open this call in Symantic AI/);
   assert.deepEqual(clientLinkOf(h, call), [String(customer.id)]);
 });
 
@@ -1711,8 +1714,8 @@ test("an existing customer: nothing on their row changes; the call is linked to 
   const call = h.seedCall({ outcome: "booked" });
   h.enqueueCall(call);
   await h.drain();
-  assert.equal(JSON.stringify(jane.values), before);
-  assert.equal(jane.updates.length, 0);
+  assert.equal(JSON.stringify(jane.values), before, "no column on the row changes");
+  assert.equal(jane.updates.length, 1, "just the call summary Update");
   assert.deepEqual(clientLinkOf(h, call), [String(jane.id)]);
   assert.equal(customerRows(h).length, 1);
 });
@@ -1741,6 +1744,7 @@ test("duplicates: the same new caller calling repeatedly, or delivered twice, ge
   await h.drain();
   assert.equal(customerRows(h).length, 1);
   for (const call of calls) assert.deepEqual(clientLinkOf(h, call), [customerRows(h)[0].id]);
+  assert.equal(customerRows(h)[0].updates.length, 3, "one summary per call, never repeated");
 });
 
 test("a customer row deleted in Monday is found or added again, and the call is linked to it", async () => {

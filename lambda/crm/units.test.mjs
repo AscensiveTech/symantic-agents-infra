@@ -401,7 +401,7 @@ test("buildCallActivity escapes HTML and carries the retry reference", () => {
   assert.ok(!activity.html.includes("<script>"));
   assert.match(activity.html, /Ref: call-9/);
   assert.match(activity.html, /2m 05s/);
-  assert.match(activity.html, /call-history\?q=%2B12025550198/);
+  assert.match(activity.html, /call-history\?call=call-9/, "links to that exact call");
 });
 
 // --------------------------------------------------------------- worker ----
