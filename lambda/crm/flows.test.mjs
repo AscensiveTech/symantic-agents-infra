@@ -1809,3 +1809,20 @@ test("the phone column deleted in Monday is flagged within the hour; restoring i
   assert.equal(conn(h).mappingStatus, "valid");
   assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).crmStatus, "synced");
 });
+
+test("the Client column deleted in Monday is added back, and the call is still linked", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const first = h.seedCall();
+  h.enqueueCall(first);
+  await h.drain();
+  const { connection, board } = callsBoardOf(h);
+  h.monday.removeColumn(board.id, connection.callsBoard.clientColumn.id);
+  const second = h.seedCall();
+  h.enqueueCall(second);
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a\0${second.callId}`).crmStatus, "synced");
+  assert.equal(conn(h).mappingStatus, "valid", "the customer board isn't blamed");
+  assert.ok(clientLinkOf(h, second), "linked through the new Client column");
+  assert.equal(callsBoardOf(h).board.columns.filter((c) => c.title === "Client").length, 1);
+});

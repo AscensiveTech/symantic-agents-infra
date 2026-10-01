@@ -265,7 +265,19 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     if (!callsItemId || !clientItemId || !provider?.updateCallsRow) return false;
     const column = await ensureClientColumn(session, connection);
     if (!column) return false;
-    await provider.updateCallsRow(session, connection.callsBoard.id, callsItemId, { [column]: { item_ids: [Number(clientItemId)] } });
+    const value = (id) => ({ [id]: { item_ids: [Number(clientItemId)] } });
+    try {
+      await provider.updateCallsRow(session, connection.callsBoard.id, callsItemId, value(column));
+    } catch (error) {
+      // Someone deleted the Client column in Monday: add it back once and
+      // link again, rather than failing the call.
+      if (!(error instanceof CrmError) || error.code !== CRM_ERROR.MAPPING_INVALID) throw error;
+      const { clientColumn: _gone, ...board } = connection.callsBoard;
+      await save(connection, board);
+      const fresh = await ensureClientColumn(session, connection);
+      if (!fresh) return false;
+      await provider.updateCallsRow(session, connection.callsBoard.id, callsItemId, value(fresh));
+    }
     return true;
   }
 
