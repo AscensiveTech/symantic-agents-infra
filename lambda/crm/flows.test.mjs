@@ -1827,3 +1827,74 @@ test("the Client column deleted in Monday is added back, and the call is still l
   assert.ok(clientLinkOf(h, second), "linked through the new Client column");
   assert.equal(callsBoardOf(h).board.columns.filter((c) => c.title === "Client").length, 1);
 });
+
+// ======================================== Part M: Contact/Lead settings ====
+
+async function saveSetup(h, extra = {}) {
+  const res = await h.api("PUT", "/crm/mapping", { sub: "sub-admin-a", body: { mapping: {
+    boardId: h.board.id, columns: { phone: { id: "phone_mkx1" } }, readColumns: [], ...extra,
+  } } });
+  await h.drain();
+  return res;
+}
+
+test("Add New Callers set to No: an unknown caller isn't added and isn't linked; known contacts still link", async () => {
+  const h = createHarness();
+  await h.connect();
+  assert.equal((await saveSetup(h, { createContacts: false })).statusCode, 200);
+  const stranger = h.seedCall({ callerNumber: "+12025550777" });
+  h.enqueueCall(stranger);
+  await h.drain();
+  assert.equal(h.store.callRows.get(`ws-a\0${stranger.callId}`).crmStatus, "synced");
+  assert.ok(h.store.callRows.get(`ws-a\0${stranger.callId}`).crmCallsItemId, "still on the calls board");
+  assert.equal(customerRows(h).length, 0, "nobody added");
+  assert.equal(clientLinkOf(h, stranger), null);
+  const jane = h.monday.addItem(h.board.id, { name: "Jane", phone: "+12025550198" });
+  const known = h.seedCall();
+  h.enqueueCall(known);
+  await h.drain();
+  assert.deepEqual(clientLinkOf(h, known), [String(jane.id)]);
+});
+
+test("a Text name column: the AI greets by that name, and new contacts get it written there", async () => {
+  const h = createHarness();
+  h.board.columns.push({ id: "text_full", title: "Full Name", type: "text" });
+  await h.connect();
+  assert.equal((await saveSetup(h, { columns: { phone: { id: "phone_mkx1" }, callerName: { id: "text_full" } } })).statusCode, 200);
+  const known = h.monday.addItem(h.board.id, { name: "Row 1", phone: "+12025550198" });
+  known.values.text_full = { text: "Jane Q. Doe", value: JSON.stringify("Jane Q. Doe") };
+  const lookup = await h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber: "+12025550198" });
+  assert.match(lookup.context, /name on file: Jane Q\. Doe/);
+  const call = h.seedCall({ callerNumber: "+12025550777", callerName: "Bob Newcomer" });
+  h.enqueueCall(call);
+  await h.drain();
+  const added = h.monday.items.get(h.store.callRows.get(`ws-a\0${call.callId}`).crmItemId);
+  assert.equal(added.name, "Bob Newcomer");
+  assert.equal(added.values.text_full.text, "Bob Newcomer");
+});
+
+test("the name column must exist and be text; the extra AI details are capped at 3 and never repeat name or phone", async () => {
+  const h = createHarness();
+  await h.connect();
+  const wrong = await saveSetup(h, { columns: { phone: { id: "phone_mkx1" }, callerName: { id: "date_last" } } });
+  assert.equal(body(wrong).problems[0].field, "callerName");
+  const tooMany = await saveSetup(h, { readColumns: ["person", "lead_status", "text_outcome", "text_source"] });
+  assert.equal(tooMany.statusCode, 400);
+  await saveSetup(h, { readColumns: ["phone_mkx1", "person"] });
+  assert.deepEqual(conn(h).mapping.readColumns.map((c) => c.id), ["person"]);
+});
+
+test("Keep Contact Names in Sync set to No: no webhooks, and renames are ignored both ways", async () => {
+  const h = createHarness();
+  await h.connect();
+  await saveSetup(h, { syncNames: false });
+  assert.equal(h.monday.webhooks.size, 0);
+  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "off");
+  const { item } = await syncedJane(h);
+  await h.runtime.enqueue({ kind: "name-to-monday", workspaceId: "ws-a", provider: "monday", phone: "+12025550198", name: "Renamed In Symantic" });
+  await h.drain();
+  assert.equal(h.monday.items.get(String(item.id)).name, "Jane Doe");
+  // Turning it back on registers the webhook again.
+  await saveSetup(h, { syncNames: true });
+  assert.equal(webhooksOn(h, h.board.id).length, 1);
+});

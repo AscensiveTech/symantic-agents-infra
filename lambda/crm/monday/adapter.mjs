@@ -53,7 +53,8 @@ export function createMondayCrmAdapter({ graphql }) {
   // Column ids to fetch for a customer row: the phone (for matching) and
   // the columns the AI reads.
   function readColumns(mapping) {
-    return [mapping?.columns?.phone?.id, mapping?.columns?.email?.id, ...(mapping?.readColumns ?? []).map((ref) => ref.id)]
+    return [mapping?.columns?.phone?.id, mapping?.columns?.callerName?.id, mapping?.columns?.email?.id,
+      ...(mapping?.readColumns ?? []).map((ref) => ref.id)]
       .filter(Boolean);
   }
 
@@ -79,7 +80,8 @@ export function createMondayCrmAdapter({ graphql }) {
     const emailValue = values.get(mapping.columns.email?.id);
     return {
       externalId: String(item.id),
-      name: typeof item.name === "string" ? item.name : "",
+      // The chosen name column when there is one, else the row's own name.
+      name: textOf(values.get(mapping.columns.callerName?.id)) ?? (typeof item.name === "string" ? item.name : ""),
       phoneE164: readPhone(phoneValue),
       email: readEmail(emailValue),
       status: textOf(values.get(mapping.columns.status?.id)),
@@ -357,6 +359,15 @@ export function createMondayCrmAdapter({ graphql }) {
         problems.push({ field: "phone", code: "not_found", message: "The phone column was deleted from this board." });
       } else if (phone.type !== "phone") {
         problems.push({ field: "phone", code: "wrong_type", message: "The phone column must be a Phone column." });
+      }
+      const nameId = mapping.columns?.callerName?.id;
+      if (nameId) {
+        const nameColumn = byId.get(nameId);
+        if (!nameColumn) {
+          problems.push({ field: "callerName", code: "not_found", message: "The contact name column was deleted from this board." });
+        } else if (!["text", "long_text"].includes(nameColumn.type)) {
+          problems.push({ field: "callerName", code: "wrong_type", message: "The contact name column must be a Text column." });
+        }
       }
       for (const ref of mapping.readColumns ?? []) {
         if (!byId.has(ref.id)) {

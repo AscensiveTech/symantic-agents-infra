@@ -689,10 +689,11 @@ function toPublicConnection(connection, now = Date.now) {
 
 // Validates and trims a mapping sent from the browser: numeric ids only,
 // known fields only, bounded labels.
-// The customer board setup from the browser: the board, its phone column,
-// and up to MAX_READ_COLUMNS columns the AI reads. Ids only; titles and
-// types come from the live board when it's saved.
-const MAX_READ_COLUMNS = 5;
+// The Contact/Lead board setup from the browser: the board, its phone
+// column, an optional name column (else the row's built-in Name), the two
+// Yes/No settings, and up to MAX_READ_COLUMNS extra columns the AI gets.
+// Ids only; titles and types come from the live board when it's saved.
+const MAX_READ_COLUMNS = 3;
 function normalizeMappingInput(value) {
   if (!value || typeof value !== "object") {
     throw new ApiError(400, "invalid_request", "A board setup is required");
@@ -703,14 +704,21 @@ function normalizeMappingInput(value) {
   if (!/^\d{1,20}$/.test(boardId)) throw new ApiError(400, "invalid_request", "Choose a board.");
   const columnId = (raw) => (typeof raw === "string" && /^[A-Za-z0-9_]{1,64}$/.test(raw) ? raw : null);
   const phone = columnId(value.columns?.phone?.id ?? value.columns?.phone);
+  // "name" means the row's built-in Name; anything else is a text column.
+  const nameColumn = columnId(value.columns?.callerName?.id ?? value.columns?.callerName);
   const readIds = Array.isArray(value.readColumns) ? value.readColumns.map((ref) => columnId(ref?.id ?? ref)).filter(Boolean) : [];
   if (readIds.length > MAX_READ_COLUMNS) {
-    throw new ApiError(400, "invalid_request", `Pick up to ${MAX_READ_COLUMNS} columns for the AI to read.`);
+    throw new ApiError(400, "invalid_request", `Pick up to ${MAX_READ_COLUMNS} extra details for the AI.`);
   }
   return {
     boardId,
-    columns: phone ? { phone: { id: phone } } : {},
-    readColumns: [...new Set(readIds)].map((id) => ({ id })),
+    columns: {
+      ...(phone ? { phone: { id: phone } } : {}),
+      ...(nameColumn && nameColumn !== "name" ? { callerName: { id: nameColumn } } : {}),
+    },
+    readColumns: [...new Set(readIds)].filter((id) => id !== phone && id !== nameColumn).map((id) => ({ id })),
+    createContacts: value.createContacts !== false,
+    syncNames: value.syncNames !== false,
     labels: { newLead: null, followUp: null },
     defaultOwnerId: null,
   };
