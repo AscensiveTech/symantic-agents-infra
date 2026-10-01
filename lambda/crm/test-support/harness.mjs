@@ -132,6 +132,9 @@ export function createHarness({ secret = TEST_APP_SECRET } = {}) {
     await connect(options);
     const saved = await configureMapping(options);
     if (saved.statusCode !== 200) throw new Error(`mapping failed: ${saved.body}`);
+    // Let the name-sync webhook registration queued by the save finish, so
+    // tests start counting Monday requests from a settled state.
+    await drain();
     monday.reset();
     return saved;
   }

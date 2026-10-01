@@ -7682,6 +7682,13 @@ function superAdminEvent(method, path, body, queryStringParameters) {
   return event;
 }
 
+// A moment a few minutes ago: always inside the current billing cycle. (A
+// fixed day such as the 5th is still in the future on the 1st of a month,
+// which broke these tests on Oct 1, 2026.)
+function recentIso(minutesAgo) {
+  return new Date(Date.now() - minutesAgo * 60_000).toISOString();
+}
+
 function meteringStore(overrides = {}) {
   return {
     async ensureWorkspace() {},
@@ -7724,8 +7731,8 @@ test("GET /workspaces/me/usage returns a tz-correct billing cycle with no cost d
   const store = meteringStore({
     async listCalls() {
       return [
-        minuteCall(`${period}-05T10:00:00-04:00`, 90_000),
-        minuteCall(`${period}-06T11:00:00-04:00`, 30_000),
+        minuteCall(recentIso(3), 90_000),
+        minuteCall(recentIso(2), 30_000),
       ];
     },
   });
@@ -7749,8 +7756,8 @@ test("GET /workspaces/me/usage's agentBreakdown drops a deleted agent's entry, b
   const store = meteringStore({
     async listCalls() {
       return [
-        { callId: "call-live", agentId: "agent-live", startedAt: `${period}-05T10:00:00-04:00`, durationMs: 60_000, outcome: "answered" },
-        { callId: "call-deleted", agentId: "agent-deleted", startedAt: `${period}-06T10:00:00-04:00`, durationMs: 120_000, outcome: "answered" },
+        { callId: "call-live", agentId: "agent-live", startedAt: recentIso(3), durationMs: 60_000, outcome: "answered" },
+        { callId: "call-deleted", agentId: "agent-deleted", startedAt: recentIso(2), durationMs: 120_000, outcome: "answered" },
       ];
     },
     async listAgents() {
@@ -7778,8 +7785,8 @@ test("GET /workspaces/me/usage?agentId= scopes the cycle and months to just that
   const store = meteringStore({
     async listCalls() {
       return [
-        { ...minuteCall(`${period}-05T10:00:00-04:00`, 90_000), agentId: "agent-1" },
-        { ...minuteCall(`${period}-06T11:00:00-04:00`, 30_000), agentId: "agent-2" },
+        { ...minuteCall(recentIso(3), 90_000), agentId: "agent-1" },
+        { ...minuteCall(recentIso(2), 30_000), agentId: "agent-2" },
       ];
     },
     async listAgents() {
@@ -7810,8 +7817,8 @@ test("GET /workspaces/me/usage?agentId= depends on listCallsForUsage actually re
   const store = meteringStore({
     async listCallsForUsage() {
       return [
-        { ...minuteCall(`${period}-05T10:00:00-04:00`, 90_000), agentId: "agent-1" },
-        { ...minuteCall(`${period}-06T11:00:00-04:00`, 30_000), agentId: "agent-2" },
+        { ...minuteCall(recentIso(3), 90_000), agentId: "agent-1" },
+        { ...minuteCall(recentIso(2), 30_000), agentId: "agent-2" },
       ];
     },
     async listAgents() {
@@ -7834,8 +7841,8 @@ test("GET /workspaces/me/usage always returns monthlyByAgent for every agent, re
   const store = meteringStore({
     async listCalls() {
       return [
-        { ...minuteCall(`${period}-05T10:00:00-04:00`, 90_000), agentId: "agent-1" },
-        { ...minuteCall(`${period}-06T11:00:00-04:00`, 30_000), agentId: "agent-2" },
+        { ...minuteCall(recentIso(3), 90_000), agentId: "agent-1" },
+        { ...minuteCall(recentIso(2), 30_000), agentId: "agent-2" },
       ];
     },
     async listAgents() {

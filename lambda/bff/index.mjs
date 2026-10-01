@@ -1332,6 +1332,11 @@ export function createHandler({
           updatedByName: actorDisplayName(event, actor),
           hidden: false,
         });
+        // Renamed: rename the caller in Monday too (fire-and-forget).
+        // putContact stamps nameUpdatedAt only when the name actually changed.
+        if (name && saved?.nameSource === "symantic" && saved.nameUpdatedAt === saved.updatedAt) {
+          await notifyCrmContactRenamed({ workspaceId, phone: phoneNumber, name });
+        }
         return json(200, saved);
       }
 
@@ -7817,8 +7822,15 @@ export function createDynamoStore(client, commands, tableNames) {
         Key: marshall({ workspaceId, phoneNumber }),
         ConsistentRead: true,
       }));
-      const createdAt = existing.Item ? unmarshall(existing.Item).createdAt : now;
-      const item = { workspaceId, phoneNumber, createdAt, updatedAt: now, ...patch };
+      const previous = existing.Item ? unmarshall(existing.Item) : null;
+      const createdAt = previous ? previous.createdAt : now;
+      // Name sync with Monday: the newest rename wins, so a name change is
+      // stamped here and an unchanged name keeps its stamp.
+      const renamed = patch.name !== undefined && patch.name !== previous?.name;
+      const nameStamp = renamed
+        ? { nameUpdatedAt: now, nameSource: "symantic" }
+        : { nameUpdatedAt: previous?.nameUpdatedAt, nameSource: previous?.nameSource };
+      const item = { workspaceId, phoneNumber, createdAt, updatedAt: now, ...nameStamp, ...patch };
       await client.send(new commands.PutItemCommand({
         TableName: tableNames.contacts,
         Item: marshall(item, { removeUndefinedValues: true }),
@@ -8738,6 +8750,26 @@ async function notifyCrmFollowUp({ workspaceId, callId }) {
     }));
   } catch (error) {
     console.warn("CRM follow-up sync not requested", { name: error?.name });
+  }
+}
+
+// Push a contact rename to Monday (every connected agent's mapped board),
+// fire-and-forget: saving the contact never waits on, or fails because of,
+// Monday.
+async function notifyCrmContactRenamed({ workspaceId, phone, name }) {
+  const functionName = process.env.CRM_LOOKUP_FUNCTION_NAME;
+  if (!functionName) return;
+  try {
+    crmFollowUpClientPromise ??= import("@aws-sdk/client-lambda")
+      .then((lambda) => ({ lambda, client: new lambda.LambdaClient({}) }));
+    const { lambda, client } = await crmFollowUpClientPromise;
+    await client.send(new lambda.InvokeCommand({
+      FunctionName: functionName,
+      InvocationType: "Event",
+      Payload: new TextEncoder().encode(JSON.stringify({ action: "contact-renamed", workspaceId, phone, name })),
+    }));
+  } catch (error) {
+    console.warn("CRM contact rename not requested", { name: error?.name });
   }
 }
 

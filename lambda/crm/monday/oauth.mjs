@@ -20,6 +20,8 @@ export const MONDAY_SCOPES = Object.freeze([
   "boards:write",
   "updates:write",
   "users:read",
+  // Two-way name sync: a webhook on the mapped board reports row renames.
+  "webhooks:write",
 ]);
 
 const REFRESH_TOKEN_MAX_LIFETIME_MS = 180 * 24 * 60 * 60 * 1000;

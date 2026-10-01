@@ -133,6 +133,81 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
 
     // Every connection for one Monday account, via the account index. The
     // uninstall webhook uses it to disconnect them all.
+    // Name sync: the webhooks registered on the mapped board (null removes).
+    saveNameWebhooks(workspaceId, provider, record) {
+      return update(connections, { workspaceId, provider }, {
+        set: { nameWebhooks: record, updatedAt: iso() },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
+    // When the hourly name check last ran for this connection.
+    markNameChecked(workspaceId, provider) {
+      return update(connections, { workspaceId, provider }, {
+        set: { nameCheckedAt: iso() },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
+    // A workspace contact (name, company, nameUpdatedAt...), or null.
+    async getContactRecord(workspaceId, phoneNumber) {
+      if (!tables.contacts || !phoneNumber) return null;
+      return get(tables.contacts, { workspaceId, phoneNumber });
+    },
+
+    // Renames a contact from the CRM, only if this change is newer than the
+    // last rename (from anywhere). Other contact fields are kept. Returns the
+    // contact, or null when a newer name is already there.
+    renameContactFromCrm(workspaceId, phoneNumber, name, { at, source }) {
+      requireTable(tables.contacts);
+      return update(tables.contacts, { workspaceId, phoneNumber }, {
+        set: { name, nameUpdatedAt: at, nameSource: source, updatedByName: "Monday.com", updatedAt: iso() },
+        condition: "attribute_not_exists(nameUpdatedAt) OR nameUpdatedAt < :at",
+        conditionValues: { ":at": at },
+        conditional: true,
+      });
+    },
+
+    // Every call from a number, as {callId}.
+    async listCallsForPhone(workspaceId, phoneNumber) {
+      requireTable(tables.calls);
+      const items = [];
+      let startKey;
+      do {
+        const result = await client.send(new commands.QueryCommand({
+          TableName: tables.calls,
+          KeyConditionExpression: "workspaceId = :w",
+          FilterExpression: "callerNumber = :p",
+          ProjectionExpression: "callId",
+          ExpressionAttributeValues: marshall({ ":w": workspaceId, ":p": phoneNumber }),
+          ExclusiveStartKey: startKey,
+        }));
+        items.push(...(result.Items ?? []).map(unmarshall));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+      return items;
+    },
+
+    async countCallsForPhone(workspaceId, phoneNumber) {
+      return (await this.listCallsForPhone(workspaceId, phoneNumber)).length;
+    },
+
+    // Sets the caller name on every call from a number, as a manual name
+    // (so automatic naming on a later call never overwrites it).
+    async renameCallsForPhone(workspaceId, phoneNumber, name) {
+      const calls = await this.listCallsForPhone(workspaceId, phoneNumber);
+      for (const call of calls) {
+        await update(tables.calls, { workspaceId, callId: call.callId }, {
+          set: { callerName: name, callerNameSource: "manual" },
+          condition: "attribute_exists(workspaceId)",
+          conditional: true,
+        });
+      }
+      return calls.length;
+    },
+
     // Every connection (one per agent) in a workspace, used to find all of its
     // calls boards so none is ever offered for mapping.
     async listWorkspaceConnections(workspaceId) {

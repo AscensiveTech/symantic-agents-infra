@@ -18,6 +18,12 @@ const BACKGROUND_JOBS = {
   "calls-board-row": (sync, m) => sync.syncCallsBoardRow({ workspaceId: m.workspaceId, callId: m.callId, provider: m.provider }),
   "catch-up": (sync, m) => sync.catchUpAfterReconnect({ workspaceId: m.workspaceId, provider: m.provider, since: m.since }),
   "rewrite-links": (sync, m) => sync.rewriteCallLinks({ workspaceId: m.workspaceId, callId: m.callId, provider: m.provider }),
+  // Two-way name sync (name-sync.mjs).
+  "name-webhooks": (sync, m) => sync.registerNameWebhooks({ workspaceId: m.workspaceId, provider: m.provider }),
+  "name-from-monday": (sync, m) => sync.applyNameFromMonday({
+    workspaceId: m.workspaceId, provider: m.provider, boardId: m.boardId, itemId: m.itemId, name: m.name, at: m.at, phoneE164: m.phoneE164 ?? null,
+  }),
+  "name-to-monday": (sync, m) => sync.pushNameToMonday({ workspaceId: m.workspaceId, phone: m.phone, name: m.name }),
 };
 
 /** Exponential backoff with jitter, unless the error names its own wait. */

@@ -1,3 +1,4 @@
+import { createNameSync } from "./name-sync.mjs";
 import { createCrmApi } from "./api.mjs";
 import { createTokenKeeper } from "./keeper.mjs";
 import { createCrmLookup } from "./lookup.mjs";
@@ -47,6 +48,8 @@ export function composeRuntime({
     metrics,
   });
   const crmSync = createCrmSync({ store, providers, sessions, appUrl, metrics, enqueue, now, log });
+  // Two-way caller-name sync with each agent's mapped board (name-sync.mjs).
+  const nameSync = createNameSync({ store, providers, sessions, apiBaseUrl, getAppSecret, enqueue, now, log });
   const api = createCrmApi({
     store,
     adapter,
@@ -59,6 +62,7 @@ export function composeRuntime({
     appUrl,
     apiBaseUrl,
     notifyDisconnected: createDisconnectNotifier({ store, sendEmail, appUrl, now, log }),
+    removeNameWebhooks: nameSync.removeWebhooks,
     now,
     log,
   });
@@ -69,7 +73,15 @@ export function composeRuntime({
     sessions,
     metrics,
     changeVisibility,
-    sync: crmSync,
+    // The worker's jobs: call syncs plus the name-sync jobs.
+    sync: {
+      ...crmSync,
+      registerNameWebhooks: nameSync.registerWebhooks,
+      applyNameFromMonday: nameSync.applyFromMonday,
+      pushNameToMonday: nameSync.pushToMonday,
+    },
+    nameSync,
+    enqueue,
     syncFollowUp: crmSync.syncFollowUp,
     lookup: createCrmLookup({ store, providers, sessions, metrics, now, log }),
     refreshTokens: createTokenKeeper({
@@ -77,7 +89,14 @@ export function composeRuntime({
       sessions,
       requeueFailed: createRequeuer({ store, enqueue, metrics, now }),
       remindReauth: createReauthReminders({ store, sendEmail, appUrl, now, log }),
-      checkCallsBoard: crmSync.checkCallsBoard,
+      // Calls board + mapping checks, then the hourly name check for
+      // connections that don't have name-sync webhooks yet.
+      checkCallsBoard: async (connection) => {
+        await crmSync.checkCallsBoard(connection);
+        await nameSync.hourlyCheck(connection).catch((error) => {
+          log.warn?.("Hourly name check failed", { workspaceId: connection.workspaceId, name: error?.name, code: error?.code });
+        });
+      },
       metrics,
       now,
       log,
