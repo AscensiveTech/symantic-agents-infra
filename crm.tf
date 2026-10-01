@@ -477,8 +477,8 @@ resource "aws_iam_role_policy" "crm_worker_runtime" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadAndRefreshConnections"
-        Effect   = "Allow"
+        Sid    = "ReadAndRefreshConnections"
+        Effect = "Allow"
         # Query: name sync finds every agent's connection in a workspace.
         Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.crm_connections.arn
@@ -510,8 +510,8 @@ resource "aws_iam_role_policy" "crm_worker_runtime" {
         Resource = aws_dynamodb_table.control_plane["agents"].arn
       },
       {
-        Sid      = "ReadContactCompany"
-        Effect   = "Allow"
+        Sid    = "ReadContactCompany"
+        Effect = "Allow"
         # UpdateItem: a rename made in Monday renames the contact.
         Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
         Resource = aws_dynamodb_table.control_plane["contacts"].arn
