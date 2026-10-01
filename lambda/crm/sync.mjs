@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { buildCallActivity } from "./activity.mjs";
 import { callsBoardIdsOf, callsRowIsCurrent, checkMapping, createCallsLog } from "./calls-log.mjs";
 import { createRequeuer } from "./requeue.mjs";
 import { callLink } from "./monday/calls-board.mjs";
@@ -18,6 +19,9 @@ const LEASE_MS = 120_000;
 // A "no CRM record" answer from the call-time lookup is trusted this long,
 // saving a second search for a brand-new caller.
 const NEGATIVE_LOOKUP_TTL_MS = 15 * 60 * 1000;
+// Monday replays a request with the same idempotency key for about this
+// long; after that a retried summary is looked for before posting again.
+const PROVIDER_IDEMPOTENCY_WINDOW_MS = 25 * 60 * 1000;
 const FOLLOW_UP_DAYS = 1;
 export const ACCOUNT_INACTIVE_PAUSE_MS = 24 * 60 * 60 * 1000;
 // How often the keeper re-checks a customer-board mapping against Monday.
@@ -189,6 +193,7 @@ export function createCrmSync({
       await finish(call, "synced", {
         crmItemId: result.externalId,
         crmItemUrl: result.url,
+        crmActivityId: result.activityId,
         crmCreated: result.created,
         crmSyncedAt: new Date(Number(now())).toISOString(),
         crmLastErrorCode: null,
@@ -388,7 +393,24 @@ export function createCrmSync({
       await store.updateCallSync(workspaceId, callId, { crmItemId: externalId, crmItemUrl: url, crmCreated: created });
       await callsLog.linkClient(session, connection, call.crmCallsItemId, externalId);
     }
-    return { externalId, url, created };
+
+    // A short summary of this call as an Update on the customer's row -
+    // Monday's comment thread, not a column - exactly once per call.
+    let activityId = call.crmActivityId ?? null;
+    if (!activityId) {
+      const activity = buildCallActivity(facts, { appUrl });
+      const previousAttempt = Date.parse(call.crmActivityAttemptedAt ?? "");
+      if (Number.isFinite(previousAttempt) && Number(now()) - previousAttempt > PROVIDER_IDEMPOTENCY_WINDOW_MS) {
+        activityId = await provider.findActivityByRef(session, externalId, activity.ref);
+      }
+      if (!activityId) {
+        await store.updateCallSync(workspaceId, callId, { crmActivityAttemptedAt: new Date(Number(now())).toISOString() });
+        const logged = await provider.logCallActivity(session, externalId, activity, { idempotencyKey: `${idempotencyBase}-note-${externalId}` });
+        activityId = logged.activityId;
+      }
+      await store.updateCallSync(workspaceId, callId, { crmActivityId: activityId });
+    }
+    return { externalId, url, created, activityId };
   }
 
   /**

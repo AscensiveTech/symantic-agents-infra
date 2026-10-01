@@ -1,8 +1,9 @@
 import { formatLocal } from "./facts.mjs";
+import { callLink } from "./monday/calls-board.mjs";
 
-// The call note posted to the CRM record. The transcript and recording stay
-// in Symantic (they hold PII and can be large); the CRM gets the summary and
-// a link back. The trailing "Ref:" line is how a retry recognises a note it
+// The short call summary posted as an Update on the customer's row. The
+// transcript and recording stay in Symantic (they hold PII and can be
+// large); the row gets the essentials and a link to the call. The trailing "Ref:" line is how a retry recognises a note it
 // already posted.
 
 function activityRef(callId) {
@@ -17,14 +18,11 @@ export function buildCallActivity(facts, { appUrl } = {}) {
     }</p>`,
     row("Outcome", facts.outcomeLabel),
     row("Reason for call", facts.intent),
-    row("Summary", facts.summary),
+    row("Summary", facts.summary, 600),
     row("Appointment", describeAppointment(facts.appointment, facts.timezone)),
-    row("Message", facts.message),
-    row("Lead notes", facts.leadNotes),
   ];
-  if (appUrl && facts.phoneE164) {
-    const href = `${appUrl.replace(/\/+$/, "")}/call-history?q=${encodeURIComponent(facts.phoneE164)}`;
-    lines.push(`<p><a href="${escapeHtml(href)}">View this caller's calls in Symantic</a></p>`);
+  if (appUrl && facts.callId) {
+    lines.push(`<p><a href="${escapeHtml(callLink(appUrl.replace(/\/+$/, ""), facts.callId))}">Open this call in Symantic AI</a></p>`);
   }
   lines.push(`<p>${escapeHtml(activityRef(facts.callId))}</p>`);
   return {
@@ -48,9 +46,9 @@ function describeAppointment(appointment, timezone) {
   return `${verb} ${service}appointment${when ? ` for ${when}` : ""}`;
 }
 
-function row(label, value) {
+function row(label, value, max = 4000) {
   if (!value) return null;
-  return `<p><strong>${escapeHtml(label)}:</strong> ${escapeHtml(truncate(value, 4000))}</p>`;
+  return `<p><strong>${escapeHtml(label)}:</strong> ${escapeHtml(truncate(value, max))}</p>`;
 }
 
 function formatDuration(ms) {
