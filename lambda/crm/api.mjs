@@ -665,7 +665,7 @@ function toPublicConnection(connection, now = Date.now) {
     mappingStatus: connection.mappingStatus ?? "unconfigured",
     boardSyncEnabled: connection.boardSyncEnabled !== false,
     callsBoardEnabled: connection.callsBoardEnabled !== false,
-    // "instant" (webhooks), "hourly" (renew to make it instant) or "off".
+    // "instant" (both ways, live), "renew" (renew for Monday -> Symantic) or "off".
     nameSync: nameSyncMode(connection),
     callsBoard: publicCallsBoard(connection),
     mapping: connection.mapping ?? null,

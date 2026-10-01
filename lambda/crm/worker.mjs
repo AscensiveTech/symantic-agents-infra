@@ -24,6 +24,7 @@ const BACKGROUND_JOBS = {
     workspaceId: m.workspaceId, provider: m.provider, boardId: m.boardId, itemId: m.itemId, name: m.name, at: m.at, phoneE164: m.phoneE164 ?? null,
   }),
   "name-to-monday": (sync, m) => sync.pushNameToMonday({ workspaceId: m.workspaceId, phone: m.phone, name: m.name }),
+  "name-catch-up": (sync, m) => sync.catchUpNames({ workspaceId: m.workspaceId, provider: m.provider }),
 };
 
 /** Exponential backoff with jitter, unless the error names its own wait. */

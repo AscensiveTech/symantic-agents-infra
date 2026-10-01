@@ -2,10 +2,16 @@
 // board. The Symantic AI Calls board is never involved: it's a per-call log,
 // so renaming one of its rows renames a call, not a person.
 //
-//  - Monday -> Symantic: Monday webhooks on the mapped board (instant), or,
-//    for a connection that hasn't granted webhooks yet, an hourly check.
+//  - Monday -> Symantic: Monday webhooks on the mapped board, live.
 //  - Symantic -> Monday: renaming a contact in Symantic renames that caller's
 //    row on every connected agent's mapped board (once per board).
+//  - Catch-up: whenever an agent's sync is (re)set up - first setup, a
+//    reconnect or renewal, a board change, board sync turned back on - the
+//    board's names and Symantic's are compared once, both ways, so changes
+//    made while disconnected (on either side) aren't lost.
+//  - Daily check: confirms the agent's webhooks still exist in Monday (and
+//    that our background jobs weren't offline); if not, re-creates them and
+//    catches up. No hourly polling.
 //
 // The newest change wins (contacts carry nameUpdatedAt), our own writes
 // coming back from Monday are ignored, and a number Symantic has never heard
@@ -19,9 +25,10 @@ import { boardLinkKeyFor, linkKeyFor } from "./store.mjs";
 /** The OAuth scope Monday requires before an app may create webhooks. */
 export const WEBHOOK_SCOPE = "webhooks:write";
 
-const HOURLY_CHECK_MS = 60 * 60 * 1000;
-const HOURLY_MAX_PAGES = 5; // 500 rows; bigger boards are covered by webhooks
-const HOURLY_MAX_RENAMES = 200;
+const DAILY_CHECK_MS = 24 * 60 * 60 * 1000;
+// Background jobs offline longer than this may have missed webhook deliveries.
+const OUTAGE_GAP_MS = 60 * 60 * 1000;
+const CATCH_UP_MAX_PAGES = 20; // 2,000 rows; a catch-up is rare
 const NAME_MAX = 120;
 
 /** True when the connection's grant lets us create webhooks. */
@@ -31,12 +38,13 @@ export function hasWebhookScope(connection) {
 
 /**
  * How names currently sync for a connection, for the Monday card:
- * "instant" (webhooks registered), "hourly" (no webhook grant yet - renew to
- * upgrade) or "off" (no board sync).
+ * "instant" (both ways, live), "renew" (Symantic -> Monday live, Monday ->
+ * Symantic only at catch-ups until the connection is renewed with the
+ * webhook permission) or "off" (no board sync).
  */
 export function nameSyncMode(connection) {
   if (connection?.connectionState !== "connected" || connection.boardSyncEnabled === false || !connection.mapping) return "off";
-  return connection.nameWebhooks?.ids?.length ? "instant" : "hourly";
+  return connection.nameWebhooks?.ids?.length ? "instant" : "renew";
 }
 
 // Signature carried in each webhook URL: proves a delivery is for this
@@ -99,9 +107,12 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
       await deleteAll(session, provider, connection);
       const wanted = connection.boardSyncEnabled !== false && connection.mapping?.boardId &&
         connection.mappingStatus === "valid" && hasWebhookScope(connection);
+      const syncOn = connection.boardSyncEnabled !== false && connection.mapping?.boardId && connection.mappingStatus === "valid";
       if (!wanted) {
         if (connection.nameWebhooks) await store.saveNameWebhooks(workspaceId, key, null);
-        return { status: hasWebhookScope(connection) ? "off" : "hourly" };
+        // Even without webhooks, a (re)setup reconciles names once.
+        if (syncOn) await enqueue({ kind: "name-catch-up", workspaceId, provider: key });
+        return { status: syncOn ? "renew" : "off" };
       }
       const url = await webhookUrl(connection);
       const boardId = String(connection.mapping.boardId);
@@ -110,6 +121,8 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
       if (column) ids.push(await provider.createWebhook(session, { boardId, url, event: "change_specific_column_value", config: { columnId: column } }));
       await store.saveNameWebhooks(workspaceId, key, { boardId, ids, createdAt: stamp() });
       log.info?.("Name-sync webhooks registered", { workspaceId, agentId: agentIdOf(key), count: ids.length });
+      // Anything renamed on either side before now is reconciled once.
+      await enqueue({ kind: "name-catch-up", workspaceId, provider: key });
       return { status: "instant", ids };
     });
   }
@@ -127,7 +140,7 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
   }
 
   /**
-   * A row was renamed in Monday (webhook or hourly check): rename that caller
+   * A row was renamed in Monday (webhook or catch-up): rename that caller
    * in Symantic - the contact and every one of their calls - unless the
    * change is our own write coming back, is older than the last rename, or
    * is for a number Symantic has never had a call from.
@@ -198,46 +211,84 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
   }
 
   /**
-   * Hourly fallback for a connection without webhooks (granted before
-   * webhooks:write was requested): read the mapped board's rows and queue a
-   * rename for each one whose name differs from Symantic's. Renewing the
-   * Monday connection switches the agent to instant webhooks.
+   * One two-way pass over an agent's mapped board, run when its sync is
+   * (re)set up and by the daily check when something was missed. For each
+   * row whose caller Symantic knows:
+   *  - Monday renamed it more recently than Symantic (and it isn't the name
+   *    we wrote ourselves): the rename is applied in Symantic;
+   *  - Symantic renamed it more recently than the row last changed (or the
+   *    row still shows what we last wrote): the row is renamed in Monday.
+   * Monday only records when a row last changed at all, so "our own last
+   * write" is what decides most ties safely.
    */
-  async function hourlyCheck(connection) {
-    if (!isConnectionUsable(connection) || nameSyncMode(connection) !== "hourly") return null;
-    if (Number(now()) - Date.parse(connection.nameCheckedAt ?? 0) < HOURLY_CHECK_MS) return null;
-    const provider = providers.get(connection.provider);
-    if (!provider?.listNamedRows) return null;
-    await store.markNameChecked(connection.workspaceId, connection.provider);
+  async function catchUp({ workspaceId, provider: key }) {
+    const connection = await store.getConnection(workspaceId, key);
+    const provider = providers.get(key);
+    if (!isConnectionUsable(connection) || !provider?.listNamedRows) return { status: "skipped" };
+    const boardId = String(connection.mapping.boardId);
     const rows = await sessions.withSession(connection, (session) =>
-      provider.listNamedRows(session, connection.mapping, { maxPages: HOURLY_MAX_PAGES }));
-    let queued = 0;
+      provider.listNamedRows(session, connection.mapping, { maxPages: CATCH_UP_MAX_PAGES }));
+    let fromMonday = 0;
+    let toMonday = 0;
     for (const row of rows) {
-      if (queued >= HOURLY_MAX_RENAMES) break;
       if (!row.phoneE164 || !row.name) continue;
-      const contact = await store.getContactRecord(connection.workspaceId, row.phoneE164);
-      if (contact?.name === row.name) continue;
-      if (contact?.nameUpdatedAt && row.updatedAt && row.updatedAt <= contact.nameUpdatedAt) continue;
-      if (!contact) {
-        // No contact record: only callers we've synced to this board count,
-        // and only when the row's name isn't the one we wrote ourselves.
-        const link = await store.getLink(connection.workspaceId, boardLinkKeyFor(connection.provider, connection.mapping.boardId, row.phoneE164));
-        if (!link || link.lastWrittenName === row.name) continue;
+      const [contact, link] = await Promise.all([
+        store.getContactRecord(workspaceId, row.phoneE164),
+        store.getLink(workspaceId, boardLinkKeyFor(key, boardId, row.phoneE164)),
+      ]);
+      if (!contact && !link) continue; // a caller Symantic doesn't know
+      const symanticName = contact?.name ?? null;
+      if (symanticName === row.name) continue;
+      const mondayIsOurs = link?.lastWrittenName === row.name;
+      const symanticNewer = Boolean(symanticName && contact.nameSource === "symantic" &&
+        (mondayIsOurs || !row.updatedAt || (contact.nameUpdatedAt && contact.nameUpdatedAt > row.updatedAt)));
+      if (symanticNewer) {
+        await sessions.withSession(connection, (session) => provider.renameItem(session, boardId, row.externalId, symanticName,
+          { callerNameColumnId: connection.mapping.columns?.callerName?.id }));
+        await store.saveLink(workspaceId, boardLinkKeyFor(key, boardId, row.phoneE164), { lastWrittenName: symanticName });
+        toMonday += 1;
+        continue;
       }
-      await enqueue({
-        kind: "name-from-monday",
-        workspaceId: connection.workspaceId,
-        provider: connection.provider,
-        boardId: String(connection.mapping.boardId),
-        itemId: row.externalId,
-        name: row.name,
-        phoneE164: row.phoneE164,
-        at: row.updatedAt ?? stamp(),
+      if (mondayIsOurs) continue;
+      if (contact?.nameUpdatedAt && row.updatedAt && row.updatedAt <= contact.nameUpdatedAt) continue;
+      const result = await applyFromMonday({
+        workspaceId, provider: key, boardId, itemId: row.externalId, name: row.name, phoneE164: row.phoneE164, at: row.updatedAt ?? stamp(),
       });
-      queued += 1;
+      if (result.status === "renamed") fromMonday += 1;
     }
-    return queued;
+    log.info?.("Name catch-up done", { workspaceId, agentId: agentIdOf(key), rows: rows.length, fromMonday, toMonday });
+    return { status: "done", fromMonday, toMonday };
   }
 
-  return { registerWebhooks, removeWebhooks, applyFromMonday, pushToMonday, hourlyCheck };
+  /**
+   * Once a day per agent with live name sync (from the keeper): ask Monday
+   * whether our webhooks are still on the board - one small request. If one
+   * is gone (removed in Monday, board permissions changed), re-create them,
+   * which also runs a catch-up. A long gap since the keeper last saw this
+   * connection means webhook deliveries may have been missed while we were
+   * offline, so that also triggers a catch-up.
+   */
+  async function dailyCheck(connection) {
+    if (!isConnectionUsable(connection)) return null;
+    const { workspaceId, provider: key } = connection;
+    const lastSeen = Date.parse(connection.nameKeeperSeenAt ?? "");
+    await store.markNameKeeperSeen(workspaceId, key);
+    if (nameSyncMode(connection) !== "instant") return null;
+    if (Number.isFinite(lastSeen) && Number(now()) - lastSeen > OUTAGE_GAP_MS) {
+      log.info?.("Name sync: background jobs were offline; catching up", { workspaceId, agentId: agentIdOf(key) });
+      await enqueue({ kind: "name-catch-up", workspaceId, provider: key });
+    }
+    if (Number(now()) - Date.parse(connection.nameCheckedAt ?? 0) < DAILY_CHECK_MS) return null;
+    await store.markNameChecked(workspaceId, key);
+    const provider = providers.get(key);
+    if (!provider?.listWebhooks) return null;
+    const present = new Set(await sessions.withSession(connection, (session) => provider.listWebhooks(session, connection.nameWebhooks.boardId)));
+    const missing = connection.nameWebhooks.ids.filter((id) => !present.has(String(id)));
+    if (!missing.length) return "ok";
+    log.warn?.("Name-sync webhooks missing in Monday; re-creating", { workspaceId, agentId: agentIdOf(key), missing: missing.length });
+    await enqueue({ kind: "name-webhooks", workspaceId, provider: key });
+    return "repaired";
+  }
+
+  return { registerWebhooks, removeWebhooks, applyFromMonday, pushToMonday, catchUp, dailyCheck };
 }

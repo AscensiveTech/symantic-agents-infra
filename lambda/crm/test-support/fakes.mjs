@@ -68,6 +68,11 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       else delete row.nameWebhooks;
       return clone(row);
     },
+    async markNameKeeperSeen(workspaceId, provider) {
+      const row = connections.get(key(workspaceId, provider));
+      if (row) row.nameKeeperSeenAt = iso();
+      return clone(row);
+    },
     async markNameChecked(workspaceId, provider) {
       const row = connections.get(key(workspaceId, provider));
       if (row) row.nameCheckedAt = iso();
@@ -502,6 +507,7 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
   });
 
   function classify(query) {
+    if (query.includes("webhooks(board_id")) return "list_webhooks";
     if (query.includes("create_webhook")) return "create_webhook";
     if (query.includes("delete_webhook")) return "delete_webhook";
     if (query.includes("items_page(limit: 100, cursor")) return "list_rows";
@@ -758,6 +764,8 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
         webhooks.set(webhook.id, webhook);
         return { data: { create_webhook: { id: webhook.id } } };
       }
+      case "list_webhooks":
+        return { data: { webhooks: [...webhooks.values()].filter((w) => w.boardId === String(v.board)).map((w) => ({ id: w.id, event: w.event })) } };
       case "delete_webhook": {
         if (!webhooks.delete(String(v.id))) return errorBody("ResourceNotFoundException", "Webhook not found");
         return { data: { delete_webhook: { id: v.id } } };
