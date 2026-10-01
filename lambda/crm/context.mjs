@@ -12,12 +12,23 @@ const FIELD_MAX = 60;
 export function buildCallerContext(contact) {
   if (!contact) return NO_CRM_CONTEXT;
   const name = clean(contact.name);
-  const status = clean(contact.status);
-  const owner = clean(contact.ownerName);
-  if (!name && !status && !owner) return NO_CRM_CONTEXT;
+  // The columns the admin picked for the AI to read, as "Title: value".
+  const details = (contact.details ?? [])
+    .map((detail) => {
+      const title = clean(detail.title);
+      const text = clean(detail.text);
+      return title && text ? `${title}: ${text}` : null;
+    })
+    .filter(Boolean)
+    .slice(0, 5);
+  // Older setups read status and owner instead.
+  const status = details.length ? null : clean(contact.status);
+  const owner = details.length ? null : clean(contact.ownerName);
+  if (!name && !details.length && !status && !owner) return NO_CRM_CONTEXT;
   const parts = [
     "Existing contact in the business's CRM",
     name ? `name on file: ${name}` : null,
+    ...details,
     status ? `status: ${status}` : null,
     owner ? `account owner: ${owner}` : null,
   ].filter(Boolean);

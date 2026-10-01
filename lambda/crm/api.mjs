@@ -470,12 +470,18 @@ export function createCrmApi({
           const column = columnsById.get(id);
           return [field, { id, type: column.type, title: column.title }];
         })),
+        readColumns: requested.readColumns.map(({ id }) => {
+          const column = columnsById.get(id);
+          return { id, type: column.type, title: column.title };
+        }),
       };
       await store.saveMapping(identity.workspaceId, key, mapping, { status: "valid", problems: [] });
       // Saving a board mapping is choosing to sync to that board.
       const saved = await store.setBoardSyncEnabled(identity.workspaceId, key, true);
       const requeued = await requeueFailed(identity.workspaceId, key);
       await enqueue({ kind: "name-webhooks", workspaceId: identity.workspaceId, provider: key }).catch(() => {});
+      // Add the calls board's Client link column and link past calls once.
+      await enqueue({ kind: "link-clients", workspaceId: identity.workspaceId, provider: key }).catch(() => {});
       log.info?.("CRM mapping saved", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), requeued });
       return json(200, { ...toPublicConnection(saved, now), requeued });
     },
@@ -683,30 +689,30 @@ function toPublicConnection(connection, now = Date.now) {
 
 // Validates and trims a mapping sent from the browser: numeric ids only,
 // known fields only, bounded labels.
+// The customer board setup from the browser: the board, its phone column,
+// and up to MAX_READ_COLUMNS columns the AI reads. Ids only; titles and
+// types come from the live board when it's saved.
+const MAX_READ_COLUMNS = 5;
 function normalizeMappingInput(value) {
   if (!value || typeof value !== "object") {
-    throw new ApiError(400, "invalid_request", "A mapping is required");
+    throw new ApiError(400, "invalid_request", "A board setup is required");
   }
   const boardId = typeof value.boardId === "string" || typeof value.boardId === "number"
     ? String(value.boardId).trim()
     : "";
   if (!/^\d{1,20}$/.test(boardId)) throw new ApiError(400, "invalid_request", "Choose a board.");
-  const columns = {};
-  for (const field of Object.keys(FIELD_TYPES)) {
-    const id = value.columns?.[field]?.id ?? value.columns?.[field];
-    if (typeof id === "string" && /^[A-Za-z0-9_]{1,64}$/.test(id)) columns[field] = { id };
+  const columnId = (raw) => (typeof raw === "string" && /^[A-Za-z0-9_]{1,64}$/.test(raw) ? raw : null);
+  const phone = columnId(value.columns?.phone?.id ?? value.columns?.phone);
+  const readIds = Array.isArray(value.readColumns) ? value.readColumns.map((ref) => columnId(ref?.id ?? ref)).filter(Boolean) : [];
+  if (readIds.length > MAX_READ_COLUMNS) {
+    throw new ApiError(400, "invalid_request", `Pick up to ${MAX_READ_COLUMNS} columns for the AI to read.`);
   }
-  // A status label, trimmed and capped, or null.
-  const label = (text) => (typeof text === "string" && text.trim() ? text.trim().slice(0, 100) : null);
-  const owner = value.defaultOwnerId === null || value.defaultOwnerId === undefined || value.defaultOwnerId === ""
-    ? null
-    : String(value.defaultOwnerId);
-  if (owner !== null && !/^\d{1,20}$/.test(owner)) throw new ApiError(400, "invalid_request", "Invalid default owner.");
   return {
     boardId,
-    columns,
-    labels: { newLead: label(value.labels?.newLead), followUp: label(value.labels?.followUp) },
-    defaultOwnerId: owner,
+    columns: phone ? { phone: { id: phone } } : {},
+    readColumns: [...new Set(readIds)].map((id) => ({ id })),
+    labels: { newLead: null, followUp: null },
+    defaultOwnerId: null,
   };
 }
 

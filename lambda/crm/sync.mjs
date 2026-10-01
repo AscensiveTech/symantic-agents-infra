@@ -1,10 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { buildCallActivity } from "./activity.mjs";
 import { callsBoardIdsOf, callsRowIsCurrent, checkMapping, createCallsLog } from "./calls-log.mjs";
 import { createRequeuer } from "./requeue.mjs";
 import { callLink } from "./monday/calls-board.mjs";
-import { deriveCallFacts, followUpText, localDatePlusDays, transcriptText } from "./facts.mjs";
+import { deriveCallFacts } from "./facts.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone } from "./phone.mjs";
 import { connectionKeyFor, isConnectionPaused, isConnectionUsable, providerIdOf } from "./provider.mjs";
@@ -16,7 +15,6 @@ const LEASE_MS = 120_000;
 // Monday replays a mutation with the same Idempotency-Key for 30 minutes.
 // Inside that window a retry is protected by the provider; outside it we
 // check the record for our own note before posting again.
-const PROVIDER_IDEMPOTENCY_WINDOW_MS = 25 * 60 * 1000;
 // A "no CRM record" answer from the call-time lookup is trusted this long,
 // saving a second search for a brand-new caller.
 const NEGATIVE_LOOKUP_TTL_MS = 15 * 60 * 1000;
@@ -26,7 +24,6 @@ export const ACCOUNT_INACTIVE_PAUSE_MS = 24 * 60 * 60 * 1000;
 export const MAPPING_RECHECK_MS = 60 * 60 * 1000;
 // Failures fixed by repairing the mapping: replayed once it's valid again.
 const MAPPING_FAILURE_CODES = new Set([CRM_ERROR.MAPPING_INVALID]);
-const LEAD_SOURCE = "AI Receptionist";
 
 /**
  * Post-call CRM synchronization for one call. Safe to run any number of
@@ -192,7 +189,6 @@ export function createCrmSync({
       await finish(call, "synced", {
         crmItemId: result.externalId,
         crmItemUrl: result.url,
-        crmActivityId: result.activityId,
         crmCreated: result.created,
         crmSyncedAt: new Date(Number(now())).toISOString(),
         crmLastErrorCode: null,
@@ -207,7 +203,6 @@ export function createCrmSync({
         provider: providerId,
         caller: maskPhone(facts.phoneE164),
         created: result.created,
-        fieldsApplied: result.fieldsApplied,
       });
       return { status: "synced", ...result };
     } catch (error) {
@@ -305,16 +300,17 @@ export function createCrmSync({
     throw error;
   }
 
-  // The customer's own board: find the caller's row (by the saved link, then
-  // phone, then email), create a lead if there is none, then log this call on
-  // it. Idempotency keys stop duplicates when Monday times out after writing.
+  // The customer board: find the caller's row by phone - or, for a new
+  // caller, add one with just their name and phone - then link this call's
+  // row on the calls board to it. Nothing else on the customer board is
+  // written; call details live on the calls board (customers can mirror
+  // them onto their own board in Monday). Idempotency keys stop duplicates
+  // when Monday times out after writing.
   async function runSync({ session, provider, call, facts, link, linkKey, connection }) {
     const { workspaceId, callId } = call;
     const boardKey = connection.mapping?.boardId ?? null;
-    // Stable per call and bounded in length (Monday documents no key limit).
     const idempotencyBase = idempotencyBaseFor(workspaceId, callId);
 
-    // 1. Which CRM record is this caller?
     let externalId = call.crmItemId ?? null;
     let url = call.crmItemUrl;
     let created = call.crmCreated === true;
@@ -326,19 +322,14 @@ export function createCrmSync({
     // Look the caller up in Monday. A recent "not found" for this number is
     // trusted for a while to save API calls; several matches is an error the
     // admin must fix (we never guess).
-    const resolve = async () => {
-      const recentlyNotFound = linkUsable && link.state === "none" &&
-        Number(now()) - Date.parse(link.checkedAt ?? 0) < NEGATIVE_LOOKUP_TTL_MS;
-      let found = null;
-      if (!recentlyNotFound) found = await provider.findContactByPhone(session, facts.phoneE164);
-      if (!found && facts.email) found = await provider.findContactByEmail(session, facts.email);
+    const resolve = async (current) => {
+      const recentlyNotFound = linkUsable && current.state === "none" &&
+        Number(now()) - Date.parse(current.checkedAt ?? 0) < NEGATIVE_LOOKUP_TTL_MS;
+      const found = recentlyNotFound ? null : await provider.findContactByPhone(session, facts.phoneE164);
       if (found) {
         if (found.matchCount > 1) {
           metrics?.count("AmbiguousMatch", { Provider: provider.id });
-          throw new CrmError(
-            CRM_ERROR.AMBIGUOUS_MATCH,
-            "Multiple CRM records match this caller",
-          );
+          throw new CrmError(CRM_ERROR.AMBIGUOUS_MATCH, "Multiple CRM records match this caller");
         }
         await store.saveLink(workspaceId, linkKey, {
           provider: provider.id,
@@ -351,7 +342,7 @@ export function createCrmSync({
         return { externalId: found.externalId, url: found.url, created: false };
       }
       // Mark the attempt before creating: if we crash after Monday creates
-      // the record, the retry sees "creating" and searches instead of trusting
+      // the row, the retry sees "creating" and searches instead of trusting
       // a stale "none".
       await store.saveLink(workspaceId, linkKey, {
         provider: provider.id,
@@ -360,12 +351,10 @@ export function createCrmSync({
         boardId: boardKey,
         externalId: null,
       });
-      const contact = await provider.createLead(session, {
-        name: facts.name ?? `New caller ${facts.phoneE164}`,
-        phoneE164: facts.phoneE164,
-        email: facts.email ?? undefined,
-        fields: { ...fieldPatch(facts, { isNew: true, call, appUrl }), assignDefaultOwner: true, source: LEAD_SOURCE },
-      }, { idempotencyKey: `${idempotencyBase}-create` });
+      const name = facts.name ?? `New caller ${facts.phoneE164}`;
+      // A new caller: their name and phone only.
+      const contact = await provider.createLead(session, { name, phoneE164: facts.phoneE164, fields: {} },
+        { idempotencyKey: `${idempotencyBase}-create` });
       await store.saveLink(workspaceId, linkKey, {
         provider: provider.id,
         phoneE164: facts.phoneE164,
@@ -373,86 +362,67 @@ export function createCrmSync({
         externalId: contact.externalId,
         boardId: boardKey,
         // The name we gave the new row: its rename echo is ignored.
-        lastWrittenName: facts.name ?? `New caller ${facts.phoneE164}`,
+        lastWrittenName: name,
         checkedAt: new Date(Number(now())).toISOString(),
         createdByCallId: callId,
       });
-      if (facts.endedAt) {
-        await store.advanceWatermark(workspaceId, linkKey, facts.endedAt, appointmentMarker(facts, link)).catch(() => {});
-      }
       return { externalId: contact.externalId, url: contact.url, created: true };
     };
 
     if (!externalId) {
-      ({ externalId, url, created } = await resolve());
-      await store.updateCallSync(workspaceId, callId, {
-        crmItemId: externalId,
-        crmItemUrl: url,
-        crmCreated: created,
-      });
+      ({ externalId, url, created } = await resolve(link));
+      await store.updateCallSync(workspaceId, callId, { crmItemId: externalId, crmItemUrl: url, crmCreated: created });
     }
 
-    // 2. The call note, exactly once.
-    if (call.crmActivityId) {
-      return { externalId, url, created, activityId: call.crmActivityId, fieldsApplied: false };
-    }
-    const activity = buildCallActivity(facts, { appUrl });
-    const previousAttempt = Date.parse(call.crmActivityAttemptedAt ?? "");
-    if (Number.isFinite(previousAttempt) && Number(now()) - previousAttempt > PROVIDER_IDEMPOTENCY_WINDOW_MS) {
-      const existing = await provider.findActivityByRef(session, externalId, activity.ref);
-      if (existing) {
-        return { externalId, url, created, activityId: existing, fieldsApplied: false };
-      }
-    }
-
-    const applyFields = !created && isNewest(facts, link, linkUsable);
-    const fields = applyFields ? fieldPatch(facts, { isNew: false, link, call, appUrl }) : undefined;
-    await store.updateCallSync(workspaceId, callId, {
-      crmActivityAttemptedAt: new Date(Number(now())).toISOString(),
-    });
-
-    let logged;
     try {
-      logged = await provider.logCallActivity(session, externalId, activity, {
-        fields,
-        idempotencyKey: `${idempotencyBase}-note`,
-      });
+      await callsLog.linkClient(session, connection, call.crmCallsItemId, externalId);
     } catch (error) {
-      // The record was deleted in the CRM since we linked it: forget the link
-      // and resolve again (find or create) once.
-      if (error instanceof CrmError && error.code === CRM_ERROR.NOT_FOUND && !created) {
-        metrics?.count("StaleLink", { Provider: provider.id });
-        await store.saveLink(workspaceId, linkKey, { state: "none", externalId: null, boardId: boardKey, checkedAt: "1970-01-01T00:00:00.000Z" });
-        link = { ...link, state: "none", checkedAt: "1970-01-01T00:00:00.000Z" };
-        await store.updateCallSync(workspaceId, callId, { crmItemId: null, crmItemUrl: null, crmCreated: null });
-        ({ externalId, url, created } = await resolve());
-        await store.updateCallSync(workspaceId, callId, { crmItemId: externalId, crmItemUrl: url, crmCreated: created });
-        logged = await provider.logCallActivity(session, externalId, activity, {
-          fields: created ? undefined : fieldPatch(facts, { isNew: false, link, call, appUrl }),
-          idempotencyKey: `${idempotencyBase}-note-${externalId}`,
-        });
-      } else {
-        throw error;
-      }
+      // The customer row was deleted in Monday since we linked it: forget
+      // it, find or add the caller again, and link once more.
+      const gone = error instanceof CrmError && [CRM_ERROR.NOT_FOUND, CRM_ERROR.INVALID_VALUE].includes(error.code);
+      if (!gone || created) throw error;
+      metrics?.count("StaleLink", { Provider: provider.id });
+      const reset = { ...link, state: "none", externalId: null, checkedAt: "1970-01-01T00:00:00.000Z" };
+      await store.saveLink(workspaceId, linkKey, { state: "none", externalId: null, boardId: boardKey, checkedAt: reset.checkedAt });
+      ({ externalId, url, created } = await resolve(reset));
+      await store.updateCallSync(workspaceId, callId, { crmItemId: externalId, crmItemUrl: url, crmCreated: created });
+      await callsLog.linkClient(session, connection, call.crmCallsItemId, externalId);
     }
-    await store.updateCallSync(workspaceId, callId, { crmActivityId: logged.activityId });
+    return { externalId, url, created };
+  }
 
-    if (logged.fieldsApplied && facts.endedAt) {
-      await store.advanceWatermark(workspaceId, linkKey, facts.endedAt, appointmentMarker(facts, link)).catch(() => {});
+  /**
+   * Once, when the customer board is set up (or changed): add the calls
+   * board's Client column and link every call already on the calls board to
+   * its caller's existing row. Unknown callers get a row on their next call.
+   * One search per phone number.
+   */
+  async function linkPastCalls({ workspaceId, provider: connectionKey }) {
+    const connection = await store.getConnection(workspaceId, connectionKey);
+    const provider = providers.get(providerIdOf(connectionKey));
+    if (!isConnectionUsable(connection) || connection.callsBoard?.status !== "active" || !connection.agentId || !provider) {
+      return { status: "skipped" };
     }
-    if (logged.fieldsError) {
-      // The note landed; the column write did not. Surface a mapping problem
-      // to the admin, but the call itself is recorded in the CRM.
-      log.warn?.("CRM fields not applied", { workspaceId, callId, ...describeError(logged.fieldsError) });
-      if (logged.fieldsError.code === CRM_ERROR.MAPPING_INVALID) {
-        await store.markMappingInvalid(workspaceId, connection.provider, [{
-          field: "columns",
-          code: "rejected",
-          message: "Monday rejected one of the mapped columns.",
-        }]).catch(() => {});
+    const boardId = String(connection.callsBoard.id);
+    const calls = (await store.listAgentCalls(workspaceId, connection.agentId))
+      .filter((call) => call.crmCallsItemId && call.callerNumber && String(call.crmCallsBoardId ?? boardId) === boardId);
+    const byPhone = new Map();
+    let linked = 0;
+    await sessions.withSession(connection, async (session) => {
+      await callsLog.ensureClientColumn(session, connection);
+      for (const call of calls) {
+        if (!byPhone.has(call.callerNumber)) {
+          const found = await provider.findContactByPhone(session, call.callerNumber).catch(() => null);
+          byPhone.set(call.callerNumber, found && found.matchCount <= 1 ? found.externalId : null);
+        }
+        const clientId = byPhone.get(call.callerNumber);
+        if (!clientId) continue;
+        await callsLog.linkClient(session, connection, call.crmCallsItemId, clientId);
+        linked += 1;
       }
-    }
-    return { externalId, url, created, activityId: logged.activityId, fieldsApplied: logged.fieldsApplied };
+    });
+    log.info?.("Past calls linked to customers", { workspaceId, calls: calls.length, linked });
+    return { status: "done", linked };
   }
 
   // A follow-up added or changed in Symantic after the call synced. Best
@@ -466,19 +436,14 @@ export function createCrmSync({
     const providerId = providerIdOf(connectionKey ?? "monday");
     const connection = connectionKey ? await store.getConnection(workspaceId, connectionKey) : null;
     if (connection?.connectionState !== "connected") return { status: "skipped", reason: "not_connected" };
-    const provider = providers.get(providerId);
-    const userBoard = Boolean(call.crmItemId && isConnectionUsable(connection) &&
-      connection.mapping?.columns?.followUp?.id && provider?.updateFields);
+    // Follow-ups live on the calls board only; the customer board isn't written.
     const callsBoard = Boolean(call.crmCallsItemId && connection.callsBoard?.status === "active" &&
       connection.callsBoard.columns?.followUp);
-    if (!userBoard && !callsBoard) return { status: "skipped", reason: "no_follow_up_column" };
+    if (!callsBoard) return { status: "skipped", reason: "no_follow_up_column" };
     try {
-      await sessions.withSession(connection, async (session) => {
-        if (callsBoard) await callsLog.updateFollowUp(session, connection, call);
-        if (userBoard) await provider.updateFields(session, call.crmItemId, { followUp: followUpText(call.followUp) });
-      });
+      await sessions.withSession(connection, (session) => callsLog.updateFollowUp(session, connection, call));
       metrics?.count("FollowUpSynced", { Provider: providerId });
-      return { status: "synced", callsBoard, userBoard };
+      return { status: "synced", callsBoard };
     } catch (error) {
       log.warn?.("CRM follow-up not synced", { workspaceId, callId, ...describeError(error) });
       return { status: "failed", code: error instanceof CrmError ? error.code : "unexpected" };
@@ -646,7 +611,7 @@ export function createCrmSync({
     return status;
   }
 
-  return { syncCall, syncFollowUp, ensureCallsBoard, checkCallsBoard, rebuildCallsBoard, syncCallsBoardRow, catchUpAfterReconnect, rewriteCallLinks };
+  return { syncCall, syncFollowUp, ensureCallsBoard, checkCallsBoard, rebuildCallsBoard, syncCallsBoardRow, catchUpAfterReconnect, rewriteCallLinks, linkPastCalls };
 }
 
 // Stable per call and bounded in length (Monday documents no key limit).
@@ -662,64 +627,8 @@ export function connectionKeyOfCall(call) {
   return call?.agentId ? connectionKeyFor(recorded || "monday", call.agentId) : null;
 }
 
-// True when this call is the newest one applied to the caller's row, so an
-// older call replayed late never overwrites newer fields.
-function isNewest(facts, link, linkUsable) {
-  if (!facts.endedAt) return false;
-  if (!linkUsable || !link.lastAppliedEndedAt) return true;
-  return facts.endedAt >= link.lastAppliedEndedAt;
-}
 
-// Fields we own on the CRM record. Status is only ever set on creation, or
-// to "follow up" when this call needs one; the owner only on creation.
-function fieldPatch(facts, { isNew, link, call, appUrl }) {
-  const patch = {
-    lastCallAt: facts.endedAt ?? undefined,
-    outcome: facts.outcomeLabel,
-  };
-  if (isNew) patch.status = "new_lead";
-  if (facts.followUpRequired) {
-    patch.followUpDate = localDatePlusDays(facts.endedAt, facts.timezone, FOLLOW_UP_DAYS) ?? undefined;
-    if (!isNew) patch.status = "follow_up";
-  }
-  const appointment = facts.appointment;
-  if (appointment?.kind === "cancelled") {
-    if (!isNew && appointment.startTimeUtc && link?.appointmentAt === appointment.startTimeUtc) {
-      patch.nextAppointmentAt = null;
-    }
-  } else if (appointment?.startTimeUtc) {
-    patch.nextAppointmentAt = appointment.startTimeUtc;
-  }
-  if (facts.summary) patch.transcriptSummary = facts.summary;
-  const transcript = transcriptText(call?.transcript);
-  if (transcript) patch.fullTranscript = transcript;
-  if (facts.companyName) patch.companyName = facts.companyName;
-  if (typeof call?.userSentiment === "string" && call.userSentiment.trim()) patch.sentiment = call.userSentiment.trim();
-  const followUp = followUpText(call?.followUp);
-  if (followUp) patch.followUp = followUp;
-  if (appUrl && facts.callId) patch.audioLink = callLink(appUrl, facts.callId);
-  if (facts.durationMs != null) patch.callDuration = Math.round(facts.durationMs / 60000);
-  if (facts.name) patch.callerName = facts.name;
-  if (facts.startedAt) {
-    patch.date = facts.startedAt;
-    patch.time = facts.startedAt;
-  }
-  if (facts.intent) patch.intent = facts.intent;
-  patch.direction = "Inbound";
-  if (facts.appointment) patch.appointment = facts.appointment.kind === "booked" || facts.appointment.kind === "rescheduled";
-  return patch;
-}
 
-// Remembers which appointment date we last wrote, so a later cancellation
-// clears only that one.
-function appointmentMarker(facts, link) {
-  const appointment = facts.appointment;
-  if (!appointment?.startTimeUtc) return {};
-  if (appointment.kind === "cancelled") {
-    return link?.appointmentAt === appointment.startTimeUtc ? { appointmentAt: null } : {};
-  }
-  return { appointmentAt: appointment.startTimeUtc };
-}
 
 // When Monday's daily API limit resets (just after 00:00 UTC); the connection
 // is paused until then.
