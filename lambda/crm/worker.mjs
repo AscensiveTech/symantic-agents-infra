@@ -25,6 +25,8 @@ const BACKGROUND_JOBS = {
   }),
   "name-to-monday": (sync, m) => sync.pushNameToMonday({ workspaceId: m.workspaceId, phone: m.phone, name: m.name }),
   "name-catch-up": (sync, m) => sync.catchUpNames({ workspaceId: m.workspaceId, provider: m.provider }),
+  // Customer board set up or changed: Client link column + link past calls.
+  "link-clients": (sync, m) => sync.linkPastCalls({ workspaceId: m.workspaceId, provider: m.provider }),
 };
 
 /** Exponential backoff with jitter, unless the error names its own wait. */

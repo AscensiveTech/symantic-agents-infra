@@ -50,9 +50,10 @@ const ITEM_FIELDS = `
  */
 export function createMondayCrmAdapter({ graphql }) {
   // Column ids needed to read a matched row (phone, email, status, owner).
+  // Column ids to fetch for a customer row: the phone (for matching) and
+  // the columns the AI reads.
   function readColumns(mapping) {
-    return ["phone", "email", "status", "owner"]
-      .map((field) => mapping?.columns?.[field]?.id)
+    return [mapping?.columns?.phone?.id, mapping?.columns?.email?.id, ...(mapping?.readColumns ?? []).map((ref) => ref.id)]
       .filter(Boolean);
   }
 
@@ -83,6 +84,10 @@ export function createMondayCrmAdapter({ graphql }) {
       email: readEmail(emailValue),
       status: textOf(values.get(mapping.columns.status?.id)),
       ownerName: textOf(values.get(mapping.columns.owner?.id)),
+      // What the AI reads during a call: the columns picked in the setup.
+      details: (mapping.readColumns ?? [])
+        .map((ref) => ({ title: ref.title ?? ref.id, text: textOf(values.get(ref.id)) }))
+        .filter((detail) => detail.text),
       url: typeof item.url === "string" ? item.url : undefined,
       updatedAt: item.updated_at,
     };
@@ -328,10 +333,13 @@ export function createMondayCrmAdapter({ graphql }) {
     // Checks a mapping against the board as it is now: board exists, each
     // mapped column still exists with a compatible type, and the status
     // labels are real.
+    // Checks the customer board setup against the board as it is in Monday:
+    // the board exists, the phone column is still a Phone column, and the
+    // columns the AI reads still exist. Renamed columns are fine (by id).
     async validateMapping(session, mapping) {
       const problems = [];
       if (!mapping?.boardId) {
-        return { ok: false, problems: [{ field: "board", code: "missing", message: "Choose a board." }] };
+        return { ok: false, problems: [{ field: "board", code: "missing", message: "Choose your customer board." }] };
       }
       const [board] = await queryBoards(session, [String(mapping.boardId)]);
       if (!board) {
@@ -341,39 +349,18 @@ export function createMondayCrmAdapter({ graphql }) {
         };
       }
       const byId = new Map(board.columns.map((column) => [column.id, column]));
-      for (const [field, allowed] of Object.entries(FIELD_TYPES)) {
-        const columnId = mapping.columns?.[field]?.id;
-        if (!columnId) {
-          if (REQUIRED_FIELDS.includes(field)) {
-            problems.push({ field, code: "missing", message: "A phone column is required to match callers." });
-          }
-          continue;
-        }
-        const column = byId.get(columnId);
-        if (!column) {
-          problems.push({ field, code: "not_found", message: "This column was deleted or renamed on the board." });
-        } else if (!allowed.includes(column.type)) {
-          problems.push({ field, code: "wrong_type", message: `This column must be a ${allowed.join(" or ")} column.` });
-        }
+      const phoneId = mapping.columns?.phone?.id;
+      const phone = byId.get(phoneId);
+      if (!phoneId) {
+        problems.push({ field: "phone", code: "missing", message: "Choose the column with your customers' phone numbers." });
+      } else if (!phone) {
+        problems.push({ field: "phone", code: "not_found", message: "The phone column was deleted from this board." });
+      } else if (phone.type !== "phone") {
+        problems.push({ field: "phone", code: "wrong_type", message: "The phone column must be a Phone column." });
       }
-      const statusColumn = byId.get(mapping.columns?.status?.id);
-      if (statusColumn?.type === "status") {
-        for (const [key, label] of Object.entries(mapping.labels ?? {})) {
-          if (label && !statusColumn.labels.includes(label)) {
-            problems.push({ field: `labels.${key}`, code: "not_found", message: `The status "${label}" doesn't exist on this column.` });
-          }
-        }
-      } else if (Object.values(mapping.labels ?? {}).some(Boolean)) {
-        problems.push({ field: "labels", code: "missing", message: "Status labels need a status column." });
-      }
-      if (mapping.defaultOwnerId) {
-        if (!mapping.columns?.owner?.id) {
-          problems.push({ field: "defaultOwnerId", code: "missing", message: "A default owner needs an owner column." });
-        } else {
-          const users = await this.listUsers(session);
-          if (!users.some((user) => user.id === String(mapping.defaultOwnerId))) {
-            problems.push({ field: "defaultOwnerId", code: "not_found", message: "That person is no longer an active user." });
-          }
+      for (const ref of mapping.readColumns ?? []) {
+        if (!byId.has(ref.id)) {
+          problems.push({ field: `read.${ref.id}`, code: "not_found", message: `The "${ref.title ?? ref.id}" column the AI reads was deleted from this board.` });
         }
       }
       return { ok: problems.length === 0, problems, board };
@@ -502,6 +489,22 @@ export function createMondayCrmAdapter({ graphql }) {
         }`,
         variables: { board: String(boardId), item: String(itemId), values: JSON.stringify(values) },
       });
+    },
+
+    // The calls board's "Client" column: a Monday link (board_relation)
+    // column pointing at the customer board.
+    async createClientColumn(session, boardId, customerBoardId) {
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "create_column",
+        query: `mutation ($board: ID!, $title: String!, $type: ColumnType!, $defaults: JSON) {
+          create_column(board_id: $board, title: $title, column_type: $type, defaults: $defaults) { id title type }
+        }`,
+        variables: { board: String(boardId), title: "Client", type: "board_relation", defaults: JSON.stringify({ boardIds: [Number(customerBoardId)] }) },
+      });
+      const id = data?.create_column?.id;
+      if (!id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the Client column");
+      return String(id);
     },
 
     // Name sync: a webhook on one board, delivered to our webhook route.
@@ -683,48 +686,25 @@ export function createMondayCrmAdapter({ graphql }) {
 }
 
 /** A starting mapping for a board, by column type and title. */
+// A starting customer-board setup for the picker: its phone column, plus up
+// to three columns the AI would find useful (company, account owner, status)
+// when their titles suggest them. The admin can change all of it.
 export function suggestMapping(board) {
   const columns = board?.columns ?? [];
-  // First column of the given types, preferring one whose title matches the
-  // pattern.
-  const pick = (types, pattern) => {
-    const ofType = columns.filter((column) => types.includes(column.type));
-    const column = (pattern && ofType.find((c) => pattern.test(c.title))) ?? (pattern ? null : ofType[0]);
-    return column ? { id: column.id, type: column.type, title: column.title } : undefined;
-  };
-  const status = pick(["status"], /status|stage/i) ?? pick(["status"]);
-  const labels = columns.find((column) => column.id === status?.id)?.labels ?? [];
+  const phone = columns.find((column) => column.type === "phone");
+  const wanted = [/company|organi[sz]ation|business/i, /owner|manager|assign|rep/i, /status|stage/i];
+  const readColumns = [];
+  for (const pattern of wanted) {
+    const column = columns.find((c) => pattern.test(c.title) && c.type !== "phone" && c.type !== "name" &&
+      !readColumns.some((picked) => picked.id === c.id));
+    if (column) readColumns.push({ id: column.id, title: column.title, type: column.type });
+  }
   return {
     boardId: board?.id,
     boardName: board?.name,
-    columns: Object.fromEntries(Object.entries({
-      phone: pick(["phone"]),
-      email: pick(["email"]),
-      status,
-      owner: pick(["people"], /owner|assign|rep|sales/i) ?? pick(["people"]),
-      lastCall: pick(["date"], /last.*(call|contact|interaction)/i),
-      outcome: pick(["text", "long_text"], /outcome|result/i),
-      followUpDate: pick(["date"], /follow/i),
-      nextAppointment: pick(["date"], /appoint|meeting|next/i),
-      source: pick(["text", "long_text"], /source/i),
-      transcriptSummary: pick(["text", "long_text"], /summary|transcript.*sum/i),
-      fullTranscript: pick(["long_text"], /transcript/i),
-      audioLink: pick(["text", "long_text", "link"], /audio|recording|listen/i),
-      callDuration: pick(["numbers", "text"], /duration|length/i),
-      callerName: pick(["text", "long_text"], /caller.*name|full.*name|contact.*name/i),
-      companyName: pick(["text", "long_text"], /company|organization|org/i),
-      date: pick(["date"], /^date$|call.*date|date.*time/i),
-      time: pick(["text", "hour"], /^time$|call.*time|date.*time/i),
-      sentiment: pick(["text"], /sentiment|mood/i),
-      appointment: pick(["checkbox", "text"], /appointment.*set|booked/i),
-      followUp: pick(["text", "long_text"], /follow.*up|action/i),
-      direction: pick(["text"], /direction|inbound|outbound/i),
-      intent: pick(["text", "long_text"], /intent|reason|purpose/i),
-    }).filter(([, value]) => value)),
-    labels: {
-      newLead: labels.find((label) => /new/i.test(label)) ?? null,
-      followUp: labels.find((label) => /follow|call ?back|contact/i.test(label)) ?? null,
-    },
+    columns: phone ? { phone: { id: phone.id, type: phone.type, title: phone.title } } : {},
+    readColumns,
+    labels: { newLead: null, followUp: null },
     defaultOwnerId: null,
   };
 }

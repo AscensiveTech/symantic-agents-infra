@@ -274,19 +274,6 @@ test("adapter satisfies the CrmProvider contract", () => {
   assert.throws(() => assertCrmProvider({ id: "x" }), /missing/);
 });
 
-test("suggestMapping picks columns by type and title", () => {
-  const { board } = adapterWithBoard();
-  const mapping = suggestMapping(board);
-  assert.equal(mapping.columns.phone.id, "phone_mkx1");
-  assert.equal(mapping.columns.status.id, "lead_status");
-  assert.equal(mapping.columns.owner.id, "person");
-  assert.equal(mapping.columns.lastCall.id, "date_last");
-  assert.equal(mapping.columns.followUpDate.id, "date_follow");
-  assert.equal(mapping.columns.nextAppointment.id, "date_appt");
-  assert.equal(mapping.columns.outcome.id, "text_outcome");
-  assert.equal(mapping.columns.source.id, "text_source");
-});
-
 test("board discovery only requests data covered by the boards scope", async () => {
   const requests = [];
   const adapter = createMondayCrmAdapter({
@@ -325,8 +312,7 @@ test("adapter finds a caller whatever format the phone was typed in", async () =
   const found = await adapter.findContactByPhone(session, "+12025550198");
   assert.equal(found.externalId, jane.id);
   assert.equal(found.name, "Jane Doe");
-  assert.equal(found.status, "Qualified");
-  assert.equal(found.ownerName, "Sam Lee");
+  assert.deepEqual(found.details, [{ title: "Owner", text: "Sam Lee" }, { title: "Status", text: "Qualified" }]);
   assert.equal(found.matchCount, 1);
   assert.equal(await adapter.findContactByPhone(session, "+12025550100"), null);
 });
@@ -338,49 +324,6 @@ test("adapter prefers the most recently updated record when a number is duplicat
   const found = await adapter.findContactByPhone(session, "+12025550198");
   assert.equal(found.externalId, recent.id);
   assert.equal(found.matchCount, 2);
-});
-
-test("adapter creates a lead with every mapped column in one request", async () => {
-  const { monday, adapter, session } = adapterWithBoard();
-  const contact = await adapter.createLead(session, {
-    name: "Jane Doe",
-    phoneE164: "+14165550198",
-    email: "jane@example.com",
-    fields: { status: "new_lead", assignDefaultOwner: true, source: "AI Receptionist", lastCallAt: "2026-09-25T14:59:00Z", outcome: "Question answered" },
-  }, { idempotencyKey: "k" });
-  const item = monday.items.get(contact.externalId);
-  assert.equal(item.values.phone_mkx1.text, "+14165550198");
-  assert.equal(JSON.parse(item.values.phone_mkx1.value).countryShortName, "CA");
-  assert.equal(item.values.lead_status.text, "New Lead");
-  assert.equal(item.values.person.text, "Priya Shah");
-  assert.equal(item.values.text_source.text, "AI Receptionist");
-  assert.equal(item.values.date_last.text, "2026-09-25 14:59:00");
-  assert.equal(monday.count("create_item"), 1);
-  assert.match(monday.requests[0].idempotencyKey, /^k-/);
-});
-
-test("adapter writes fields and the call note in a single API call", async () => {
-  const { monday, board, adapter, session } = adapterWithBoard();
-  const jane = monday.addItem(board.id, { name: "Jane", phone: "+12025550198" });
-  const result = await adapter.logCallActivity(session, jane.id, { ref: "Ref: call-1", html: "<p>Hi</p><p>Ref: call-1</p>" }, {
-    fields: { followUpDate: "2026-09-26", status: "follow_up" },
-  });
-  assert.equal(result.fieldsApplied, true);
-  assert.equal(monday.graphqlCount(), 1);
-  assert.equal(jane.values.lead_status.text, "Follow up");
-  assert.equal(jane.values.date_follow.text, "2026-09-26");
-  assert.equal(await adapter.findActivityByRef(session, jane.id, "Ref: call-1"), result.activityId);
-  assert.equal(await adapter.findActivityByRef(session, jane.id, "Ref: call-2"), null);
-});
-
-test("adapter reports a rejected column without losing the note", async () => {
-  const { monday, board, adapter, session } = adapterWithBoard();
-  const jane = monday.addItem(board.id, { name: "Jane", phone: "+12025550198" });
-  monday.removeColumn(board.id, "date_follow");
-  const result = await adapter.logCallActivity(session, jane.id, { ref: "r", html: "<p>r</p>" }, { fields: { followUpDate: "2026-09-26" } });
-  assert.ok(result.activityId);
-  assert.equal(result.fieldsApplied, false);
-  assert.equal(result.fieldsError.code, CRM_ERROR.MAPPING_INVALID);
 });
 
 test("adapter surfaces a deleted item as not_found", async () => {
@@ -400,39 +343,6 @@ test("adapter never reads records from a board other than the mapped one", async
   const secret = monday.addItem(other.id, { name: "Secret", phone: "+12025550198" });
   assert.equal(await adapter.getContact(session, secret.id), null);
   assert.equal(await adapter.findContactByPhone(session, "+12025550198"), null);
-});
-
-test("validateMapping catches every way a mapping can be wrong", async () => {
-  const { monday, board, adapter, session } = adapterWithBoard();
-  assert.equal((await adapter.validateMapping(session, session.mapping)).ok, true);
-
-  const wrongType = { ...session.mapping, columns: { ...session.mapping.columns, phone: { id: "email_mkx2" } } };
-  assert.equal((await adapter.validateMapping(session, wrongType)).problems[0].code, "wrong_type");
-
-  const noPhone = { ...session.mapping, columns: { ...session.mapping.columns, phone: undefined } };
-  assert.equal((await adapter.validateMapping(session, noPhone)).problems[0].field, "phone");
-
-  const badLabel = { ...session.mapping, labels: { newLead: "Hot", followUp: null } };
-  assert.equal((await adapter.validateMapping(session, badLabel)).problems[0].field, "labels.newLead");
-
-  const badOwner = { ...session.mapping, defaultOwnerId: "999" };
-  assert.equal((await adapter.validateMapping(session, badOwner)).problems[0].field, "defaultOwnerId");
-
-  monday.removeColumn(board.id, "date_appt");
-  assert.equal((await adapter.validateMapping(session, session.mapping)).problems[0].code, "not_found");
-
-  monday.deleteBoard(board.id);
-  assert.equal((await adapter.validateMapping(session, session.mapping)).problems[0].field, "board");
-});
-
-test("buildColumnValues only writes owner, source, email and phone on creation", () => {
-  const { session } = adapterWithBoard();
-  const patch = { phoneE164: "+12025550198", email: "a@b.co", assignDefaultOwner: true, source: "AI", status: "follow_up", nextAppointmentAt: null };
-  const update = buildColumnValues(session.mapping, patch, { isNew: false });
-  assert.deepEqual(Object.keys(update).sort(), ["date_appt", "lead_status"]);
-  assert.equal(update.date_appt, null, "null clears the date column");
-  const created = buildColumnValues(session.mapping, patch, { isNew: true });
-  assert.ok(created.phone_mkx1 && created.email_mkx2 && created.person && created.text_source);
 });
 
 // ------------------------------------------------------ facts & context ----
@@ -601,4 +511,31 @@ test("inactive Monday account: one notice per inactive spell, reset when it reco
   assert.match(sent[0].text, /Check Again/);
   await store.clearPause("ws", "monday#agent-1");
   assert.equal((await store.getConnection("ws", "monday#agent-1")).accountInactiveNotifiedAt, undefined);
+});
+
+test("suggestMapping proposes the phone column and up to three useful columns for the AI", () => {
+  const board = {
+    id: "1", name: "Clients",
+    columns: [
+      { id: "name", title: "Name", type: "name" },
+      { id: "p", title: "Mobile", type: "phone" },
+      { id: "c", title: "Company", type: "text" },
+      { id: "o", title: "Account Manager", type: "people" },
+      { id: "s", title: "Stage", type: "status" },
+      { id: "x", title: "Notes", type: "long_text" },
+    ],
+  };
+  const suggestion = suggestMapping(board);
+  assert.equal(suggestion.columns.phone.id, "p");
+  assert.deepEqual(suggestion.readColumns.map((c) => c.id), ["c", "o", "s"]);
+});
+
+test("validateMapping: phone required and a Phone column; deleted AI columns are flagged", async () => {
+  const { board, adapter, session } = adapterWithBoard();
+  const check = (mapping) => adapter.validateMapping(session, { boardId: board.id, ...mapping });
+  assert.equal((await check({ columns: {} })).problems[0].field, "phone");
+  assert.equal((await check({ columns: { phone: { id: "text_source" } } })).problems[0].code, "wrong_type");
+  const gone = await check({ columns: { phone: { id: "phone_mkx1" } }, readColumns: [{ id: "x", title: "Notes" }] });
+  assert.match(gone.problems[0].message, /"Notes" column the AI reads was deleted/);
+  assert.equal((await check({ columns: { phone: { id: "phone_mkx1" } }, readColumns: [{ id: "person" }] })).ok, true);
 });

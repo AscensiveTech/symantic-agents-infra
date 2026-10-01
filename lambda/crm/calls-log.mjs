@@ -240,6 +240,47 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
   // A follow-up edited in Call History after the call: rewrite the Follow-Up
   // cell on that call's row. Skipped when the row is on an older board (it
   // was recreated since) or the board isn't active.
+  /**
+   * The calls board's "Client" link column for the agent's customer board,
+   * created the first time it's needed (and again if the customer board
+   * changed or the calls board was rebuilt). Returns its id, or null when
+   * there's no active calls board or customer board.
+   */
+  async function ensureClientColumn(session, connection) {
+    const board = connection.callsBoard;
+    const customerBoardId = connection.mapping?.boardId ? String(connection.mapping.boardId) : null;
+    const provider = providers.get(connection.provider);
+    if (board?.status !== "active" || !customerBoardId || !provider?.createClientColumn) return null;
+    if (board.clientColumn?.boardId === customerBoardId && board.clientColumn.id) return board.clientColumn.id;
+    const id = await provider.createClientColumn(session, board.id, customerBoardId);
+    await save(connection, { ...board, clientColumn: { id, boardId: customerBoardId } });
+    log.info?.("Calls board Client column added", { workspaceId: connection.workspaceId, boardId: board.id });
+    return id;
+  }
+
+  // Links one call's row on the calls board to the caller's row on the
+  // customer board (Monday shows the call under that customer).
+  async function linkClient(session, connection, callsItemId, clientItemId) {
+    const provider = providers.get(connection.provider);
+    if (!callsItemId || !clientItemId || !provider?.updateCallsRow) return false;
+    const column = await ensureClientColumn(session, connection);
+    if (!column) return false;
+    const value = (id) => ({ [id]: { item_ids: [Number(clientItemId)] } });
+    try {
+      await provider.updateCallsRow(session, connection.callsBoard.id, callsItemId, value(column));
+    } catch (error) {
+      // Someone deleted the Client column in Monday: add it back once and
+      // link again, rather than failing the call.
+      if (!(error instanceof CrmError) || error.code !== CRM_ERROR.MAPPING_INVALID) throw error;
+      const { clientColumn: _gone, ...board } = connection.callsBoard;
+      await save(connection, board);
+      const fresh = await ensureClientColumn(session, connection);
+      if (!fresh) return false;
+      await provider.updateCallsRow(session, connection.callsBoard.id, callsItemId, value(fresh));
+    }
+    return true;
+  }
+
   async function updateFollowUp(session, connection, call) {
     const provider = providers.get(connection.provider);
     const board = connection.callsBoard;
@@ -251,7 +292,7 @@ export function createCallsLog({ store, providers, appUrl, metrics, log = consol
     return true;
   }
 
-  return { ensureBoard, logCall, checkBoard, markDeleted, updateFollowUp };
+  return { ensureBoard, logCall, checkBoard, markDeleted, updateFollowUp, ensureClientColumn, linkClient };
 }
 
 // Is this call's row on the agent's current calls board? Rows written before

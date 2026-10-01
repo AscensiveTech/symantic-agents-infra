@@ -576,6 +576,12 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
         out[columnId] = { text: value.email, value: JSON.stringify(value) };
       } else if (column.type === "link") {
         out[columnId] = { text: value.text, value: JSON.stringify(value) };
+      } else if (column.type === "board_relation") {
+        const ids = (value.item_ids ?? []).map(String);
+        if (!ids.length || ids.some((itemId) => !items.has(itemId) || items.get(itemId).state !== "active")) {
+          return { error: errorBody("ColumnValueException", "Linked item not found") };
+        }
+        out[columnId] = { text: ids.join(", "), value: JSON.stringify({ linkedPulseIds: ids.map((linkedPulseId) => ({ linkedPulseId: Number(linkedPulseId) })) }), linkedIds: ids };
       } else if (column.type === "long_text") {
         out[columnId] = { text: value.text, value: JSON.stringify(value) };
       } else {
