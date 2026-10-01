@@ -79,6 +79,7 @@ export function composeRuntime({
       registerNameWebhooks: nameSync.registerWebhooks,
       applyNameFromMonday: nameSync.applyFromMonday,
       pushNameToMonday: nameSync.pushToMonday,
+      catchUpNames: nameSync.catchUp,
     },
     nameSync,
     enqueue,
@@ -89,12 +90,11 @@ export function composeRuntime({
       sessions,
       requeueFailed: createRequeuer({ store, enqueue, metrics, now }),
       remindReauth: createReauthReminders({ store, sendEmail, appUrl, now, log }),
-      // Calls board + mapping checks, then the hourly name check for
-      // connections that don't have name-sync webhooks yet.
+      // Calls board + mapping checks, then the daily name-sync webhook check.
       checkCallsBoard: async (connection) => {
         await crmSync.checkCallsBoard(connection);
-        await nameSync.hourlyCheck(connection).catch((error) => {
-          log.warn?.("Hourly name check failed", { workspaceId: connection.workspaceId, name: error?.name, code: error?.code });
+        await nameSync.dailyCheck(connection).catch((error) => {
+          log.warn?.("Daily name-sync check failed", { workspaceId: connection.workspaceId, name: error?.name, code: error?.code });
         });
       },
       metrics,

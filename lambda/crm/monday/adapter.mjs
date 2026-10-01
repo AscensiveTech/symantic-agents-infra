@@ -520,6 +520,17 @@ export function createMondayCrmAdapter({ graphql }) {
       return String(id);
     },
 
+    // Ids of the webhooks currently on a board (the daily name-sync check).
+    async listWebhooks(session, boardId) {
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "list_webhooks",
+        query: "query ($board: ID!) { webhooks(board_id: $board) { id event } }",
+        variables: { board: String(boardId) },
+      });
+      return (data?.webhooks ?? []).map((webhook) => String(webhook.id));
+    },
+
     // Removes a webhook; one already gone counts as removed.
     async deleteWebhook(session, webhookId) {
       try {
@@ -548,8 +559,8 @@ export function createMondayCrmAdapter({ graphql }) {
     },
 
     // Rows on the mapped board with their name (the Caller Name column when
-    // mapped, else the row name), phone and last update - for the hourly
-    // name check. Pages of 100, at most `maxPages`.
+    // mapped, else the row name), phone and last update - for the name
+    // catch-up. Pages of 100, at most `maxPages`.
     async listNamedRows(session, mapping, { maxPages = 5 } = {}) {
       const phoneId = mapping?.columns?.phone?.id;
       const nameId = mapping?.columns?.callerName?.id ?? null;

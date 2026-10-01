@@ -1990,25 +1990,96 @@ test("the BFF's contact-renamed notice queues the push to Monday", async () => {
   assert.equal(h.monday.items.get(String(item.id)).name, "Jane Renamed");
 });
 
-test("a connection made before webhooks were granted syncs names hourly until it's renewed", async () => {
+test("a connection without the webhook permission: no webhooks, but a reconnect catches up names", async () => {
   const h = createHarness();
   h.monday.grantScope("me:read account:read boards:read boards:write updates:write users:read");
   await h.connectAndMap();
   assert.equal(h.monday.webhooks.size, 0);
-  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "hourly");
+  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "renew");
   const { call, item } = await syncedJane(h);
-  item.name = "Jane Hourly";
+  item.name = "Jane Later";
   item.updatedAt = new Date(h.clock()).toISOString();
-  h.clock.advance(HOUR_MS + 1000);
+  // No polling: nothing changes until the connection is (re)set up.
+  h.clock.advance(3 * HOUR_MS);
   await h.runtime.refreshTokens();
   await h.drain();
-  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Hourly");
-  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).callerName, "Jane Hourly");
-
-  // Renewing with the new permission switches it to instant webhooks.
+  assert.equal(h.store.contacts["ws-a\0+12025550198"], undefined);
+  // Renewing (now with the permission) registers webhooks and catches up.
   h.monday.grantScope("me:read account:read boards:read boards:write updates:write users:read webhooks:write");
   await h.connect();
   await h.drain();
   assert.equal(webhooksOn(h, h.board.id).length, 1);
-  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "instant");
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Later");
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).callerName, "Jane Later");
+});
+
+test("after a disconnect, a reconnect catches up renames made on either side meanwhile", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const { item: jane } = await syncedJane(h);
+  const bobCall = h.seedCall({ callerNumber: "+12025550111", callerName: "Bob" });
+  h.enqueueCall(bobCall);
+  await h.drain();
+  const bob = h.monday.items.get(String(h.store.callRows.get(`ws-a\0${bobCall.callId}`).crmItemId));
+  await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
+
+  h.clock.advance(60_000);
+  jane.name = "Jane From Monday"; // renamed in Monday while disconnected
+  jane.updatedAt = new Date(h.clock()).toISOString();
+  h.clock.advance(60_000);
+  h.store.contacts["ws-a\0+12025550111"] = { // renamed in Symantic while disconnected
+    workspaceId: "ws-a", phoneNumber: "+12025550111", name: "Robert Symantic", nameSource: "symantic", nameUpdatedAt: new Date(h.clock()).toISOString(),
+  };
+
+  await h.connect();
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane From Monday");
+  assert.equal(h.monday.items.get(String(bob.id)).name, "Robert Symantic");
+});
+
+test("catch-up: a row still showing the name we wrote never overrides a newer Symantic rename", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const { item } = await syncedJane(h);
+  // Symantic renamed Jane; later an unrelated column changed on her row in
+  // Monday (so the row looks newer), but the row's name is still ours.
+  h.store.contacts["ws-a\0+12025550198"] = {
+    workspaceId: "ws-a", phoneNumber: "+12025550198", name: "Jane Symantic", nameSource: "symantic", nameUpdatedAt: new Date(h.clock()).toISOString(),
+  };
+  h.clock.advance(60_000);
+  item.updatedAt = new Date(h.clock()).toISOString();
+  await h.runtime.enqueue({ kind: "name-catch-up", workspaceId: "ws-a", provider: "monday#agent-a" });
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Symantic");
+  assert.equal(h.monday.items.get(String(item.id)).name, "Jane Symantic", "Monday follows Symantic");
+});
+
+test("the daily check re-creates a webhook removed in Monday and catches up what was missed", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const { item } = await syncedJane(h);
+  await h.runtime.refreshTokens(); // first keeper pass stamps the connection
+  h.monday.webhooks.clear(); // someone removed it in Monday
+  item.name = "Jane Unheard"; // and this rename never reached us
+  item.updatedAt = new Date(h.clock()).toISOString();
+  for (let i = 0; i < 145; i += 1) { // a day of 10-minute keeper runs
+    h.clock.advance(10 * 60 * 1000);
+    await h.runtime.refreshTokens();
+  }
+  await h.drain();
+  assert.equal(webhooksOn(h, h.board.id).length, 1, "re-created");
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Unheard");
+});
+
+test("background jobs offline for a while: the next keeper pass catches up names", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const { item } = await syncedJane(h);
+  await h.runtime.refreshTokens();
+  h.clock.advance(3 * HOUR_MS); // nothing ran for 3 hours
+  item.name = "Jane During Outage";
+  item.updatedAt = new Date(h.clock()).toISOString();
+  await h.runtime.refreshTokens();
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane During Outage");
 });

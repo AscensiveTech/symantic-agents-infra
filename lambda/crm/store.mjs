@@ -142,7 +142,17 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
-    // When the hourly name check last ran for this connection.
+    // Every keeper pass stamps this, so a long gap (we were offline and may
+    // have missed webhook deliveries) can be noticed.
+    markNameKeeperSeen(workspaceId, provider) {
+      return update(connections, { workspaceId, provider }, {
+        set: { nameKeeperSeenAt: iso() },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
+    // When the daily name-sync webhook check last ran for this connection.
     markNameChecked(workspaceId, provider) {
       return update(connections, { workspaceId, provider }, {
         set: { nameCheckedAt: iso() },
