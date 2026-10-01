@@ -3425,10 +3425,11 @@ export async function isMostAskedQuestionsEnabled(store, workspaceId) {
 // thing everywhere in the app. Compares against the most recent digest
 // across every agent (not per-agent) - the entitlement, and its cost, are
 // workspace-wide. A super admin is exempt entirely (see the call site).
-export function mostAskedQuestionsCycleLimitReached(digests, timezone) {
+// `nowMs` lets the scheduled refresh judge "this cycle" by its own clock.
+export function mostAskedQuestionsCycleLimitReached(digests, timezone, nowMs = Date.now()) {
   const latest = digests[0];
   if (!latest?.generatedAt) return false;
-  return periodKey(latest.generatedAt, timezone) === periodKey(new Date(), timezone);
+  return periodKey(latest.generatedAt, timezone) === periodKey(new Date(nowMs), timezone);
 }
 
 // Caps the number of calls fed to the LLM per digest run - bounds both cost

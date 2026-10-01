@@ -75,7 +75,7 @@ export function createHandler({
           store.listMostAskedDigests(workspaceId),
         ]);
         const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
-        if (mostAskedQuestionsCycleLimitReached(digests, timezone)) {
+        if (mostAskedQuestionsCycleLimitReached(digests, timezone, nowMs)) {
           skipped += 1;
           continue;
         }
