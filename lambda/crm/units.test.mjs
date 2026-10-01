@@ -182,6 +182,7 @@ test("PKCE pair and authorize URL follow Monday's OAuth 2.1 flow", () => {
   assert.equal(url.searchParams.get("scope"), MONDAY_SCOPES.join(" "));
   assert.equal(url.searchParams.get("force_install_if_needed"), "true");
   assert.ok(MONDAY_SCOPES.includes("webhooks:write"), "webhooks:write is requested for two-way name sync");
+  assert.ok(MONDAY_SCOPES.includes("webhooks:read"), "webhooks:read lets the daily check confirm our webhooks exist");
 });
 
 test("Monday app installation uses the dedicated account-level install flow", () => {
