@@ -443,7 +443,7 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
   let columnSerial = 0;
   // What Monday grants on consent; a test can drop webhooks:write to act
   // like a connection made before name sync asked for it.
-  let grantedScope = "me:read account:read boards:read boards:write updates:write users:read webhooks:write";
+  let grantedScope = "me:read account:read boards:read boards:write updates:write users:read webhooks:write webhooks:read";
   const webhooks = new Map();
   function addBoard({ name = "Leads", columns, kind = "public", type = "board" } = {}) {
     const board = {
