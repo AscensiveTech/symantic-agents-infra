@@ -504,6 +504,85 @@ export function createMondayCrmAdapter({ graphql }) {
       });
     },
 
+    // Name sync: a webhook on one board, delivered to our webhook route.
+    // Monday checks the URL with a challenge request before it answers.
+    async createWebhook(session, { boardId, url, event, config }) {
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "create_webhook",
+        query: `mutation ($board: ID!, $url: String!, $event: WebhookEventType!, $config: JSON) {
+          create_webhook(board_id: $board, url: $url, event: $event, config: $config) { id }
+        }`,
+        variables: { board: String(boardId), url, event, ...(config ? { config: JSON.stringify(config) } : {}) },
+      });
+      const id = data?.create_webhook?.id;
+      if (!id) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "Monday did not return the webhook");
+      return String(id);
+    },
+
+    // Removes a webhook; one already gone counts as removed.
+    async deleteWebhook(session, webhookId) {
+      try {
+        await graphql.request({
+          accessToken: session.accessToken,
+          operation: "delete_webhook",
+          query: "mutation ($id: ID!) { delete_webhook(id: $id) { id } }",
+          variables: { id: String(webhookId) },
+        });
+      } catch (error) {
+        if (!(error instanceof CrmError) || error.code !== CRM_ERROR.NOT_FOUND) throw error;
+      }
+    },
+
+    // Renames a caller's row, plus the mapped Caller Name column if any.
+    async renameItem(session, boardId, itemId, name, { callerNameColumnId = null } = {}) {
+      const values = { name, ...(callerNameColumnId ? { [callerNameColumnId]: name } : {}) };
+      await graphql.request({
+        accessToken: session.accessToken,
+        operation: "rename_item",
+        query: `mutation ($board: ID!, $item: ID!, $values: JSON!) {
+          change_multiple_column_values(board_id: $board, item_id: $item, column_values: $values) { id }
+        }`,
+        variables: { board: String(boardId), item: String(itemId), values: JSON.stringify(values) },
+      });
+    },
+
+    // Rows on the mapped board with their name (the Caller Name column when
+    // mapped, else the row name), phone and last update - for the hourly
+    // name check. Pages of 100, at most `maxPages`.
+    async listNamedRows(session, mapping, { maxPages = 5 } = {}) {
+      const phoneId = mapping?.columns?.phone?.id;
+      const nameId = mapping?.columns?.callerName?.id ?? null;
+      if (!mapping?.boardId || !phoneId) return [];
+      const columnIds = [phoneId, ...(nameId ? [nameId] : [])];
+      const rows = [];
+      let cursor = null;
+      for (let page = 0; page < maxPages; page += 1) {
+        const data = await graphql.request({
+          accessToken: session.accessToken,
+          operation: "list_rows",
+          query: `query ($board: [ID!], $cursor: String, $columns: [String!]) {
+            boards(ids: $board) { items_page(limit: 100, cursor: $cursor) { cursor items { id name updated_at column_values(ids: $columns) { id text value } } } }
+          }`,
+          variables: { board: [String(mapping.boardId)], cursor, columns: columnIds },
+        });
+        const itemsPage = data?.boards?.[0]?.items_page;
+        for (const item of itemsPage?.items ?? []) {
+          const values = new Map((item.column_values ?? []).map((value) => [value.id, value]));
+          const named = nameId ? textOf(values.get(nameId)) : null;
+          rows.push({
+            externalId: String(item.id),
+            name: (named ?? item.name ?? "").trim(),
+            phoneE164: readPhone(values.get(phoneId)),
+            updatedAt: item.updated_at ?? null,
+          });
+        }
+        cursor = itemsPage?.cursor ?? null;
+        if (!cursor) break;
+      }
+      return rows;
+    },
+
     suggestMapping,
   };
 

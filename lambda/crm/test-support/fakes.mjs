@@ -61,6 +61,44 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
         .filter((row) => row.connectionState === "connected" || row.connectionState === "reauth_required")
         .map((row) => ({ workspaceId: row.workspaceId, provider: row.provider, connectionState: row.connectionState }));
     },
+    async saveNameWebhooks(workspaceId, provider, record) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row) return null;
+      if (record) row.nameWebhooks = structuredClone(record);
+      else delete row.nameWebhooks;
+      return clone(row);
+    },
+    async markNameChecked(workspaceId, provider) {
+      const row = connections.get(key(workspaceId, provider));
+      if (row) row.nameCheckedAt = iso();
+      return clone(row);
+    },
+    async getContactRecord(workspaceId, phoneNumber) {
+      return clone(contacts[key(workspaceId, phoneNumber)]) ?? null;
+    },
+    async renameContactFromCrm(workspaceId, phoneNumber, name, { at, source }) {
+      const k = key(workspaceId, phoneNumber);
+      const row = contacts[k] ?? { workspaceId, phoneNumber, createdAt: iso() };
+      if (row.nameUpdatedAt && !(row.nameUpdatedAt < at)) return null;
+      Object.assign(row, { name, nameUpdatedAt: at, nameSource: source, updatedByName: "Monday.com", updatedAt: iso() });
+      contacts[k] = row;
+      return clone(row);
+    },
+    async countCallsForPhone(workspaceId, phoneNumber) {
+      return [...callRows.values()].filter((row) => row.workspaceId === workspaceId && row.callerNumber === phoneNumber).length;
+    },
+    async renameCallsForPhone(workspaceId, phoneNumber, name) {
+      let count = 0;
+      for (const row of callRows.values()) {
+        if (row.workspaceId === workspaceId && row.callerNumber === phoneNumber) {
+          row.callerName = name;
+          row.callerNameSource = "manual";
+          count += 1;
+        }
+      }
+      return count;
+    },
+    contacts,
     async listWorkspaceConnections(workspaceId) {
       return [...connections.values()].filter((row) => row.workspaceId === workspaceId).map(clone);
     },
@@ -398,6 +436,10 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
   const boardCreation = { refuse: null };
 
   let columnSerial = 0;
+  // What Monday grants on consent; a test can drop webhooks:write to act
+  // like a connection made before name sync asked for it.
+  let grantedScope = "me:read account:read boards:read boards:write updates:write users:read webhooks:write";
+  const webhooks = new Map();
   function addBoard({ name = "Leads", columns, kind = "public", type = "board" } = {}) {
     const board = {
       id: id(),
@@ -450,7 +492,7 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
     const refresh = `ref-${tokenCounter}`;
     accessTokens.set(access, { exp: exp * 1000 });
     refreshTokens.set(refresh, { authorizedAt, used: false });
-    return { access_token: access, refresh_token: refresh, token_type: "Bearer", expires_in: 3600, scope: "me:read account:read boards:read boards:write updates:write users:read" };
+    return { access_token: access, refresh_token: refresh, token_type: "Bearer", expires_in: 3600, scope: grantedScope };
   }
 
   const errorBody = (code, message = code, extra = {}) => ({ errors: [{ message, extensions: { code, ...extra } }] });
@@ -460,6 +502,9 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
   });
 
   function classify(query) {
+    if (query.includes("create_webhook")) return "create_webhook";
+    if (query.includes("delete_webhook")) return "delete_webhook";
+    if (query.includes("items_page(limit: 100, cursor")) return "list_rows";
     if (query.includes("{ id state }")) return "board_state";
     if (query.includes("create_board")) return "create_board";
     if (query.includes("create_column")) return "create_column";
@@ -705,11 +750,39 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
         }
         return errors.length ? { data, errors } : { data };
       }
+      case "create_webhook": {
+        const board = boards.get(String(v.board));
+        if (!board || board.deleted) return errorBody("InvalidBoardIdException", "Board not found");
+        if (!["change_name", "change_specific_column_value"].includes(v.event)) return errorBody("InvalidArgumentException", "Bad event");
+        const webhook = { id: id(), boardId: board.id, url: v.url, event: v.event, config: v.config ? JSON.parse(v.config) : null };
+        webhooks.set(webhook.id, webhook);
+        return { data: { create_webhook: { id: webhook.id } } };
+      }
+      case "delete_webhook": {
+        if (!webhooks.delete(String(v.id))) return errorBody("ResourceNotFoundException", "Webhook not found");
+        return { data: { delete_webhook: { id: v.id } } };
+      }
+      case "list_rows": {
+        const board = boards.get(String(v.board?.[0]));
+        if (!board || board.deleted) return { data: { boards: [] } };
+        const all = [...items.values()].filter((item) => item.boardId === board.id && item.state === "active");
+        const start = Number(v.cursor ?? 0);
+        const page = all.slice(start, start + 100);
+        const next = start + 100 < all.length ? String(start + 100) : null;
+        return { data: { boards: [{ items_page: { cursor: next, items: page.map((item) => ({ ...itemJson(item, v.columns), updated_at: item.updatedAt })) } }] } };
+      }
       case "update_fields": {
         const item = resolveItem(v.item);
         const board = boards.get(String(v.board));
         if (!board || board.deleted) return errorBody("InvalidBoardIdException", "Board not found");
         if (!item) return errorBody("InvalidItemIdException", "Item not found", { error_data: { item_id: v.item } });
+        // Monday renames the row when column_values carries "name".
+        const parsed = JSON.parse(v.values);
+        if (typeof parsed.name === "string") {
+          item.name = parsed.name;
+          delete parsed.name;
+          v.values = JSON.stringify(parsed);
+        }
         const checked = validateColumnValues(board, v.values);
         if (checked.error) return checked.error;
         for (const [columnId, value] of Object.entries(checked.values)) {
@@ -809,6 +882,10 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
     revoked,
     addBoard,
     addItem,
+    webhooks,
+    grantScope(scope) {
+      grantedScope = scope;
+    },
     createdBoards,
     boardCreation,
     /** Consent from now on comes from a different Monday account. */

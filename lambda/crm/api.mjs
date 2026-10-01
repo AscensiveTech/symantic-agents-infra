@@ -1,4 +1,5 @@
 import { CALLS_BOARD_MAPPING_PROBLEM, callsBoardIdsOf, checkMapping, isCallsBoard } from "./calls-log.mjs";
+import { nameFromWebhookEvent, nameSyncMode, verifyWebhookSignature } from "./name-sync.mjs";
 import { randomBytes } from "node:crypto";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { FIELD_TYPES, suggestMapping } from "./monday/adapter.mjs";
@@ -41,6 +42,7 @@ export function createCrmApi({
   now = Date.now,
   randomState = () => randomBytes(32).toString("base64url"),
   notifyDisconnected = null,
+  removeNameWebhooks = null,
   log = console,
 }) {
   // The OAuth redirect URI registered with Monday; it must match exactly on
@@ -148,6 +150,8 @@ export function createCrmApi({
           row.connectionState === "connected" &&
           String(row.mondayUserId ?? "") === String(connection.mondayUserId ?? ""))
       : [];
+    // Name-sync webhooks go first, while this agent's tokens still work.
+    await removeNameWebhooks?.(connection);
     if (sharing.length) {
       log.info?.("Monday revoke skipped: grant shared with another agent", { workspaceId: connection.workspaceId, sharedWith: sharing.length });
     } else if (connection.encryptedRefreshToken) {
@@ -336,6 +340,8 @@ export function createCrmApi({
           connection = await revalidate(workspaceId, connection);
         }
         await queueCallsBoard(connection);
+        // A renewal may have granted webhooks: (re)register the name-sync ones.
+        if (connection.mapping) await enqueue({ kind: "name-webhooks", workspaceId, provider: key }).catch(() => {});
         // Reconnecting after a disconnect: calls taken meanwhile were never
         // queued. Send only those (each checked by Call ID, so nothing already
         // on the board is added again).
@@ -362,6 +368,36 @@ export function createCrmApi({
       const saved = await disconnectConnection(connection, "user_disconnected", { byName: identity.displayName });
       log.info?.("CRM disconnected", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), by: identity.userId });
       return json(200, toPublicConnection(saved, now));
+    },
+
+    // Monday name-sync webhook (public). The URL's signature proves which
+    // workspace and agent it's for; Monday's one-time challenge is echoed
+    // back. Deliveries are queued for the worker, so this answers at once.
+    async "POST /crm/monday/webhook"(event) {
+      const query = event?.queryStringParameters ?? {};
+      const secret = await loadAppSecret(getAppSecret);
+      if (!verifyWebhookSignature(secret.clientSecret, query.w, query.a, query.s)) {
+        metrics?.count("Webhook", { Provider: PROVIDER, Outcome: "name_rejected" });
+        return json(401, { message: "Unauthorized" });
+      }
+      const body = readBody(event);
+      if (typeof body?.challenge === "string") return json(200, { challenge: body.challenge });
+      const change = body?.event;
+      const name = nameFromWebhookEvent(change);
+      const itemId = change?.pulseId ?? change?.itemId;
+      if (name && itemId && change?.boardId && AGENT_ID_PATTERN.test(query.a)) {
+        await enqueue({
+          kind: "name-from-monday",
+          workspaceId: query.w,
+          provider: connectionKeyFor(PROVIDER, query.a),
+          boardId: String(change.boardId),
+          itemId: String(itemId),
+          name,
+          at: typeof change.triggerTime === "string" ? change.triggerTime : new Date(Number(now())).toISOString(),
+        });
+      }
+      metrics?.count("Webhook", { Provider: PROVIDER, Outcome: "name_change" });
+      return json(200, { ok: true });
     },
 
     async "GET /crm/monday/boards"(event) {
@@ -439,6 +475,7 @@ export function createCrmApi({
       // Saving a board mapping is choosing to sync to that board.
       const saved = await store.setBoardSyncEnabled(identity.workspaceId, key, true);
       const requeued = await requeueFailed(identity.workspaceId, key);
+      await enqueue({ kind: "name-webhooks", workspaceId: identity.workspaceId, provider: key }).catch(() => {});
       log.info?.("CRM mapping saved", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), requeued });
       return json(200, { ...toPublicConnection(saved, now), requeued });
     },
@@ -455,6 +492,8 @@ export function createCrmApi({
         throw new ApiError(409, "not_connected", "Connect Monday first.");
       }
       const saved = await store.setBoardSyncEnabled(identity.workspaceId, key, enabled);
+      // Board sync on: watch the board for renames; off: stop watching.
+      await enqueue({ kind: "name-webhooks", workspaceId: identity.workspaceId, provider: key }).catch(() => {});
       log.info?.("CRM board sync toggled", { workspaceId: identity.workspaceId, agentId: agentIdOf(key), enabled });
       return json(200, toPublicConnection(saved, now));
     },
@@ -626,6 +665,8 @@ function toPublicConnection(connection, now = Date.now) {
     mappingStatus: connection.mappingStatus ?? "unconfigured",
     boardSyncEnabled: connection.boardSyncEnabled !== false,
     callsBoardEnabled: connection.callsBoardEnabled !== false,
+    // "instant" (webhooks), "hourly" (renew to make it instant) or "off".
+    nameSync: nameSyncMode(connection),
     callsBoard: publicCallsBoard(connection),
     mapping: connection.mapping ?? null,
     mappingProblems: connection.mappingProblems ?? [],

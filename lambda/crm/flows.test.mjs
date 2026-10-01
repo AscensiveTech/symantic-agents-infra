@@ -1852,3 +1852,163 @@ test("rewriting a Listen link on a row deleted in Monday is skipped, not retried
   const result = await h.runtime.sync.rewriteCallLinks({ workspaceId: "ws-a", callId: call.callId, provider: "monday#agent-a" });
   assert.deepEqual({ status: result.status, updated: result.updated, gone: result.gone }, { status: "done", updated: 0, gone: 1 });
 });
+
+// ================================================ Part J: two-way name sync ====
+
+const HOUR_MS = 60 * 60 * 1000;
+const webhooksOn = (h, boardId) => [...h.monday.webhooks.values()].filter((w) => w.boardId === String(boardId));
+function webhookQuery(h, boardId) {
+  const url = new URL(webhooksOn(h, boardId)[0].url);
+  return Object.fromEntries(url.searchParams);
+}
+async function syncedJane(h) {
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const item = h.monday.items.get(String(h.store.callRows.get(`ws-a\0${call.callId}`).crmItemId));
+  return { call, item };
+}
+function renameEvent(h, item, name, at = new Date(h.clock()).toISOString()) {
+  return h.api("POST", "/crm/monday/webhook", {
+    query: webhookQuery(h, h.board.id),
+    body: { event: { type: "update_name", boardId: Number(h.board.id), pulseId: Number(item.id), value: { name }, previousValue: { name: item.name }, triggerTime: at } },
+  });
+}
+
+test("saving a mapping watches that board for renames; turning board sync off or disconnecting stops it", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const hooks = webhooksOn(h, h.board.id);
+  assert.equal(hooks.length, 1);
+  assert.equal(hooks[0].event, "change_name");
+  assert.match(hooks[0].url, /\/crm\/monday\/webhook\?w=ws-a&a=agent-a&s=/);
+  const callsBoardId = conn(h).callsBoard.id;
+  assert.equal(webhooksOn(h, callsBoardId).length, 0, "never the Symantic AI Calls board");
+  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "instant");
+
+  await h.api("PUT", "/crm/board-sync", { sub: "sub-admin-a", body: { enabled: false } });
+  await h.drain();
+  assert.equal(h.monday.webhooks.size, 0);
+  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "off");
+
+  await h.api("PUT", "/crm/board-sync", { sub: "sub-admin-a", body: { enabled: true } });
+  await h.drain();
+  assert.equal(h.monday.webhooks.size, 1);
+  await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
+  assert.equal(h.monday.webhooks.size, 0, "removed before the tokens were deleted");
+});
+
+test("a mapped Caller Name column gets its own webhook too", async () => {
+  const h = createHarness();
+  h.board.columns.push({ id: "text_caller", title: "Caller Name", type: "text" });
+  await h.connect();
+  const boards = JSON.parse((await h.api("GET", "/crm/monday/boards", { sub: "sub-admin-a" })).body);
+  const target = boards.boards.find((b) => b.id === h.board.id);
+  await h.api("PUT", "/crm/mapping", { sub: "sub-admin-a", body: { mapping: {
+    ...target.suggestion, columns: { ...target.suggestion.columns, callerName: { id: "text_caller" } },
+    labels: { newLead: "New Lead", followUp: "Follow up" }, defaultOwnerId: null } } });
+  await h.drain();
+  const events = webhooksOn(h, h.board.id).map((w) => `${w.event}:${w.config?.columnId ?? ""}`).sort();
+  assert.deepEqual(events, ["change_name:", "change_specific_column_value:text_caller"]);
+});
+
+test("the webhook route: wrong signature is refused, Monday's challenge is echoed", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const good = webhookQuery(h, h.board.id);
+  const bad = await h.api("POST", "/crm/monday/webhook", { query: { ...good, s: "x".repeat(32) }, body: { challenge: "abc" } });
+  assert.equal(bad.statusCode, 401);
+  const forged = await h.api("POST", "/crm/monday/webhook", { query: { ...good, w: "ws-b" }, body: { challenge: "abc" } });
+  assert.equal(forged.statusCode, 401, "a signature is bound to its workspace");
+  const challenge = await h.api("POST", "/crm/monday/webhook", { query: good, body: { challenge: "abc" } });
+  assert.deepEqual(JSON.parse(challenge.body), { challenge: "abc" });
+});
+
+test("renamed in Monday: the contact and every call from that number take the new name", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const { call, item } = await syncedJane(h);
+  const older = h.seedCall({ crmStatus: "synced" });
+  h.clock.advance(60_000);
+  const response = await renameEvent(h, item, "Jane Smith");
+  assert.equal(response.statusCode, 200);
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Smith");
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].nameSource, "monday");
+  for (const id of [call.callId, older.callId]) {
+    const row = h.store.callRows.get(`ws-a\0${id}`);
+    assert.equal(row.callerName, "Jane Smith");
+    assert.equal(row.callerNameSource, "manual");
+  }
+});
+
+test("name sync ignores our own write echoing back, older changes, and numbers Symantic never heard from", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const { item } = await syncedJane(h);
+  // The lead we created was named "Jane Doe": its echo is not a rename.
+  await renameEvent(h, item, "Jane Doe");
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"], undefined);
+
+  // A rename in Symantic at 12:00 beats a Monday change stamped 11:00.
+  h.store.contacts["ws-a\0+12025550198"] = { workspaceId: "ws-a", phoneNumber: "+12025550198", name: "Janet", nameUpdatedAt: new Date(h.clock()).toISOString() };
+  await renameEvent(h, item, "Jane Old", new Date(h.clock() - HOUR_MS).toISOString());
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Janet");
+
+  // A row whose number never called is not added to Contacts.
+  const stranger = h.monday.addItem(h.board.id, { name: "Stranger", phone: "+12025550777" });
+  await renameEvent(h, stranger, "Stranger Danger");
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550777"], undefined);
+});
+
+test("renamed in Symantic: the caller's row is renamed on each mapped board once, and its echo is ignored", async () => {
+  const h = await twoAgentsOneBoard();
+  const { item } = await syncedJane(h);
+  h.monday.reset();
+  await h.runtime.enqueue({ kind: "name-to-monday", workspaceId: "ws-a", provider: "monday", phone: "+12025550198", name: "Jane Q. Public" });
+  await h.drain();
+  assert.equal(h.monday.items.get(String(item.id)).name, "Jane Q. Public");
+  assert.equal(h.monday.count("update_fields"), 1, "the shared board is renamed once, not once per agent");
+  // Monday reports that rename back: nothing changes.
+  h.store.contacts["ws-a\0+12025550198"] = { workspaceId: "ws-a", phoneNumber: "+12025550198", name: "Jane Q. Public", nameUpdatedAt: new Date(h.clock()).toISOString() };
+  await renameEvent(h, item, "Jane Q. Public");
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].nameSource, undefined, "still Symantic's own rename");
+});
+
+test("the BFF's contact-renamed notice queues the push to Monday", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const { item } = await syncedJane(h);
+  const handler = createHandler({ getRuntime: async () => h.runtime });
+  const result = await handler({ action: "contact-renamed", workspaceId: "ws-a", phone: "+12025550198", name: "Jane Renamed" });
+  assert.equal(result.status, "queued");
+  await h.drain();
+  assert.equal(h.monday.items.get(String(item.id)).name, "Jane Renamed");
+});
+
+test("a connection made before webhooks were granted syncs names hourly until it's renewed", async () => {
+  const h = createHarness();
+  h.monday.grantScope("me:read account:read boards:read boards:write updates:write users:read");
+  await h.connectAndMap();
+  assert.equal(h.monday.webhooks.size, 0);
+  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "hourly");
+  const { call, item } = await syncedJane(h);
+  item.name = "Jane Hourly";
+  item.updatedAt = new Date(h.clock()).toISOString();
+  h.clock.advance(HOUR_MS + 1000);
+  await h.runtime.refreshTokens();
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Hourly");
+  assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).callerName, "Jane Hourly");
+
+  // Renewing with the new permission switches it to instant webhooks.
+  h.monday.grantScope("me:read account:read boards:read boards:write updates:write users:read webhooks:write");
+  await h.connect();
+  await h.drain();
+  assert.equal(webhooksOn(h, h.board.id).length, 1);
+  assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "instant");
+});

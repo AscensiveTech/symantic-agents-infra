@@ -372,6 +372,8 @@ export function createCrmSync({
         state: "linked",
         externalId: contact.externalId,
         boardId: boardKey,
+        // The name we gave the new row: its rename echo is ignored.
+        lastWrittenName: facts.name ?? `New caller ${facts.phoneE164}`,
         checkedAt: new Date(Number(now())).toISOString(),
         createdByCallId: callId,
       });

@@ -41,6 +41,14 @@ export function createHandler({ getRuntime: loadRuntime = getRuntime } = {}) {
       const runtime = await loadRuntime();
       return runtime.syncFollowUp({ workspaceId: event.workspaceId, callId: event.callId });
     }
+    // Async invoke from the BFF after a contact rename: queue the push of
+    // the new name to Monday.
+    if (event?.action === "contact-renamed") {
+      const runtime = await loadRuntime();
+      if (typeof event.workspaceId !== "string" || typeof event.phone !== "string" || typeof event.name !== "string") return { status: "skipped" };
+      await runtime.enqueue({ kind: "name-to-monday", workspaceId: event.workspaceId, provider: "monday", phone: event.phone, name: event.name });
+      return { status: "queued" };
+    }
     if (event?.action === "refresh-tokens") {
       const runtime = await loadRuntime();
       return runtime.refreshTokens();
