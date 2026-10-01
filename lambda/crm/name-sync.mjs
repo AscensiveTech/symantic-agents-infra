@@ -43,7 +43,8 @@ export function hasWebhookScope(connection) {
  * webhook permission) or "off" (no board sync).
  */
 export function nameSyncMode(connection) {
-  if (connection?.connectionState !== "connected" || connection.boardSyncEnabled === false || !connection.mapping) return "off";
+  if (connection?.connectionState !== "connected" || connection.boardSyncEnabled === false || !connection.mapping ||
+    connection.mapping.syncNames === false) return "off";
   return connection.nameWebhooks?.ids?.length ? "instant" : "renew";
 }
 
@@ -105,9 +106,10 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
     if (!connection || connection.connectionState !== "connected" || !provider?.createWebhook) return { status: "skipped" };
     return sessions.withSession(connection, async (session) => {
       await deleteAll(session, provider, connection);
-      const wanted = connection.boardSyncEnabled !== false && connection.mapping?.boardId &&
-        connection.mappingStatus === "valid" && hasWebhookScope(connection);
-      const syncOn = connection.boardSyncEnabled !== false && connection.mapping?.boardId && connection.mappingStatus === "valid";
+      // "Keep Contact Names in Sync?" set to No turns all of this off.
+      const syncOn = connection.boardSyncEnabled !== false && connection.mapping?.boardId &&
+        connection.mappingStatus === "valid" && connection.mapping.syncNames !== false;
+      const wanted = syncOn && hasWebhookScope(connection);
       if (!wanted) {
         if (connection.nameWebhooks) await store.saveNameWebhooks(workspaceId, key, null);
         // Even without webhooks, a (re)setup reconciles names once.
@@ -152,6 +154,7 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
     if (!isConnectionUsable(connection) || String(connection.mapping.boardId) !== String(boardId)) {
       return { status: "skipped", reason: "not_mapped" };
     }
+    if (connection.mapping.syncNames === false) return { status: "skipped", reason: "name_sync_off" };
     let phone = phoneE164;
     if (!phone) {
       const provider = providers.get(key);
@@ -180,7 +183,8 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
   async function pushToMonday({ workspaceId, phone, name }) {
     const clean = typeof name === "string" ? name.trim().slice(0, NAME_MAX) : "";
     if (!clean || !phone) return { status: "skipped", renamed: 0 };
-    const connections = (await store.listWorkspaceConnections(workspaceId)).filter(isConnectionUsable);
+    const connections = (await store.listWorkspaceConnections(workspaceId))
+      .filter((connection) => isConnectionUsable(connection) && connection.mapping.syncNames !== false);
     const boards = new Set();
     let renamed = 0;
     for (const connection of connections) {
@@ -224,7 +228,7 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
   async function catchUp({ workspaceId, provider: key }) {
     const connection = await store.getConnection(workspaceId, key);
     const provider = providers.get(key);
-    if (!isConnectionUsable(connection) || !provider?.listNamedRows) return { status: "skipped" };
+    if (!isConnectionUsable(connection) || connection.mapping.syncNames === false || !provider?.listNamedRows) return { status: "skipped" };
     const boardId = String(connection.mapping.boardId);
     const rows = await sessions.withSession(connection, (session) =>
       provider.listNamedRows(session, connection.mapping, { maxPages: CATCH_UP_MAX_PAGES }));

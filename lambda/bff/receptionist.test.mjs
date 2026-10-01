@@ -715,3 +715,12 @@ test("receptionist config: invocation-safe tools, end_call, call handling, and o
   assert.deepEqual(transfers[0].transfer_option, { type: "warm_transfer", show_transferee_as_caller: false });
 });
 
+test("CALLER RECORD: check the caller by first name as a question, and never reveal anything else on file", () => {
+  const prompt = buildReceptionistPrompt(agent, profile);
+  const section = prompt.slice(prompt.indexOf("# CALLER RECORD"), prompt.indexOf("# CRITICAL RULES"));
+  assert.match(section, /\{\{crm_context\}\}/);
+  assert.match(section, /"Hi, is this Jane\?"/);
+  assert.match(section, /shared line/);
+  assert.match(section, /silent background/);
+  assert.match(section, /Never mention, read out, or confirm any of it/);
+});

@@ -341,6 +341,15 @@ export function createCrmSync({
         });
         return { externalId: found.externalId, url: found.url, created: false };
       }
+      // "Add New Callers as Contacts?" set to No: remember the caller isn't
+      // on the board, and leave this call unlinked.
+      if (connection.mapping?.createContacts === false) {
+        await store.saveLink(workspaceId, linkKey, {
+          provider: provider.id, phoneE164: facts.phoneE164, state: "none", externalId: null, boardId: boardKey,
+          checkedAt: new Date(Number(now())).toISOString(),
+        });
+        return { externalId: null, url: null, created: false };
+      }
       // Mark the attempt before creating: if we crash after Monday creates
       // the row, the retry sees "creating" and searches instead of trusting
       // a stale "none".
@@ -353,7 +362,8 @@ export function createCrmSync({
       });
       const name = facts.name ?? `New caller ${facts.phoneE164}`;
       // A new caller: their name and phone only.
-      const contact = await provider.createLead(session, { name, phoneE164: facts.phoneE164, fields: {} },
+      // Name + phone only (the name also goes in the chosen name column).
+      const contact = await provider.createLead(session, { name, phoneE164: facts.phoneE164, fields: { callerName: name } },
         { idempotencyKey: `${idempotencyBase}-create` });
       await store.saveLink(workspaceId, linkKey, {
         provider: provider.id,
@@ -374,6 +384,7 @@ export function createCrmSync({
       await store.updateCallSync(workspaceId, callId, { crmItemId: externalId, crmItemUrl: url, crmCreated: created });
     }
 
+    if (!externalId) return { externalId: null, url: null, created: false };
     try {
       await callsLog.linkClient(session, connection, call.crmCallsItemId, externalId);
     } catch (error) {
