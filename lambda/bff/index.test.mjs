@@ -4127,6 +4127,20 @@ test("signature blocks on a hidden page don't count", async () => {
   assert.equal(signWellRequest.with_signature_page, true);
 });
 
+test("signature blocks left on a page that doesn't take signatures (e.g. Parts) don't count", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig-parts",
+    name: "Services proposal",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "parts", kind: "parts", hidden: false, signatureFields: [
+      { id: "sig-1", signerIndex: 0, xFrac: 0.1, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Jane Client", email: "jane@example.com" }]);
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, false);
+  assert.equal(signWellRequest.with_signature_page, true);
+});
+
 test("signature blocks whose printed names don't match the recipients are refused", async () => {
   const { response, signWellRequest } = await sendWithPlacedSignatures({
     id: "prp-sig-mismatch",
@@ -9671,4 +9685,73 @@ test("CRM context lookup returns the CRM Lambda's context, or the default on a f
     log: {},
   });
   assert.equal(await failing({ workspaceId: "ws", agentId: "agent-1", callerNumber: "+17035550100" }), "Not available.");
+});
+
+test("super admin manages a company's proposal templates (Manage Company Accounts > Templates)", async () => {
+  const templates = new Map([["tpl-1", { id: "tpl-1", name: "Alaskan Winter", isDefault: true, items: [] }]]);
+  const calls = [];
+  const store = {
+    async getMembership(userId) { return { workspaceId: userId, role: "company-admin", status: "active" }; },
+    async getWorkspace(workspaceId) { return { workspaceId, name: "Technovate" }; },
+    async listProposalTemplates(workspaceId) { calls.push(["list", workspaceId]); return [...templates.values()]; },
+    async getProposalTemplate(workspaceId, id) { calls.push(["get", workspaceId, id]); return templates.get(id) ?? null; },
+    async createProposalTemplate(workspaceId, template) { calls.push(["create", workspaceId, template.id]); templates.set(template.id, template); return template; },
+    async putProposalTemplate(workspaceId, template) { calls.push(["put", workspaceId, template.id]); templates.set(template.id, template); return template; },
+    async deleteProposalTemplate(workspaceId, id) { calls.push(["delete", workspaceId, id]); templates.delete(id); },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const base = "/platform/companies/workspace-technovate/proposal-templates";
+
+  const forbidden = await handler(authenticatedEvent("GET", base));
+  assert.ok(forbidden.statusCode >= 400);
+  assert.equal(calls.length, 0);
+
+  const list = await handler(superAdminEvent("GET", base));
+  assert.equal(list.statusCode, 200);
+  assert.equal(JSON.parse(list.body)[0].name, "Alaskan Winter");
+
+  const created = await handler(superAdminEvent("POST", base, { id: "tpl-2", name: "New One", isDefault: false, items: [] }));
+  assert.equal(created.statusCode, 201);
+  const patched = await handler(superAdminEvent("PATCH", `${base}/tpl-1`, { id: "tpl-1", name: "Alaskan Winter", isDefault: true, items: [{ id: "itm-1", kind: "cover" }] }));
+  assert.equal(patched.statusCode, 200);
+  const removed = await handler(superAdminEvent("DELETE", `${base}/tpl-2`));
+  assert.equal(removed.statusCode, 200);
+  const missing = await handler(superAdminEvent("GET", `${base}/tpl-2`));
+  assert.equal(missing.statusCode, 404);
+
+  // Every call landed on the company's workspace, never the admin's own.
+  assert.ok(calls.every((call) => call[1] === "workspace-technovate"));
+});
+
+test("super admin gets upload/download links only for a company's template PDFs", async () => {
+  const signed = [];
+  const store = {
+    async getMembership(userId) { return { workspaceId: userId, role: "company-admin", status: "active" }; },
+    async getWorkspace(workspaceId) { return { workspaceId, name: "Technovate" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getAssetSigner: async () => ({
+      async createUploadUrl(workspaceId, key) { signed.push(["up", workspaceId, key]); return "https://up.example.com"; },
+      async createDownloadUrl(workspaceId, key) { signed.push(["down", workspaceId, key]); return "https://down.example.com"; },
+    }),
+  });
+  const base = "/platform/companies/workspace-technovate/proposal-assets";
+
+  const up = await handler(superAdminEvent("POST", `${base}/upload-url`, { key: "templates/tpl-1/itm-1.pdf", contentType: "application/pdf" }));
+  assert.equal(up.statusCode, 200);
+  const down = await handler(superAdminEvent("POST", `${base}/download-url`, { key: "templates/tpl-1/itm-1.pdf" }));
+  assert.equal(down.statusCode, 200);
+  assert.deepEqual(signed, [["up", "workspace-technovate", "templates/tpl-1/itm-1.pdf"], ["down", "workspace-technovate", "templates/tpl-1/itm-1.pdf"]]);
+
+  // A company's proposals and exports stay out of reach.
+  for (const key of ["proposals/prp-1/itm-1.pdf", "exports/prp-1.pdf"]) {
+    const refused = await handler(superAdminEvent("POST", `${base}/download-url`, { key }));
+    assert.equal(refused.statusCode, 400);
+  }
+  const notAdmin = await handler(authenticatedEvent("POST", `${base}/download-url`, { key: "templates/tpl-1/itm-1.pdf" }));
+  assert.ok(notAdmin.statusCode >= 400);
+  assert.equal(signed.length, 2);
 });

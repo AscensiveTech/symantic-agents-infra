@@ -439,6 +439,9 @@ const IDENTITY_NAME_INVALID_CHARS = /[^\p{L}\p{M}\p{N}\s&.,'()/#!*-]/u;
 
 // Validate a super-admin "log a payment" body. Returns a clean record (minus
 // server-set fields) or null.
+// Shown in its own column of the payment history - kept short so it fits in two lines.
+export const MAX_PAYMENT_NOTE_LENGTH = 100;
+
 export function validProposalPayment(body) {
   if (!body || typeof body !== "object") return null;
   const paidAt = typeof body.paidAt === "string" ? body.paidAt.trim() : "";
@@ -452,6 +455,6 @@ export function validProposalPayment(body) {
   const method = typeof body.method === "string" ? body.method.trim() : "";
   if (method.length > 60) return null;
   const note = typeof body.note === "string" ? body.note.trim() : "";
-  if (note.length > 500) return null;
+  if (note.length > MAX_PAYMENT_NOTE_LENGTH) return null;
   return { paidAt, planLabel, amount, receivedBy, method, note };
 }
