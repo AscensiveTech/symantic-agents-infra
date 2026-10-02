@@ -5,7 +5,9 @@ import {
   PROPOSAL_LIMITS,
   PROPOSAL_PLAN_PRICES,
   PROPOSAL_STORAGE_LIMITS,
+  billingCyclesAround,
   buildProposalBilling,
+  cycleStartFor,
   buildProposalUsage,
   buildPlanChangePreview,
   dayKey,
@@ -297,4 +299,88 @@ test("a payment note is up to 100 characters", () => {
   const base = { paidAt: "2026-09-01", planLabel: "Pro", amount: 119, receivedBy: "Sulav", method: "Stripe" };
   assert.equal(validProposalPayment({ ...base, note: "x".repeat(100) }).note.length, 100);
   assert.equal(validProposalPayment({ ...base, note: "x".repeat(101) }), null);
+});
+
+// ---- Billing cycles: payments logged against a cycle -------------------------
+
+const pay = (paymentId, paidAt, extra = {}) => ({ paymentId, paidAt, planLabel: "Pro", amount: 119, receivedBy: "Sulav", ...extra });
+const techWorkspace = { billingAnchorDate: "2026-09-09", createdAt: "2026-09-01T00:00:00.000Z" };
+const oct15 = new Date("2026-10-15T12:00:00.000Z");
+
+test("cycles run from the billing day to the day before it next month", () => {
+  assert.equal(cycleStartFor("2026-10-15", 9), "2026-10-09");
+  assert.equal(cycleStartFor("2026-10-08", 9), "2026-09-09");
+  // A 31st billing day clamps in short months.
+  assert.equal(cycleStartFor("2027-02-28", 31), "2027-02-28");
+  assert.equal(cycleStartFor("2027-03-30", 31), "2027-02-28");
+  const { cycles } = billingCyclesAround([], { todayKey: "2027-02-10", anchorDay: 31, startKey: "2026-10-31" });
+  const feb = cycles.find((cycle) => cycle.start === "2027-01-31");
+  assert.equal(feb.end, "2027-02-27");
+});
+
+test("the window: the last five (counting the current cycle) and the next five, never before the start", () => {
+  const { cycles } = billingCyclesAround([], { todayKey: "2026-10-15", anchorDay: 9, startKey: "2026-09-09" });
+  // Only two cycles exist before/at today (Sep 9, Oct 9) - no cycle before the start date.
+  assert.deepEqual(cycles.map((cycle) => cycle.start), ["2026-09-09", "2026-10-09", "2026-11-09", "2026-12-09", "2027-01-09", "2027-02-09", "2027-03-09"]);
+  assert.deepEqual(cycles.map((cycle) => cycle.number), [1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(cycles[0].end, "2026-10-08");
+  assert.equal(cycles[1].status, "due");
+  assert.equal(cycles[0].status, "unpaid");
+  assert.equal(cycles[2].status, "upcoming");
+
+  const later = billingCyclesAround([], { todayKey: "2027-06-15", anchorDay: 9, startKey: "2026-09-09" }).cycles;
+  assert.equal(later.length, 10);
+  assert.equal(later[0].start, "2027-02-09");
+  assert.equal(later[4].start, "2027-06-09");
+});
+
+test("a start date in the future lists cycles from it", () => {
+  const view = billingCyclesAround([], { todayKey: "2026-10-15", anchorDay: 20, startKey: "2026-11-20" });
+  assert.equal(view.notStarted, true);
+  assert.equal(view.cycles[0].start, "2026-11-20");
+  assert.equal(view.cycles[0].number, 1);
+});
+
+test("paying cycle 3 early makes cycle 4 the next payment; old payments count by date paid; cancelled ones don't", () => {
+  const payments = [
+    pay("p1", "2026-09-09"), // no cycle: counts toward Sep 9 - Oct 8 by its date paid
+    pay("p2", "2026-10-02", { billingCycleStart: "2026-10-09" }), // cycle 2, paid early
+    pay("p3", "2026-10-14", { billingCycleStart: "2026-11-09" }), // cycle 3, paid early
+    pay("p4", "2026-10-14", { billingCycleStart: "2026-12-09", canceledAt: "2026-10-14T00:00:00.000Z" }),
+  ];
+  const billing = buildProposalBilling(techWorkspace, "pro", payments, { now: oct15, timezone: "UTC" });
+  assert.equal(billing.upcoming.dueOn, "2026-12-09");
+  assert.equal(billing.upcoming.cycleNumber, 4);
+  assert.equal(billing.upcoming.paidThrough, "2026-12-08");
+  const byStart = Object.fromEntries(billing.cycles.map((cycle) => [cycle.start, cycle]));
+  assert.deepEqual(byStart["2026-09-09"].paymentIds, ["p1"]);
+  assert.equal(byStart["2026-10-09"].status, "paid");
+  assert.equal(byStart["2026-11-09"].status, "paid");
+  assert.equal(byStart["2026-12-09"].status, "upcoming");
+});
+
+test("an unpaid current cycle is the one due; a company with no payments logged keeps the plain next billing date", () => {
+  const unpaidNow = buildProposalBilling(techWorkspace, "pro", [pay("p1", "2026-09-09")], { now: oct15, timezone: "UTC" });
+  assert.equal(unpaidNow.upcoming.dueOn, "2026-10-09");
+  assert.equal(unpaidNow.upcoming.cycleNumber, 2);
+  assert.equal(unpaidNow.upcoming.paidThrough, null);
+  const untracked = buildProposalBilling(techWorkspace, "pro", [], { now: oct15, timezone: "UTC" });
+  assert.equal(untracked.upcoming.dueOn, "2026-11-09");
+  assert.equal(untracked.upcoming.cycleNumber, null);
+});
+
+test("after a re-anchor, a payment's old cycle start counts toward the new cycle containing it", () => {
+  const reanchored = { billingAnchorDate: "2026-10-02", createdAt: "2026-09-01T00:00:00.000Z" };
+  const billing = buildProposalBilling(reanchored, "pro", [pay("p1", "2026-10-02", { billingCycleStart: "2026-10-09" })], { now: oct15, timezone: "UTC" });
+  // Oct 9 falls inside the new Oct 2 - Nov 1 cycle.
+  assert.equal(billing.cycles[0].start, "2026-10-02");
+  assert.equal(billing.cycles[0].status, "paid");
+  assert.equal(billing.upcoming.dueOn, "2026-11-02");
+});
+
+test("a payment's billing cycle must be a real date", () => {
+  const base = { paidAt: "2026-09-01", planLabel: "Pro", amount: 119, receivedBy: "Sulav" };
+  assert.equal(validProposalPayment({ ...base, billingCycleStart: "2026-11-09" }).billingCycleStart, "2026-11-09");
+  assert.equal(validProposalPayment({ ...base, billingCycleStart: "2026-02-30" }), null);
+  assert.equal("billingCycleStart" in validProposalPayment(base), false);
 });

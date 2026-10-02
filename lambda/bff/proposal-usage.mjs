@@ -280,6 +280,89 @@ export function billingAnchorDay(workspace, now, tz) {
   return Number(anchor.split("-")[2]) || 1;
 }
 
+// The billing start date as a day key: an explicit billingAnchorDate, else the
+// join date (createdAt) - the same source billingAnchorDay reads its day from.
+export function billingStartKey(workspace, now, tz) {
+  return typeof workspace?.billingAnchorDate === "string" && /^\d{4}-\d{2}-\d{2}/.test(workspace.billingAnchorDate)
+    ? workspace.billingAnchorDate.slice(0, 10)
+    : (dayKey(workspace?.createdAt ?? now, tz) ?? dayKey(now, tz));
+}
+
+// Billing cycles run from the billing day to the day before it next month
+// (Sep 9 - Oct 8, Oct 9 - Nov 8, ...), the day clamped in short months.
+// A cycle is identified by its start date.
+export function cycleStartFor(dayKeyValue, anchorDay) {
+  return prevBillingDate(dayKeyValue, anchorDay);
+}
+
+function nextCycleStart(start, anchorDay) {
+  return nextBillingDate(addDayKey(start, 1), anchorDay);
+}
+
+function previousCycleStart(start, anchorDay) {
+  return prevBillingDate(addDayKey(start, -1), anchorDay);
+}
+
+const MAX_CYCLE_STEPS = 1200; // 100 years of monthly cycles - a hard stop for every walk below.
+
+/**
+ * The billing cycles around today - the last `before` (counting the current
+ * one) and the next `after` - with which ones have a payment logged against
+ * them. A payment covers the cycle containing its billingCycleStart (older
+ * payments without one: their paidAt). Cancelled payments don't count. No
+ * cycle before the billing start date is listed; a start date still in the
+ * future lists cycles from it.
+ */
+export function billingCyclesAround(payments, { todayKey, anchorDay, startKey, before = 5, after = 5 }) {
+  const firstStart = cycleStartFor(startKey, anchorDay);
+  const notStarted = startKey > todayKey;
+  const current = notStarted ? firstStart : cycleStartFor(todayKey, anchorDay);
+  const active = (payments ?? []).filter((payment) => !payment.canceledAt);
+  const paymentsIn = (start, end) => active
+    .filter((payment) => {
+      const key = payment.billingCycleStart || payment.paidAt;
+      return key >= start && key < end;
+    })
+    .map((payment) => payment.paymentId);
+
+  // Cycle numbers count from the billing start date (cycle 1).
+  const numberOf = (start) => {
+    let number = 1;
+    for (let cursor = firstStart, steps = 0; cursor < start && steps < MAX_CYCLE_STEPS; steps += 1) {
+      cursor = nextCycleStart(cursor, anchorDay);
+      number += 1;
+    }
+    return number;
+  };
+  const describe = (start) => {
+    const end = nextCycleStart(start, anchorDay);
+    const paymentIds = paymentsIn(start, end);
+    const status = paymentIds.length > 0 ? "paid" : start < current ? "unpaid" : start === current ? "due" : "upcoming";
+    return { start, end: addDayKey(end, -1), number: numberOf(start), status, paymentIds };
+  };
+
+  const starts = [current];
+  for (let cursor = current, i = 1; i < before; i += 1) {
+    const previous = previousCycleStart(cursor, anchorDay);
+    if (previous < firstStart) break;
+    starts.unshift(previous);
+    cursor = previous;
+  }
+  for (let cursor = current, i = 0; i < after; i += 1) {
+    cursor = nextCycleStart(cursor, anchorDay);
+    starts.push(cursor);
+  }
+  const cycles = starts.map(describe);
+
+  // The first cycle from the current one on with nothing paid against it.
+  let firstUnpaid = current;
+  for (let steps = 0; steps < MAX_CYCLE_STEPS && paymentsIn(firstUnpaid, nextCycleStart(firstUnpaid, anchorDay)).length > 0; steps += 1) {
+    firstUnpaid = nextCycleStart(firstUnpaid, anchorDay);
+  }
+  const paidThrough = firstUnpaid > current ? addDayKey(firstUnpaid, -1) : null;
+  return { cycles, current, firstUnpaid, firstUnpaidNumber: numberOf(firstUnpaid), paidThrough, notStarted };
+}
+
 /**
  * Preview a super-admin plan change made on behalf of a customer: credit the
  * unused days of the current cycle at the OLD price, apply it to the NEW plan's
@@ -340,6 +423,9 @@ function normalizePayment(row) {
     receivedBy: str(row?.receivedBy),
     method: str(row?.method),
     note: str(row?.note),
+    // The billing cycle (its start date) this payment covers. Empty on
+    // payments logged before cycles existed - those count by paidAt.
+    billingCycleStart: str(row?.billingCycleStart),
     loggedByName: str(row?.loggedByName),
     createdAt: str(row?.createdAt),
     // Soft-delete: a canceled payment stays in the history as a struck-through
@@ -391,6 +477,11 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
     .sort((a, b) => `${b.paidAt}#${b.paymentId}`.localeCompare(`${a.paidAt}#${a.paymentId}`));
 
   const anchorDay = billingAnchorDay(workspace, now, tz);
+  const cycleView = billingCyclesAround(payments, {
+    todayKey: dayKey(now, tz),
+    anchorDay,
+    startKey: billingStartKey(workspace, now, tz),
+  });
   const creditBalance = Math.max(0, money(workspace?.billingCreditBalance) ?? 0);
   const creditApplied = Math.min(creditBalance, monthlyPrice);
   // A billing start date that hasn't arrived yet: the first charge is that
@@ -401,8 +492,18 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
     : null;
   const notStarted = startDate != null && startDate > today;
   const rawAmount = notStarted ? monthlyPrice : (money(monthlyPrice - creditApplied) ?? monthlyPrice);
+  // Next payment: the first cycle from the current one on that has no payment
+  // logged against it (paying ahead moves it on). A company with no payments
+  // logged at all keeps the plain next billing date, so one whose payments are
+  // tracked elsewhere isn't shown as overdue.
+  const tracksPayments = payments.some((payment) => !payment.canceledAt);
+  const dueOn = tracksPayments
+    ? cycleView.firstUnpaid
+    : (notStarted ? startDate : nextBillingDate(today, anchorDay));
   const upcoming = {
-    dueOn: notStarted ? startDate : nextBillingDate(today, anchorDay),
+    dueOn,
+    cycleNumber: tracksPayments ? cycleView.firstUnpaidNumber : null,
+    paidThrough: cycleView.paidThrough,
     planLabel,
     amount: discountPct > 0 ? (money(rawAmount * (1 - discountPct / 100)) ?? rawAmount) : rawAmount,
     rawAmount: discountPct > 0 ? rawAmount : undefined,
@@ -413,7 +514,7 @@ export function buildProposalBilling(workspace, tier, paymentRows, { now, timezo
     notStarted,
   };
 
-  return { tier: normalizedTier, planLabel, monthlyPrice, priceOverridden, upcoming, payments };
+  return { tier: normalizedTier, planLabel, monthlyPrice, priceOverridden, upcoming, payments, cycles: cycleView.cycles };
 }
 
 // A naive `!isNaN(new Date(paidAt))` check does not catch an impossible
@@ -437,10 +538,12 @@ function isRealDateOnly(value) {
 // frontend's sanitizeIdentityName in lib/domain/validation.ts.
 const IDENTITY_NAME_INVALID_CHARS = /[^\p{L}\p{M}\p{N}\s&.,'()/#!*-]/u;
 
-// Validate a super-admin "log a payment" body. Returns a clean record (minus
-// server-set fields) or null.
 // Shown in its own column of the payment history - kept short so it fits in two lines.
 export const MAX_PAYMENT_NOTE_LENGTH = 100;
+
+// Validate a super-admin "log a payment" body. Returns a clean record (minus
+// server-set fields) or null. billingCycleStart is optional (a real date);
+// the route snaps it to the start of the cycle it falls in.
 
 export function validProposalPayment(body) {
   if (!body || typeof body !== "object") return null;
@@ -456,5 +559,7 @@ export function validProposalPayment(body) {
   if (method.length > 60) return null;
   const note = typeof body.note === "string" ? body.note.trim() : "";
   if (note.length > MAX_PAYMENT_NOTE_LENGTH) return null;
-  return { paidAt, planLabel, amount, receivedBy, method, note };
+  const billingCycleStart = typeof body.billingCycleStart === "string" ? body.billingCycleStart.trim() : "";
+  if (billingCycleStart && !isRealDateOnly(billingCycleStart)) return null;
+  return { paidAt, planLabel, amount, receivedBy, method, note, ...(billingCycleStart ? { billingCycleStart } : {}) };
 }

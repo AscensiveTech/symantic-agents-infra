@@ -9755,3 +9755,105 @@ test("super admin gets upload/download links only for a company's template PDFs"
   assert.ok(notAdmin.statusCode >= 400);
   assert.equal(signed.length, 2);
 });
+
+test("a payment's billing cycle is stored as that cycle's start, on log and on edit", async () => {
+  const base = usageQuotaStore(); // billing day 10 (joined Sep 10)
+  const store = {
+    ...base,
+    async getMembership(userId) { return { userId, workspaceId: "user-123", role: "company-admin", status: "active", name: "Sulav" }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+
+  const logged = await handler(superAdminEvent("POST", "/platform/companies/user-123/proposal-payments", {
+    paidAt: "2026-09-10", planLabel: "Pro", amount: 119, receivedBy: "Ops", billingCycleStart: "2026-11-20",
+  }));
+  assert.equal(logged.statusCode, 201);
+  const payment = JSON.parse(logged.body).payments[0];
+  assert.equal(payment.billingCycleStart, "2026-11-10");
+
+  const edited = await handler(superAdminEvent(
+    "PATCH",
+    `/platform/companies/user-123/proposal-payments/${payment.paymentId}`,
+    { billingCycleStart: "2026-12-25", reason: "Belongs to the December cycle" },
+    { paidAt: "2026-09-10" },
+  ));
+  assert.equal(edited.statusCode, 200);
+  assert.equal(JSON.parse(edited.body).payments[0].billingCycleStart, "2026-12-10");
+
+  const bad = await handler(superAdminEvent("POST", "/platform/companies/user-123/proposal-payments", {
+    paidAt: "2026-09-10", planLabel: "Pro", amount: 119, receivedBy: "Ops", billingCycleStart: "2026-13-01",
+  }));
+  assert.equal(bad.statusCode, 400);
+});
+
+test("support mode: a super admin with X-Support-Workspace works inside that company; anyone else's header is ignored", async () => {
+  const templatesByWorkspace = {
+    "workspace-technovate": [{ id: "tpl-t", name: "Technovate Template", isDefault: true, items: [] }],
+    "user-123": [{ id: "tpl-own", name: "Own Template", isDefault: true, items: [] }],
+  };
+  const saved = [];
+  const activity = [];
+  const store = {
+    async getMembership(userId) { return { userId, workspaceId: "user-123", role: "company-admin", status: "active", name: "Sulav" }; },
+    async getWorkspace(workspaceId) { return workspaceId === "workspace-technovate" || workspaceId === "user-123" ? { workspaceId, name: "Technovate LLC" } : null; },
+    async listProposalTemplates(workspaceId) { return templatesByWorkspace[workspaceId] ?? []; },
+    async putProposalTemplate(workspaceId, template) { saved.push(workspaceId); return template; },
+    async recordActivity(workspaceId, entry) { activity.push([workspaceId, entry.eventType, entry.support]); },
+    async ensureWorkspace() {},
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const supporting = (event) => { event.headers = { ...(event.headers ?? {}), "X-Support-Workspace": "workspace-technovate" }; return event; };
+
+  const list = await handler(supporting(superAdminEvent("GET", "/workspaces/me/proposal-templates")));
+  assert.equal(list.statusCode, 200);
+  assert.equal(JSON.parse(list.body)[0].name, "Technovate Template");
+
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args);
+  try {
+    const save = await handler(supporting(superAdminEvent("PATCH", "/workspaces/me/proposal-templates/tpl-t", { id: "tpl-t", name: "Renamed", isDefault: true, items: [] })));
+    assert.equal(save.statusCode, 200);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.deepEqual(saved, ["workspace-technovate"]);
+  const audit = logs.find(([label]) => label === "support action");
+  assert.ok(audit, "a support action is logged");
+  assert.equal(audit[1].workspaceId, "workspace-technovate");
+  assert.equal(audit[1].method, "PATCH");
+  assert.equal(audit[1].status, 200);
+
+  // Support visits go into the company's own activity log, marked as support.
+  const view = await handler(supporting(superAdminEvent("POST", "/workspaces/me/activity", { eventType: "page_view", page: "/proposals" })));
+  assert.equal(view.statusCode, 200);
+  assert.deepEqual(activity, [["workspace-technovate", "page_view", true]]);
+
+  // A company admin sending the header just gets their own workspace.
+  const companyAdminEvent = authenticatedEvent("GET", "/workspaces/me/proposal-templates");
+  companyAdminEvent.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  const own = await handler(supporting(companyAdminEvent));
+  assert.equal(own.statusCode, 200);
+  assert.equal(JSON.parse(own.body)[0].name, "Own Template");
+
+  // An unknown company is refused, not silently swapped for the admin's own.
+  const unknown = superAdminEvent("GET", "/workspaces/me/proposal-templates");
+  unknown.headers = { ...(unknown.headers ?? {}), "x-support-workspace": "workspace-missing" };
+  assert.equal((await handler(unknown)).statusCode, 404);
+});
+
+test("signature blocks on a Custom Page count like Work With Us! ones", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig-custom",
+    name: "Services proposal",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "custom", kind: "staticPage", hidden: false, signatureFields: [
+      { id: "sig-1", signerIndex: 0, xFrac: 0.1, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Jane Client", email: "jane@example.com" }]);
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, true);
+  assert.equal(signWellRequest.with_signature_page, false);
+});

@@ -31,6 +31,7 @@ import {
   billingAnchorDay,
   buildProposalBilling,
   buildProposalUsage,
+  cycleStartFor,
   dayKey,
   firstOfNextMonthKey,
   paymentWithinEditWindow,
@@ -538,7 +539,45 @@ async function resolveActor(event, store) {
   const roles = claimGroups(claims["cognito:groups"])
     .filter((group) => WORKSPACE_ROLES.has(group));
   if (!roles.includes(membership.role) && !roles.includes("super-admin")) return null;
+
+  // Support mode: a super administrator working inside a company's workspace
+  // (Manage Company Accounts > Support). Every /workspaces/me request then
+  // acts on that company; the super admin's own login, membership and roles
+  // are unchanged. The header from anyone else is ignored.
+  const supportWorkspaceId = readHeader(event?.headers, SUPPORT_WORKSPACE_HEADER);
+  if (supportWorkspaceId && roles.includes("super-admin") && supportWorkspaceId !== membership.workspaceId) {
+    const workspace = ENTITY_ID_PATTERN.test(supportWorkspaceId) && typeof store.getWorkspace === "function"
+      ? await store.getWorkspace(supportWorkspaceId)
+      : null;
+    if (!workspace) return { userId, workspaceId: membership.workspaceId, roles, membership, supportNotFound: true };
+    return {
+      userId,
+      workspaceId: supportWorkspaceId,
+      roles,
+      membership,
+      supporting: { workspaceId: supportWorkspaceId, workspaceName: workspace.name ?? null },
+    };
+  }
   return { userId, workspaceId: membership.workspaceId, roles, membership };
+}
+
+const SUPPORT_WORKSPACE_HEADER = "x-support-workspace";
+
+// Every change a super administrator makes while supporting a company is
+// written to the log (CloudWatch) - who, which company, what, and the result.
+function logSupportAction(event, response) {
+  const supportWorkspaceId = readHeader(event?.headers, SUPPORT_WORKSPACE_HEADER);
+  const method = event?.requestContext?.http?.method;
+  if (!supportWorkspaceId || !method || method === "GET" || method === "OPTIONS") return;
+  const claims = event?.requestContext?.authorizer?.jwt?.claims ?? {};
+  if (!claimGroups(claims["cognito:groups"]).includes("super-admin")) return;
+  console.info("support action", {
+    actorUserId: claims.sub ?? null,
+    workspaceId: supportWorkspaceId,
+    method,
+    path: event?.rawPath ?? event?.requestContext?.http?.path,
+    status: response?.statusCode ?? null,
+  });
 }
 
 // Best-effort human name for attributing an action (block/unblock, delete
@@ -833,7 +872,7 @@ export function createHandler({
   // A new handler may be backed by a different store (tests, or a config
   // reload) - don't let the per-container active-legal cache leak across.
   invalidateActiveLegalCache();
-  return async function handle(event) {
+  const handleRequest = async function handle(event) {
     const method = event?.requestContext?.http?.method;
     const path = event?.rawPath ?? event?.requestContext?.http?.path;
     try {
@@ -864,6 +903,9 @@ export function createHandler({
       const actor = await resolveActor(event, store);
       if (!actor) {
         return json(401, { message: "Unauthorized" });
+      }
+      if (actor.supportNotFound) {
+        return json(404, { message: "The company you're supporting was not found. Exit support and try again." });
       }
       const { workspaceId } = actor;
 
@@ -1218,6 +1260,9 @@ export function createHandler({
             userId: actor.userId,
             userName: actorDisplayName(event, actor),
             userEmail,
+            // A super administrator supporting this company (the Terms say
+            // every support visit is recorded in the company's activity log).
+            ...(actor.supporting ? { support: true } : {}),
           });
         } catch (error) {
           console.error("recordActivity failed", { name: error?.name, message: error?.message });
@@ -2467,6 +2512,11 @@ export function createHandler({
       return json(500, { message: "Internal server error" });
     }
   };
+  return async function handleWithSupportAudit(event) {
+    const response = await handleRequest(event);
+    logSupportAction(event, response);
+    return response;
+  };
 }
 
 // A workspace's proposal templates: the list (templateId null) or one
@@ -2699,6 +2749,7 @@ async function handlePlatformCompanies(event, {
           page: item.page ?? null,
           userName: item.userName ?? null,
           userEmail: item.userEmail ?? null,
+          support: item.support === true,
         })),
         nextCursor,
       });
@@ -2758,8 +2809,9 @@ async function handlePlatformCompanies(event, {
     }
 
     if (target.kind === "proposal-payments" && method === "POST") {
-      const clean = validProposalPayment(readBody(event));
-      if (!clean) return json(400, { message: "Invalid payment. Provide paidAt (YYYY-MM-DD), planLabel, amount, and receivedBy." });
+      const valid = validProposalPayment(readBody(event));
+      if (!valid) return json(400, { message: "Invalid payment. Provide paidAt (YYYY-MM-DD), planLabel, amount, and receivedBy." });
+      const clean = await withSnappedBillingCycle(store, workspace, target.workspaceId, valid);
       const nowIso = new Date().toISOString();
       await store.putProposalPayment(target.workspaceId, {
         ...clean,
@@ -2796,14 +2848,14 @@ async function handlePlatformCompanies(event, {
         next = { ...existing, canceledAt: nowIso, canceledByName: actorName, canceledByUserId: actor.userId, cancelReason: reason };
       } else {
         const patch = {};
-        for (const field of ["planLabel", "amount", "receivedBy", "method", "note"]) {
+        for (const field of ["planLabel", "amount", "receivedBy", "method", "note", "billingCycleStart"]) {
           if (Object.hasOwn(body, field)) patch[field] = body[field];
         }
         // A note saved before the 100-character limit is trimmed to fit
         // rather than blocking an unrelated edit to that payment.
         const merged = validProposalPayment({ ...existing, note: typeof existing.note === "string" ? existing.note.slice(0, MAX_PAYMENT_NOTE_LENGTH) : existing.note, ...patch });
         if (!merged) return json(400, { message: "Invalid payment fields." });
-        next = { ...existing, ...merged, editedAt: nowIso, editedByName: actorName, editReason: reason };
+        next = { ...existing, ...(await withSnappedBillingCycle(store, workspace, target.workspaceId, merged)), editedAt: nowIso, editedByName: actorName, editReason: reason };
       }
       await store.putProposalPayment(target.workspaceId, next);
       return json(200, await loadProposalBilling(store, target.workspaceId));
@@ -3358,6 +3410,17 @@ async function loadProposalUsage(store, workspaceId) {
   }
   const anchorDay = billingAnchorDay(workspace, now, timezone);
   return buildProposalUsage(monthCounter, dayRows, monthRows, { tier, now, timezone, anchorDay, storageBytes, storageByState });
+}
+
+// A payment's billing cycle is stored as that cycle's start date: whatever
+// day inside the cycle was sent is snapped to the cycle's first day (cycles
+// run from the billing day to the day before it next month).
+async function withSnappedBillingCycle(store, workspace, workspaceId, payment) {
+  if (!payment.billingCycleStart) return payment;
+  const profile = typeof store.getProfile === "function" ? await store.getProfile(workspaceId) : null;
+  const timezone = (profile && typeof profile.timezone === "string" && profile.timezone) || "UTC";
+  const anchorDay = billingAnchorDay(workspace, new Date(), timezone);
+  return { ...payment, billingCycleStart: cycleStartFor(payment.billingCycleStart, anchorDay) };
 }
 
 // Build the RapidProposal billing view (monthly price + logged payment history
@@ -5098,7 +5161,7 @@ function signerNamesMatchRecipients(proposal, recipients) {
 // on a visible page. A block points at a signer row (signerIndex); its number
 // is that row's place among the rows with a name - the order recipients are
 // sent in. Mirrors signerNumberFor in the frontend's lib/proposals/signers.ts.
-const SIGNATURE_PAGE_KINDS = new Set(["workWithUs", "agreement"]);
+const SIGNATURE_PAGE_KINDS = new Set(["workWithUs", "agreement", "staticPage"]);
 
 function placedSignatureSignerNumbers(proposal) {
   const rows = Array.isArray(proposal?.signerNames)
@@ -5106,7 +5169,7 @@ function placedSignatureSignerNumbers(proposal) {
     : proposalSignerNames(proposal);
   const numbers = new Set();
   for (const item of Array.isArray(proposal?.documentItems) ? proposal.documentItems : []) {
-    // Only Work With Us! and Agreement & Signature take placed signatures.
+    // Only Work With Us!, Agreement & Signature and Custom Pages take placed signatures.
     if (item?.hidden === true || !SIGNATURE_PAGE_KINDS.has(item?.kind) || !Array.isArray(item?.signatureFields)) continue;
     for (const field of item.signatureFields) {
       const index = Number(field?.signerIndex);
