@@ -174,6 +174,7 @@ const PROPOSAL_SECTION_KINDS = [
   "scope",
   "agreement",
   "payment",
+  "workWithUs",
   "closing",
 ];
 const PROPOSAL_SECTION_SET = new Set(PROPOSAL_SECTION_KINDS);
@@ -4978,10 +4979,36 @@ function hasAgreementSigningFields(proposal, recipients) {
   const agreementIncluded = Array.isArray(proposal?.documentItems) &&
     proposal.documentItems.some((item) => item?.kind === "agreement" && item.hidden !== true);
   if (!agreementIncluded) return false;
+  return signerNamesMatchRecipients(proposal, recipients);
+}
+
+// The names printed in the PDF are the recipients, in the same order - so
+// each baked-in SignWell tag (numbered by that order) reaches the right person.
+function signerNamesMatchRecipients(proposal, recipients) {
   const names = proposalSignerNames(proposal);
   return names.length === recipients.length && names.every(
     (name, index) => name.toLocaleLowerCase() === recipients[index]?.name.toLocaleLowerCase(),
   );
+}
+
+// The SignWell recipient numbers (1-based) that have a signature block placed
+// on a visible page. A block points at a signer row (signerIndex); its number
+// is that row's place among the rows with a name - the order recipients are
+// sent in. Mirrors signerNumberFor in the frontend's lib/proposals/signers.ts.
+function placedSignatureSignerNumbers(proposal) {
+  const rows = Array.isArray(proposal?.signerNames)
+    ? proposal.signerNames.slice(0, 10).map((name) => (typeof name === "string" ? name.trim() : ""))
+    : proposalSignerNames(proposal);
+  const numbers = new Set();
+  for (const item of Array.isArray(proposal?.documentItems) ? proposal.documentItems : []) {
+    if (item?.hidden === true || item?.kind === "cover" || item?.kind === "closing" || !Array.isArray(item?.signatureFields)) continue;
+    for (const field of item.signatureFields) {
+      const index = Number(field?.signerIndex);
+      if (!Number.isInteger(index) || index < 0 || !rows[index]) continue;
+      numbers.add(rows.slice(0, index + 1).filter(Boolean).length);
+    }
+  }
+  return numbers;
 }
 
 // Whether any visible document item carries dropped "initial here" markers.
@@ -5136,7 +5163,16 @@ async function handleProposalApi(event, {
           input.recipients,
         );
         const hasInitials = proposalHasInitialFields(proposal);
-        if (proposal.documentItems?.some((item) => item?.kind === "agreement" && !item.hidden) && !agreementHasSigningFields) {
+        const placedSignatures = placedSignatureSignerNumbers(proposal);
+        // Every recipient already signs somewhere in the PDF, so SignWell
+        // shouldn't add its own signature page at the end.
+        const everyoneSignsInPdf = agreementHasSigningFields || (
+          placedSignatures.size > 0 &&
+          input.recipients.every((_, index) => placedSignatures.has(index + 1))
+        );
+        const signersMismatch = !signerNamesMatchRecipients(proposal, input.recipients);
+        if ((proposal.documentItems?.some((item) => item?.kind === "agreement" && !item.hidden) && !agreementHasSigningFields) ||
+          (placedSignatures.size > 0 && signersMismatch)) {
           return json(409, {
             message: "The generated PDF signer names do not match these recipients. Save the signer names and regenerate the PDF first.",
           });
@@ -5240,8 +5276,8 @@ async function handleProposalApi(event, {
           ...requesterFields,
           ...expiryFields,
           ...(embeddedTestMode ? { embedded_signing: true } : {}),
-          text_tags: agreementHasSigningFields || hasInitials,
-          with_signature_page: !agreementHasSigningFields,
+          text_tags: agreementHasSigningFields || hasInitials || (placedSignatures.size > 0 && !signersMismatch),
+          with_signature_page: !everyoneSignsInPdf,
           files: [{
             name: proposalPdfFilename(proposal.name),
             file_url: fileUrl,
