@@ -4127,6 +4127,20 @@ test("signature blocks on a hidden page don't count", async () => {
   assert.equal(signWellRequest.with_signature_page, true);
 });
 
+test("signature blocks left on a page that doesn't take signatures (e.g. Parts) don't count", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig-parts",
+    name: "Services proposal",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "parts", kind: "parts", hidden: false, signatureFields: [
+      { id: "sig-1", signerIndex: 0, xFrac: 0.1, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Jane Client", email: "jane@example.com" }]);
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, false);
+  assert.equal(signWellRequest.with_signature_page, true);
+});
+
 test("signature blocks whose printed names don't match the recipients are refused", async () => {
   const { response, signWellRequest } = await sendWithPlacedSignatures({
     id: "prp-sig-mismatch",
