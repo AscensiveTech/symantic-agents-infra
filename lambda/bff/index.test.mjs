@@ -4052,6 +4052,94 @@ test("initials markers on a proposal with no agreement page still force SignWell
   assert.equal(signWellRequest.text_tags, true);
 });
 
+async function sendWithPlacedSignatures(proposal, recipients) {
+  let signWellRequest;
+  const store = {
+    async ensureWorkspace() {},
+    async getProposal() { return proposal; },
+    async updateProposalSignature(_w, _p, signatureRequest) { return signatureRequest; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getSignWell: async () => ({
+      webhookId: "webhook-123",
+      client: {
+        testMode: false,
+        async createDocument(input) {
+          signWellRequest = input;
+          return { id: "signwell-doc-sig", status: "Sent", recipients: recipients.map((_, i) => ({ id: String(i + 1), status: "sent" })) };
+        },
+      },
+    }),
+    getAssetSigner: async () => ({ async createDownloadUrl() { return "https://private.example.com/p.pdf"; } }),
+  });
+  const response = await handler(authenticatedEvent("POST", `/workspaces/me/proposals/${proposal.id}/signature-requests`, {
+    assetKey: `exports/${proposal.id}.pdf`,
+    recipients,
+    subject: "Please sign",
+    message: "Please review and sign.",
+    applySigningOrder: false,
+  }));
+  return { response, signWellRequest };
+}
+
+test("signature blocks placed for every signer turn on text tags and skip SignWell's own signature page", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig",
+    name: "Services proposal",
+    signerNames: ["Sam Seller", "", "Jane Client"],
+    documentItems: [{ id: "wwu", kind: "workWithUs", hidden: false, signatureFields: [
+      { id: "sig-1", signerIndex: 0, xFrac: 0.1, yFracFromTop: 0.7 },
+      { id: "sig-2", signerIndex: 2, xFrac: 0.6, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Sam Seller", email: "sam@example.com" }, { name: "Jane Client", email: "jane@example.com" }]);
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, true);
+  assert.equal(signWellRequest.with_signature_page, false);
+});
+
+test("a signer without a placed signature block (and no agreement page) still gets SignWell's signature page", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig-some",
+    name: "Services proposal",
+    signerNames: ["Sam Seller", "Jane Client"],
+    documentItems: [{ id: "wwu", kind: "workWithUs", hidden: false, signatureFields: [
+      { id: "sig-1", signerIndex: 1, xFrac: 0.1, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Sam Seller", email: "sam@example.com" }, { name: "Jane Client", email: "jane@example.com" }]);
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, true);
+  assert.equal(signWellRequest.with_signature_page, true);
+});
+
+test("signature blocks on a hidden page don't count", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig-hidden",
+    name: "Services proposal",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "wwu", kind: "workWithUs", hidden: true, signatureFields: [
+      { id: "sig-1", signerIndex: 0, xFrac: 0.1, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Jane Client", email: "jane@example.com" }]);
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, false);
+  assert.equal(signWellRequest.with_signature_page, true);
+});
+
+test("signature blocks whose printed names don't match the recipients are refused", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig-mismatch",
+    name: "Services proposal",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "wwu", kind: "workWithUs", hidden: false, signatureFields: [
+      { id: "sig-1", signerIndex: 0, xFrac: 0.1, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Someone Else", email: "else@example.com" }]);
+  assert.equal(response.statusCode, 409);
+  assert.equal(signWellRequest, undefined);
+});
+
 test("editing an untouched signer email updates the sent SignWell recipient and resends its notification", async () => {
   let proposal = {
     id: "prp-sign",
@@ -5186,8 +5274,8 @@ test("super administrators onboard a company with an isolated default template",
     tier: "repository",
     entitlements: { receptionist: false, rapidProposal: true },
     billingAnchorDate: "2099-01-01",
-    allowedProposalSections: ["cover", "agenda", "parts", "closing"],
-    defaultTemplateSections: ["cover", "agenda", "closing"],
+    allowedProposalSections: ["cover", "agenda", "parts", "workWithUs", "closing"],
+    defaultTemplateSections: ["cover", "agenda", "workWithUs", "closing"],
   });
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "[\"super-admin\"]";
 
@@ -5203,12 +5291,13 @@ test("super administrators onboard a company with an isolated default template",
   assert.equal(bundle.workspace.tier, "repository");
   assert.deepEqual(bundle.workspace.entitlements, { receptionist: false, rapidProposal: true });
   assert.deepEqual(body.entitlements, { receptionist: false, rapidProposal: true });
-  assert.deepEqual(bundle.workspace.allowedProposalSections, ["cover", "agenda", "parts", "closing"]);
+  // "Work With Us!" is a recognised section like the rest.
+  assert.deepEqual(bundle.workspace.allowedProposalSections, ["cover", "agenda", "parts", "workWithUs", "closing"]);
   assert.equal(bundle.membership.email, "ajm@technovate.design");
   assert.equal(bundle.membership.role, "company-admin");
   assert.equal(bundle.template.name, "Default");
   assert.equal(bundle.template.isDefault, true);
-  assert.deepEqual(bundle.template.items.map((item) => item.kind), ["cover", "agenda", "closing"]);
+  assert.deepEqual(bundle.template.items.map((item) => item.kind), ["cover", "agenda", "workWithUs", "closing"]);
   assert.deepEqual(directoryCalls.map((call) => call[0]), ["create", "role"]);
 });
 
