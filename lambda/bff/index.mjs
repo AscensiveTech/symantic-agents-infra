@@ -36,6 +36,7 @@ import {
   paymentWithinEditWindow,
   resolveProposalMonthlyPrice,
   validProposalPayment,
+  MAX_PAYMENT_NOTE_LENGTH,
 } from "./proposal-usage.mjs";
 import {
   createSignWellClient,
@@ -2468,6 +2469,46 @@ export function createHandler({
   };
 }
 
+// A workspace's proposal templates: the list (templateId null) or one
+// template. Shared by the workspace's own /workspaces/me/proposal-templates
+// routes and the super-admin /platform/companies/{id}/proposal-templates
+// routes, so both behave exactly the same. Null when the method isn't handled.
+async function handleProposalTemplateRequest(event, { method, store, workspaceId, templateId }) {
+  if (!templateId) {
+    if (method === "GET") return json(200, await store.listProposalTemplates(workspaceId));
+    if (method === "POST") {
+      const template = pickEntity(readBody(event), "id");
+      if (!template) return json(400, { message: "Invalid proposal template" });
+      try {
+        return json(201, await store.createProposalTemplate(workspaceId, template));
+      } catch (error) {
+        if (isConditionalCheckFailed(error)) return json(409, { message: "Proposal template already exists" });
+        throw error;
+      }
+    }
+    return null;
+  }
+  if (method === "GET") {
+    const template = await store.getProposalTemplate(workspaceId, templateId);
+    return template ? json(200, template) : json(404, { message: "Proposal template not found" });
+  }
+  if (method === "PATCH") {
+    const template = pickEntity(readBody(event), "id", templateId);
+    if (!template) return json(400, { message: "Invalid proposal template" });
+    try {
+      return json(200, await store.putProposalTemplate(workspaceId, template));
+    } catch (error) {
+      if (isConditionalCheckFailed(error)) return json(404, { message: "Proposal template not found" });
+      throw error;
+    }
+  }
+  if (method === "DELETE") {
+    await store.deleteProposalTemplate(workspaceId, templateId);
+    return json(200, { ok: true });
+  }
+  return null;
+}
+
 async function handlePlatformCompanies(event, {
   method,
   path,
@@ -2498,6 +2539,51 @@ async function handlePlatformCompanies(event, {
     if (!target) return json(404, { message: "Not found" });
     const workspace = await store.getWorkspace(target.workspaceId);
     if (!workspace) return json(404, { message: "Company workspace not found" });
+
+    // A super administrator editing a company's proposal templates (Manage
+    // Company Accounts > Templates) - the same template logic the company's
+    // own Templates page uses. Not written to the company's activity log
+    // (that log is the customer's own usage); changes go to CloudWatch.
+    if (target.kind === "proposal-templates" || target.kind === "proposal-template") {
+      const response = await handleProposalTemplateRequest(event, {
+        method,
+        store,
+        workspaceId: target.workspaceId,
+        templateId: target.templateId ?? null,
+      });
+      if (response) {
+        if (method !== "GET") {
+          console.info("platform template change", {
+            workspaceId: target.workspaceId,
+            templateId: target.templateId ?? null,
+            method,
+            status: response.statusCode,
+            actorUserId: actor.userId,
+          });
+        }
+        return response;
+      }
+    }
+
+    // Upload/download links for that company's template PDFs only (keys
+    // under templates/) - never its proposals or exports.
+    if (target.kind === "proposal-assets-url" && method === "POST") {
+      const body = readBody(event);
+      if (!validAssetKey(body?.key) || !body.key.startsWith("templates/")) {
+        return json(400, { message: "Invalid template asset key" });
+      }
+      const signer = await getAssetSigner();
+      if (target.assetAction === "upload-url") {
+        if (body.contentType !== undefined && body.contentType !== "application/pdf") {
+          return json(400, { message: "Only PDF proposal assets are supported" });
+        }
+        return json(200, {
+          url: await signer.createUploadUrl(target.workspaceId, body.key, "application/pdf"),
+          key: body.key,
+        });
+      }
+      return json(200, { url: await signer.createDownloadUrl(target.workspaceId, body.key) });
+    }
 
     if (target.kind === "logo-upload" && method === "POST") {
       const logo = validCompanyLogoRequest(readBody(event));
@@ -2713,7 +2799,9 @@ async function handlePlatformCompanies(event, {
         for (const field of ["planLabel", "amount", "receivedBy", "method", "note"]) {
           if (Object.hasOwn(body, field)) patch[field] = body[field];
         }
-        const merged = validProposalPayment({ ...existing, ...patch });
+        // A note saved before the 100-character limit is trimmed to fit
+        // rather than blocking an unrelated edit to that payment.
+        const merged = validProposalPayment({ ...existing, note: typeof existing.note === "string" ? existing.note.slice(0, MAX_PAYMENT_NOTE_LENGTH) : existing.note, ...patch });
         if (!merged) return json(400, { message: "Invalid payment fields." });
         next = { ...existing, ...merged, editedAt: nowIso, editedByName: actorName, editReason: reason };
       }
@@ -3614,6 +3702,9 @@ function getPlatformCompanyTarget(event, path) {
     ["receptionist-payments", /^\/platform\/companies\/([^/]+)\/receptionist-payments$/],
     ["receptionist-payment", /^\/platform\/companies\/([^/]+)\/receptionist-payments\/([A-Za-z0-9._-]{1,64})$/],
     ["legal-acceptances", /^\/platform\/companies\/([^/]+)\/legal-acceptances$/],
+    ["proposal-templates", /^\/platform\/companies\/([^/]+)\/proposal-templates$/],
+    ["proposal-template", /^\/platform\/companies\/([^/]+)\/proposal-templates\/([^/]+)$/],
+    ["proposal-assets-url", /^\/platform\/companies\/([^/]+)\/proposal-assets\/(upload-url|download-url)$/],
     ["company", /^\/platform\/companies\/([^/]+)$/],
   ];
   for (const [kind, pattern] of patterns) {
@@ -3629,11 +3720,23 @@ function getPlatformCompanyTarget(event, path) {
       const paymentId = kind === "proposal-payment" || kind === "receptionist-payment"
         ? decodeURIComponent(event?.pathParameters?.paymentId ?? match[2])
         : null;
+      const templateId = kind === "proposal-template"
+        ? decodeURIComponent(event?.pathParameters?.templateId ?? match[2])
+        : null;
+      const assetAction = kind === "proposal-assets-url" ? match[2] : null;
       if (
         !ENTITY_ID_PATTERN.test(workspaceId) ||
-        (kind === "user" && !ENTITY_ID_PATTERN.test(userId))
+        (kind === "user" && !ENTITY_ID_PATTERN.test(userId)) ||
+        (kind === "proposal-template" && !ENTITY_ID_PATTERN.test(templateId))
       ) return null;
-      return { kind, workspaceId, ...(userId ? { userId } : {}), ...(paymentId ? { paymentId } : {}) };
+      return {
+        kind,
+        workspaceId,
+        ...(userId ? { userId } : {}),
+        ...(paymentId ? { paymentId } : {}),
+        ...(templateId ? { templateId } : {}),
+        ...(assetAction ? { assetAction } : {}),
+      };
     } catch {
       return null;
     }
@@ -5603,39 +5706,14 @@ async function handleProposalApi(event, {
   }
 
   if (path === "/workspaces/me/proposal-templates") {
-    if (method === "GET") return json(200, await store.listProposalTemplates(workspaceId));
-    if (method === "POST") {
-      const template = pickEntity(readBody(event), "id");
-      if (!template) return json(400, { message: "Invalid proposal template" });
-      try {
-        return json(201, await store.createProposalTemplate(workspaceId, template));
-      } catch (error) {
-        if (isConditionalCheckFailed(error)) return json(409, { message: "Proposal template already exists" });
-        throw error;
-      }
-    }
+    const response = await handleProposalTemplateRequest(event, { method, store, workspaceId, templateId: null });
+    if (response) return response;
   }
 
   const templateId = getEntityId(event, path, "proposal-templates", "templateId");
   if (templateId) {
-    if (method === "GET") {
-      const template = await store.getProposalTemplate(workspaceId, templateId);
-      return template ? json(200, template) : json(404, { message: "Proposal template not found" });
-    }
-    if (method === "PATCH") {
-      const template = pickEntity(readBody(event), "id", templateId);
-      if (!template) return json(400, { message: "Invalid proposal template" });
-      try {
-        return json(200, await store.putProposalTemplate(workspaceId, template));
-      } catch (error) {
-        if (isConditionalCheckFailed(error)) return json(404, { message: "Proposal template not found" });
-        throw error;
-      }
-    }
-    if (method === "DELETE") {
-      await store.deleteProposalTemplate(workspaceId, templateId);
-      return json(200, { ok: true });
-    }
+    const response = await handleProposalTemplateRequest(event, { method, store, workspaceId, templateId });
+    if (response) return response;
   }
 
   if (path === "/workspaces/me/parts") {

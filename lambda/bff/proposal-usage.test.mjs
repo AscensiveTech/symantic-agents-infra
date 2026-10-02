@@ -292,3 +292,9 @@ test("validProposalPayment enforces the required fields", () => {
     { paidAt: "2026-09-01", planLabel: "Pro", amount: 119, receivedBy: "Sulav", method: "Stripe", note: "ok" },
   );
 });
+
+test("a payment note is up to 100 characters", () => {
+  const base = { paidAt: "2026-09-01", planLabel: "Pro", amount: 119, receivedBy: "Sulav", method: "Stripe" };
+  assert.equal(validProposalPayment({ ...base, note: "x".repeat(100) }).note.length, 100);
+  assert.equal(validProposalPayment({ ...base, note: "x".repeat(101) }), null);
+});
