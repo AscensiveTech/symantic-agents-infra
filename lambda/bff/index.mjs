@@ -5161,7 +5161,7 @@ function signerNamesMatchRecipients(proposal, recipients) {
 // on a visible page. A block points at a signer row (signerIndex); its number
 // is that row's place among the rows with a name - the order recipients are
 // sent in. Mirrors signerNumberFor in the frontend's lib/proposals/signers.ts.
-const SIGNATURE_PAGE_KINDS = new Set(["workWithUs", "agreement"]);
+const SIGNATURE_PAGE_KINDS = new Set(["workWithUs", "agreement", "staticPage"]);
 
 function placedSignatureSignerNumbers(proposal) {
   const rows = Array.isArray(proposal?.signerNames)
@@ -5169,7 +5169,7 @@ function placedSignatureSignerNumbers(proposal) {
     : proposalSignerNames(proposal);
   const numbers = new Set();
   for (const item of Array.isArray(proposal?.documentItems) ? proposal.documentItems : []) {
-    // Only Work With Us! and Agreement & Signature take placed signatures.
+    // Only Work With Us!, Agreement & Signature and Custom Pages take placed signatures.
     if (item?.hidden === true || !SIGNATURE_PAGE_KINDS.has(item?.kind) || !Array.isArray(item?.signatureFields)) continue;
     for (const field of item.signatureFields) {
       const index = Number(field?.signerIndex);

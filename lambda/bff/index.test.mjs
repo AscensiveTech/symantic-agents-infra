@@ -9843,3 +9843,17 @@ test("support mode: a super admin with X-Support-Workspace works inside that com
   unknown.headers = { ...(unknown.headers ?? {}), "x-support-workspace": "workspace-missing" };
   assert.equal((await handler(unknown)).statusCode, 404);
 });
+
+test("signature blocks on a Custom Page count like Work With Us! ones", async () => {
+  const { response, signWellRequest } = await sendWithPlacedSignatures({
+    id: "prp-sig-custom",
+    name: "Services proposal",
+    signerNames: ["Jane Client"],
+    documentItems: [{ id: "custom", kind: "staticPage", hidden: false, signatureFields: [
+      { id: "sig-1", signerIndex: 0, xFrac: 0.1, yFracFromTop: 0.7 },
+    ] }],
+  }, [{ name: "Jane Client", email: "jane@example.com" }]);
+  assert.equal(response.statusCode, 201);
+  assert.equal(signWellRequest.text_tags, true);
+  assert.equal(signWellRequest.with_signature_page, false);
+});
