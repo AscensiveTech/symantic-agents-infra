@@ -106,6 +106,7 @@ locals {
     "PATCH /workspaces/me/proposals/{proposalId}",
     "DELETE /workspaces/me/proposals/{proposalId}",
     "POST /workspaces/me/proposals/{proposalId}/duplicate",
+    "POST /workspaces/me/proposals/{proposalId}/presence",
     "POST /workspaces/me/proposals/{proposalId}/mark-generated",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests",
     "POST /workspaces/me/proposals/{proposalId}/signature-requests/resend",

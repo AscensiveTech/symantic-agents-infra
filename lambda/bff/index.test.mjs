@@ -9857,3 +9857,94 @@ test("signature blocks on a Custom Page count like Work With Us! ones", async ()
   assert.equal(signWellRequest.text_tags, true);
   assert.equal(signWellRequest.with_signature_page, false);
 });
+
+// --- Concurrent editing: who else has a proposal open ---------------------------
+function eventAs(sub, name, method, path, body) {
+  const event = authenticatedEvent(method, path, body);
+  event.requestContext.authorizer.jwt.claims = { sub, name };
+  return event;
+}
+
+function presenceStore(initial) {
+  let stored = structuredClone(initial);
+  return {
+    get stored() { return stored; },
+    async ensureWorkspace() {},
+    async getProposal() { return structuredClone(stored); },
+    async putProposal(_workspaceId, proposal) { stored = structuredClone(proposal); return stored; },
+    async touchProposalPresence(_workspaceId, _proposalId, userId, entry) {
+      const presence = { ...(stored.presence ?? {}) };
+      if (entry) presence[userId] = entry;
+      else delete presence[userId];
+      stored = { ...stored, presence };
+      return { rev: stored.rev, updatedAt: stored.updatedAt, presence: stored.presence };
+    },
+  };
+}
+
+test("presence: each open builder sees the OTHER people editing the proposal, and its current rev", async () => {
+  const store = presenceStore({ id: "prp-1", name: "Shared", rev: 7, updatedAt: "2026-10-04T10:00:00.000Z" });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const path = "/workspaces/me/proposals/prp-1/presence";
+
+  const alone = JSON.parse((await handler(eventAs("user-a", "Ana Admin", "POST", path, {}))).body);
+  assert.deepEqual(alone.editors, [], "nobody else yet - and never yourself");
+  assert.equal(alone.rev, 7);
+
+  const seenByB = JSON.parse((await handler(eventAs("user-b", "Ben Builder", "POST", path, {}))).body);
+  assert.deepEqual(seenByB.editors.map((editor) => editor.name), ["Ana Admin"]);
+  const seenByA = JSON.parse((await handler(eventAs("user-a", "Ana Admin", "POST", path, {}))).body);
+  assert.deepEqual(seenByA.editors.map((editor) => editor.name), ["Ben Builder"]);
+
+  // Ben closes the proposal.
+  await handler(eventAs("user-b", "Ben Builder", "POST", path, { leaving: true }));
+  assert.deepEqual(JSON.parse((await handler(eventAs("user-a", "Ana Admin", "POST", path, {}))).body).editors, []);
+});
+
+test("presence: a heartbeat older than a minute means they've left", async () => {
+  const { freshEditors } = await loadBff();
+  const now = Date.parse("2026-10-04T10:00:00.000Z");
+  const editors = freshEditors({
+    "user-a": { name: "Ana", at: "2026-10-04T09:59:40.000Z" },
+    "user-b": { name: "Ben", at: "2026-10-04T09:58:00.000Z" },
+    "user-c": { name: "Cy", at: "2026-10-04T09:59:50.000Z", support: true },
+  }, now, "user-a");
+  assert.deepEqual(editors.map(({ name, support }) => ({ name, support })), [{ name: "Cy", support: true }]);
+});
+
+test("presence: saving the proposal keeps who's editing (a browser's old copy can't wipe it)", async () => {
+  const store = presenceStore({ id: "prp-1", name: "Shared", rev: 2, presence: { "user-b": { name: "Ben", at: new Date().toISOString() } } });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const saved = await handler(authenticatedEvent("PATCH", "/workspaces/me/proposals/prp-1", { id: "prp-1", name: "Edited", rev: 2, presence: {} }));
+  assert.equal(saved.statusCode, 200);
+  assert.deepEqual(Object.keys(store.stored.presence), ["user-b"]);
+});
+
+test("templates: a save based on a stale copy is rejected instead of erasing the other admin's work", async () => {
+  let stored = { id: "tpl-1", name: "Original", items: [], rev: 3 };
+  const store = {
+    async ensureWorkspace() {},
+    async getProposalTemplate() { return structuredClone(stored); },
+    async putProposalTemplate(_workspaceId, template, { expectedRev = null } = {}) {
+      if (Number.isFinite(expectedRev) && Number.isFinite(stored.rev) && stored.rev !== expectedRev) {
+        const error = new Error("The conditional request failed");
+        error.name = "ConditionalCheckFailedException";
+        throw error;
+      }
+      stored = structuredClone(template);
+      return stored;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const path = "/workspaces/me/proposal-templates/tpl-1";
+  const first = await handler(authenticatedEvent("PATCH", path, { id: "tpl-1", name: "By A", items: [], rev: 3 }));
+  assert.equal(first.statusCode, 200);
+  assert.equal(JSON.parse(first.body).rev, 4);
+  const second = await handler(authenticatedEvent("PATCH", path, { id: "tpl-1", name: "By B", items: [], rev: 3 }));
+  assert.equal(second.statusCode, 409);
+  assert.equal(JSON.parse(second.body).error, "template_conflict");
+  assert.equal(stored.name, "By A");
+});
