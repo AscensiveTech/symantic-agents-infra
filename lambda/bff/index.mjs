@@ -5210,11 +5210,27 @@ function proposalHasInitialFields(proposal) {
 const PRESENCE_FRESH_MS = 60_000;
 
 /** The people with a fresh heartbeat on a proposal, other than `selfId`. */
+/** A heartbeat's location - { itemId, elementId? } of short id strings - or null. */
+export function presenceLocation(value) {
+  if (!value || typeof value !== "object") return null;
+  const id = (raw) => (typeof raw === "string" && /^[\w:.-]{1,120}$/.test(raw) ? raw : null);
+  const itemId = id(value.itemId);
+  if (!itemId) return null;
+  const elementId = id(value.elementId);
+  return elementId ? { itemId, elementId } : { itemId };
+}
+
 export function freshEditors(presence, now = Date.now(), selfId = null) {
   if (!presence || typeof presence !== "object") return [];
   return Object.entries(presence)
     .filter(([userId, entry]) => userId !== selfId && entry && Date.parse(entry.at ?? "") > now - PRESENCE_FRESH_MS)
-    .map(([userId, entry]) => ({ userId, name: entry.name || "A teammate", support: entry.support === true, at: entry.at }))
+    .map(([userId, entry]) => ({
+      userId,
+      name: entry.name || "A teammate",
+      support: entry.support === true,
+      at: entry.at,
+      ...(entry.location ? { location: entry.location } : {}),
+    }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
@@ -5263,12 +5279,17 @@ async function handleProposalApi(event, {
     const proposalId = decodeEntityId(event?.pathParameters?.proposalId ?? presenceMatch[1]);
     if (!proposalId) return json(400, { message: "Invalid proposal ID" });
     if (typeof store.touchProposalPresence !== "function") return json(200, { rev: null, updatedAt: null, editors: [] });
-    const leaving = readBody(event)?.leaving === true;
+    const body = readBody(event) ?? {};
+    const leaving = body.leaving === true;
     const now = Date.now();
+    const location = presenceLocation(body.location);
     const entry = leaving ? null : {
       name: actorDisplayName(event, actor),
       at: new Date(now).toISOString(),
       ...(actor.supporting ? { support: true } : {}),
+      // Where they are: the page (document item) and the box on it, so the
+      // others see a marker on that page's tab and an outline on that box.
+      ...(location ? { location } : {}),
     };
     const state = await store.touchProposalPresence(workspaceId, proposalId, actor.userId, entry);
     if (!state) return json(404, { message: "Proposal not found" });

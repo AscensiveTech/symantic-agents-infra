@@ -9980,3 +9980,17 @@ test("presence: a super admin in Virtual Support shows up in the company's propo
   const seenByCompanyUser = freshEditors(presence, Date.now(), "company-user");
   assert.deepEqual(seenByCompanyUser.map(({ name, support }) => ({ name, support })), [{ name: "Sulav Rupakheti", support: true }]);
 });
+
+test("presence: a heartbeat says where that person is - page and box - and the others see it", async () => {
+  const store = presenceStore({ id: "prp-1", name: "Shared", rev: 1 });
+  const { createHandler, presenceLocation } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const path = "/workspaces/me/proposals/prp-1/presence";
+  await handler(eventAs("user-b", "Ben Builder", "POST", path, { location: { itemId: "itm-scope", elementId: "txt-1" } }));
+  const seen = JSON.parse((await handler(eventAs("user-a", "Ana Admin", "POST", path, { location: { itemId: "itm-cover" } }))).body);
+  assert.deepEqual(seen.editors[0].location, { itemId: "itm-scope", elementId: "txt-1" });
+  // Junk never gets stored.
+  assert.equal(presenceLocation({ itemId: "<script>" }), null);
+  assert.deepEqual(presenceLocation({ itemId: "itm-1", elementId: 42 }), { itemId: "itm-1" });
+  assert.equal(presenceLocation("nope"), null);
+});
