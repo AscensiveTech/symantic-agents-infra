@@ -2545,10 +2545,26 @@ async function handleProposalTemplateRequest(event, { method, store, workspaceId
   if (method === "PATCH") {
     const template = pickEntity(readBody(event), "id", templateId);
     if (!template) return json(400, { message: "Invalid proposal template" });
+    // Same optimistic concurrency as proposals: a save only lands on the rev
+    // it was loaded from, so two admins editing one template can't silently
+    // overwrite each other. (A client that sends no rev keeps the old
+    // unconditional behaviour.)
+    const current = typeof store.getProposalTemplate === "function" ? await store.getProposalTemplate(workspaceId, templateId) : null;
+    const expectedRev = Number.isFinite(template.rev) ? template.rev : null;
+    const updated = { ...template, rev: (Number.isFinite(current?.rev) ? current.rev : 0) + 1 };
     try {
-      return json(200, await store.putProposalTemplate(workspaceId, template));
+      return json(200, await store.putProposalTemplate(workspaceId, updated, { expectedRev }));
     } catch (error) {
-      if (isConditionalCheckFailed(error)) return json(404, { message: "Proposal template not found" });
+      if (isConditionalCheckFailed(error)) {
+        if (current && expectedRev !== null) {
+          return json(409, {
+            error: "template_conflict",
+            message: "Someone else saved this template while you were editing. Reload to get their changes before saving again.",
+            template: current,
+          });
+        }
+        return json(404, { message: "Proposal template not found" });
+      }
       throw error;
     }
   }
@@ -5189,6 +5205,35 @@ function proposalHasInitialFields(proposal) {
   );
 }
 
+// A heartbeat older than this means that person has left (closed the tab,
+// lost connection) - the builder posts one every ~20s.
+const PRESENCE_FRESH_MS = 60_000;
+
+/** The people with a fresh heartbeat on a proposal, other than `selfId`. */
+/** A heartbeat's location - { itemId, elementId? } of short id strings - or null. */
+export function presenceLocation(value) {
+  if (!value || typeof value !== "object") return null;
+  const id = (raw) => (typeof raw === "string" && /^[\w:.-]{1,120}$/.test(raw) ? raw : null);
+  const itemId = id(value.itemId);
+  if (!itemId) return null;
+  const elementId = id(value.elementId);
+  return elementId ? { itemId, elementId } : { itemId };
+}
+
+export function freshEditors(presence, now = Date.now(), selfId = null) {
+  if (!presence || typeof presence !== "object") return [];
+  return Object.entries(presence)
+    .filter(([userId, entry]) => userId !== selfId && entry && Date.parse(entry.at ?? "") > now - PRESENCE_FRESH_MS)
+    .map(([userId, entry]) => ({
+      userId,
+      name: entry.name || "A teammate",
+      support: entry.support === true,
+      at: entry.at,
+      ...(entry.location ? { location: entry.location } : {}),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 async function handleProposalApi(event, {
   method,
   path,
@@ -5222,6 +5267,37 @@ async function handleProposalApi(event, {
         throw error;
       }
     }
+  }
+
+  // "Who else has this proposal open": each open builder posts a heartbeat
+  // every ~20s (and once with leaving: true when closed). The reply lists the
+  // OTHER people seen in the last PRESENCE_FRESH_MS - with whether they're a
+  // super admin in Virtual Support - plus the proposal's current rev, so the
+  // builder can pick up someone else's save before it collides with it.
+  const presenceMatch = path.match(/^\/workspaces\/me\/proposals\/([^/]+)\/presence$/);
+  if (presenceMatch && method === "POST") {
+    const proposalId = decodeEntityId(event?.pathParameters?.proposalId ?? presenceMatch[1]);
+    if (!proposalId) return json(400, { message: "Invalid proposal ID" });
+    if (typeof store.touchProposalPresence !== "function") return json(200, { rev: null, updatedAt: null, editors: [] });
+    const body = readBody(event) ?? {};
+    const leaving = body.leaving === true;
+    const now = Date.now();
+    const location = presenceLocation(body.location);
+    const entry = leaving ? null : {
+      name: actorDisplayName(event, actor),
+      at: new Date(now).toISOString(),
+      ...(actor.supporting ? { support: true } : {}),
+      // Where they are: the page (document item) and the box on it, so the
+      // others see a marker on that page's tab and an outline on that box.
+      ...(location ? { location } : {}),
+    };
+    const state = await store.touchProposalPresence(workspaceId, proposalId, actor.userId, entry);
+    if (!state) return json(404, { message: "Proposal not found" });
+    return json(200, {
+      rev: Number.isFinite(state.rev) ? state.rev : 0,
+      updatedAt: state.updatedAt ?? null,
+      editors: freshEditors(state.presence, now, actor.userId),
+    });
   }
 
   const duplicateMatch = path.match(/^\/workspaces\/me\/proposals\/([^/]+)\/duplicate$/);
@@ -5734,6 +5810,10 @@ async function handleProposalApi(event, {
         // able to drop or rewrite it.
         if (Array.isArray(current.signatureHistory)) updated.signatureHistory = current.signatureHistory;
         else delete updated.signatureHistory;
+        // Who's editing is server-managed too (the presence heartbeat) - a
+        // save carries the stored map over instead of the browser's old copy.
+        if (current.presence) updated.presence = current.presence;
+        else delete updated.presence;
 
         // Optimistic concurrency. The client echoes back the `rev` it loaded;
         // the write only lands if the stored record is still on that rev.
@@ -8285,7 +8365,7 @@ export function createDynamoStore(client, commands, tableNames) {
       const records = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
         expression:
           "workspaceId, proposalId, #name, #status, clientName, clientNameSecondary, " +
-          "presentedBy, assignedTo, dueDate, createdAt, updatedAt, revisedAt, canceledAt, signatureRequest, usageCountedAt",
+          "presentedBy, assignedTo, dueDate, createdAt, updatedAt, revisedAt, canceledAt, signatureRequest, usageCountedAt, presence",
         names: { "#name": "name", "#status": "status" },
       });
       return records.sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""));
@@ -8351,6 +8431,65 @@ export function createDynamoStore(client, commands, tableNames) {
           : "attribute_exists(proposalId)",
         guarded ? { ":expectedRev": expectedRev } : null,
       );
+    },
+
+    // Records (entry) or clears (null) one person's heartbeat on a proposal, in
+    // a small map on the proposal itself: presence.<userId> = { name, at,
+    // support? }. No rev bump - it isn't an edit. Returns { rev, updatedAt,
+    // presence } read back strongly consistent, or null if the proposal is gone.
+    async touchProposalPresence(workspaceId, proposalId, userId, entry) {
+      const Key = marshall({ workspaceId, proposalId });
+      const setEntry = () => client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.proposals,
+        Key,
+        UpdateExpression: "SET #presence.#user = :entry",
+        ConditionExpression: "attribute_exists(proposalId)",
+        ExpressionAttributeNames: { "#presence": "presence", "#user": userId },
+        ExpressionAttributeValues: marshall({ ":entry": entry }, { removeUndefinedValues: true }),
+      }));
+      try {
+        if (entry) {
+          try {
+            await setEntry();
+          } catch (error) {
+            // The first heartbeat on a proposal: there's no presence map yet
+            // to set a key in, so create the map (unless someone just did).
+            if (error?.name !== "ValidationException") throw error;
+            try {
+              await client.send(new commands.UpdateItemCommand({
+                TableName: tableNames.proposals,
+                Key,
+                UpdateExpression: "SET #presence = :map",
+                ConditionExpression: "attribute_exists(proposalId) AND attribute_not_exists(#presence)",
+                ExpressionAttributeNames: { "#presence": "presence" },
+                ExpressionAttributeValues: marshall({ ":map": { [userId]: entry } }, { removeUndefinedValues: true }),
+              }));
+            } catch (inner) {
+              if (!isConditionalCheckFailed(inner)) throw inner;
+              await setEntry();
+            }
+          }
+        } else {
+          await client.send(new commands.UpdateItemCommand({
+            TableName: tableNames.proposals,
+            Key,
+            UpdateExpression: "REMOVE #presence.#user",
+            ConditionExpression: "attribute_exists(proposalId) AND attribute_exists(#presence)",
+            ExpressionAttributeNames: { "#presence": "presence", "#user": userId },
+          }));
+        }
+      } catch (error) {
+        if (!isConditionalCheckFailed(error)) throw error;
+        // Gone, or nothing to remove - fall through to the read below.
+      }
+      const result = await client.send(new commands.GetItemCommand({
+        TableName: tableNames.proposals,
+        Key,
+        ConsistentRead: true,
+        ProjectionExpression: "rev, updatedAt, #presence",
+        ExpressionAttributeNames: { "#presence": "presence" },
+      }));
+      return result.Item ? unmarshall(result.Item) : null;
     },
 
     // A short-lived mutex on "this proposal is being sent for signature right
@@ -8475,13 +8614,17 @@ export function createDynamoStore(client, commands, tableNames) {
       );
     },
 
-    putProposalTemplate(workspaceId, template) {
+    putProposalTemplate(workspaceId, template, { expectedRev = null } = {}) {
+      const guarded = Number.isFinite(expectedRev);
       return putRecord(
         tableNames.proposalTemplates,
         "templateId",
         workspaceId,
         template,
-        "attribute_exists(templateId)",
+        guarded
+          ? "attribute_exists(templateId) AND (attribute_not_exists(rev) OR rev = :expectedRev)"
+          : "attribute_exists(templateId)",
+        guarded ? { ":expectedRev": expectedRev } : null,
       );
     },
 
