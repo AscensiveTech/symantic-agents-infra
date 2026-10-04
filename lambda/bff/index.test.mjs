@@ -9948,3 +9948,35 @@ test("templates: a save based on a stale copy is rejected instead of erasing the
   assert.equal(JSON.parse(second.body).error, "template_conflict");
   assert.equal(stored.name, "By A");
 });
+
+test("presence: a super admin in Virtual Support shows up in the company's proposal, marked as support - and sees the company user", async () => {
+  const touched = [];
+  const presence = { "company-user": { name: "Ben Builder", at: new Date().toISOString() } };
+  const store = {
+    async getMembership(userId) { return { userId, workspaceId: "user-123", role: "company-admin", status: "active", name: "Sulav Rupakheti" }; },
+    async getWorkspace(workspaceId) { return workspaceId === "workspace-technovate" || workspaceId === "user-123" ? { workspaceId, name: "Technovate LLC" } : null; },
+    async ensureWorkspace() {},
+    async recordActivity() {},
+    async touchProposalPresence(workspaceId, proposalId, userId, entry) {
+      touched.push({ workspaceId, proposalId, userId, entry });
+      if (entry) presence[userId] = entry;
+      return { rev: 3, updatedAt: null, presence };
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const event = superAdminEvent("POST", "/workspaces/me/proposals/prp-shared/presence", {});
+  event.headers = { ...(event.headers ?? {}), "X-Support-Workspace": "workspace-technovate" };
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  // Recorded on the company's proposal, flagged as Virtual Support.
+  assert.equal(touched[0].workspaceId, "workspace-technovate");
+  assert.equal(touched[0].entry.support, true);
+  assert.equal(touched[0].entry.name, "Sulav Rupakheti");
+  // The super admin sees the company user editing.
+  assert.deepEqual(JSON.parse(response.body).editors.map((editor) => editor.name), ["Ben Builder"]);
+  // And the company user sees the super admin, marked as Virtual Support.
+  const { freshEditors } = await loadBff();
+  const seenByCompanyUser = freshEditors(presence, Date.now(), "company-user");
+  assert.deepEqual(seenByCompanyUser.map(({ name, support }) => ({ name, support })), [{ name: "Sulav Rupakheti", support: true }]);
+});
