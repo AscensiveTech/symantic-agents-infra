@@ -4825,6 +4825,7 @@ async function handleSignWellWebhook(event, { getStore, getSignWell, getAssetSig
   const eventAt = Number.isFinite(eventTimeNumber)
     ? new Date(eventTimeNumber * 1000).toISOString()
     : new Date().toISOString();
+  const FINAL_RECIPIENT_STATUSES = new Set(["signed", "declined"]);
   const recipientEventStatus = eventType === "document_signed"
     ? "signed"
     : eventType === "document_viewed"
@@ -4843,7 +4844,10 @@ async function handleSignWellWebhook(event, { getStore, getSignWell, getAssetSig
         ...recipient,
         ...(typeof documentRecipient?.name === "string" ? { name: documentRecipient.name } : {}),
         ...(typeof documentRecipient?.email === "string" ? { email: documentRecipient.email.toLowerCase() } : {}),
-        ...(related && recipientEventStatus ? { status: recipientEventStatus } : {}),
+        // A signer's status only moves forward: SignWell also sends a "viewed"
+        // event when a signer lands on its thank-you page after signing, which
+        // must not turn "signed" back into "viewed".
+        ...(related && recipientEventStatus && !(recipientEventStatus === "viewed" && FINAL_RECIPIENT_STATUSES.has(recipient.status)) ? { status: recipientEventStatus } : {}),
         ...(related && eventType === "document_signed" ? { signedAt: eventAt } : {}),
         ...(related && eventType === "document_viewed" ? { viewedAt: eventAt } : {}),
         ...(related && eventType === "document_declined" ? { declinedAt: eventAt } : {}),
