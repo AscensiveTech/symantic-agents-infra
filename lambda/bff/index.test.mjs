@@ -1795,6 +1795,22 @@ test("retell-status: an agent published before fingerprints existed is compared 
   assert.deepEqual(body.changedFields, ["llm.general_prompt", "llm.begin_message"]);
 });
 
+test("retell-status without fingerprints: a prompt from an older Symantic generator and the old default greeting are not flagged as edited", async () => {
+  const olderGenerated = "# ROLE\nYou are Maya, the AI receptionist for Arc Dental. Old wording.\n\n# CRITICAL RULES\n1) Old rule.\n\n# CLOSING\nOld closing.";
+  const { body } = await retellStatus({
+    agentOverrides: { configuration: { ...receptionistAgent().configuration, greeting: "" } },
+    live: {
+      version: 1,
+      agent: {},
+      llm: {
+        general_prompt: olderGenerated,
+        begin_message: "Thanks for calling Arc Dental. This is Maya, the virtual receptionist. How can I help you today?",
+      },
+    },
+  });
+  assert.deepEqual(body, { editedInRetell: false, changedFields: [] });
+});
+
 test("retell-status: never flags drafts or agents that aren't live, and a Retell outage just hides the label", async () => {
   assert.deepEqual((await retellStatus({ agentOverrides: { status: "draft" } })).body, { editedInRetell: false, changedFields: [] });
   assert.deepEqual((await retellStatus({ agentOverrides: { retellAgentId: undefined } })).body, { editedInRetell: false, changedFields: [] });
@@ -10207,4 +10223,26 @@ test("GET generated-config still renders when provider settings can't resolve th
   const response = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
   assert.equal(response.statusCode, 200);
   assert.ok(JSON.parse(response.body).diagnostics.some((item) => item.code === "voice_unresolved"));
+});
+
+test("syncPhoneNumber (activation path) sends the normalised country list, not the raw stored one", async () => {
+  const { syncPhoneNumber } = await loadBff();
+  const updates = [];
+  let stored;
+  const agent = { ...receptionistAgent(), retellAgentId: "retell-agent-123", configuration: { ...receptionistAgent().configuration, allowedInboundCountries: ["us", " ca ", "US", "bad"] } };
+  await syncPhoneNumber({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    agent,
+    profile: receptionistProfile(),
+    store: {
+      async getPhoneNumberForAgent() { return { workspaceId: "workspace-123", agentId: "agent-123", telnyxPhoneNumber: "+17035550177", retellPhoneNumberId: "+17035550177", allowedInboundCountries: [] }; },
+      async putPhoneNumber(record) { stored = record; return record; },
+    },
+    providers: { retell: { async setPhoneNumberCountries(number, body) { updates.push([number, body]); } } },
+    toolBaseUrl: "https://api.example.com",
+    phoneStatus: "active",
+  });
+  assert.deepEqual(updates, [["+17035550177", { allowed_inbound_country_list: ["US", "CA"] }]]);
+  assert.deepEqual(stored.allowedInboundCountries, ["US", "CA"]);
 });

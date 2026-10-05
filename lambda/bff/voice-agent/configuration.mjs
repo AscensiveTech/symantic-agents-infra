@@ -236,6 +236,24 @@ export function sampleGreeting(language, businessName, agentName, withDisclosure
     + `we have tasked our virtual receptionist, ${agent}, to assist you while we are unable to do so. How can we help you today?`;
 }
 
+// The default greeting the backend sent before 2026-10-05 (blank greeting).
+// Only used to recognise an untouched live agent in retellEditStatus.
+export function legacyDefaultGreeting(agent, workspaceProfile) {
+  const profile = effectiveProfile(agent, workspaceProfile);
+  const disclosure = agent?.configuration?.recordingDisclosure ? " This call may be recorded for quality assurance." : "";
+  return `Thanks for calling ${text(profile?.businessName) || "the business"}.${disclosure} This is ${spokenAgentName(agent)}, `
+    + "the virtual receptionist. How can I help you today?";
+}
+
+// True for a prompt with the structure every Symantic generator version has
+// produced, as opposed to one written by hand in the Retell dashboard.
+export function looksAppGeneratedPrompt(prompt) {
+  return typeof prompt === "string"
+    && /^# ROLE\nYou are .+, the AI receptionist for /.test(prompt)
+    && prompt.includes("\n# CRITICAL RULES\n")
+    && prompt.includes("\n# CLOSING\n");
+}
+
 function greetingFor(agent, profile) {
   const configured = text(agent?.configuration?.greeting);
   const language = resolveLanguage(agent);

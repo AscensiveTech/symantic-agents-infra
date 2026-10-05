@@ -14,6 +14,8 @@ export {
   AGENT_PROFILE_FIELDS,
   CALL_HANDLING,
   effectiveProfile,
+  legacyDefaultGreeting,
+  looksAppGeneratedPrompt,
   resolveAllowedInboundCountries,
   resolveAmbientSound,
   resolveAmbientSoundVolume,

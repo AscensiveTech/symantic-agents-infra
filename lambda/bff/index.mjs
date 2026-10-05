@@ -10,7 +10,7 @@ import {
   resolveRetellVoiceId,
   retellFingerprints,
 } from "./providers.mjs";
-import { buildReceptionistConfig, buildReceptionistPrompt, effectiveProfile, resolveAllowedInboundCountries, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
+import { buildReceptionistConfig, buildReceptionistPrompt, effectiveProfile, legacyDefaultGreeting, looksAppGeneratedPrompt, resolveAllowedInboundCountries, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
 import { inspectVoiceAgent } from "./voice-agent/inspect.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
@@ -6468,10 +6468,17 @@ export async function retellEditStatus({ workspaceId, agent, store, getProviders
     if (agent.retellFingerprints && typeof agent.retellFingerprints === "object") {
       changedFields = changedRetellFields(agent.retellFingerprints, retellFingerprints(live.agent, live.llm));
     } else {
+      // No baseline. An exact comparison with what the app would send now
+      // flags every such agent whenever the prompt generator changes, so a
+      // live prompt with the app-generated structure, and a greeting that
+      // matches the current or previous default, count as untouched. The
+      // next Save Changes stores real fingerprints.
       const profile = await store.getProfile(workspaceId);
+      const livePrompt = live.llm?.general_prompt;
+      const liveGreeting = live.llm?.begin_message;
       changedFields = [
-        ...(live.llm?.general_prompt !== buildReceptionistPrompt(agent, profile) ? ["llm.general_prompt"] : []),
-        ...(live.llm?.begin_message !== resolveGreeting(agent, profile) ? ["llm.begin_message"] : []),
+        ...(livePrompt !== buildReceptionistPrompt(agent, profile) && !looksAppGeneratedPrompt(livePrompt) ? ["llm.general_prompt"] : []),
+        ...(![resolveGreeting(agent, profile), legacyDefaultGreeting(agent, profile)].includes(liveGreeting) ? ["llm.begin_message"] : []),
       ];
     }
     return { editedInRetell: changedFields.length > 0, changedFields };
@@ -6534,7 +6541,7 @@ export async function syncPhoneNumber({
     });
     phoneNumber = { ...phoneNumber, ...imported };
   }
-  const desiredCountries = config?.allowedInboundCountries ?? agent?.configuration?.allowedInboundCountries ?? [];
+  const desiredCountries = config?.allowedInboundCountries ?? resolveAllowedInboundCountries(agent);
   const appliedCountries = Array.isArray(phoneNumber.allowedInboundCountries)
     ? phoneNumber.allowedInboundCountries
     : [];

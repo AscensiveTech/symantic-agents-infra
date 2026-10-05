@@ -618,3 +618,10 @@ test("sampleGreeting matches the wizard's buildSampleGreeting (hashes shared wit
     "es-419 true": "22cfeb764112ba06b31e4a6ebdf6cc8c",
   });
 });
+
+test("inspector says when the next publish will migrate legacy per-agent knowledge", () => {
+  const legacy = inspectVoiceAgent({ ...BUILD, agent: minimalAgent({ knowledgeBaseText: "Old notes" }), profile: workspaceProfile, source: "saved" });
+  assert.ok(legacy.diagnostics.some((item) => item.code === "legacy_knowledge_pending"));
+  const migrated = inspectVoiceAgent({ ...BUILD, agent: minimalAgent({ knowledgeBaseText: "Old notes", legacyKnowledgeMigrated: true }), profile: workspaceProfile, source: "saved" });
+  assert.ok(!migrated.diagnostics.some((item) => item.code === "legacy_knowledge_pending"));
+});

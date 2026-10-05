@@ -73,6 +73,10 @@ export function inspectVoiceAgent({
     diagnostics: [
       ...compiled.diagnostics,
       ...(voiceId ? [] : [{ level: "warning", code: "voice_unresolved", message: "Voice id could not be resolved here; the publish path resolves it from provider settings." }]),
+      ...(agent?.configuration?.legacyKnowledgeMigrated !== true
+        && (String(agent?.configuration?.knowledgeBaseText ?? "").trim() || (agent?.configuration?.knowledgeBaseFiles ?? []).length)
+        ? [{ level: "info", code: "legacy_knowledge_pending", message: "This agent still has pre-hub knowledge text/files; the next publish moves them into a new knowledge base and attaches it (not shown above yet)." }]
+        : []),
     ],
   };
 }

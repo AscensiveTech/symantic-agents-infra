@@ -45,6 +45,8 @@ One pipeline replaces the single 1,000-line prompt function:
 | 12 | (Found in the final audit.) The wizard seeds an English sample greeting into every new agent, so Spanish agents still greeted in English. A blank greeting also sent different text from the default the wizard shows. | A blank greeting sends the wizard's own sample. A Spanish agent's untouched English sample becomes the Spanish sample, and the wizard swaps it when the language changes. A test in each repo fails if the two copies drift. |
 | 13 | (Found in the final audit.) With a matching emergency transfer rule, the 911 rule said "hang up and call 911" and then transferred. | With a matching rule the agent says "if anyone is in danger, hang up and call 911 - otherwise I'll connect you now", then transfers. |
 | 14 | (Found in the final audit.) Small inconsistencies: transfer tool descriptions said "mentions" while the prompt matches by meaning; TAKING A MESSAGE didn't defer to transfer rules; CLOSING didn't list NO PROGRESS as an early end. | All three aligned. |
+| 15 | (Found in the second audit.) Live agents with no stored publish fingerprint would all show "Manually Edited by Admin in Retell" right after deploy, because the fallback compared their live prompt with the new generator's output. | Without a fingerprint, only a prompt that lacks the app-generated structure, or a greeting matching neither the current nor the previous default, is flagged. The next Save Changes stores fingerprints. |
+| 16 | (Found in the second audit.) Activation sent the stored country list without normalising it. | Normalised the same way as everywhere else. The inspector also notes when the next publish will migrate legacy per-agent knowledge. |
 
 ### New: Generated Configuration (admins only)
 
@@ -80,12 +82,13 @@ left out of the prompt with the reason). It never includes credentials or storag
 
 | Suite | Result |
 |---|---|
-| Infra BFF (`node --test`, includes 8 golden prompt + payload scenarios) | 498 pass |
+| Infra BFF (`node --test`, includes 8 golden prompt + payload scenarios) | 508 pass |
 | Infra tools | 64 pass |
 | Infra oauth, postcall, digest, kb-refresh, most-asked-refresh, crm | 262 pass |
 | Infra contract | 2 pass |
 | Terraform fmt + validate | clean |
-| Frontend lint, typecheck, unit tests, build | clean, 973 pass |
+| Frontend lint, typecheck, unit tests, build | clean, 975 pass |
+| Frontend Playwright end-to-end | 98 pass; 8 fail identically on `main` (analytics/proposal accessibility, PDF preview, Connections step) - unrelated |
 
 Golden files: `lambda/bff/voice-agent/golden/`. After an intended prompt change,
 regenerate with `cd lambda/bff && UPDATE_GOLDEN=1 node --test voice-agent/voice-agent.test.mjs`
@@ -122,4 +125,4 @@ Configuration** on Summary & Launch. Checks must show no errors.
 | 19 | Caller speaks first | Who Speaks First = caller | "Hi, are you open?" | Introduces itself, then answers | `start_speaker: user` |
 | 20 | Closing | - | "Well..." then "No thanks" | Waits; closing line + `end_call` once | - |
 | 21 | Countries | Add CA on a live agent, Save | - | - | Number's `allowed_inbound_country_list` includes CA |
-| 22 | Existing agents | A live agent not yet re-saved | Normal call | Behaves as before | Old prompt still has a real time |
+| 22 | Existing agents | A live agent not yet re-saved | Normal call | Behaves as before; Agents list shows no "Manually Edited by Admin in Retell" badge unless someone really edited it in Retell | Old prompt still has a real time |
