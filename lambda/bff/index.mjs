@@ -10,7 +10,8 @@ import {
   resolveRetellVoiceId,
   retellFingerprints,
 } from "./providers.mjs";
-import { buildReceptionistConfig, buildReceptionistPrompt, effectiveProfile, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
+import { buildReceptionistConfig, buildReceptionistPrompt, effectiveProfile, legacyDefaultGreeting, looksAppGeneratedPrompt, resolveAllowedInboundCountries, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
+import { inspectVoiceAgent } from "./voice-agent/inspect.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
@@ -2350,6 +2351,11 @@ export function createHandler({
                 toolBaseUrl,
               });
               retellSync = synced.retellSync;
+              try {
+                await syncPhoneNumberCountries({ store, providers, workspaceId, agentId, agent: updatedAgent });
+              } catch (countriesError) {
+                console.error("Failed to update the number's allowed inbound countries after edit", { agentId, countriesError });
+              }
             } catch (syncError) {
               // The edit is saved either way, so the save still succeeds -
               // but the app is told the change isn't live, instead of this
@@ -2382,6 +2388,48 @@ export function createHandler({
         const agent = await store.getAgent(workspaceId, decodeURIComponent(retellStatusMatch[1]));
         if (!agent || agent.status === "deleted") return json(404, { message: "Agent not found" });
         return json(200, await retellEditStatus({ workspaceId, agent, store, getProviders }));
+      }
+
+      // Read-only, admins only: everything Symantic generates for this agent -
+      // canonical configuration, prompt, tools, and the exact Retell request
+      // bodies the next Save Changes would send. ?source=pending previews an
+      // active agent's unpublished draft instead of what's live.
+      const generatedConfigMatch = path.match(/^\/workspaces\/me\/agents\/([^/]+)\/generated-config$/);
+      if (generatedConfigMatch && method === "GET") {
+        if (!isWorkspaceAdmin(actor)) {
+          return json(403, { message: "Only a workspace admin can view the generated configuration" });
+        }
+        const store = await getStore();
+        await store.ensureWorkspace(workspaceId);
+        let targetAgentId;
+        try {
+          targetAgentId = decodeURIComponent(generatedConfigMatch[1]);
+        } catch {
+          return json(404, { message: "Agent not found" });
+        }
+        const stored = await store.getAgent(workspaceId, targetAgentId);
+        if (!stored || stored.status === "deleted") return json(404, { message: "Agent not found" });
+        const usePending = event?.queryStringParameters?.source === "pending" && stored.pendingConfiguration;
+        const agent = usePending ? { ...stored, configuration: stored.pendingConfiguration } : stored;
+        const profile = await store.getProfile(workspaceId);
+        let voiceId = null;
+        try {
+          voiceId = resolveConfiguredVoiceId(agent.configuration, (await getProviders()).resolveVoiceId);
+        } catch (error) {
+          console.warn("Generated config: voice id unresolved", { agentId: targetAgentId, message: error?.message });
+        }
+        const ids = Array.isArray(agent.configuration?.knowledgeBaseIds)
+          ? agent.configuration.knowledgeBaseIds.filter((id) => typeof id === "string" && id)
+          : [];
+        return json(200, inspectVoiceAgent({
+          workspaceId,
+          agent,
+          profile,
+          toolBaseUrl,
+          voiceId,
+          knowledgeBases: await loadAssignedKnowledgeBases(store, workspaceId, ids),
+          source: usePending ? "pending" : "saved",
+        }));
       }
 
       const discardDraftMatch = path.match(/^\/workspaces\/me\/agents\/([^/]+)\/discard-draft$/);
@@ -6339,20 +6387,23 @@ export async function syncRetellAgent({
     agent?.configuration,
     providers.resolveVoiceId,
   );
-  const config = buildReceptionistConfig({
-    workspaceId,
-    agent,
-    profile,
-    toolBaseUrl,
-    voiceId,
-  });
-  config.knowledgeBaseIds = await resolveAgentKnowledgeBaseIds({
+  // Resolved first, so the configuration is built from the same knowledge
+  // bases that get attached.
+  const knowledgeBases = await resolveAgentKnowledgeBaseIds({
     store,
     workspaceId,
     agentId,
     agent,
     providers,
     getKnowledgeSigner,
+  });
+  const config = buildReceptionistConfig({
+    workspaceId,
+    agent,
+    profile,
+    toolBaseUrl,
+    voiceId,
+    knowledgeBases,
   });
   // One-way: whatever the app sends replaces what's in Retell.
   const synced = await providers.retell.upsertAgent({
@@ -6417,10 +6468,17 @@ export async function retellEditStatus({ workspaceId, agent, store, getProviders
     if (agent.retellFingerprints && typeof agent.retellFingerprints === "object") {
       changedFields = changedRetellFields(agent.retellFingerprints, retellFingerprints(live.agent, live.llm));
     } else {
+      // No baseline. An exact comparison with what the app would send now
+      // flags every such agent whenever the prompt generator changes, so a
+      // live prompt with the app-generated structure, and a greeting that
+      // matches the current or previous default, count as untouched. The
+      // next Save Changes stores real fingerprints.
       const profile = await store.getProfile(workspaceId);
+      const livePrompt = live.llm?.general_prompt;
+      const liveGreeting = live.llm?.begin_message;
       changedFields = [
-        ...(live.llm?.general_prompt !== buildReceptionistPrompt(agent, profile) ? ["llm.general_prompt"] : []),
-        ...(live.llm?.begin_message !== resolveGreeting(agent, profile) ? ["llm.begin_message"] : []),
+        ...(livePrompt !== buildReceptionistPrompt(agent, profile) && !looksAppGeneratedPrompt(livePrompt) ? ["llm.general_prompt"] : []),
+        ...(![resolveGreeting(agent, profile), legacyDefaultGreeting(agent, profile)].includes(liveGreeting) ? ["llm.begin_message"] : []),
       ];
     }
     return { editedInRetell: changedFields.length > 0, changedFields };
@@ -6483,7 +6541,7 @@ export async function syncPhoneNumber({
     });
     phoneNumber = { ...phoneNumber, ...imported };
   }
-  const desiredCountries = config?.allowedInboundCountries ?? agent?.configuration?.allowedInboundCountries ?? [];
+  const desiredCountries = config?.allowedInboundCountries ?? resolveAllowedInboundCountries(agent);
   const appliedCountries = Array.isArray(phoneNumber.allowedInboundCountries)
     ? phoneNumber.allowedInboundCountries
     : [];
@@ -6508,6 +6566,20 @@ export async function syncPhoneNumber({
   };
   await store.putPhoneNumber(phoneNumber);
   return { phoneNumber, retellAgentId };
+}
+
+// Allowed Inbound Countries lives on the Retell phone number, not the agent,
+// so Save Changes on a live agent pushes it there too - syncRetellAgent alone
+// never did, and a changed list only reached Retell on the next activation
+// or test call. Only touches a number that's already attached; never orders one.
+export async function syncPhoneNumberCountries({ store, providers, workspaceId, agentId, agent }) {
+  const phoneNumber = await store.getPhoneNumberForAgent?.(workspaceId, agentId);
+  if (!phoneNumber?.retellPhoneNumberId || typeof providers.retell?.setPhoneNumberCountries !== "function") return;
+  const desired = resolveAllowedInboundCountries(agent);
+  const applied = Array.isArray(phoneNumber.allowedInboundCountries) ? phoneNumber.allowedInboundCountries : [];
+  if (desired.length === applied.length && desired.every((code, index) => code === applied[index])) return;
+  await providers.retell.setPhoneNumberCountries(phoneNumber.retellPhoneNumberId, { allowed_inbound_country_list: desired });
+  await store.putPhoneNumber({ ...phoneNumber, allowedInboundCountries: desired, updatedAt: new Date().toISOString() });
 }
 
 // Both halves together - kept for call sites (like start-test-call) that
@@ -6577,11 +6649,7 @@ async function resolveAgentKnowledgeBaseIds({ store, workspaceId, agentId, agent
   const selectedIds = Array.isArray(agent?.configuration?.knowledgeBaseIds)
     ? agent.configuration.knowledgeBaseIds.filter((id) => typeof id === "string" && id)
     : [];
-  const resolved = selectedIds.length
-    ? (await Promise.all(selectedIds.map((id) => store.getKnowledgeBase(workspaceId, id))))
-      .filter((record) => record?.retellKnowledgeBaseId)
-      .map((record) => record.retellKnowledgeBaseId)
-    : [];
+  const resolved = await loadAssignedKnowledgeBases(store, workspaceId, selectedIds);
 
   const alreadyMigrated = Boolean(agent?.configuration?.legacyKnowledgeMigrated);
   if (!alreadyMigrated) {
@@ -6597,9 +6665,19 @@ async function resolveAgentKnowledgeBaseIds({ store, workspaceId, agentId, agent
       if (isConditionalCheckFailed(error)) throw error;
       console.error("Failed to persist legacy knowledge base migration", error);
     }
-    if (migrated) resolved.push(migrated.retellKnowledgeBaseId);
+    if (migrated) resolved.push(migrated);
   }
   return resolved;
+}
+
+// Read-only: the agent's assigned hub items that have a Retell knowledge base.
+async function loadAssignedKnowledgeBases(store, workspaceId, ids) {
+  if (!ids.length) return [];
+  return (await Promise.all(ids.map((id) => store.getKnowledgeBase(workspaceId, id))))
+    .map((record, index) => (record?.retellKnowledgeBaseId
+      ? { knowledgeBaseId: ids[index], retellKnowledgeBaseId: record.retellKnowledgeBaseId, ...(record.name ? { name: record.name } : {}) }
+      : null))
+    .filter(Boolean);
 }
 
 async function buildRetellKnowledgeBase({ providers, getKnowledgeSigner, workspaceId, name, text, fileMetadata, url, enableAutoRefresh }) {

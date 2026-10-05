@@ -1,6 +1,7 @@
 import { resolveTimeRange } from "./time.mjs";
 import { enforceBookingWindow, enforceMinimumLeadTime, paddedProviderRange, resolveAppointmentType } from "./appointment-types.mjs";
 import { effectiveProfile } from "./profile.mjs";
+import { enforceBusinessHours } from "./business-hours.mjs";
 
 export async function handleAvailability(input, {
   store,
@@ -31,6 +32,7 @@ export async function handleAvailability(input, {
   // caller asking to check first.
   enforceMinimumLeadTime(appointmentType, range.startTimeUtc, now);
   enforceBookingWindow(agent, range.startTimeUtc, now);
+  enforceBusinessHours(profile, range);
   const providerRange = appointmentType ? paddedProviderRange(range, appointmentType) : range;
   const result = await calendar.getAvailability({
     workspaceId: input.workspaceId,

@@ -9,6 +9,7 @@ import {
 import { resolveTimeRange } from "./time.mjs";
 import { enforceBookingWindow, enforceMinimumLeadTime, inviteOptions, paddedProviderRange, resolveAppointmentType } from "./appointment-types.mjs";
 import { effectiveProfile } from "./profile.mjs";
+import { enforceBusinessHours } from "./business-hours.mjs";
 
 export async function handleFindAppointment(input, { store }) {
   const callerPhone = normalizePhone(
@@ -100,6 +101,7 @@ export async function handleCreateBooking(input, {
   );
   if (appointmentType) enforceMinimumLeadTime(appointmentType, range.startTimeUtc, now);
   enforceBookingWindow(agent, range.startTimeUtc, now);
+  enforceBusinessHours(profile, range);
   // Before/After buffers only ever reach the provider-facing calls below -
   // the appointment record keeps the unpadded, spoken range (see
   // paddedProviderRange's own comment).
@@ -228,13 +230,38 @@ export async function handleRescheduleBooking(input, {
   const agent = await store.getAgent(input.workspaceId, input.agentId ?? appointment.agentId);
   const profile = effectiveProfile(agent, await store.getBusinessProfile(input.workspaceId));
   const timezone = profile?.timezone || appointment.timezone || "UTC";
-  const range = resolveTimeRange(input, timezone, now);
+  // A move keeps the appointment's type and length: the model only sends the
+  // new start, so without this a 2-hour visit came back as the 30-minute
+  // default. The type (matched by the stored service name) also brings its
+  // lead time and before/after buffers, exactly as at booking time.
+  const calComEventType = await calendar.resolveEventType?.({
+    workspaceId: input.workspaceId,
+    agentId: input.agentId ?? appointment.agentId,
+    appointmentType: appointment.service,
+  });
+  const appointmentType = calComEventType ? undefined : resolveAppointmentType(agent, appointment.service);
+  const originalMinutes = Math.round(
+    (Date.parse(appointment.endTimeUtc ?? "") - Date.parse(appointment.startTimeUtc ?? "")) / 60_000,
+  );
+  const keptDuration = calComEventType?.lengthInMinutes
+    ?? appointmentType?.durationMin
+    ?? (input.endTime || input.durationMinutes !== undefined
+      ? undefined
+      : (Number.isFinite(originalMinutes) && originalMinutes > 0 ? originalMinutes : undefined));
+  const range = resolveTimeRange(
+    keptDuration ? { ...input, durationMinutes: keptDuration, endTime: undefined } : input,
+    timezone,
+    now,
+  );
+  if (appointmentType) enforceMinimumLeadTime(appointmentType, range.startTimeUtc, now);
   enforceBookingWindow(agent, range.startTimeUtc, now);
+  enforceBusinessHours(profile, range);
+  const providerRange = appointmentType ? paddedProviderRange(range, appointmentType) : range;
   let providerEventId = appointment.providerEventId;
   // Same race the create-booking path guards against - hold the target
   // slot for the whole recheck+reschedule sequence so a second concurrent
   // attempt at the same new time is turned away immediately.
-  const lockId = slotLockId(input.agentId ?? appointment.agentId, range.startTimeUtc, range.endTimeUtc);
+  const lockId = slotLockId(input.agentId ?? appointment.agentId, providerRange.startTimeUtc, providerRange.endTimeUtc);
   const gotLock = await store.acquireSlotLock(input.workspaceId, lockId);
   if (!gotLock) requireAvailable({ available: false });
   try {
@@ -243,7 +270,7 @@ export async function handleRescheduleBooking(input, {
       agentId: input.agentId,
       appointmentType: appointment.service,
       providerEventId: appointment.providerEventId,
-      ...range,
+      ...providerRange,
     });
     requireAvailable(availability);
     try {
@@ -252,7 +279,7 @@ export async function handleRescheduleBooking(input, {
         agentId: input.agentId,
         appointmentType: appointment.service,
         providerEventId: appointment.providerEventId,
-        ...range,
+        ...providerRange,
         ...inviteOptions(agent, {
           startTimeUtc: range.startTimeUtc,
           timezone,

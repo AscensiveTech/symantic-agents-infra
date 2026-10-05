@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { buildRetellAgentPayload, buildRetellLlmBody } from "./voice-agent/retell.mjs";
+
 const TELNYX_BASE_URL = "https://api.telnyx.com/v2";
 const RETELL_BASE_URL = "https://api.retellai.com";
 
@@ -18,11 +20,6 @@ function canonical(value) {
   }
   return value ?? null;
 }
-
-// Filled in per call by the inbound webhook (see handleInboundLookup); this
-// default covers calls that skip it - dashboard test calls and web calls - so
-// the prompt never shows a raw {{crm_context}} placeholder.
-const DEFAULT_DYNAMIC_VARIABLES = Object.freeze({ crm_context: "Not available." });
 
 const sameValue = (left, right) => JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
 
@@ -316,50 +313,14 @@ export function createRetellClient({
   async function createLlm({ greeting, config }) {
     const result = await retellRequest("/create-retell-llm", {
       method: "POST",
-      body: {
-        start_speaker: config.startSpeaker === "user" ? "user" : "agent",
-        begin_message: greeting,
-        general_prompt: config.prompt,
-        general_tools: config.tools,
-        knowledge_base_ids: config.knowledgeBaseIds ?? [],
-        default_dynamic_variables: DEFAULT_DYNAMIC_VARIABLES,
-      },
+      body: buildRetellLlmBody({ greeting, config }),
     });
     return required(result?.llm_id, "Retell llm_id");
   }
 
-  function agentBody({
-    llmId,
-    symanticAgentId,
-    agentName,
-    config,
-  }) {
-    return {
-      response_engine: {
-        type: "retell-llm",
-        llm_id: llmId,
-      },
-      voice_id: config.voice,
-      // Background track played under the call. Sent even when unset, as
-      // null, so clearing it on an existing agent actually removes it at
-      // Retell rather than leaving the previous track in place.
-      ambient_sound: config.ambientSound || null,
-      // Retell ignores this when ambient_sound is unset, so only send it
-      // alongside a chosen track (resolveAmbientSoundVolume in
-      // receptionist.mjs always returns a value in Retell's 0.1-1 range).
-      ...(config.ambientSound ? { ambient_sound_volume: config.ambientSoundVolume } : {}),
-      // Custom word pronunciations (IPA/CMU). Sent as null rather than
-      // omitted when empty, so clearing every entry actually clears it at
-      // Retell instead of leaving stale ones from an earlier save.
-      pronunciation_dictionary: config.pronunciationDictionary?.length ? config.pronunciationDictionary : null,
-      agent_name: `Symantic ${symanticAgentId} · ${agentName}`,
-      // Explicit rather than relying on Retell's account-level default -
-      // call_started is what makes an "ongoing" row show up in Call History
-      // before the call ends; this guarantees it stays subscribed per agent
-      // regardless of what the account-level webhook is configured to send.
-      webhook_events: ["call_started", "call_ended", "call_analyzed"],
-      ...(config.retellAgent ?? {}),
-    };
+  // Body shape lives in voice-agent/retell.mjs, shared with the inspector.
+  function agentBody({ llmId, symanticAgentId, agentName, config }) {
+    return buildRetellAgentPayload({ config, llmId, symanticAgentId, agentName });
   }
 
   const agentPath = (endpoint, agentId, query = "") =>
@@ -494,14 +455,7 @@ export function createRetellClient({
   }
 
   function appLlmPatch({ greeting, config }) {
-    return {
-      start_speaker: config.startSpeaker === "user" ? "user" : "agent",
-      begin_message: greeting,
-      general_prompt: config.prompt,
-      general_tools: config.tools,
-      knowledge_base_ids: config.knowledgeBaseIds ?? [],
-      default_dynamic_variables: DEFAULT_DYNAMIC_VARIABLES,
-    };
+    return buildRetellLlmBody({ greeting, config });
   }
 
   // Knowledge base edits reach a live agent the same way a save does.

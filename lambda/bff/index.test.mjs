@@ -1635,6 +1635,42 @@ test("PUT agent keeps an already-active agent active and pushes the edit to Rete
   assert.match(retellCalls[0].config.prompt, /Updated answering restrictions/);
 });
 
+test("Save Changes on a live agent also pushes a changed Allowed Inbound Countries list to its phone number", async () => {
+  const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
+  existing.configuration = { ...existing.configuration, allowedInboundCountries: ["US"] };
+  const changed = { ...existing, configuration: { ...existing.configuration, allowedInboundCountries: ["US", "ca"] } };
+  let savedAgent;
+  let phone = { workspaceId: "workspace-123", agentId: "agent-123", retellPhoneNumberId: "+17035550177", allowedInboundCountries: ["US"] };
+  const countryUpdates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async getProfile() { return receptionistProfile(); },
+    async putAgent(_workspaceId, _agentId, agent) { savedAgent = agent; return agent; },
+    async updateAgentRuntime(_workspaceId, _agentId, updates) { return { ...savedAgent, ...updates }; },
+    async getPhoneNumberForAgent() { return phone; },
+    async putPhoneNumber(record) { phone = record; return record; },
+  };
+  const providers = {
+    retell: {
+      async upsertAgent() { return { retellAgentId: "retell-agent-123" }; },
+      async setPhoneNumberCountries(number, body) { countryUpdates.push([number, body]); },
+    },
+    resolveVoiceId(requestedVoice) { return requestedVoice; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers, toolBaseUrl: "https://api.example.com" });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", changed));
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(countryUpdates, [["+17035550177", { allowed_inbound_country_list: ["US", "CA"] }]]);
+  assert.deepEqual(phone.allowedInboundCountries, ["US", "CA"]);
+
+  // Saving again with the same list makes no further call.
+  await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", changed));
+  assert.equal(countryUpdates.length, 1);
+});
+
 // Shared set-up for Save Changes on a live agent: a store that keeps what
 // the route writes, and a Retell whose upsert the test controls.
 async function saveLiveAgent({ upsertAgent, query, existingOverrides = {} }) {
@@ -1757,6 +1793,22 @@ test("retell-status: an agent published before fingerprints existed is compared 
 
   assert.equal(body.editedInRetell, true);
   assert.deepEqual(body.changedFields, ["llm.general_prompt", "llm.begin_message"]);
+});
+
+test("retell-status without fingerprints: a prompt from an older Symantic generator and the old default greeting are not flagged as edited", async () => {
+  const olderGenerated = "# ROLE\nYou are Maya, the AI receptionist for Arc Dental. Old wording.\n\n# CRITICAL RULES\n1) Old rule.\n\n# CLOSING\nOld closing.";
+  const { body } = await retellStatus({
+    agentOverrides: { configuration: { ...receptionistAgent().configuration, greeting: "" } },
+    live: {
+      version: 1,
+      agent: {},
+      llm: {
+        general_prompt: olderGenerated,
+        begin_message: "Thanks for calling Arc Dental. This is Maya, the virtual receptionist. How can I help you today?",
+      },
+    },
+  });
+  assert.deepEqual(body, { editedInRetell: false, changedFields: [] });
 });
 
 test("retell-status: never flags drafts or agents that aren't live, and a Retell outage just hides the label", async () => {
@@ -10088,4 +10140,109 @@ test("presence: a heartbeat says where that person is - page and box - and the o
   assert.equal(presenceLocation({ itemId: "<script>" }), null);
   assert.deepEqual(presenceLocation({ itemId: "itm-1", elementId: 42 }), { itemId: "itm-1" });
   assert.equal(presenceLocation("nope"), null);
+});
+
+// --- Generated Configuration inspector route ---
+
+function inspectorStore(agent, knowledgeBases = {}) {
+  return {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+    async getAgent() { return agent; },
+    async getProfile() { return receptionistProfile(); },
+    async getKnowledgeBase(_workspaceId, id) { return knowledgeBases[id] ?? null; },
+  };
+}
+
+test("GET generated-config: admins see the prompt, Retell requests and checks; read-only, no storage keys", async () => {
+  const agent = {
+    ...receptionistAgent(),
+    status: "active",
+    retellAgentId: "retell-agent-123",
+    configuration: {
+      ...receptionistAgent().configuration,
+      knowledgeBaseIds: ["kb-1", "kb-missing"],
+      knowledgeBaseFiles: [{ id: "f", name: "menu.pdf", key: "workspaces/user-123/knowledge/private.pdf", contentType: "application/pdf", size: 10 }],
+    },
+    pendingConfiguration: { ...receptionistAgent().configuration, roleInstructions: "PENDING-ONLY-RULE" },
+  };
+  let writes = 0;
+  const store = {
+    ...inspectorStore(agent, { "kb-1": { knowledgeBaseId: "kb-1", retellKnowledgeBaseId: "knowledge_base_1", name: "Menu" } }),
+    async putAgent() { writes += 1; },
+    async createKnowledgeBase() { writes += 1; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({ resolveVoiceId: (voice) => `11labs-${voice.replace(/\s+/g, "")}` }),
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const saved = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
+  assert.equal(saved.statusCode, 200);
+  const body = JSON.parse(saved.body);
+  assert.equal(body.source, "saved");
+  assert.match(body.prompt.text, /^# ROLE\nYou are Maya, the AI receptionist for Arc Dental/);
+  assert.doesNotMatch(body.prompt.text, /PENDING-ONLY-RULE/);
+  assert.deepEqual(body.retellRequests.updateRetellLlm.knowledge_base_ids, ["knowledge_base_1"]);
+  assert.equal(body.retellRequests.updateAgent.voice_id, "11labs-Calmandnatural");
+  assert.equal(body.retellRequests.updateAgent.response_engine, undefined);
+  assert.deepEqual(body.validation, []);
+  assert.doesNotMatch(saved.body, /private\.pdf|Bearer|apiKey/);
+  assert.equal(writes, 0, "the inspector never writes");
+
+  const pending = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config", undefined, { source: "pending" }));
+  assert.equal(JSON.parse(pending.body).source, "pending");
+  assert.match(JSON.parse(pending.body).prompt.text, /PENDING-ONLY-RULE/);
+});
+
+test("GET generated-config is refused for non-admins and 404s for a deleted agent", async () => {
+  const { createHandler } = await loadBff();
+  const nonAdmin = createHandler({
+    getStore: async () => ({
+      ...inspectorStore(receptionistAgent()),
+      async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+    }),
+  });
+  const event = authenticatedEvent("GET", "/workspaces/me/agents/agent-123/generated-config");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  assert.equal((await nonAdmin(event)).statusCode, 403);
+
+  const deleted = createHandler({ getStore: async () => inspectorStore({ ...receptionistAgent(), status: "deleted" }) });
+  assert.equal((await deleted(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"))).statusCode, 404);
+});
+
+test("GET generated-config still renders when provider settings can't resolve the voice", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => inspectorStore(receptionistAgent()),
+    getProviders: async () => { throw new Error("secrets unavailable"); },
+    toolBaseUrl: "https://api.example.com",
+  });
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
+  assert.equal(response.statusCode, 200);
+  assert.ok(JSON.parse(response.body).diagnostics.some((item) => item.code === "voice_unresolved"));
+});
+
+test("syncPhoneNumber (activation path) sends the normalised country list, not the raw stored one", async () => {
+  const { syncPhoneNumber } = await loadBff();
+  const updates = [];
+  let stored;
+  const agent = { ...receptionistAgent(), retellAgentId: "retell-agent-123", configuration: { ...receptionistAgent().configuration, allowedInboundCountries: ["us", " ca ", "US", "bad"] } };
+  await syncPhoneNumber({
+    workspaceId: "workspace-123",
+    agentId: "agent-123",
+    agent,
+    profile: receptionistProfile(),
+    store: {
+      async getPhoneNumberForAgent() { return { workspaceId: "workspace-123", agentId: "agent-123", telnyxPhoneNumber: "+17035550177", retellPhoneNumberId: "+17035550177", allowedInboundCountries: [] }; },
+      async putPhoneNumber(record) { stored = record; return record; },
+    },
+    providers: { retell: { async setPhoneNumberCountries(number, body) { updates.push([number, body]); } } },
+    toolBaseUrl: "https://api.example.com",
+    phoneStatus: "active",
+  });
+  assert.deepEqual(updates, [["+17035550177", { allowed_inbound_country_list: ["US", "CA"] }]]);
+  assert.deepEqual(stored.allowedInboundCountries, ["US", "CA"]);
 });
