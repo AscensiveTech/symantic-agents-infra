@@ -2506,7 +2506,11 @@ export function createHandler({
           providerStatus: error.status,
           message: error.message,
         });
-        return json(502, { message: error.message });
+        // SignWell's own wording is a raw JSON blob - say it plainly where we can.
+        const message = DRAFT_NOT_READY.test(error.message)
+          ? "SignWell is still preparing the document. Wait a minute and try again - any request already out for signature is unchanged."
+          : error.message;
+        return json(502, { message });
       }
       console.error("BFF request failed", error);
       return json(500, { message: "Internal server error" });
@@ -4905,6 +4909,29 @@ const TERMINAL_SIGNATURE_STATUSES = new Set([
   "error",
 ]);
 
+// SignWell processes an uploaded draft (finding its text tags and making the
+// fields) in the background, so sending it straight away is refused with
+// "isn't draft" / "There aren't fields" - especially for a big PDF. Retried
+// every 1.5s while that's the reason, within the request's time budget.
+const DRAFT_NOT_READY = /isn.t draft|aren.t fields/i;
+export async function sendDraftWhenReady(client, draftId, body, {
+  budgetMs = 18_000,
+  intervalMs = 1_500,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+} = {}) {
+  const deadline = now() + budgetMs;
+  for (;;) {
+    try {
+      return await client.sendDocument(draftId, body);
+    } catch (error) {
+      const notReady = error instanceof SignWellRequestError && error.status === 422 && DRAFT_NOT_READY.test(error.message);
+      if (!notReady || now() + intervalMs > deadline) throw error;
+      await sleep(intervalMs);
+    }
+  }
+}
+
 function normalizeSignWellStatus(value, fallback = "sent") {
   if (typeof value !== "string" || !value.trim()) return fallback;
   const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
@@ -5553,11 +5580,11 @@ async function handleProposalApi(event, {
         }
         if (replacing) {
           const draftId = created.id;
-          let previousCanceled = false;
+          // Send the replacement first and only then cancel the old request:
+          // cancelling first meant a failed send left the proposal with
+          // neither (and the old one's signatures gone).
           try {
-            await signWell.client.deleteDocument(previous.documentId);
-            previousCanceled = true;
-            const sent = await signWell.client.sendDocument(draftId, {
+            const sent = await sendDraftWhenReady(signWell.client, draftId, {
               name: proposal.name || "Proposal",
               subject: input.subject,
               message: input.message,
@@ -5576,17 +5603,21 @@ async function handleProposalApi(event, {
               recipients: Array.isArray(sent?.recipients) ? sent.recipients : created.recipients,
             };
           } catch (error) {
+            // The old request is untouched - only the unsent draft goes.
             try { await signWell.client.deleteDocument(draftId); } catch { /* best-effort draft cleanup */ }
-            if (previousCanceled) {
-              await store.updateProposalSignature(workspaceId, proposalId, {
-                ...previous,
-                status: "canceled",
-                lastEvent: "document_replaced",
-                lastEventAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
-              });
-            }
             throw error;
+          }
+          // The replacement is out: retire the old document so its links stop
+          // working. Retried once; if SignWell still refuses, the new request
+          // stands and the old one is logged for clean-up.
+          try {
+            await signWell.client.deleteDocument(previous.documentId);
+          } catch {
+            try {
+              await signWell.client.deleteDocument(previous.documentId);
+            } catch (error) {
+              console.error("Replaced SignWell document could not be cancelled", { documentId: previous.documentId, message: error?.message });
+            }
           }
         }
         const now = new Date().toISOString();

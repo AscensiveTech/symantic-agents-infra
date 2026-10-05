@@ -4315,7 +4315,8 @@ test("adding a signer and initials markers cancels the old request and sends a r
   const body = JSON.parse(response.body);
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(calls, ["create-draft", "delete:signwell-doc-old", "send:signwell-doc-new"]);
+  // The replacement is sent first; the old request is cancelled only after.
+  assert.deepEqual(calls, ["create-draft", "send:signwell-doc-new", "delete:signwell-doc-old"]);
   assert.equal(draftInput.draft, true);
   assert.equal(draftInput.text_tags, true);
   assert.equal(draftInput.with_signature_page, false);
@@ -4323,6 +4324,37 @@ test("adding a signer and initials markers cancels the old request and sends a r
   assert.equal(body.replacedDocumentId, "signwell-doc-old");
   assert.equal(body.initials, undefined);
   assert.deepEqual(body.recipients.map((recipient) => recipient.email), ["jane@example.com", "alex@example.com"]);
+});
+
+test("a draft SignWell is still processing is sent once it's ready", async () => {
+  const { sendDraftWhenReady } = await loadBff();
+  const { SignWellRequestError } = await import("./signwell.mjs");
+  let attempts = 0;
+  let clock = 0;
+  const client = {
+    async sendDocument(id) {
+      attempts += 1;
+      if (attempts < 3) throw new SignWellRequestError(`{"send":["The document you're trying to send isn't draft","There aren't fields in the document"]}`, 422);
+      return { id, status: "Sent" };
+    },
+  };
+  const sent = await sendDraftWhenReady(client, "draft-1", {}, { sleep: async (ms) => { clock += ms; }, now: () => clock });
+  assert.equal(sent.status, "Sent");
+  assert.equal(attempts, 3);
+});
+
+test("a draft still not ready when time runs out gives up with the error; other errors aren't retried", async () => {
+  const { sendDraftWhenReady } = await loadBff();
+  const { SignWellRequestError } = await import("./signwell.mjs");
+  let clock = 0;
+  let attempts = 0;
+  const notReady = { async sendDocument() { attempts += 1; throw new SignWellRequestError(`{"send":["There aren't fields in the document"]}`, 422); } };
+  await assert.rejects(sendDraftWhenReady(notReady, "d", {}, { budgetMs: 5_000, sleep: async (ms) => { clock += ms; }, now: () => clock }), /aren't fields/);
+  assert.ok(attempts >= 3 && attempts <= 5);
+  attempts = 0;
+  const broken = { async sendDocument() { attempts += 1; throw new SignWellRequestError("Recipient email is invalid", 422); } };
+  await assert.rejects(sendDraftWhenReady(broken, "d", {}, { sleep: async () => {}, now: () => 0 }), /invalid/);
+  assert.equal(attempts, 1);
 });
 
 test("cancel action cancels an active SignWell document and reopens the proposal for editing", async () => {
@@ -6866,6 +6898,31 @@ function resendEvent(recipients) {
   });
 }
 
+test("a resend whose replacement can't be sent leaves the original request untouched", async () => {
+  const store = usageQuotaStore();
+  store._proposals.set("prp-sign", activeRequestProposal("prp-sign"));
+  const calls = [];
+  const { createHandler } = await loadBff();
+  const { SignWellRequestError } = await import("./signwell.mjs");
+  const stub = resendSignWellStub(calls);
+  const handler = createHandler({
+    ...stub,
+    getSignWell: async () => {
+      const signWell = await stub.getSignWell();
+      return { ...signWell, client: { ...signWell.client, async sendDocument(id) { calls.push(`send:${id}`); throw new SignWellRequestError("Recipient email is invalid", 422); } } };
+    },
+    getStore: async () => store,
+  });
+  const res = await handler(resendEvent([
+    { name: "Jane Client", email: "jane@example.com" },
+    { name: "Alex Client", email: "alex@example.com" },
+  ]));
+  assert.equal(res.statusCode, 502);
+  assert.deepEqual(calls, ["create", "send:signwell-doc-new", "delete:signwell-doc-new"]); // the old request is never touched
+  assert.equal(store._proposals.get("prp-sign").signatureRequest.documentId, "signwell-doc-old");
+  assert.notEqual(store._proposals.get("prp-sign").signatureRequest.status, "canceled");
+});
+
 test("a resend that mints a new SignWell document counts another signature request, never another proposal", async () => {
   const store = usageQuotaStore();
   store._proposals.set("prp-sign", activeRequestProposal("prp-sign"));
@@ -6879,7 +6936,7 @@ test("a resend that mints a new SignWell document counts another signature reque
   ]));
 
   assert.equal(res.statusCode, 200);
-  assert.deepEqual(calls, ["create", "delete:signwell-doc-old", "send:signwell-doc-new"]);
+  assert.deepEqual(calls, ["create", "send:signwell-doc-new", "delete:signwell-doc-old"]);
   assert.equal(store._counters.get(`proposal#${currentPeriod()}`).signaturesSent, 1);
   assert.equal(generatedCount(store), 0); // proposal was already counted; never re-counted
 });
