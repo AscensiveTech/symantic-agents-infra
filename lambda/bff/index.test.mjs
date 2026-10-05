@@ -852,11 +852,11 @@ test("PUT agent with ?reactivate=true on a disabled agent goes active, publishes
     getStore: async () => store,
     getProviders: async () => ({
       retell: {
-        async updateAgent() { synced = true; return { agent_id: "retell-1" }; },
-        async createLlm() { return { llm_id: "llm-1" }; },
-        async updateLlm() {},
+        async upsertAgent() { synced = true; return { retellAgentId: "retell-1" }; },
       },
+      resolveVoiceId(requestedVoice) { return requestedVoice || "retell-Cimo"; },
     }),
+    toolBaseUrl: "https://api.example.com",
   });
 
   const response = await handler(authenticatedEvent(
@@ -870,6 +870,7 @@ test("PUT agent with ?reactivate=true on a disabled agent goes active, publishes
   const body = JSON.parse(response.body);
   assert.equal(body.status, "active");
   assert.equal(body.configuration.greeting, "New greeting");
+  assert.equal(synced, true);
 });
 
 test("PUT agent (real save) on an already-active agent never blanks a plan it already had, even if the outgoing payload's plan field came through empty", async () => {
@@ -1673,21 +1674,30 @@ test("Save Changes on a live agent also pushes a changed Allowed Inbound Countri
 
 // Shared set-up for Save Changes on a live agent: a store that keeps what
 // the route writes, and a Retell whose upsert the test controls.
-async function saveLiveAgent({ upsertAgent, query, existingOverrides = {} }) {
+async function saveLiveAgent({
+  upsertAgent,
+  query,
+  existingOverrides = {},
+  requestedOverrides = {},
+  storeOverrides = {},
+  providerOverrides = {},
+}) {
   const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123", ...existingOverrides };
   let record = existing;
+  let putCalls = 0;
   const runtimeUpdates = [];
   const retellCalls = [];
   const store = {
     async ensureWorkspace() {},
     async getAgent() { return record; },
     async getProfile() { return receptionistProfile(); },
-    async putAgent(_workspaceId, _agentId, agent) { record = { ...record, ...agent }; return record; },
+    async putAgent(_workspaceId, _agentId, agent) { putCalls += 1; record = { ...record, ...agent }; return record; },
     async updateAgentRuntime(_workspaceId, _agentId, updates) {
       runtimeUpdates.push(updates);
       record = { ...record, ...Object.fromEntries(Object.entries(updates).filter(([, value]) => value !== undefined)) };
       return record;
     },
+    ...storeOverrides,
   };
   const providers = {
     retell: {
@@ -1697,6 +1707,7 @@ async function saveLiveAgent({ upsertAgent, query, existingOverrides = {} }) {
       },
     },
     resolveVoiceId(requestedVoice) { return requestedVoice; },
+    ...providerOverrides,
   };
   const { createHandler } = await loadBff();
   const handler = createHandler({
@@ -1704,12 +1715,41 @@ async function saveLiveAgent({ upsertAgent, query, existingOverrides = {} }) {
     getProviders: async () => providers,
     toolBaseUrl: "https://api.example.com",
   });
-  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", existing, query));
-  return { response, body: JSON.parse(response.body), runtimeUpdates, retellCalls, record: () => record };
+  const requested = { ...existing, ...requestedOverrides };
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", requested, query));
+  return { response, body: JSON.parse(response.body), runtimeUpdates, retellCalls, putCalls, record: () => record };
 }
 
+test("Save Changes rejects a deterministic configuration error before changing the live Symantic record", async () => {
+  const existingConfiguration = receptionistAgent().configuration;
+  const { response, body, putCalls, retellCalls, record } = await saveLiveAgent({
+    requestedOverrides: {
+      configuration: {
+        ...existingConfiguration,
+        booking: false,
+        connections: [],
+        exampleDialogues: "Connect the caller to the owner, then set up an appointment.",
+      },
+    },
+    async upsertAgent() {
+      throw new Error("Retell must not be called for an invalid local configuration");
+    },
+  });
+
+  assert.equal(response.statusCode, 422);
+  assert.equal(body.code, "invalid_voice_agent_configuration");
+  assert.ok(body.diagnostics.some((item) => item.code === "disabled_scheduling_in_examples"));
+  assert.ok(body.diagnostics.some((item) => item.code === "disabled_transfers_in_custom_instructions"));
+  assert.equal(putCalls, 0);
+  assert.equal(retellCalls.length, 0);
+  assert.deepEqual(record().configuration, existingConfiguration);
+});
+
 test("Save Changes on a live agent still saves when Retell rejects the update, but tells the app it isn't live (no more silent failures)", async () => {
-  const { response, body, record } = await saveLiveAgent({
+  const existingConfiguration = receptionistAgent().configuration;
+  const requestedConfiguration = { ...existingConfiguration, finalReminders: "Be concise and professional." };
+  const { response, body, putCalls, record } = await saveLiveAgent({
+    requestedOverrides: { configuration: requestedConfiguration },
     async upsertAgent() {
       throw Object.assign(new Error("Retell request failed"), {
         details: { message: "Cannot update response engine after agent versions have been created" },
@@ -1719,6 +1759,12 @@ test("Save Changes on a live agent still saves when Retell rejects the update, b
 
   assert.equal(response.statusCode, 200);
   assert.equal(record().status, "active");
+  assert.equal(record().configuration.finalReminders, undefined, "the failed edit must not become live in Symantic");
+  assert.equal(record().configuration.booking, existingConfiguration.booking);
+  assert.equal(record().configuration.legacyKnowledgeMigrated, true, "a completed migration marker must survive rollback");
+  assert.deepEqual(record().pendingConfiguration, requestedConfiguration, "the valid edit remains recoverable for retry");
+  assert.equal(record().hasUnpublishedChanges, true);
+  assert.ok(putCalls >= 2, "the failed publish restores the previous live record and stages the edit");
   assert.deepEqual(body.retellSync, {
     status: "failed",
     message: "Cannot update response engine after agent versions have been created",
@@ -1738,6 +1784,30 @@ test("Save Changes reports a live publish and stores the published version's fin
   assert.equal("retellEditsDecision" in retellCalls[0], false);
   assert.deepEqual(runtimeUpdates.at(-1), { retellAgentId: "retell-agent-123", retellFingerprints: { "llm.general_prompt": "h1" } });
   assert.deepEqual(body.retellSync, { status: "live", publishedVersion: 4 });
+});
+
+test("a Telnyx retag failure cannot block or misreport a successful Retell publish", async () => {
+  const original = receptionistAgent().configuration;
+  const renamed = { ...original, name: "Maya Renamed" };
+  const { response, body, retellCalls } = await saveLiveAgent({
+    existingOverrides: { configuration: original },
+    requestedOverrides: { configuration: renamed },
+    storeOverrides: {
+      async getPhoneNumberForAgent() { return { telnyxNumberId: "telnyx-number-1" }; },
+    },
+    providerOverrides: {
+      telnyx: {
+        async retagNumber() { throw new Error("Telnyx tag service unavailable"); },
+      },
+    },
+    async upsertAgent() {
+      return { retellAgentId: "retell-agent-123", publishedVersion: 5 };
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(body.retellSync, { status: "live", publishedVersion: 5 });
+  assert.equal(retellCalls.length, 1);
 });
 
 // The retell-status route against an in-memory store and Retell.
@@ -2879,13 +2949,14 @@ test("POST activate publishes to Retell AND provisions a real Telnyx phone numbe
   const events = [];
   const agent = receptionistAgent();
   agent.configuration.knowledgeBaseText = "Appointments require 24 hours notice for cancellation.";
+  let storedAgent = agent;
   const profile = receptionistProfile();
   let putPhoneNumberRecord;
   const store = {
     async ensureWorkspace() {},
     async getAgent(workspaceId, agentId) {
       events.push(["getAgent", workspaceId, agentId]);
-      return agent;
+      return storedAgent;
     },
     async getProfile(workspaceId) {
       events.push(["getProfile", workspaceId]);
@@ -2908,7 +2979,8 @@ test("POST activate publishes to Retell AND provisions a real Telnyx phone numbe
     },
     async updateAgentRuntime(workspaceId, agentId, updates) {
       events.push(["updateAgentRuntime", workspaceId, agentId, updates]);
-      return { ...agent, ...updates };
+      storedAgent = { ...storedAgent, ...updates };
+      return storedAgent;
     },
     async createKnowledgeBase(workspaceId, knowledgeBaseId, record) {
       events.push(["storeCreateKnowledgeBase", workspaceId, knowledgeBaseId, record]);
@@ -2916,7 +2988,7 @@ test("POST activate publishes to Retell AND provisions a real Telnyx phone numbe
     },
     async putAgent(workspaceId, agentId, nextAgent) {
       events.push(["putAgent", workspaceId, agentId, nextAgent]);
-      Object.assign(agent, nextAgent);
+      storedAgent = nextAgent;
       return nextAgent;
     },
   };
@@ -2982,9 +3054,51 @@ test("POST activate publishes to Retell AND provisions a real Telnyx phone numbe
     Array.isArray(nextAgent?.configuration?.knowledgeBaseIds) &&
     nextAgent.configuration.knowledgeBaseIds.length === 1
   ));
+  assert.equal(storedAgent.configuration.legacyKnowledgeMigrated, true);
+  assert.equal(storedAgent.configuration.knowledgeBaseIds.length, 1);
+  assert.equal(storedAgent.configuration.platformDid, "+17035550199");
   assert.ok(retellInput.config.tools.filter(({ type }) => type === "custom").every(({ url }) =>
     url.startsWith("https://api.example.com/retell/tools/")
   ));
+});
+
+test("legacy knowledge migration reuses its tenant-scoped hub record when an older agent lost the marker", async () => {
+  const { syncRetellAgent } = await loadBff();
+  const agent = receptionistAgent();
+  agent.configuration.knowledgeBaseText = "Appointments require 24 hours notice.";
+  let savedAgent;
+  let published;
+
+  await syncRetellAgent({
+    workspaceId: "user-123",
+    agentId: "agent-123",
+    agent,
+    profile: receptionistProfile(),
+    store: {
+      async listKnowledgeBases() {
+        return [{
+          knowledgeBaseId: "kb-existing-migration",
+          retellKnowledgeBaseId: "retell-kb-existing",
+          migratedFromAgentId: "agent-123",
+        }];
+      },
+      async putAgent(_workspaceId, _agentId, nextAgent) { savedAgent = nextAgent; return nextAgent; },
+      async updateAgentRuntime() {},
+    },
+    providers: {
+      resolveVoiceId: (voice) => voice || "retell-Cimo",
+      retell: {
+        async createKnowledgeBase() { throw new Error("must not duplicate the migrated knowledge base"); },
+        async upsertAgent(input) { published = input; return { retellAgentId: "retell-agent-123" }; },
+      },
+    },
+    getKnowledgeSigner: async () => null,
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  assert.deepEqual(published.config.knowledgeBaseIds, ["retell-kb-existing"]);
+  assert.equal(savedAgent.configuration.legacyKnowledgeMigrated, true);
+  assert.deepEqual(savedAgent.configuration.knowledgeBaseIds, ["kb-existing-migration"]);
 });
 
 test("POST activate reuses an already-attached phone number (e.g. from an earlier Test call) instead of ordering a second one", async () => {
@@ -3267,6 +3381,71 @@ test("POST activate rejects a missing Forward All Incoming Calls To (ownerPhone)
 
   assert.equal(response.statusCode, 409);
   assert.match(JSON.parse(response.body).message, /business profile/i);
+});
+
+test("POST activate rejects an invalid business timezone before calling providers", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => ({
+      async ensureWorkspace() {},
+      async getAgent() { return receptionistAgent(); },
+      async getProfile() { return { ...receptionistProfile(), timezone: "Mars/Olympus" }; },
+      async getCalendarConnection() {
+        return { provider: "google-calendar", selectedCalendarId: "primary", connectionState: "connected" };
+      },
+    }),
+    getProviders: async () => { throw new Error("providers must not be called for an invalid timezone"); },
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/activate",
+  ));
+
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /valid business timezone/i);
+});
+
+test("POST activate returns an actionable 422 for a prompt/tool capability contradiction", async () => {
+  const agent = receptionistAgent();
+  agent.configuration = {
+    ...agent.configuration,
+    booking: false,
+    connections: [],
+    legacyKnowledgeMigrated: true,
+    exampleDialogues: "You: I've booked you for tomorrow at 2 PM.",
+  };
+  let retellCalled = false;
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => ({
+      async ensureWorkspace() {},
+      async getAgent() { return agent; },
+      async getProfile() { return receptionistProfile(); },
+    }),
+    getProviders: async () => ({
+      resolveVoiceId: () => "retell-Cimo",
+      retell: {
+        async upsertAgent() {
+          retellCalled = true;
+          throw new Error("must not write an invalid configuration to Retell");
+        },
+      },
+    }),
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const response = await handler(authenticatedEvent(
+    "POST",
+    "/workspaces/me/agents/agent-123/activate",
+  ));
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 422);
+  assert.equal(body.code, "invalid_voice_agent_configuration");
+  assert.match(body.message, /scheduling is disabled/i);
+  assert.ok(body.diagnostics.some((item) => item.code === "disabled_scheduling_in_examples"));
+  assert.equal(retellCalled, false);
 });
 
 test("POST activate rejects booking without a connected selected calendar", async () => {

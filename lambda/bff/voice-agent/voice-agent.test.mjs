@@ -8,6 +8,7 @@ import { unknownVariables } from "./dynamic-variables.mjs";
 import { inspectVoiceAgent } from "./inspect.mjs";
 import { mentionedToolNames, SECTION_IDS } from "./prompt.mjs";
 import { buildRetellAgentPayload, validateRetellPayloads } from "./retell.mjs";
+import { buildReceptionistConfig } from "../receptionist.mjs";
 import { SEEDED_TEMPLATE_EXAMPLES, SEEDED_TEMPLATE_PARAGRAPHS, seedHash } from "./seeded-defaults.mjs";
 import { TEMPLATE_TITLES } from "./templates.mjs";
 import {
@@ -358,7 +359,7 @@ test("knowledge bases: none, one, several - ids attached, content never copied, 
 test("scheduling off: no calendar tools and no scheduling sections; on: all five tools and sections", () => {
   const off = compile(minimalAgent({ booking: false, appointmentTypes: [{ name: "Visit", durationMin: 30, minimumLeadTimeMin: 0 }] }));
   assert.ok(!off.retell.llm.general_tools.some((tool) => tool.name.startsWith("calendar_")));
-  assert.doesNotMatch(off.prompt.text, /calendar_|APPOINTMENT TYPES|Only book up to/);
+  assert.doesNotMatch(off.prompt.text, /calendar_|APPOINTMENT TYPES|Only book up to|earliest openings|every time you say or book/);
   const on = compile(minimalAgent({ booking: true, appointmentTypes: [{ name: "Visit", durationMin: 30, minimumLeadTimeMin: 0 }] }));
   assert.deepEqual(on.retell.llm.general_tools.filter((tool) => tool.name.startsWith("calendar_")).map((tool) => tool.name), [
     "calendar_find_appointment", "calendar_get_availability", "calendar_create_booking", "calendar_reschedule_booking", "calendar_cancel_booking",
@@ -366,6 +367,53 @@ test("scheduling off: no calendar tools and no scheduling sections; on: all five
   for (const title of ["APPOINTMENT TYPES", "SCHEDULING RULES", "BOOKING FLOW", "RESCHEDULING AND CANCELLING"]) {
     assert.ok(section(on.prompt.text, title), title);
   }
+});
+
+test("scheduling off rejects affirmative scheduling instructions but permits explicit prohibitions", () => {
+  for (const exampleDialogues of [
+    "You: I have an opening tomorrow. You're scheduled for 2 PM.",
+    "You: I've booked you for 2 PM.",
+    "You: You're all set for tomorrow at 2.",
+    "You: Your appointment has been confirmed.",
+    "You: I can set up an appointment for Friday.",
+    "Arrange a visit whenever the caller requests one.",
+  ]) {
+    const agent = minimalAgent({ booking: false, exampleDialogues });
+    const compiled = compile(agent);
+    assert.ok(compiled.diagnostics.some((item) => item.code === "disabled_scheduling_in_examples"));
+    assert.throws(() => buildReceptionistConfig({
+      ...BUILD,
+      agent,
+      profile: workspaceProfile,
+      knowledgeBases: [],
+    }), /Custom instructions tell the agent to schedule or confirm appointments/);
+  }
+  const prohibition = compile(minimalAgent({
+    booking: false,
+    roleInstructions: "Never book or schedule an appointment. When a caller asks to book, take a message instead.",
+  }));
+  assert.ok(!prohibition.diagnostics.some((item) => item.code === "disabled_scheduling_in_examples"));
+  const mixed = compile(minimalAgent({
+    booking: false,
+    roleInstructions: "Never transfer a caller, but schedule appointments when asked.",
+  }));
+  assert.ok(mixed.diagnostics.some((item) => item.code === "disabled_scheduling_in_examples"));
+});
+
+test("an agent without a transfer tool rejects affirmative transfer instructions but permits no-transfer rules", () => {
+  for (const roleInstructions of [
+    "Transfer the caller to the owner when they ask for a person.",
+    "Connect the caller to the owner when they ask for a person.",
+    "Put the caller through to a representative.",
+  ]) {
+    const contradiction = compile(minimalAgent({ allowCallTransfers: false, roleInstructions }));
+    assert.ok(contradiction.diagnostics.some((item) => item.code === "disabled_transfers_in_custom_instructions"));
+  }
+  const prohibition = compile(minimalAgent({
+    allowCallTransfers: false,
+    roleInstructions: "Never transfer a call. For transfer requests, take a message instead.",
+  }));
+  assert.ok(!prohibition.diagnostics.some((item) => item.code === "disabled_transfers_in_custom_instructions"));
 });
 
 test("one appointment type vs several: several asks the model to name the type on every call", () => {
@@ -415,8 +463,25 @@ test("timezone: the zoned clock variable and Retell's agent timezone follow the 
   assert.equal(la.retell.agentSettings.timezone, "America/Los_Angeles");
   const bad = compile(minimalAgent(), { profile: { ...workspaceProfile, timezone: "Nowhere" } });
   assert.match(bad.prompt.text, /\{\{current_time_Etc\/UTC\}\}/);
-  assert.equal(bad.retell.agentSettings.timezone, undefined);
+  assert.equal(bad.retell.agentSettings.timezone, "Etc/UTC", "legacy invalid zones use the same explicit UTC fallback in Retell");
   assert.ok(bad.diagnostics.some((item) => item.code === "timezone_invalid"));
+});
+
+test("the publish boundary rejects a Retell-invalid payload with an actionable 422 error", () => {
+  assert.throws(() => buildReceptionistConfig({
+    ...BUILD,
+    toolBaseUrl: "http://insecure.example",
+    agent: minimalAgent(),
+    profile: workspaceProfile,
+    knowledgeBases: [],
+  }), (error) => {
+    assert.equal(error.code, "invalid_voice_agent_configuration");
+    assert.equal(error.statusCode, 422);
+    assert.equal(error.payload?.code, "invalid_voice_agent_configuration");
+    assert.ok(error.details.diagnostics.some((item) => item.code === "invalid_retell_payload"));
+    assert.match(error.message, /must be an https URL/);
+    return true;
+  });
 });
 
 test("service area: tool and section only when configured", () => {
@@ -470,6 +535,12 @@ test("custom instruction fields each land in their own section, in precedence or
 test("a custom instruction naming a tool the agent lacks is flagged", () => {
   const compiled = compile(minimalAgent({ booking: false, roleInstructions: "Always use calendar_create_booking." }));
   assert.ok(compiled.diagnostics.some((item) => item.code === "prompt_mentions_unregistered_tool"));
+  assert.throws(() => buildReceptionistConfig({
+    ...BUILD,
+    agent: minimalAgent({ booking: false, roleInstructions: "Always use calendar_create_booking." }),
+    profile: workspaceProfile,
+    knowledgeBases: [],
+  }), /prompt mentions calendar_create_booking, which this agent doesn't have/);
 });
 
 // --- Voice / language / speech ------------------------------------------------------
@@ -538,7 +609,7 @@ test("who speaks first: the context line and begin_message_delay_ms follow it", 
   const callerFirst = compile(minimalAgent({ startSpeaker: "user", pauseBeforeSpeakingMs: 1000 }));
   assert.match(callerFirst.prompt.text, /The caller speaks first\. In your first reply, say briefly that you're Ava with Brightwater/);
   assert.equal(callerFirst.retell.llm.start_speaker, "user");
-  assert.equal(callerFirst.retell.agentSettings.begin_message_delay_ms, undefined);
+  assert.equal(callerFirst.retell.agentSettings.begin_message_delay_ms, 0, "caller-first clears a previously published delay");
 });
 
 // --- Legacy -------------------------------------------------------------------------

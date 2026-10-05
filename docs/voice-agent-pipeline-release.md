@@ -18,7 +18,8 @@ One pipeline replaces the single 1,000-line prompt function:
    No Retell field names.
 2. **Tool plan** (`tools.mjs`) - decides which tools the agent has.
 3. **Prompt** (`prompt.mjs`) - 24 sections in a fixed order, each included only when
-   relevant. Building fails if a section names a tool the agent doesn't have.
+   relevant. Compilation diagnoses a section that names a tool the agent doesn't have,
+   and publishing rejects the error before writing to Retell.
 4. **Retell payloads** (`retell.mjs`, `post-call.mjs`) - the only place that knows
    Retell field names, plus a validator for Retell's documented enums, ranges,
    E.164 numbers, and `{{variables}}`.
@@ -47,6 +48,19 @@ One pipeline replaces the single 1,000-line prompt function:
 | 14 | (Found in the final audit.) Small inconsistencies: transfer tool descriptions said "mentions" while the prompt matches by meaning; TAKING A MESSAGE didn't defer to transfer rules; CLOSING didn't list NO PROGRESS as an early end. | All three aligned. |
 | 15 | (Found in the second audit.) Live agents with no stored publish fingerprint would all show "Manually Edited by Admin in Retell" right after deploy, because the fallback compared their live prompt with the new generator's output. | Without a fingerprint, only a prompt that lacks the app-generated structure, or a greeting matching neither the current nor the previous default, is flagged. The next Save Changes stores fingerprints. |
 | 16 | (Found in the second audit.) Activation sent the stored country list without normalising it. | Normalised the same way as everywhere else. The inspector also notes when the next publish will migrate legacy per-agent knowledge. |
+| 17 | Phone reconciliation called Retell's removed legacy list endpoint and assumed an unpaginated array response. | Uses the current paginated `/v2/list-phone-numbers` endpoint and consumes `items`; provider and publish-flow tests cover it. |
+| 18 | Clearing a timezone or changing from agent-first to caller-first could leave stale values in Retell because its PATCH updates preserve omitted fields. | Every owned update now sends `timezone` (`Etc/UTC` for a legacy invalid/cleared value) and `begin_message_delay_ms` (`0` when caller-first). |
+| 19 | Error-level compile diagnostics were visible in the inspector but did not prevent publication. | The publish configuration boundary rejects them with `invalid_voice_agent_configuration` before any Retell request. |
+| 20 | With scheduling disabled, generated prompt examples no longer mentioned booking, but customer-authored examples could still claim a booking succeeded without calendar tools. | Generated examples are capability-aware; contradictory custom examples produce a blocking diagnostic. |
+| 21 | The frontend draft round trip marked only six of eight wizard steps complete. | `forward` and `guardrails` are included, with a round-trip unit test. |
+| 22 | Retell payload validation was visible in the inspector but not enforced at the write boundary. | The exact generated LLM and agent payloads are validated before publication; invalid configurations receive a 422 and make no Retell request. |
+| 23 | Scheduling/transfer contradictions written without an exact tool name could survive in customer instructions. | Retained customer instruction clauses are checked for affirmative disabled capabilities; explicit prohibitions and stripped legacy seed text are not blocked. |
+| 24 | Invalid timezone values could make the prompt use UTC, Retell use its account default, and calendar tools fail. | New activation rejects invalid IANA zones; legacy values consistently use UTC in prompt, Retell and calendar tools. |
+| 25 | Activation-time configuration errors fell through to a generic HTTP 500. | Configuration errors now return a stable `422 invalid_voice_agent_configuration` response with actionable diagnostics. |
+| 26 | Save Changes wrote a deterministic invalid configuration into an active Symantic record before discovering that Retell could not publish it. | Active saves and reactivations preflight the candidate before persistence, preventing guaranteed state drift while retaining valid edits when a genuine provider outage occurs. |
+| 27 | A transient Retell failure left Symantic's requested configuration marked live with no unpublished flag even though Retell still had the previous version. | The route restores the prior live record and stages the requested configuration as an unpublished, retryable draft. |
+| 28 | Phone-number persistence could overwrite newly stored legacy-KB migration IDs/markers; losing a marker could duplicate the migrated Retell KB. | Activation and test-call updates merge the latest stored configuration, failed publishes retain migration fields, and migration reuses an existing tenant-scoped migration record. |
+| 29 | Telnyx number retagging ran before Retell publication, so metadata failure could block and misreport the actual agent publish. | Retell publication is authoritative; retagging runs afterward as isolated best-effort metadata. |
 
 ### New: Generated Configuration (admins only)
 
@@ -69,8 +83,8 @@ left out of the prompt with the reason). It never includes credentials or storag
 - **Live agents don't change until they're saved again.** The prompt is rebuilt only on
   Save Changes, activation, or a test call. The inbound webhook still sends the old
   `currentTime`/`timezone` variables, so prompts published earlier keep working.
-- **First re-save of each agent changes:** the prompt, the new agent `timezone` field,
-  and the transfer extension format.
+- **First re-save of each agent changes:** the prompt, the owned agent `timezone` and
+  greeting-delay fields (including explicit clearing), and the transfer extension format.
 - **Nothing is deleted from storage.** Legacy fields (`intents`, `escalation`, legacy
   message rules, old knowledge text) are kept and reported as ignored.
 - **Terraform** adds one API Gateway route (`generated-config`) and redeploys the BFF and
@@ -82,20 +96,22 @@ left out of the prompt with the reason). It never includes credentials or storag
 
 | Suite | Result |
 |---|---|
-| Infra BFF (`node --test`, includes 8 golden prompt + payload scenarios) | 508 pass |
-| Infra tools | 64 pass |
-| Infra oauth, postcall, digest, kb-refresh, most-asked-refresh, crm | 262 pass |
-| Infra contract | 2 pass |
-| Terraform fmt + validate | clean |
-| Frontend lint, typecheck, unit tests, build | clean, 975 pass |
-| Frontend Playwright end-to-end | 98 pass; 8 fail identically on `main` (analytics/proposal accessibility, PDF preview, Connections step) - unrelated |
+| Infra full Node suite (`find infra/lambda -name '*.test.mjs'`) | **PASS - 844/844** (includes 8 golden prompt + payload scenarios, provider/versioning, tools, contract, post-call and integrations) |
+| Frontend lint | **PASS** |
+| Frontend typecheck | **PASS** |
+| Frontend Vitest | **PASS - 123 files, 977 tests** |
+| Frontend production build | **PASS** |
+| Receptionist-focused Playwright suite | **PASS - 12/12** |
+| Full Chromium Playwright run | **FAIL - 49/53 initially**; the one receptionist copy assertion was corrected and its focused suite passed. Three remaining failures are outside this pipeline: Analytics accessibility, Proposal accessibility, and Proposal PDF preview. |
+| Diff whitespace check | **PASS** |
 
 Golden files: `lambda/bff/voice-agent/golden/`. After an intended prompt change,
 regenerate with `cd lambda/bff && UPDATE_GOLDEN=1 node --test voice-agent/voice-agent.test.mjs`
 and review the diff.
 
-No real calls were made and no Retell account was used: Retell was replaced by an
-in-memory fake that enforces its versioning rules.
+No production Retell agent was modified and no real call was claimed. Retell writes were tested
+at the repository boundary with an in-memory fake that enforces the create/draft/update/publish
+versioning rules. The manual cases below remain required in the team's actual environment.
 
 ## Manual verification (real Symantic + Retell)
 

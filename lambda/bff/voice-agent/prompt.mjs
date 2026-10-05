@@ -139,6 +139,11 @@ function roleSection({ cfg, booking, transferTools, business }) {
 
 function criticalRulesSection({ cfg, booking, business, transferTools }) {
   const clock = zonedTimeVariable(cfg.business.timezoneValid ? cfg.business.timezone : "Etc/UTC");
+  const confirmedActions = [
+    "a message",
+    ...(booking ? ["a booking, change, or cancellation"] : []),
+    ...(transferTools.length ? ["a transfer"] : []),
+  ];
   const rules = [
     `The caller's number is {{user_number}}. The current time is ${clock} - treat it as the authoritative clock for `
       + "\"are you open right now\", for anything about today or tomorrow, and for working out the exact date (year "
@@ -149,7 +154,7 @@ function criticalRulesSection({ cfg, booking, business, transferTools }) {
       + "between.",
     "Never guess. Answer only from the business information below, the knowledge base, and this prompt. If you "
       + "don't know, say so and take a message.",
-    "Never confirm a message, booking, change, cancellation, or transfer until the tool has actually returned "
+    `Never confirm ${listJoin(confirmedActions)} until the tool has actually returned `
       + "success - then state exactly what it returned. If a tool fails, say so briefly and offer to try again or "
       + "take a message. Never pretend it worked.",
     "When a tool result says ok: false, tell the caller briefly in your own words what its message says, and follow "
@@ -214,7 +219,7 @@ function callerRecordSection() {
   };
 }
 
-function oneThingSection({ hasOnSiteTypes }) {
+function oneThingSection({ booking, hasOnSiteTypes }) {
   return {
     title: "ONE THING AT A TIME",
     lines: [
@@ -231,8 +236,15 @@ function oneThingSection({ hasOnSiteTypes }) {
       "- Names, places, addresses, and anything easy to mishear: read it back and get a yes. If they correct you, read "
         + "the corrected version back once more. Still not right after two tries? Stop asking, carry on with what you "
         + "have, say someone will confirm it, and mark it unconfirmed in whatever you pass along.",
-      "Bad: \"The earliest openings I see are Monday, so I'd need to check Tuesday. Before I look, what's your name?\"",
-      "Good: [checks] \"Tuesday at one is open. Can I get your name for the appointment?\"",
+      ...(booking
+        ? [
+          "Bad: \"The earliest openings I see are Monday, so I'd need to check Tuesday. Before I look, what's your name?\"",
+          "Good: [checks] \"Tuesday at one is open. Can I get your name for the appointment?\"",
+        ]
+        : [
+          "Bad: \"I don't know that, but what's your name?\"",
+          "Good: \"I don't have that information. I can take a message for the team.\"",
+        ]),
       ...(hasOnSiteTypes
         ? ["Exception: for a visit at the caller's location, ask their city before checking availability - it decides "
           + "whether a visit can be booked at all. If they've already asked about a specific time, answer that first, "
@@ -242,7 +254,7 @@ function oneThingSection({ hasOnSiteTypes }) {
   };
 }
 
-function businessInfoSection({ cfg, business }) {
+function businessInfoSection({ cfg, booking, business }) {
   const info = cfg.business;
   const hoursLine = info.weeklyHours ? formatBusinessHours(info.weeklyHours) : info.hoursText;
   const holidays = info.holidays.map((holiday) => {
@@ -258,7 +270,7 @@ function businessInfoSection({ cfg, business }) {
       `- Address: ${info.address || "Not provided"}`,
       ...(info.mailingAddress ? [`- Mailing address: ${info.mailingAddress}`] : []),
       ...(info.website ? [`- Website: ${info.website}`] : []),
-      `- Timezone: ${info.timezone} - every time you say or book is in this timezone.`,
+      `- Timezone: ${info.timezone}${booking ? " - every time you say or book is in this timezone." : "."}`,
       `- Hours: ${hoursLine || "Not provided"}`,
       ...(holidays.length ? [`- Holidays: ${holidays.join(", ")}`] : []),
       ...(info.contactEmails.length

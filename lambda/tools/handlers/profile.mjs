@@ -38,5 +38,20 @@ export function effectiveProfile(agent, workspaceProfile) {
       if (own[field] !== undefined) merged[field] = own[field];
     }
   }
+  // Legacy records can contain a non-IANA timezone. The prompt compiler and
+  // Retell adapter fall back to UTC for those records, so calendar tools must
+  // use the same fallback rather than failing mid-call or interpreting time in
+  // a different zone.
+  if (!isIanaTimezone(merged.timezone)) merged.timezone = "UTC";
   return merged;
+}
+
+function isIanaTimezone(value) {
+  if (typeof value !== "string" || !value) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
 }

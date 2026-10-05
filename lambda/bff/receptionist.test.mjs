@@ -352,7 +352,7 @@ test("buildReceptionistConfig sets language and begin_message_delay_ms when the 
   assert.equal(config.retellAgent.begin_message_delay_ms, 1000);
 });
 
-test("buildReceptionistConfig omits begin_message_delay_ms when the caller speaks first", () => {
+test("buildReceptionistConfig clears begin_message_delay_ms when the caller speaks first", () => {
   const config = buildReceptionistConfig({
     workspaceId: "workspace-123",
     agent: {
@@ -364,7 +364,7 @@ test("buildReceptionistConfig omits begin_message_delay_ms when the caller speak
     voiceId: "retell-voice-1",
   });
   assert.equal(config.startSpeaker, "user");
-  assert.equal(config.retellAgent.begin_message_delay_ms, undefined);
+  assert.equal(config.retellAgent.begin_message_delay_ms, 0);
 });
 
 test("end_call is always available, independent of spamScreening - the agent also uses it to end calls gracefully", () => {

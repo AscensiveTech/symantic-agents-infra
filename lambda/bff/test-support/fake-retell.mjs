@@ -152,7 +152,7 @@ export function createFakeRetell() {
         return ok({ message: "Agent version published successfully" });
       }
       case "GET list-phone-numbers":
-        return ok([...phones.values()].map(clone));
+        return ok({ items: [...phones.values()].map(clone), has_more: false });
       case "POST import-phone-number": {
         phones.set(body.phone_number, clone(body));
         return ok({ phone_number: body.phone_number }, 201);

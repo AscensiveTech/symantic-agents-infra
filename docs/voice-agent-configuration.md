@@ -75,7 +75,7 @@ Stored = `agent.configuration.<field>`; profile fields live in `agent.configurat
 | Physical Address | profile `address` | P, B | BUSINESS INFO; default booking `location` (tools) | |
 | Mailing Address / Same as Physical | profile `mailingAddress` ("" = same) | P | BUSINESS INFO, only when it differs | |
 | Company Website | profile `website` | P | BUSINESS INFO | Never crawled. |
-| Timezone | profile `timezone` | P, N, B, DV | prompt clock `{{current_time_<zone>}}` and Timezone line; agent `timezone`; tools time parsing and hours enforcement | Invalid zone: `Etc/UTC` clock and no agent `timezone` (diagnostic). |
+| Timezone | profile `timezone` | P, N, B, DV | prompt clock `{{current_time_<zone>}}` and Timezone line; agent `timezone`; tools time parsing and hours enforcement | New activation rejects an invalid IANA zone. Legacy invalid values consistently fall back to UTC in the prompt, Retell (`Etc/UTC`) and calendar tools (diagnostic). |
 | Emails + labels | profile `contactEmails[]` | P | BUSINESS INFO, "share only if asked" | |
 | Service Area Coverage | profile `serviceAreas[]` | P, T | SERVICE AREA section + `check_service_area` tool (list baked in as `const`) | Absent: neither exists. |
 | Business Hours / closed days / Open 24 Hours / multiple ranges | profile `businessHours` (+ free-text `hours`) | P, B | BUSINESS INFO, SCHEDULING RULES; **enforced** by availability/create/reschedule | Structured hours win; free text shown as-is and not enforced. |
@@ -96,7 +96,7 @@ Stored = `agent.configuration.<field>`; profile fields live in `agent.configurat
 | Background Sound / volume | `ambientSound`, `ambientSoundVolume` | N | `ambient_sound` (null clears), `ambient_sound_volume` 0.1-1 (sent only with a sound) | |
 | Language | `language` | N, P | agent `language`; for es-419 a "speak Spanish" line in ROLE and the Spanish sample greeting | Only en-US / es-419 offered. Anything else becomes en-US. The wizard swaps an untouched sample greeting when the language changes. |
 | Who Speaks First | `startSpeaker` | N, P | LLM `start_speaker`; CONTEXT line (agent-first: "greeting already said"; caller-first: introduce yourself) | |
-| Pause Before Speaking | `pauseBeforeSpeakingMs` | N | agent `begin_message_delay_ms` (agent-first only) | 0 or 1000. |
+| Pause Before Speaking | `pauseBeforeSpeakingMs` | N | agent `begin_message_delay_ms` | 0 or 1000 for agent-first; explicitly 0 for caller-first so an old Retell delay cannot survive an update. |
 | Call Recording Disclosure | `recordingDisclosure` | N | adds the disclosure sentence to the **default** greeting | Custom greeting without "record" gets a diagnostic. Prompt answers "is this recorded?" truthfully either way. |
 | Custom Greeting Message | `greeting` | N | LLM `begin_message` only | Blank: the wizard's sample (`sampleGreeting`, identical to the wizard's `buildSampleGreeting`; never empty, since `""` would make the agent wait silently). A Spanish agent still carrying the untouched English sample is sent the Spanish sample. |
 
@@ -153,7 +153,7 @@ Stored = `agent.configuration.<field>`; profile fields live in `agent.configurat
 |---|---|---|---|---|
 | Role Instructions | `roleInstructions` | P | HOW THIS BUSINESS WANTS CALLS HANDLED | Seeded lines already covered are left out (see below). |
 | Restrictions | `restrictions` | P | RESTRICTIONS - WHAT NOT TO SAY OR DO | Same. |
-| Example Dialogues | `exampleDialogues` | P | EXAMPLE DIALOGUES | An untouched template example is replaced by generated examples that use the agent's real tool names. Empty also gets generated examples. |
+| Example Dialogues | `exampleDialogues` | P | EXAMPLE DIALOGUES | An untouched template example is replaced by generated examples that use the agent's real tool names. Empty also gets generated examples. Publishing is rejected if retained customer instructions affirm scheduling or transfers for which no tool exists; explicit prohibitions remain valid. |
 | Final Reminders | `finalReminders` | P | last lines of FINAL REMINDERS | Seeded defaults are all covered, so they're left out. |
 
 ### Internal / legacy (never sent)
@@ -195,7 +195,8 @@ still carry them) and regenerate `voice-agent/golden/frontend-seeds.json`.
 All webhook tools get `workspaceId`, `agentId` (baked in as `const`) and `callId` (`{{call_id}}`),
 a 10 s timeout and one retry. A failure comes back as a speakable `ok: false` with an `action`,
 and the prompt says to follow it. `disableBookingTools` means stop using calendar tools for the
-rest of the call. `buildPrompt` throws if a section names a tool that isn't registered.
+rest of the call. Compilation emits an error-level diagnostic if prompt text names a tool that
+isn't registered; publish rejects any error-level diagnostic before making a Retell write.
 
 ## Dynamic variables
 
@@ -226,3 +227,40 @@ cd lambda/bff && UPDATE_GOLDEN=1 node --test voice-agent/voice-agent.test.mjs
 Then review the diff. Also covered: `publish-flow.test.mjs` (create/update through the
 versioning-enforcing fake Retell), `lambda/tools/handlers/business-hours.test.mjs`, and
 reschedule/hours tests in `lambda/tools/index.test.mjs`.
+
+## Sanitized generated examples
+
+The checked-in `booking-multiple-types` golden fixture is the complete, reviewable example for a
+fictional plumbing business. It is generated by the production builders, not hand-written audit
+documentation:
+
+- `lambda/bff/voice-agent/golden/booking-multiple-types.prompt.txt` is the exact final prompt. It
+  demonstrates conditional scheduling, KB-use instructions without KB content, business hours,
+  holidays, service area, transfers, confirmation gates, failure behavior and closing.
+- `lambda/bff/voice-agent/golden/booking-multiple-types.retell.json` is the corresponding sanitized
+  Retell request. Its top-level operations are `updateRetellLlm`, `updateAgent` and
+  `postCallAnalysis`; fixture IDs, phone numbers, tool URLs and KB IDs are non-production values.
+
+The `faq-only`, `no-calendar-general-template`, `knowledge-base-heavy`, `transfer-enabled`,
+`customer-support-template`, `spanish-caller-first` and `legacy-agent` pairs prove that sections,
+tools and native settings are added or removed by capability instead of being concatenated into
+one universal prompt.
+
+## Audit defects and disposition
+
+| Evidence-backed defect | Disposition |
+|---|---|
+| Phone reconciliation used Retell's removed legacy list endpoint and did not paginate. | Uses paginated `GET /v2/list-phone-numbers`; fake-provider and publish-flow coverage added. |
+| PATCH updates could retain a removed timezone or a prior greeting delay because omitted Retell fields are merged. | Builder always sends a valid timezone (`Etc/UTC` for a legacy invalid value) and sends `begin_message_delay_ms: 0` when clearing the delay. |
+| Error diagnostics, including prompt references to absent tools, did not stop publish. | `buildReceptionistConfig` rejects error-level diagnostics before the provider boundary and returns an actionable 422 response on activation. |
+| Scheduling-disabled agents could retain customer examples or instructions that positively confirmed a booking; transfer-disabled agents could retain affirmative transfer instructions. | Capability-aware generated examples omit disabled behavior; retained customer instructions are checked clause-by-clause while explicit prohibitions remain valid. |
+| Retell payload schema validation existed only in the inspector and tests. | The publish boundary now validates the exact LLM and agent payloads before any Retell write. |
+| Legacy invalid timezone values produced a UTC prompt, Retell's default timezone, and failing calendar tools. | New activations reject invalid zones; legacy records use the same UTC fallback across all three runtime layers. |
+| Wizard round trips omitted Call Forwarding and Guardrails from `completedSteps`. | Draft domain now includes all eight steps, with unit coverage. |
+| Save Changes persisted a deterministically invalid configuration for a live agent before Retell rejected it, guaranteeing Symantic/Retell drift. | Live saves and reactivations now compile and validate locally before persistence; transient provider failures still preserve the customer's valid edit and return `retellSync.status = failed`. |
+| A transient Retell rejection left the requested configuration marked live in Symantic and cleared the unpublished flag. | The prior published configuration is restored, the valid edit is retained as `pendingConfiguration`, and `hasUnpublishedChanges` remains true for retry. |
+| Legacy-KB migration state could be overwritten by later phone-number persistence, and a lost marker could create the same migrated KB again. | Phone persistence merges from the latest stored agent; failed publishes preserve migration-owned IDs/markers; migration also reuses an existing tenant-scoped `migratedFromAgentId` record. |
+| A Telnyx display-tag failure ran before Retell publication and could incorrectly report that the live agent update failed. | Retell publishes first; number retagging is isolated best-effort metadata with separate error reporting. |
+
+The unresolved product decision is intentionally not hidden: a generic human request takes a
+message unless a configured transfer rule matches; the Default Transfer Number is not a catch-all.

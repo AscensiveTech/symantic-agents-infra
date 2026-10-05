@@ -2008,6 +2008,9 @@ export function createHandler({
         const activatedAt = new Date().toISOString();
         let updatedAgent;
         try {
+          const latestAgent = phoneResult.phoneNumber?.telnyxPhoneNumber && typeof store.getAgent === "function"
+            ? await store.getAgent(workspaceId, agentAction.agentId)
+            : agent;
           updatedAgent = await store.updateAgentRuntime(
             workspaceId,
             agentAction.agentId,
@@ -2023,7 +2026,7 @@ export function createHandler({
               // tile) read a blank platformDid and never showed the phone
               // number at all, even though it was really provisioned.
               ...(phoneResult.phoneNumber?.telnyxPhoneNumber
-                ? { configuration: { ...agent.configuration, platformDid: phoneResult.phoneNumber.telnyxPhoneNumber } }
+                ? { configuration: { ...(latestAgent?.configuration ?? agent.configuration), platformDid: phoneResult.phoneNumber.telnyxPhoneNumber } }
                 : {}),
             },
           );
@@ -2260,18 +2263,6 @@ export function createHandler({
             existing &&
             !sameLaunchConfiguration(existing.configuration, agent.configuration),
           );
-          if (invalidateTest && existing?.tested === true) {
-            // A previously-passing test just got invalidated by this save -
-            // log which top-level configuration keys actually differ so a
-            // real remaining mismatch (a field neither side excludes, or a
-            // normalization gap) is visible in CloudWatch instead of only
-            // showing up as a confusing "run a test" banner in the UI.
-            const before = canonicalizeForComparison(canonicalLaunchConfiguration(existing.configuration));
-            const after = canonicalizeForComparison(canonicalLaunchConfiguration(agent.configuration));
-            const changedKeys = Array.from(new Set([...Object.keys(before ?? {}), ...Object.keys(after ?? {})]))
-              .filter((key) => JSON.stringify(before?.[key]) !== JSON.stringify(after?.[key]));
-            console.warn("Save invalidated an already-passing test", { workspaceId, agentId, changedKeys });
-          }
           const willBeLive = wasActive || reactivating;
           const previousPlan = existing?.configuration?.receptionistPlan ?? "";
           const incomingPlan = agent.configuration?.receptionistPlan ?? "";
@@ -2324,21 +2315,53 @@ export function createHandler({
             pendingConfiguration: null,
             hasUnpublishedChanges: false,
           };
+          // A provider outage must not discard a customer's edit, but a
+          // deterministic configuration error is different: persisting it
+          // as this active agent's live Symantic configuration while Retell
+          // keeps the previous version creates guaranteed cross-system
+          // drift. Compile and validate the exact candidate before the
+          // storage write. A placeholder voice id and no KB associations are
+          // sufficient here because those values do not affect prompt/tool
+          // consistency or the native payload's shape; the real sync below
+          // still resolves the actual voice and KB ids.
+          let liveProfile;
+          if (willBeLive) {
+            liveProfile = await store.getProfile(workspaceId);
+            buildReceptionistConfig({
+              workspaceId,
+              agent: saved,
+              profile: liveProfile,
+              toolBaseUrl,
+              voiceId: "preflight-validation",
+              knowledgeBases: [],
+            });
+          }
+          if (invalidateTest && existing?.tested === true) {
+            // A previously-passing test is about to be invalidated by this
+            // accepted save. This runs after deterministic preflight so a
+            // rejected configuration cannot produce a misleading audit log.
+            const before = canonicalizeForComparison(canonicalLaunchConfiguration(existing.configuration));
+            const after = canonicalizeForComparison(canonicalLaunchConfiguration(agent.configuration));
+            const changedKeys = Array.from(new Set([...Object.keys(before ?? {}), ...Object.keys(after ?? {})]))
+              .filter((key) => JSON.stringify(before?.[key]) !== JSON.stringify(after?.[key]));
+            console.warn("Save invalidated an already-passing test", { workspaceId, agentId, changedKeys });
+          }
           const nextPlan = saved.configuration?.receptionistPlan ?? "";
+          const planChanged = previousPlan !== nextPlan;
           const updatedAgent = await store.putAgent(
             workspaceId,
             agentId,
             saved,
             { invalidateTest },
           );
-          if (previousPlan !== nextPlan) {
+          if (!willBeLive && planChanged) {
             await recordAgentPlanChange(store, workspaceId, agent.name, nextPlan, actor.userId);
           }
           if (wasActive || reactivating) {
             let retellSync;
+            let responseAgent = updatedAgent;
             try {
-              const profile = await store.getProfile(workspaceId);
-              await retagNumberIfRenamed({ store, providers: await getProviders(), workspaceId, agentId, before: existing, after: updatedAgent, profile });
+              const profile = liveProfile;
               const providers = await getProviders();
               const synced = await syncRetellAgent({
                 workspaceId,
@@ -2351,23 +2374,72 @@ export function createHandler({
                 toolBaseUrl,
               });
               retellSync = synced.retellSync;
+              if (planChanged) {
+                try {
+                  await recordAgentPlanChange(store, workspaceId, agent.name, nextPlan, actor.userId);
+                } catch (planHistoryError) {
+                  // Publishing succeeded, so never misreport this as a Retell
+                  // failure or roll back the configuration Retell now has.
+                  console.error("Failed to record the live agent plan change", { agentId, planHistoryError });
+                }
+              }
+              try {
+                await retagNumberIfRenamed({ store, providers, workspaceId, agentId, before: existing, after: updatedAgent, profile });
+              } catch (retagError) {
+                // A Telnyx display tag is metadata. It must not prevent or
+                // misreport an otherwise successful Retell publication.
+                console.error("Failed to retag the phone number after agent rename", { agentId, retagError });
+              }
               try {
                 await syncPhoneNumberCountries({ store, providers, workspaceId, agentId, agent: updatedAgent });
               } catch (countriesError) {
                 console.error("Failed to update the number's allowed inbound countries after edit", { agentId, countriesError });
               }
             } catch (syncError) {
-              // The edit is saved either way, so the save still succeeds -
-              // but the app is told the change isn't live, instead of this
-              // only reaching the logs (which is how Samantha's saves failed
-              // unnoticed from Sep 17 to Sep 24, 2026).
+              // Retell still has the previously published configuration.
+              // Restore that same configuration as Symantic's live record
+              // and retain the requested edit as an unpublished draft. This
+              // makes the retry recoverable without claiming the failed
+              // version is live or silently losing the customer's work.
               console.error("Failed to resync an active agent to Retell after edit", syncError);
               retellSync = {
                 status: "failed",
                 message: syncError?.details?.message ?? syncError?.message ?? "Retell didn't accept the update.",
               };
+              // A sync may have completed the one-time legacy-KB migration
+              // before the Retell agent update failed. Preserve only those
+              // migration-owned additions while restoring customer-facing
+              // live settings; otherwise a retry could create a duplicate
+              // Retell KB after we erase the migration marker/id here.
+              const afterFailedSync = typeof store.getAgent === "function"
+                ? await store.getAgent(workspaceId, agentId)
+                : updatedAgent;
+              const requestedKnowledgeIds = new Set(Array.isArray(saved.configuration?.knowledgeBaseIds)
+                ? saved.configuration.knowledgeBaseIds
+                : []);
+              const migratedKnowledgeIds = Array.isArray(afterFailedSync?.configuration?.knowledgeBaseIds)
+                ? afterFailedSync.configuration.knowledgeBaseIds.filter((id) => !requestedKnowledgeIds.has(id))
+                : [];
+              const previousKnowledgeIds = Array.isArray(existing?.configuration?.knowledgeBaseIds)
+                ? existing.configuration.knowledgeBaseIds
+                : [];
+              const restoredConfiguration = {
+                ...existing.configuration,
+                ...(afterFailedSync?.configuration?.legacyKnowledgeMigrated === true
+                  ? { legacyKnowledgeMigrated: true }
+                  : {}),
+                ...((previousKnowledgeIds.length || migratedKnowledgeIds.length)
+                  ? { knowledgeBaseIds: [...new Set([...previousKnowledgeIds, ...migratedKnowledgeIds])] }
+                  : {}),
+              };
+              responseAgent = await store.putAgent(workspaceId, agentId, {
+                ...existing,
+                configuration: restoredConfiguration,
+                pendingConfiguration: saved.configuration ?? null,
+                hasUnpublishedChanges: true,
+              });
             }
-            return json(200, { ...updatedAgent, retellSync });
+            return json(200, { ...responseAgent, retellSync });
           }
           return json(200, updatedAgent);
         } catch (error) {
@@ -6592,8 +6664,11 @@ export async function syncReceptionistRuntime(args) {
   // roster tile's next GET /agents still shows no phone number even
   // though one is really attached - the exact bug this was chasing.
   if (phoneResult.phoneNumber?.telnyxPhoneNumber && args.agent?.configuration?.platformDid !== phoneResult.phoneNumber.telnyxPhoneNumber) {
+    const latestAgent = typeof args.store.getAgent === "function"
+      ? await args.store.getAgent(args.workspaceId, args.agentId)
+      : args.agent;
     await args.store.updateAgentRuntime(args.workspaceId, args.agentId, {
-      configuration: { ...args.agent.configuration, platformDid: phoneResult.phoneNumber.telnyxPhoneNumber },
+      configuration: { ...(latestAgent?.configuration ?? args.agent.configuration), platformDid: phoneResult.phoneNumber.telnyxPhoneNumber },
       updatedAt: new Date().toISOString(),
     });
   }
@@ -6621,6 +6696,24 @@ async function migrateLegacyAgentKnowledge({ store, workspaceId, agentId, agent,
       file.size <= MAX_KNOWLEDGE_FILE_BYTES)
     : [];
   if (!knowledgeText && fileMetadata.length === 0) return null;
+
+  // The Retell KB and hub record may already have been created even if a
+  // later agent-marker write failed or an older runtime update overwrote
+  // that marker. Reuse the tenant-scoped migration record instead of ever
+  // creating a second Retell KB for the same legacy agent.
+  if (typeof store.listKnowledgeBases === "function") {
+    const prior = (await store.listKnowledgeBases(workspaceId)).find((item) =>
+      item?.migratedFromAgentId === agentId &&
+      typeof item?.knowledgeBaseId === "string" && item.knowledgeBaseId &&
+      typeof item?.retellKnowledgeBaseId === "string" && item.retellKnowledgeBaseId
+    );
+    if (prior) {
+      return {
+        knowledgeBaseId: prior.knowledgeBaseId,
+        retellKnowledgeBaseId: prior.retellKnowledgeBaseId,
+      };
+    }
+  }
 
   const created = await buildRetellKnowledgeBase({
     providers,
@@ -7106,6 +7199,9 @@ function launchReadinessIssue(agent, profile, calendar) {
     )
   ) {
     return "Complete the business profile before activation";
+  }
+  if (!isIanaTimezone(profile.timezone)) {
+    return "Choose a valid business timezone before activation";
   }
   // guidance and escalation are both optional now - emergency rules cover
   // escalation routing, and a blank guidance field is a legitimate choice

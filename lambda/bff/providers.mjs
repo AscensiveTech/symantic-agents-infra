@@ -362,8 +362,16 @@ export function createRetellClient({
   // "latest_published", so a publish from the app or from the Retell
   // dashboard goes live without anyone re-pointing the number.
   async function followLatestPublished(agentId) {
-    const numbers = await retellRequest("/list-phone-numbers");
-    for (const number of Array.isArray(numbers) ? numbers : []) {
+    const numbers = [];
+    let paginationKey;
+    do {
+      const query = new URLSearchParams({ limit: "1000" });
+      if (paginationKey) query.set("pagination_key", paginationKey);
+      const page = await retellRequest(`/v2/list-phone-numbers?${query}`);
+      numbers.push(...(Array.isArray(page?.items) ? page.items : []));
+      paginationKey = page?.has_more ? page.pagination_key : undefined;
+    } while (paginationKey);
+    for (const number of numbers) {
       const repoint = (entries) => (Array.isArray(entries) ? entries : []).map((entry) =>
         entry?.agent_id === agentId ? { ...entry, agent_version: "latest_published" } : entry);
       const pinned = (entries) => (Array.isArray(entries) ? entries : []).some((entry) =>

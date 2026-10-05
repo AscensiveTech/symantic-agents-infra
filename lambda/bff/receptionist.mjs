@@ -8,6 +8,7 @@
 import { compileVoiceAgent } from "./voice-agent/index.mjs";
 import { buildVoiceAgentConfiguration } from "./voice-agent/configuration.mjs";
 import { buildPrompt } from "./voice-agent/prompt.mjs";
+import { buildRetellAgentPayload, validateRetellPayloads } from "./voice-agent/retell.mjs";
 import { buildToolPlan } from "./voice-agent/tools.mjs";
 
 export {
@@ -53,7 +54,37 @@ export function buildReceptionistConfig({
   }
   if (!text(toolBaseUrl)) throw new Error("toolBaseUrl is required");
   if (!text(voiceId)) throw new Error("Retell voice id is required");
-  return compileVoiceAgent({ workspaceId, agent, profile, toolBaseUrl, voiceId, knowledgeBases }).config;
+  const compiled = compileVoiceAgent({ workspaceId, agent, profile, toolBaseUrl, voiceId, knowledgeBases });
+  const agentName = text(agent?.configuration?.name) || text(agent?.name);
+  const retellAgent = buildRetellAgentPayload({
+    config: compiled.config,
+    llmId: "validation",
+    symanticAgentId: agentId,
+    agentName,
+  });
+  const payloadErrors = validateRetellPayloads({ llm: compiled.retell.llm, agent: retellAgent })
+    .map((item) => ({
+      level: "error",
+      code: "invalid_retell_payload",
+      message: `Retell payload ${item.path} ${item.message}.`,
+    }));
+  const errors = [
+    ...compiled.diagnostics.filter((item) => item.level === "error"),
+    ...payloadErrors,
+  ];
+  if (errors.length) {
+    const error = new Error(`Voice agent configuration is invalid: ${errors.map((item) => item.message).join(" ")}`);
+    error.code = "invalid_voice_agent_configuration";
+    error.details = { diagnostics: errors };
+    error.statusCode = 422;
+    error.payload = {
+      code: error.code,
+      message: error.message,
+      diagnostics: errors,
+    };
+    throw error;
+  }
+  return compiled.config;
 }
 
 function text(value) {

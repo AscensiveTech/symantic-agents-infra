@@ -745,7 +745,7 @@ test("Retell upsert re-attaches a missing LLM on an already-published agent thro
       assert.equal(body.version, 1);
       return response({ message: "Agent version published successfully" });
     }
-    if (href.includes("/list-phone-numbers")) return response([]);
+    if (href.includes("/v2/list-phone-numbers")) return response({ items: [], has_more: false });
     if (href.includes("/get-agent/agent-published-123")) {
       // readLivePublished's own read-back after publishing - either
       // version answers fine for this test's purposes.

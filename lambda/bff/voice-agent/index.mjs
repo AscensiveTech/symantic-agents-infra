@@ -13,7 +13,7 @@
 
 import { buildVoiceAgentConfiguration } from "./configuration.mjs";
 import { referencedVariables } from "./dynamic-variables.mjs";
-import { buildPrompt, mentionedToolNames } from "./prompt.mjs";
+import { buildPrompt, compileCustomInstructions, mentionedToolNames } from "./prompt.mjs";
 import {
   buildRetellAgentSettings,
   buildRetellLlmPayload,
@@ -77,14 +77,24 @@ export function diagnose(cfg, toolPlan, prompt) {
   const out = [];
   const add = (level, code, message) => out.push({ level, code, message });
   const registered = new Set(toolNames(toolPlan));
+  const retainedCustomInstructions = compileCustomInstructions(cfg);
 
   const unregistered = mentionedToolNames(prompt.text).filter((name) => !registered.has(name));
   if (unregistered.length) {
     add("error", "prompt_mentions_unregistered_tool",
       `The prompt mentions ${unregistered.join(", ")}, which this agent doesn't have - check the business's own instructions.`);
   }
-  const customText = [cfg.customInstructions.roleInstructions, cfg.customInstructions.restrictions,
-    cfg.customInstructions.exampleDialogues, cfg.customInstructions.finalReminders].join("\n");
+  if (!cfg.scheduling.enabled && customInstructionsClaimCapability(retainedCustomInstructions, "scheduling")) {
+    add("error", "disabled_scheduling_in_examples",
+      "Custom instructions tell the agent to schedule or confirm appointments, but scheduling is disabled - remove that instruction or enable a calendar.");
+  }
+  if (!toolPlan.some((tool) => tool.kind === "transfer")
+    && customInstructionsClaimCapability(retainedCustomInstructions, "transfer")) {
+    add("error", "disabled_transfers_in_custom_instructions",
+      "Custom instructions tell the agent to transfer calls, but no transfer tool is configured - remove that instruction or add an enabled transfer rule.");
+  }
+  const customText = [retainedCustomInstructions.roleInstructions, retainedCustomInstructions.restrictions,
+    retainedCustomInstructions.exampleDialogues, retainedCustomInstructions.finalReminders].join("\n");
   const customVariables = referencedVariables(customText);
   if (customVariables.length) {
     add("warning", "custom_text_has_variables",
@@ -124,4 +134,27 @@ export function diagnose(cfg, toolPlan, prompt) {
   }
   if (prompt.text.length > 28_000) add("warning", "prompt_long", `The prompt is ${prompt.text.length} characters.`);
   return out;
+}
+
+// Customer-authored text is intentionally flexible, but it must not promise
+// an operation for which this agent has no tool. Check instruction/assistant
+// lines only (not caller examples), and ignore explicitly negative rules such
+// as "never transfer" or "we cannot book appointments".
+function customInstructionsClaimCapability(customInstructions, capability) {
+  const fields = [
+    customInstructions.roleInstructions,
+    customInstructions.restrictions,
+    customInstructions.exampleDialogues,
+    customInstructions.finalReminders,
+  ];
+  const capabilityPattern = capability === "transfer"
+    ? /\btransfer(?:red|ring|s)?\b|\b(?:connect(?:ed|ing|s)?|route(?:d|ing|s)?|send(?:ing|s)?|pass(?:ed|ing|es)?|put)\b.{0,50}\b(?:caller|call|person|human|owner|staff|team|department|representative|agent)\b|\b(?:caller|call)\b.{0,50}\b(?:connect(?:ed|ing|s)?|route(?:d|ing|s)?|send(?:ing|s)?|pass(?:ed|ing|es)?|put\s+through)\b/i
+    : /\b(?:book|booked|books|schedul(?:e|ed|ing|es)|reschedul(?:e|ed|ing|es)|cancel(?:led|ing|s)?)\b|\b(?:check|consult|search|use|open|look\s+at)\b.{0,40}\b(?:calendar|availability)\b|\b(?:offer|find|give|provide|have|found)\b.{0,40}\b(?:availability|openings?|time slots?)\b|\ball set\b|\b(?:make|set\s*up|arrang(?:e|ed|ing|es)|creat(?:e|ed|ing|es)|reserv(?:e|ed|ing|es)|confirm(?:ed|ing|s)?)\b.{0,50}\b(?:appointment|booking|reservation|visit|time slot)\b|\b(?:appointment|booking|reservation|visit|time slot)\b.{0,50}\b(?:make|set\s*up|arrang(?:e|ed|ing|es)|creat(?:e|ed|ing|es)|reserv(?:e|ed|ing|es)|confirm(?:ed|ing|s)?)\b/i;
+  const nonCapabilityPattern = /\b(?:never|not|do not|don't|cannot|can't|unable|not able|not authorized|must not|without)\b|\b(?:take|capture|leave|record)\b.{0,30}\bmessage\b/i;
+  return fields.some((field) => String(field ?? "")
+    .replace(/\r\n?/g, "\n")
+    .split(/\n|(?<=[.!?;])\s+|,\s*(?:(?:but|however|instead|then)\s+)|\bbut\s+|\band\s+then\s+/i)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^caller\s*:/i.test(line))
+    .some((line) => capabilityPattern.test(line) && !nonCapabilityPattern.test(line)));
 }

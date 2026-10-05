@@ -47,6 +47,9 @@ test("create, then a Role Instructions edit: only the prompt changes at Retell; 
   await publish(retell, fullAgent({ roleInstructions: "- Ask how they heard about us." }), agentId);
   const after = fake.answering(PHONE);
 
+  assert.ok(fake.requests.some((request) => request.path === "/v2/list-phone-numbers"),
+    "published updates must use Retell's current paginated phone-number endpoint");
+
   assert.notEqual(after.llm.general_prompt, before.llm.general_prompt);
   assert.match(after.llm.general_prompt, /Ask how they heard about us/);
   for (const field of ["begin_message", "general_tools", "knowledge_base_ids", "start_speaker", "default_dynamic_variables"]) {
@@ -74,4 +77,40 @@ test("clearing the ambient sound and the pronunciations on update clears them at
   assert.equal(after.agent.ambient_sound, null);
   assert.equal(after.agent.pronunciation_dictionary, null);
   assert.equal(after.agent.voice_id, "11labs-Hailey");
+});
+
+test("turning off the first-message pause and invalidating a legacy timezone replaces stale Retell values", async () => {
+  const fake = createFakeRetell();
+  const retell = createRetellClient({ apiKey: "retell-key", fetchImpl: fake.fetchImpl });
+  const first = compileVoiceAgent({ ...BUILD, agent: fullAgent(), profile: workspaceProfile, knowledgeBases });
+  const created = await retell.upsertAgent({
+    symanticAgentId: first.canonical.identity.agentId,
+    agentName: first.canonical.identity.internalName,
+    greeting: first.canonical.conversation.greeting,
+    config: first.config,
+  });
+  fake.seedPhone(PHONE, created.retellAgentId, "latest_published");
+  assert.equal(fake.answering(PHONE).agent.begin_message_delay_ms, 1000);
+  assert.equal(fake.answering(PHONE).agent.timezone, "America/New_York");
+
+  const changed = compileVoiceAgent({
+    ...BUILD,
+    agent: fullAgent({
+      startSpeaker: "user",
+      pauseBeforeSpeakingMs: 0,
+      businessProfile: { ...fullAgent().configuration.businessProfile, timezone: "invalid" },
+    }),
+    profile: workspaceProfile,
+    knowledgeBases,
+  });
+  await retell.upsertAgent({
+    retellAgentId: created.retellAgentId,
+    symanticAgentId: changed.canonical.identity.agentId,
+    agentName: changed.canonical.identity.internalName,
+    greeting: changed.canonical.conversation.greeting,
+    config: changed.config,
+  });
+  const after = fake.answering(PHONE).agent;
+  assert.equal(after.begin_message_delay_ms, 0);
+  assert.equal(after.timezone, "Etc/UTC");
 });

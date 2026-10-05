@@ -113,10 +113,13 @@ export function buildRetellAgentSettings(cfg) {
     language: cfg.voice.language,
     // The business's timezone, so Retell's own {{current_time}} and call
     // timestamps match the business even where the prompt doesn't name a zone.
-    ...(cfg.business.timezoneValid ? { timezone: cfg.business.timezone } : {}),
-    ...(cfg.conversation.startSpeaker === "agent" && cfg.conversation.pauseBeforeSpeakingMs > 0
-      ? { begin_message_delay_ms: cfg.conversation.pauseBeforeSpeakingMs }
-      : {}),
+    // Both fields are always sent because Retell PATCH is a merge. Omitting
+    // either one would preserve a stale value from the previous published
+    // version when a user clears/corrects that setting in Symantic.
+    timezone: cfg.business.timezoneValid ? cfg.business.timezone : "Etc/UTC",
+    begin_message_delay_ms: cfg.conversation.startSpeaker === "agent"
+      ? cfg.conversation.pauseBeforeSpeakingMs
+      : 0,
   };
 }
 
