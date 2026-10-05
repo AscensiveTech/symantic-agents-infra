@@ -4777,6 +4777,44 @@ test("SignWell webhooks for a non-final event do not complete the proposal", asy
   assert.deepEqual(signatureUpdateOpts, { markProposalCompleted: false });
 });
 
+test("a viewed event after a signer has signed (SignWell's thank-you page) keeps them signed", async () => {
+  const webhookId = "webhook-123";
+  let signatureRequest = {
+    provider: "signwell",
+    documentId: "signwell-doc-123",
+    status: "viewed",
+    recipients: [
+      { id: "1", name: "Sam Seller", email: "sam@example.com", status: "viewed" },
+      { id: "2", name: "Jane Client", email: "jane@example.com", status: "signed", signedAt: "2026-10-05T02:34:25.000Z" },
+    ],
+  };
+  const store = {
+    async getProposal(_workspaceId, proposalId) {
+      return { id: proposalId, status: "draft", signatureRequest };
+    },
+    async updateProposalSignature(_workspaceId, _proposalId, next) {
+      signatureRequest = next;
+    },
+  };
+  const type = "document_viewed";
+  const time = 1791167688;
+  const hash = createHmac("sha256", webhookId).update(`${type}@${time}`).digest("hex");
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getSignWell: async () => ({ webhookId, client: {} }) });
+  const response = await handler({
+    requestContext: { http: { method: "POST", path: "/webhooks/signwell" } },
+    rawPath: "/webhooks/signwell",
+    body: JSON.stringify({
+      event: { type, time, hash, related_signer: { name: "Jane Client", email: "jane@example.com" } },
+      data: { object: { id: "signwell-doc-123", metadata: { workspace_id: "workspace-123", proposal_id: "prp-sign" }, recipients: [{ id: "1", name: "Sam Seller", email: "sam@example.com" }, { id: "2", name: "Jane Client", email: "jane@example.com" }] } },
+    }),
+  });
+  assert.equal(response.statusCode, 200);
+  const jane = signatureRequest.recipients.find((recipient) => recipient.id === "2");
+  assert.equal(jane.status, "signed");
+  assert.equal(jane.signedAt, "2026-10-05T02:34:25.000Z");
+});
+
 test("workspace membership shares proposal data across Cognito users", async () => {
   const store = {
     async getMembership(userId) {
