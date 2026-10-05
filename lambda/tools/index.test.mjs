@@ -1739,3 +1739,126 @@ test("invite options: start time in the title and a custom reminder reach Google
     { title: "Estimate Visit - Anthony" },
   );
 });
+
+// --- Reschedule keeps the appointment's length; business hours are enforced ---
+
+function existingAppointment(overrides = {}) {
+  return {
+    workspaceId,
+    appointmentId: "apt-existing",
+    agentId: "agent-1",
+    provider: "google-calendar",
+    providerEventId: "provider-event-existing",
+    status: "confirmed",
+    service: "In-Home Estimate",
+    startTimeUtc: "2026-08-17T14:00:00.000Z",
+    endTimeUtc: "2026-08-17T16:00:00.000Z",
+    timezone: "America/New_York",
+    ...overrides,
+  };
+}
+
+function rescheduleHarness({ agent = null, appointment = existingAppointment(), profile = { timezone: "America/New_York" } } = {}) {
+  const providerCalls = [];
+  const updates = [];
+  const handler = toolHandler({
+    store: createStore({
+      getAgent: async () => clone(agent),
+      getBusinessProfile: async () => clone(profile),
+      getAppointment: async () => clone(appointment),
+      updateAppointment: async (_workspaceId, _appointmentId, patch) => {
+        updates.push(patch);
+        return { ...clone(appointment), ...clone(patch) };
+      },
+    }),
+    calendar: {
+      async getAvailability(input) {
+        providerCalls.push(["availability", input]);
+        return { available: true, busy: [] };
+      },
+      async rescheduleBooking(input) {
+        providerCalls.push(["reschedule", input]);
+        return {};
+      },
+    },
+  });
+  return { handler, providerCalls, updates };
+}
+
+test("rescheduleBooking keeps a typed appointment's duration, lead time, and buffers - only a new start is sent", async () => {
+  const agent = {
+    id: "agent-1",
+    configuration: {
+      appointmentTypes: [{ name: "In-Home Estimate", durationMin: 120, minimumLeadTimeMin: 0, blockBeforeMin: 30, blockAfterMin: 15 }],
+    },
+  };
+  const { handler, providerCalls, updates } = rescheduleHarness({ agent });
+  const response = await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({ agentId: "agent-1", appointmentId: "apt-existing", startTime: "2026-08-18T10:00:00-04:00" }),
+  ));
+  assert.equal(response.statusCode, 200);
+  assert.equal(JSON.parse(response.body).ok, true);
+  // The caller-facing record keeps the real two hours, unpadded.
+  assert.equal(updates[0].startTimeUtc, "2026-08-18T14:00:00.000Z");
+  assert.equal(updates[0].endTimeUtc, "2026-08-18T16:00:00.000Z");
+  // The provider sees the padded block, exactly as at booking time.
+  const moved = providerCalls.find(([name]) => name === "reschedule")[1];
+  assert.equal(moved.startTimeUtc, "2026-08-18T13:30:00.000Z");
+  assert.equal(moved.endTimeUtc, "2026-08-18T16:15:00.000Z");
+});
+
+test("rescheduleBooking without a matching type keeps the original length instead of the 30-minute default", async () => {
+  const { handler, updates } = rescheduleHarness({
+    appointment: existingAppointment({ service: "Consultation", startTimeUtc: "2026-08-17T14:00:00.000Z", endTimeUtc: "2026-08-17T15:15:00.000Z" }),
+  });
+  await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({ appointmentId: "apt-existing", startTime: "2026-08-18T10:00:00-04:00" }),
+  ));
+  assert.equal(updates[0].endTimeUtc, "2026-08-18T15:15:00.000Z");
+});
+
+test("rescheduleBooking enforces the type's minimum lead time", async () => {
+  const agent = { id: "agent-1", configuration: { appointmentTypes: [{ name: "In-Home Estimate", durationMin: 60, minimumLeadTimeMin: 2880 }] } };
+  const { handler, updates } = rescheduleHarness({ agent });
+  const response = await handler(event(
+    "/retell/tools/calendar.rescheduleBooking",
+    requiredBody({ agentId: "agent-1", appointmentId: "apt-existing", startTime: "2026-08-17T10:00:00-04:00" }),
+  ));
+  assert.equal(JSON.parse(response.body).code, "lead_time_not_met");
+  assert.equal(updates.length, 0);
+});
+
+test("availability and booking refuse a time outside business hours or on a closed holiday, as a speakable 200", async () => {
+  const hours = Object.fromEntries(["mon", "tue", "wed", "thu", "fri"].map((day) => [day, { closed: false, intervals: [{ open: "09:00", close: "17:00" }] }]));
+  hours.sat = { closed: true, intervals: [{ open: "09:00", close: "17:00" }] };
+  hours.sun = { closed: true, intervals: [{ open: "09:00", close: "17:00" }] };
+  const profile = {
+    timezone: "America/New_York",
+    businessHours: hours,
+    holidaysEnabled: true,
+    holidays: [{ id: "h", name: "Company Day", date: "2026-08-19", closed: true }],
+  };
+  let providerCalls = 0;
+  const handler = toolHandler({
+    store: createStore({ getBusinessProfile: async () => clone(profile) }),
+    calendar: {
+      async getAvailability() {
+        providerCalls += 1;
+        return { available: true, busy: [] };
+      },
+      async createBooking() {
+        providerCalls += 1;
+        return { providerEventId: "e", provider: "google-calendar" };
+      },
+    },
+  });
+  const ask = async (path, startTime) => JSON.parse((await handler(event(path, requiredBody({ startTime, durationMinutes: 30, customer: { name: "A", phone: "+19375550100" } })))).body);
+
+  assert.equal((await ask("/retell/tools/calendar.getAvailability", "2026-08-18T18:00:00-04:00")).code, "outside_business_hours");
+  assert.equal((await ask("/retell/tools/calendar.getAvailability", "2026-08-22T10:00:00-04:00")).code, "outside_business_hours");
+  assert.equal((await ask("/retell/tools/calendar.createBooking", "2026-08-19T10:00:00-04:00")).code, "closed_holiday");
+  assert.equal(providerCalls, 0);
+  assert.equal((await ask("/retell/tools/calendar.getAvailability", "2026-08-18T10:00:00-04:00")).available, true);
+});

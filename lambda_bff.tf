@@ -8,6 +8,10 @@ data "archive_file" "bff" {
     "receptionist.test.mjs",
     "receptionist-billing.test.mjs",
     "proposals.test.mjs",
+    "voice-agent/voice-agent.test.mjs",
+    "voice-agent/publish-flow.test.mjs",
+    "voice-agent/test-fixtures.mjs",
+    "voice-agent/golden",
   ]
 }
 

@@ -23,6 +23,7 @@ test("Retell tool request and response fixtures match every HTTP route", async (
       timezone: "America/New_York",
     },
   ]]);
+  const slotLocks = new Set();
   const store = {
     async getBusinessProfile() {
       return {
@@ -38,6 +39,14 @@ test("Retell tool request and response fixtures match every HTTP route", async (
     async putAppointment(record) {
       records.set(record.appointmentId, record);
       return record;
+    },
+    async acquireSlotLock(_workspaceId, lockId) {
+      if (slotLocks.has(lockId)) return false;
+      slotLocks.add(lockId);
+      return true;
+    },
+    async releaseSlotLock(_workspaceId, lockId) {
+      slotLocks.delete(lockId);
     },
     async updateAppointment(_workspaceId, appointmentId, updates) {
       const record = { ...records.get(appointmentId), ...updates };

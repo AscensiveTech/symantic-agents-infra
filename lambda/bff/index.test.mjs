@@ -1635,6 +1635,42 @@ test("PUT agent keeps an already-active agent active and pushes the edit to Rete
   assert.match(retellCalls[0].config.prompt, /Updated answering restrictions/);
 });
 
+test("Save Changes on a live agent also pushes a changed Allowed Inbound Countries list to its phone number", async () => {
+  const existing = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
+  existing.configuration = { ...existing.configuration, allowedInboundCountries: ["US"] };
+  const changed = { ...existing, configuration: { ...existing.configuration, allowedInboundCountries: ["US", "ca"] } };
+  let savedAgent;
+  let phone = { workspaceId: "workspace-123", agentId: "agent-123", retellPhoneNumberId: "+17035550177", allowedInboundCountries: ["US"] };
+  const countryUpdates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return existing; },
+    async getProfile() { return receptionistProfile(); },
+    async putAgent(_workspaceId, _agentId, agent) { savedAgent = agent; return agent; },
+    async updateAgentRuntime(_workspaceId, _agentId, updates) { return { ...savedAgent, ...updates }; },
+    async getPhoneNumberForAgent() { return phone; },
+    async putPhoneNumber(record) { phone = record; return record; },
+  };
+  const providers = {
+    retell: {
+      async upsertAgent() { return { retellAgentId: "retell-agent-123" }; },
+      async setPhoneNumberCountries(number, body) { countryUpdates.push([number, body]); },
+    },
+    resolveVoiceId(requestedVoice) { return requestedVoice; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getProviders: async () => providers, toolBaseUrl: "https://api.example.com" });
+
+  const response = await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", changed));
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(countryUpdates, [["+17035550177", { allowed_inbound_country_list: ["US", "CA"] }]]);
+  assert.deepEqual(phone.allowedInboundCountries, ["US", "CA"]);
+
+  // Saving again with the same list makes no further call.
+  await handler(authenticatedEvent("PUT", "/workspaces/me/agents/agent-123", changed));
+  assert.equal(countryUpdates.length, 1);
+});
+
 // Shared set-up for Save Changes on a live agent: a store that keeps what
 // the route writes, and a Retell whose upsert the test controls.
 async function saveLiveAgent({ upsertAgent, query, existingOverrides = {} }) {

@@ -53,6 +53,7 @@ locals {
     "POST /workspaces/me/agents/{agentId}/start-test-call",
     "POST /workspaces/me/agents/{agentId}/discard-draft",
     "GET /workspaces/me/agents/{agentId}/retell-status",
+    "GET /workspaces/me/agents/{agentId}/generated-config",
     "GET /workspaces/me/retell/voices",
     "GET /workspaces/me/available-numbers",
     "GET /workspaces/me/knowledge-bases",
