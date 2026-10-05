@@ -2401,7 +2401,12 @@ export function createHandler({
         }
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
-        const targetAgentId = decodeURIComponent(generatedConfigMatch[1]);
+        let targetAgentId;
+        try {
+          targetAgentId = decodeURIComponent(generatedConfigMatch[1]);
+        } catch {
+          return json(404, { message: "Agent not found" });
+        }
         const stored = await store.getAgent(workspaceId, targetAgentId);
         if (!stored || stored.status === "deleted") return json(404, { message: "Agent not found" });
         const usePending = event?.queryStringParameters?.source === "pending" && stored.pendingConfiguration;

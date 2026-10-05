@@ -42,6 +42,9 @@ One pipeline replaces the single 1,000-line prompt function:
 | 9 | Spanish agents got an English default greeting and no instruction to speak Spanish. When the caller speaks first, the prompt still said the greeting had been said. | Spanish default greeting and a "speak Spanish" line. A caller-first context line. |
 | 10 | Wizard: Final Reminders showed the default when the saved value was empty. The Default Transfer Number hint promised a transfer that doesn't happen. | Field shows the saved value. Hint now says transfers happen only when a Call Transfer rule matches. |
 | 11 | `tests/contract` was already failing on main (fake store missing slot locks). | Fixed. |
+| 12 | (Found in the final audit.) The wizard seeds an English sample greeting into every new agent, so Spanish agents still greeted in English. A blank greeting also sent different text from the default the wizard shows. | A blank greeting sends the wizard's own sample. A Spanish agent's untouched English sample becomes the Spanish sample, and the wizard swaps it when the language changes. A test in each repo fails if the two copies drift. |
+| 13 | (Found in the final audit.) With a matching emergency transfer rule, the 911 rule said "hang up and call 911" and then transferred. | With a matching rule the agent says "if anyone is in danger, hang up and call 911 - otherwise I'll connect you now", then transfers. |
+| 14 | (Found in the final audit.) Small inconsistencies: transfer tool descriptions said "mentions" while the prompt matches by meaning; TAKING A MESSAGE didn't defer to transfer rules; CLOSING didn't list NO PROGRESS as an early end. | All three aligned. |
 
 ### New: Generated Configuration (admins only)
 
@@ -110,12 +113,12 @@ Configuration** on Summary & Launch. Checks must show no errors.
 | 10 | Cancel | - | "Cancel it" | Confirms, then says type/day/date/time cancelled | `calendar_cancel_booking` |
 | 11 | Transfer + extension | Rule "billing" with an extension | "I have a billing question" | Fixed transfer line, call connects, extension dialled | `transfer_call_N` |
 | 12 | Transfers off | Do Not Allow | "Let me talk to a person" | Configured response, then takes a message | No transfer tool in the config |
-| 13 | Emergency + rule | Rule "gas leak" | "I smell gas" | 911 line first, then the transfer | Order of speech and tool call |
+| 13 | Emergency + rule | Rule "gas leak" | "I smell gas" | "If anyone is in danger, hang up and call 911 - otherwise I'll connect you", then transfers | `transfer_call_N` after that line |
 | 14 | Specific person | - | "Is Maria there?" | Never confirms or denies | - |
 | 15 | Spam | Spam screening on | A sales pitch | Polite close | `end_call`; post-call `is_spam: true` |
 | 16 | Off-topic / abuse | - | Off-topic twice | One redirect, then close | `end_call` |
 | 17 | Silence | Silence timeout 30 s | Stay silent | One nudge, then hang-up | Disconnection reason |
-| 18 | Spanish | Language es-419, blank greeting | Speak Spanish | Spanish greeting and replies | Agent `language` |
+| 18 | Spanish | New agent: pick Spanish in the wizard without editing the greeting | Speak Spanish | Spanish greeting and replies | Agent `language`; `begin_message` is Spanish |
 | 19 | Caller speaks first | Who Speaks First = caller | "Hi, are you open?" | Introduces itself, then answers | `start_speaker: user` |
 | 20 | Closing | - | "Well..." then "No thanks" | Waits; closing line + `end_call` once | - |
 | 21 | Countries | Add CA on a live agent, Save | - | - | Number's `allowed_inbound_country_list` includes CA |

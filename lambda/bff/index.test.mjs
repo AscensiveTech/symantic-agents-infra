@@ -10125,3 +10125,86 @@ test("presence: a heartbeat says where that person is - page and box - and the o
   assert.deepEqual(presenceLocation({ itemId: "itm-1", elementId: 42 }), { itemId: "itm-1" });
   assert.equal(presenceLocation("nope"), null);
 });
+
+// --- Generated Configuration inspector route ---
+
+function inspectorStore(agent, knowledgeBases = {}) {
+  return {
+    async ensureWorkspace() {},
+    async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "company-admin", status: "active" }; },
+    async getAgent() { return agent; },
+    async getProfile() { return receptionistProfile(); },
+    async getKnowledgeBase(_workspaceId, id) { return knowledgeBases[id] ?? null; },
+  };
+}
+
+test("GET generated-config: admins see the prompt, Retell requests and checks; read-only, no storage keys", async () => {
+  const agent = {
+    ...receptionistAgent(),
+    status: "active",
+    retellAgentId: "retell-agent-123",
+    configuration: {
+      ...receptionistAgent().configuration,
+      knowledgeBaseIds: ["kb-1", "kb-missing"],
+      knowledgeBaseFiles: [{ id: "f", name: "menu.pdf", key: "workspaces/user-123/knowledge/private.pdf", contentType: "application/pdf", size: 10 }],
+    },
+    pendingConfiguration: { ...receptionistAgent().configuration, roleInstructions: "PENDING-ONLY-RULE" },
+  };
+  let writes = 0;
+  const store = {
+    ...inspectorStore(agent, { "kb-1": { knowledgeBaseId: "kb-1", retellKnowledgeBaseId: "knowledge_base_1", name: "Menu" } }),
+    async putAgent() { writes += 1; },
+    async createKnowledgeBase() { writes += 1; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => ({ resolveVoiceId: (voice) => `11labs-${voice.replace(/\s+/g, "")}` }),
+    toolBaseUrl: "https://api.example.com",
+  });
+
+  const saved = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
+  assert.equal(saved.statusCode, 200);
+  const body = JSON.parse(saved.body);
+  assert.equal(body.source, "saved");
+  assert.match(body.prompt.text, /^# ROLE\nYou are Maya, the AI receptionist for Arc Dental/);
+  assert.doesNotMatch(body.prompt.text, /PENDING-ONLY-RULE/);
+  assert.deepEqual(body.retellRequests.updateRetellLlm.knowledge_base_ids, ["knowledge_base_1"]);
+  assert.equal(body.retellRequests.updateAgent.voice_id, "11labs-Calmandnatural");
+  assert.equal(body.retellRequests.updateAgent.response_engine, undefined);
+  assert.deepEqual(body.validation, []);
+  assert.doesNotMatch(saved.body, /private\.pdf|Bearer|apiKey/);
+  assert.equal(writes, 0, "the inspector never writes");
+
+  const pending = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config", undefined, { source: "pending" }));
+  assert.equal(JSON.parse(pending.body).source, "pending");
+  assert.match(JSON.parse(pending.body).prompt.text, /PENDING-ONLY-RULE/);
+});
+
+test("GET generated-config is refused for non-admins and 404s for a deleted agent", async () => {
+  const { createHandler } = await loadBff();
+  const nonAdmin = createHandler({
+    getStore: async () => ({
+      ...inspectorStore(receptionistAgent()),
+      async getMembership() { return { userId: "user-123", workspaceId: "user-123", role: "quotation-builder", status: "active" }; },
+    }),
+  });
+  const event = authenticatedEvent("GET", "/workspaces/me/agents/agent-123/generated-config");
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
+  assert.equal((await nonAdmin(event)).statusCode, 403);
+
+  const deleted = createHandler({ getStore: async () => inspectorStore({ ...receptionistAgent(), status: "deleted" }) });
+  assert.equal((await deleted(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"))).statusCode, 404);
+});
+
+test("GET generated-config still renders when provider settings can't resolve the voice", async () => {
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => inspectorStore(receptionistAgent()),
+    getProviders: async () => { throw new Error("secrets unavailable"); },
+    toolBaseUrl: "https://api.example.com",
+  });
+  const response = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
+  assert.equal(response.statusCode, 200);
+  assert.ok(JSON.parse(response.body).diagnostics.some((item) => item.code === "voice_unresolved"));
+});

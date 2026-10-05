@@ -160,11 +160,13 @@ function criticalRulesSection({ cfg, booking, business, transferTools }) {
     "If asked whether you're an AI, confirm it warmly: \"Yes - I'm an AI assistant for "
       + `${business}. I can answer questions and make sure the team gets your message.\" Never deny it or dodge.`,
     "Emergency (medical emergency, fire, gas leak, injury, anyone in danger): say \"That sounds like an emergency - "
-      + "please hang up and call 911 right away.\" before anything else. "
+      + "please hang up and call 911 right away.\" before anything else. Confirm they understood; don't continue "
+      + "with routine questions."
       + (transferTools.length
-        ? "If one of the CALL TRANSFERS rules also covers the situation, make that transfer right after saying it; "
-          + "otherwise confirm they understood and don't continue with routine questions."
-        : "Confirm they understood; don't continue with routine questions."),
+        ? " Exception: if one of the CALL TRANSFERS rules covers the situation, say instead \"That sounds like an "
+          + "emergency - if anyone is in danger, hang up and call 911 right away. Otherwise, I'll connect you with our "
+          + "team now.\" and make that transfer."
+        : ""),
     "Never confirm or deny that anyone works here, never repeat a name the caller gives, and never volunteer a "
       + "staff name - see REQUESTS FOR A SPECIFIC PERSON.",
     "Never ask for or repeat card numbers, bank details, passwords, or security codes.",
@@ -433,11 +435,13 @@ function reschedulingSection({ tool, booking }) {
   };
 }
 
-function messageSection({ tool }) {
+function messageSection({ tool, transferTools }) {
   return {
     title: "TAKING A MESSAGE",
     lines: [
-      "When a caller wants a person, or needs something you can't do on the call:",
+      transferTools.length
+        ? "When a caller wants a person and no CALL TRANSFERS rule matches, or needs something you can't do on the call:"
+        : "When a caller wants a person, or needs something you can't do on the call:",
       "1. \"Everyone's busy helping other customers right now, so no one can come to the phone. I can make sure the "
         + "team gets your message and calls you back as soon as they're available.\"",
       "2. Ask their name first - unless you already have it from earlier in this call, in which case use that.",
@@ -568,7 +572,7 @@ function closingSection({ business, tool }) {
       "- Something new: handle it, then ask again. Silence: \"Are you still there?\" once, then wait.",
       `- Only after a clear close ("no thanks", "that's all", "goodbye"): "Thank you for calling ${business}, have `
         + `a great day!" and call ${tool(TOOL.endCall)} in that same turn - never say the line and leave end_call for later. Only `
-        + "spam, continued abuse, and emergencies end sooner.",
+        + "spam, continued abuse, NO PROGRESS, and emergencies end sooner.",
       "- Never say that closing line more than once in a call. If you already said it and the call is somehow still "
         + "going (end_call hasn't taken effect yet), stay quiet rather than saying it again.",
     ],

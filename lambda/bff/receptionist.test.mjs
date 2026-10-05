@@ -104,26 +104,28 @@ test("an extension goes in Retell's own transfer_destination.extension, keeping 
   assert.deepEqual(transfer.transfer_destination, { type: "predefined", number: "+17035550102", extension: "204" });
 });
 
-test("resolveGreeting uses the configured greeting when set, otherwise builds one from the real business/receptionist name", () => {
+// A blank greeting uses the same sample the wizard shows and seeds
+// (buildSampleGreeting in agent-wizard.tsx), as its hint promises.
+test("resolveGreeting uses the configured greeting when set, otherwise the wizard's sample built from the real business/receptionist name", () => {
   assert.equal(resolveGreeting(agent, profile), agent.configuration.greeting);
   assert.equal(
     resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "" } }, profile),
-    "Thanks for calling Arc Dental. This is Maya, the virtual receptionist. How can I help you today?",
+    "Thanks for calling Arc Dental. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
   );
   assert.equal(
     resolveGreeting({ ...agent, configuration: { ...agent.configuration, greeting: "  " } }, { ...profile, businessName: "" }),
-    "Thanks for calling the business. This is Maya, the virtual receptionist. How can I help you today?",
+    "Thanks for calling your business. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
   );
   assert.equal(
     resolveGreeting({ configuration: {} }, { businessName: "Rivertown Plumbing" }),
-    "Thanks for calling Rivertown Plumbing. This is the AI voice agent, the virtual receptionist. How can I help you today?",
+    "Thanks for calling Rivertown Plumbing. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, the AI voice agent, to assist you while we are unable to do so. How can we help you today?",
   );
 });
 
 test("resolveGreeting adds a short recording disclosure line when recordingDisclosure is on", () => {
   assert.equal(
     resolveGreeting({ configuration: { recordingDisclosure: true, name: "Maya" } }, { businessName: "Arc Dental" }),
-    "Thanks for calling Arc Dental. This call may be recorded for quality assurance. This is Maya, the virtual receptionist. How can I help you today?",
+    "Thanks for calling Arc Dental. This call may be recorded for quality assurance. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Maya, to assist you while we are unable to do so. How can we help you today?",
   );
 });
 
@@ -693,7 +695,7 @@ test("the agent speaks its AI Voice Agent Name; agents saved before that field f
   const prompt = buildReceptionistPrompt(named({ spokenName: "Sam" }), profile);
   assert.match(prompt, /You are Sam, the AI receptionist for Arc Dental/);
   assert.doesNotMatch(prompt, /CWR Inc/);
-  assert.match(resolveGreeting(named({ spokenName: "Sam" }), profile), /This is Sam, the virtual receptionist/);
+  assert.match(resolveGreeting(named({ spokenName: "Sam" }), profile), /our virtual receptionist, Sam, to assist you/);
 });
 
 test("receptionist config: invocation-safe tools, end_call, call handling, and one warm transfer tool per rule", () => {

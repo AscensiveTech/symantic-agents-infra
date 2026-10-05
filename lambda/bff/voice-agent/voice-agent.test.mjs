@@ -220,8 +220,8 @@ test("fully configured agent: every setting reaches its one destination", () => 
     assert.doesNotMatch(prompt, prose);
   }
   // Greeting: Retell's begin_message, built with the disclosure, not in the prompt.
-  assert.equal(llm.begin_message, "Thanks for calling Brightwater Plumbing & Heating. This call may be recorded for quality assurance. This is Nora, the virtual receptionist. How can I help you today?");
-  assert.doesNotMatch(prompt, /This is Nora, the virtual receptionist/);
+  assert.equal(llm.begin_message, "Thanks for calling Brightwater Plumbing & Heating. This call may be recorded for quality assurance. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Nora, to assist you while we are unable to do so. How can we help you today?");
+  assert.doesNotMatch(prompt, /away from our desk/);
 
   // Prompt sections from structured settings.
   assert.match(prompt, /You are Nora, the AI receptionist for Brightwater Plumbing & Heating/);
@@ -448,7 +448,8 @@ test("custom greeting goes to begin_message only; a blank one keeps the built de
   assert.equal(custom.retell.llm.begin_message, "Hi, Brightwater here - what can we fix today?");
   assert.doesNotMatch(custom.prompt.text, /what can we fix today/);
   const blank = compile(minimalAgent({ greeting: "  ", recordingDisclosure: false }));
-  assert.equal(blank.retell.llm.begin_message, "Thanks for calling Brightwater Plumbing & Heating. This is Ava, the virtual receptionist. How can I help you today?");
+  // Same text the wizard shows as the default and seeds into new agents.
+  assert.equal(blank.retell.llm.begin_message, "Thanks for calling Brightwater Plumbing & Heating. We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Ava, to assist you while we are unable to do so. How can we help you today?");
   const noDisclosure = compile(minimalAgent({ greeting: "Hi there!", recordingDisclosure: true }));
   assert.ok(noDisclosure.diagnostics.some((item) => item.code === "recording_disclosure_missing"));
 });
@@ -500,6 +501,34 @@ test("language: Spanish sets Retell's language, a Spanish default greeting, and 
   assert.equal(english.retell.agentSettings.language, "en-US");
   assert.doesNotMatch(english.prompt.text, /Speak only Spanish/);
   assert.ok(compile(minimalAgent({ language: "es-419", greeting: "Thanks for calling!" })).diagnostics.some((item) => item.code === "greeting_language_mismatch"));
+});
+
+test("a Spanish agent still carrying the wizard's untouched English sample greeting greets in Spanish; an edited one is kept", () => {
+  for (const disclosure of [false, true]) {
+    const englishSample = `Thanks for calling Brightwater Plumbing & Heating.${disclosure ? " This call may be recorded for quality assurance." : ""} We are currently away from our desk, likely at a job site. So, we have tasked our virtual receptionist, Lucía, to assist you while we are unable to do so. How can we help you today?`;
+    const spanish = compile(minimalAgent({ spokenName: "Lucía", language: "es-419", recordingDisclosure: true, greeting: englishSample }));
+    assert.match(spanish.retell.llm.begin_message, /^Gracias por llamar a Brightwater Plumbing & Heating\. Esta llamada puede ser grabada/);
+    assert.ok(!spanish.diagnostics.some((item) => item.code === "greeting_language_mismatch"));
+    // English agents keep the sample untouched.
+    assert.equal(compile(minimalAgent({ spokenName: "Lucía", greeting: englishSample })).retell.llm.begin_message, englishSample);
+  }
+  const edited = compile(minimalAgent({ spokenName: "Lucía", language: "es-419", greeting: "Thanks for calling, how can I help?" }));
+  assert.equal(edited.retell.llm.begin_message, "Thanks for calling, how can I help?");
+  assert.ok(edited.diagnostics.some((item) => item.code === "greeting_language_mismatch"));
+});
+
+test("transfer tool descriptions use the same match-by-meaning wording as the prompt", () => {
+  const compiled = compile(minimalAgent({ allowCallTransfers: true, emergencyRules: [{ phrases: ["billing", "invoices"], transferTarget: "+19375550170" }] }));
+  const tool = compiled.retell.llm.general_tools.find((candidate) => candidate.type === "transfer_call");
+  assert.equal(tool.description, 'Warm transfer when what the caller says means "billing" or "invoices".');
+  assert.doesNotMatch(JSON.stringify(compiled.retell.llm), /caller mentions/);
+});
+
+test("emergency rule never says 'hang up' and 'I'll transfer you' as one instruction without the danger condition", () => {
+  const withRule = section(compile(minimalAgent({ allowCallTransfers: true, emergencyRules: [{ phrases: ["gas leak"], transferTarget: "+19375550170" }] })).prompt.text, "CRITICAL RULES");
+  assert.match(withRule, /if anyone is in danger, hang up and call 911 right away\. Otherwise, I'll connect you with our team now\." and make that transfer/);
+  const withoutRule = section(compile(minimalAgent({ allowCallTransfers: false })).prompt.text, "CRITICAL RULES");
+  assert.doesNotMatch(withoutRule, /connect you with our team|make that transfer/);
 });
 
 test("who speaks first: the context line and begin_message_delay_ms follow it", () => {
@@ -571,4 +600,21 @@ test("the payload validator catches what Retell would reject", () => {
   }
   assert.ok(paths.some((path) => path.endsWith(".name")));
   assert.ok(paths.some((path) => path.endsWith("transfer_destination.number")));
+});
+
+test("sampleGreeting matches the wizard's buildSampleGreeting (hashes shared with the frontend seed-sync test)", async () => {
+  const { sampleGreeting } = await import("./configuration.mjs");
+  const { createHash } = await import("node:crypto");
+  const exact = (text) => createHash("sha256").update(text, "utf8").digest("hex").slice(0, 32);
+  assert.deepEqual({
+    "en-US false": exact(sampleGreeting("en-US", "Arc Dental", "Maya", false)),
+    "en-US true": exact(sampleGreeting("en-US", "Arc Dental", "Maya", true)),
+    "es-419 false": exact(sampleGreeting("es-419", "Arc Dental", "Maya", false)),
+    "es-419 true": exact(sampleGreeting("es-419", "Arc Dental", "Maya", true)),
+  }, {
+    "en-US false": "15da335b0b0b68074662d457b16c6359",
+    "en-US true": "b837c53ae9a0ba01f8b7ed77352b71b4",
+    "es-419 false": "f209ca5d29f94e14009ef3081a21fe31",
+    "es-419 true": "22cfeb764112ba06b31e4a6ebdf6cc8c",
+  });
 });

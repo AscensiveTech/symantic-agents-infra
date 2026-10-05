@@ -219,7 +219,7 @@ export function buildToolPlan(cfg) {
     ...cfg.transfers.rules.map((rule, index) => ({
       name: `${TRANSFER_TOOL_PREFIX}${index + 1}`,
       kind: "transfer",
-      description: `Warm transfer when the caller mentions ${rule.phrases.join(", ")}.`,
+      description: `Warm transfer when what the caller says means ${rule.phrases.map((phrase) => `"${phrase}"`).join(" or ")}.`,
       phrases: rule.phrases,
       number: rule.number,
       extension: rule.extension,

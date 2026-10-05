@@ -94,11 +94,11 @@ Stored = `agent.configuration.<field>`; profile fields live in `agent.configurat
 | Voice | `voice` | N | `voice_id` via provider-secret mapping (`resolveRetellVoiceId`) | Provider is implied by the id prefix. |
 | Voice ID (cloned) | `voiceId` | N | `voice_id` | Used only when `voiceMode = cloned`. |
 | Background Sound / volume | `ambientSound`, `ambientSoundVolume` | N | `ambient_sound` (null clears), `ambient_sound_volume` 0.1-1 (sent only with a sound) | |
-| Language | `language` | N, P | agent `language`; for es-419 a "speak Spanish" line in ROLE and a Spanish default greeting | Only en-US / es-419 offered. Anything else becomes en-US. |
+| Language | `language` | N, P | agent `language`; for es-419 a "speak Spanish" line in ROLE and the Spanish sample greeting | Only en-US / es-419 offered. Anything else becomes en-US. The wizard swaps an untouched sample greeting when the language changes. |
 | Who Speaks First | `startSpeaker` | N, P | LLM `start_speaker`; CONTEXT line (agent-first: "greeting already said"; caller-first: introduce yourself) | |
 | Pause Before Speaking | `pauseBeforeSpeakingMs` | N | agent `begin_message_delay_ms` (agent-first only) | 0 or 1000. |
 | Call Recording Disclosure | `recordingDisclosure` | N | adds the disclosure sentence to the **default** greeting | Custom greeting without "record" gets a diagnostic. Prompt answers "is this recorded?" truthfully either way. |
-| Custom Greeting Message | `greeting` | N | LLM `begin_message` only | Blank: built default (never empty; `""` would make the agent wait silently). |
+| Custom Greeting Message | `greeting` | N | LLM `begin_message` only | Blank: the wizard's sample (`sampleGreeting`, identical to the wizard's `buildSampleGreeting`; never empty, since `""` would make the agent wait silently). A Spanish agent still carrying the untouched English sample is sent the Spanish sample. |
 
 ### Knowledge Base
 

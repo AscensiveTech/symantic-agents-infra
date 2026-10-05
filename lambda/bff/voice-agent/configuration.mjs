@@ -217,24 +217,41 @@ export function resolveGreeting(agent, workspaceProfile) {
   return greetingFor(agent, effectiveProfile(agent, workspaceProfile)).text;
 }
 
+// Mirrors buildSampleGreeting in the wizard (agent-wizard.tsx), which writes
+// this text into `greeting` for every new agent and promises that a blank
+// greeting uses it - so blank and untouched behave the same.
+export function sampleGreeting(language, businessName, agentName, withDisclosure) {
+  if (language === "es-419") {
+    const business = businessName || "su negocio";
+    const agent = agentName || "su agente de voz";
+    const disclosure = withDisclosure ? " Esta llamada puede ser grabada para fines de calidad." : "";
+    return `Gracias por llamar a ${business}.${disclosure} En este momento no estamos en la oficina, probablemente estamos `
+      + `en un trabajo. Por eso, le pedimos a nuestra recepcionista virtual, ${agent}, que le atienda mientras no podemos `
+      + "hacerlo. ¿En qué le podemos ayudar hoy?";
+  }
+  const business = businessName || "your business";
+  const agent = agentName || "your AI Voice Agent";
+  const disclosure = withDisclosure ? " This call may be recorded for quality assurance." : "";
+  return `Thanks for calling ${business}.${disclosure} We are currently away from our desk, likely at a job site. So, `
+    + `we have tasked our virtual receptionist, ${agent}, to assist you while we are unable to do so. How can we help you today?`;
+}
+
 function greetingFor(agent, profile) {
   const configured = text(agent?.configuration?.greeting);
-  if (configured) return { text: configured, source: "custom" };
-  const businessName = text(profile?.businessName) || "the business";
+  const language = resolveLanguage(agent);
+  const businessName = text(profile?.businessName);
   const receptionistName = spokenAgentName(agent);
   const disclosure = agent?.configuration?.recordingDisclosure === true;
-  if (resolveLanguage(agent) === "es-419") {
-    return {
-      text: `Gracias por llamar a ${businessName}.${disclosure ? " Esta llamada puede ser grabada para fines de calidad." : ""}`
-        + ` Le atiende ${receptionistName}, la recepcionista virtual. ¿En qué le puedo ayudar hoy?`,
-      source: "default",
-    };
+  const defaultGreeting = { text: sampleGreeting(language, businessName, receptionistName, disclosure), source: "default" };
+  if (!configured) return defaultGreeting;
+  // The wizard seeds the English sample before a language is picked, so a
+  // Spanish agent whose greeting is still that untouched sample gets the
+  // Spanish one instead of greeting callers in English.
+  if (language !== "en-US"
+    && [true, false].some((withDisclosure) => configured === sampleGreeting("en-US", businessName, receptionistName, withDisclosure))) {
+    return defaultGreeting;
   }
-  return {
-    text: `Thanks for calling ${businessName}.${disclosure ? " This call may be recorded for quality assurance." : ""}`
-      + ` This is ${receptionistName}, the virtual receptionist. How can I help you today?`,
-    source: "default",
-  };
+  return { text: configured, source: "custom" };
 }
 
 export function isIanaTimezone(value) {
