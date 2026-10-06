@@ -93,6 +93,22 @@ export function diagnose(cfg, toolPlan, prompt) {
     add("error", "disabled_transfers_in_custom_instructions",
       "Custom instructions tell the agent to transfer calls, but no transfer tool is configured - remove that instruction or add an enabled transfer rule.");
   }
+  // The reverse: a retained line that rules out a capability the settings
+  // turned on. Untouched seeded lines like this are already left out
+  // (seeded-defaults.mjs); this catches edited or hand-written ones, which
+  // would otherwise contradict the generated sections in the live prompt.
+  if (toolPlan.some((tool) => tool.kind === "transfer")) {
+    for (const { field, line } of customInstructionsForbidCapability(retainedCustomInstructions, "transfer")) {
+      add("error", "custom_instructions_forbid_enabled_transfers",
+        `${FIELD_LABELS[field]} say the agent never transfers calls, but Call Transfers are on: "${line}" - remove or reword that line, or turn Call Transfers off.`);
+    }
+  }
+  if (cfg.scheduling.enabled) {
+    for (const { field, line } of customInstructionsForbidCapability(retainedCustomInstructions, "scheduling")) {
+      add("error", "custom_instructions_forbid_enabled_scheduling",
+        `${FIELD_LABELS[field]} say the agent can't book appointments, but booking is on: "${line}" - remove or reword that line, or turn booking off.`);
+    }
+  }
   const customText = [retainedCustomInstructions.roleInstructions, retainedCustomInstructions.restrictions,
     retainedCustomInstructions.exampleDialogues, retainedCustomInstructions.finalReminders].join("\n");
   const customVariables = referencedVariables(customText);
@@ -134,6 +150,41 @@ export function diagnose(cfg, toolPlan, prompt) {
   }
   if (prompt.text.length > 28_000) add("warning", "prompt_long", `The prompt is ${prompt.text.length} characters.`);
   return out;
+}
+
+const FIELD_LABELS = {
+  roleInstructions: "Role Instructions",
+  restrictions: "Restrictions",
+  exampleDialogues: "Example Dialogues",
+  finalReminders: "Final Reminders",
+};
+
+// Only absolute statements count ("This agent never transfers a call", "You
+// can't book appointments"). A qualified rule - "Never transfer calls about
+// billing", "Don't book appointments on Sundays" - is a valid restriction.
+const NEGATION = String.raw`\b(?:never|not|cannot|can't|can not|won't|will not|don't|do not|doesn't|does not|unable to)\b`
+  + String.raw`(?:\s+(?:be\s+)?(?:able|allowed|authori[sz]ed|permitted)\s+to)?\s+`;
+const FORBIDS = {
+  transfer: new RegExp(String.raw`${NEGATION}(?:make\s+|do\s+|perform\s+|offer\s+)?(?:any\s+)?transfer(?:s|red)?\b`
+    + String.raw`(?:\s+(?:a|any|the)?\s*(?:calls?|callers?|anyone|people))?`
+    + String.raw`(?:\s*,?\s*(?:under any circumstances?|at all|ever|for any reason))?$`, "i"),
+  scheduling: new RegExp(String.raw`${NEGATION}(?:book|schedule|make|take|set up)\s+(?:any\s+|the\s+)?`
+    + String.raw`(?:appointments?|bookings?|visits?|reservations?)`
+    + String.raw`(?:\s+(?:at all|ever|over the phone|by phone|for (?:callers|anyone)|under any circumstances?))?$`, "i"),
+};
+
+function customInstructionsForbidCapability(customInstructions, capability) {
+  const found = [];
+  for (const field of Object.keys(FIELD_LABELS)) {
+    for (const line of String(customInstructions[field] ?? "").replace(/\r\n?/g, "\n").split("\n")) {
+      if (/^\s*caller\s*:/i.test(line)) continue;
+      const clauses = line
+        .split(/(?<=[.!?;:])\s+|,\s*(?:but|however|instead|so|then)\s+/i)
+        .map((clause) => clause.replace(/^[\s\-*•"']+|[\s.!?;:"']+$/g, ""));
+      if (clauses.some((clause) => FORBIDS[capability].test(clause))) found.push({ field, line: line.trim() });
+    }
+  }
+  return found;
 }
 
 // Customer-authored text is intentionally flexible, but it must not promise

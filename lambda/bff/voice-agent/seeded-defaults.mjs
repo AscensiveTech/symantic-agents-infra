@@ -54,6 +54,8 @@ const SEEDED_LINES = [
   ["- If a caller flirts, makes sexual comments, or asks personal questions about you, don't engage or joke along - redirect once, then end the call if it continues.", "always", "OFF-TOPIC, FLIRTING AND ABUSE"],
   // Restrictions - BOOKING / NO_TRANSFER addenda
   ["- Never promise to send an email or text confirmation of a booking - confirm the appointment out loud instead.", "booking", "BOOKING FLOW"],
+  ["- If a caller asks for a specific person (\"Is Jeff there?\", \"Can Jennifer call me back?\"), treat it as a normal request to reach them and take a message for that person. Never share private details about staff - whether someone still works here, their schedule or whereabouts, or personal contact information - and never volunteer a name.", "always", "REQUESTS FOR A SPECIFIC PERSON"],
+  // Pre-2026-10-06 wording - agents saved earlier still carry it.
   ["- If a caller asks whether a specific person works here, say you're not able to share that kind of information - never confirm or deny it, never say they're unavailable or no longer here, and never volunteer a name. Just offer to pass along a message.", "always", "REQUESTS FOR A SPECIFIC PERSON"],
   // Final Reminders - DEFAULT_FINAL_REMINDERS
   ["- Be helpful without pretending to have access you do not have.", "always", "CRITICAL RULES"],
