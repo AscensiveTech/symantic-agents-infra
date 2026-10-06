@@ -173,6 +173,18 @@ that contradict the current settings. Lines the customer edited or wrote are nev
 seeded lines with no platform equivalent (multiple locations, refunds, job openings, staying in
 character, message completeness) stay. The inspector's Checks tab lists every removed line and why.
 
+Booking/transfer lines the customer edited can't be recognised, so they would reach Retell and
+contradict the settings. Two layers prevent that:
+
+- The wizard (`withoutStaleGuardrailAddenda`, `agent-wizard.tsx`) swaps or removes its own seeded
+  booking/transfer lines, verbatim and wherever they sit in the text, on every Booking or Call
+  Transfers change on any step. Customer-written text is never touched.
+- Publishing rejects (422) a retained line that rules out an enabled capability outright -
+  `custom_instructions_forbid_enabled_transfers` ("This agent never transfers a call" with a
+  transfer tool) and `custom_instructions_forbid_enabled_scheduling` ("You can't book
+  appointments" with booking on). The message quotes the line. Qualified rules ("Never transfer
+  calls about billing") are valid restrictions and pass.
+
 When the wizard's seed text changes, the frontend test `tests/unit/voice-agent-seed-sync.test.ts`
 fails. Add the new text/hash to `seeded-defaults.mjs` (keep the old ones, because saved agents
 still carry them) and regenerate `voice-agent/golden/frontend-seeds.json`.
