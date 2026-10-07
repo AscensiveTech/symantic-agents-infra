@@ -258,8 +258,9 @@ function namesAndNumbersSection() {
   return {
     title: "NAMES AND NUMBERS",
     lines: [
-      "- Say phone numbers and ZIP codes one digit at a time, written out as words: 20878 is \"two zero eight seven "
-        + "eight\", never \"twenty thousand eight hundred seventy-eight\". Group phone numbers 3-3-4.",
+      "- Say phone numbers, ZIP codes, and street numbers one digit at a time, written out as words: 20878 is \"two "
+        + "zero eight seven eight\", never \"twenty thousand eight hundred seventy-eight\", and 10321 Main Street is "
+        + "\"one zero three two one Main Street\". Always say \"zero\", never \"oh\". Group phone numbers 3-3-4.",
       "- When you need the caller's name, get their first and last name. If you can't tell which part is the first "
         + "name, ask - never guess.",
       "- Call the caller by their first name, unless they show a preference: someone who introduces themselves with a "
@@ -273,7 +274,7 @@ function businessInfoSection({ cfg, booking, business }) {
   const info = cfg.business;
   const hoursLine = info.weeklyHours ? formatBusinessHours(info.weeklyHours) : info.hoursText;
   const holidays = info.holidays.map((holiday) => {
-    const label = `${holiday.name} (${holiday.date})`;
+    const label = `${holiday.name} (${spokenDate(holiday.date)})`;
     if (holiday.closed) return `${label}: closed`;
     return holiday.hours ? `${label}: open ${holiday.hours}` : `${label}: open, normal hours`;
   });
@@ -287,7 +288,7 @@ function businessInfoSection({ cfg, booking, business }) {
       ...(info.website ? [`- Website: ${info.website}`] : []),
       `- Timezone: ${info.timezone}${booking ? " - every time you say or book is in this timezone." : "."}`,
       `- Hours: ${hoursLine || "Not provided"}`,
-      ...(holidays.length ? [`- Holidays: ${holidays.join(", ")}`] : []),
+      ...(holidays.length ? [`- Holidays (these override the weekly hours): ${holidays.join("; ")}`] : []),
       ...(info.contactEmails.length
         ? [
           "- Contact emails (share only if asked):",
@@ -298,6 +299,11 @@ function businessInfoSection({ cfg, booking, business }) {
         ? "Go strictly by these hours: a day is open or closed exactly as listed, weekends included - never call a "
           + "weekend closed or harder unless the hours say so."
         : "No hours are listed: if asked, say the team will confirm their hours and offer to take a message.",
+      ...(holidays.length
+        ? ["Holidays come first: on a date listed under Holidays, its entry replaces the weekly hours for that whole "
+          + "day - a closed holiday is closed even if the business is normally open that day or open 24 hours. "
+          + "Callers may name a holiday by another name (\"July 4th\" is Independence Day) or by its date."]
+        : []),
     ],
   };
 }
@@ -308,9 +314,15 @@ function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
     title: "SERVICE AREA",
     lines: [
       `Published coverage: ${cfg.business.serviceAreas.join(", ")}`,
-      `- The moment a caller gives a city, region, or ZIP, call ${tool(TOOL.serviceArea)} with it before deciding anything. `
-        + "Matched: say it's within the area and the team will confirm the exact address. Unmatched isn't a refusal - "
-        + "use judgment: nearby places are usually fine.",
+      ...(cfg.business.address
+        ? [`- The business itself is at ${cfg.business.address} - that town and the places around it are always covered.`]
+        : []),
+      "- Entries can be whole regions: a metro area includes its suburbs and nearby towns, and a state includes every "
+        + "town in it. Use what you know about where a place is.",
+      `- The moment a caller gives a city, region, or ZIP, call ${tool(TOOL.serviceArea)} with it (and the state, if they `
+        + "said it) before deciding anything. Matched: say it's within the area and the team will confirm the exact "
+        + "address. Not matched only means no exact text match - decide with the rules above; a place inside one of "
+        + "those regions is covered.",
       "- Clearly outside: don't refuse and don't confirm. Say the team confirms coverage for addresses out that way "
         + "and take a message so they can follow up. Never quote a mileage, radius, or travel time.",
       "- Speech-to-text mangles place names. If what you heard isn't a real place, it's a mishearing - never accept it "
@@ -465,7 +477,7 @@ function reschedulingSection({ tool, booking }) {
   };
 }
 
-function messageSection({ tool, transferTools }) {
+function messageSection({ tool, transferTools, booking }) {
   return {
     title: "TAKING A MESSAGE",
     lines: [
@@ -485,6 +497,12 @@ function messageSection({ tool, transferTools }) {
         + "they're available.\"",
       "Never promise a callback time. Never ask for an email. For someone interested in the business's services, use "
         + `${tool(TOOL.leadCapture)} with the same details instead.`,
+      ...(booking
+        ? []
+        : ["Appointments: the business does take them - only you can't schedule them. Never say \"we don't set "
+          + "appointments over the phone\" or anything that sounds like the business doesn't. Say: \"I'm not authorized "
+          + "to schedule appointments, but I can take a message and have someone call you back to set one up.\" Then "
+          + "take the message."]),
     ],
   };
 }
@@ -661,10 +679,10 @@ function finalRemindersSection({ booking, custom }) {
     lines: [
       "- One question at a time. Never guess. Never confirm anything a tool hasn't confirmed.",
       "- Never ask for an email. Take a message for anyone asked for by name; never share private staff details.",
-      "- Phone numbers and ZIP codes: one digit at a time.",
+      "- Phone numbers, ZIP codes, and street numbers: one digit at a time, and \"zero\", never \"oh\".",
       booking
         ? "- Never book, change, or cancel without a clear yes, and only for the number it was booked under."
-        : "- You can't book appointments - take a message for anything that needs the team.",
+        : "- You can't schedule appointments yourself, but the business can - take a message so the team calls back to set one up.",
       // Deliberately last - models weigh what's stated most recently more
       // heavily, so the business's own recap closes the prompt.
       ...(custom.finalReminders ? [custom.finalReminders] : []),
@@ -753,6 +771,15 @@ function generatedExamples({ cfg, tool, booking, business, hasTool }) {
 }
 
 // ---------------------------------------------------------------------------
+
+// "2027-07-04" -> "Sunday, July 4, 2027": the weekday and spelled-out date let
+// the model match "July 4th" or "next Sunday" without date arithmetic.
+export function spokenDate(isoDate) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(isoDate ?? ""));
+  if (!match) return String(isoDate ?? "");
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.toLocaleDateString("en-US", { timeZone: "UTC", weekday: "long", month: "long", day: "numeric", year: "numeric" });
+}
 
 export function formatMinutesLabel(minutes) {
   const value = Number(minutes) || 0;

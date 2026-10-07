@@ -195,12 +195,13 @@ test("every seeded template draft, in every booking/transfer combination, publis
 test("names and numbers: digit-by-digit numbers, first and last name, titles and preferred names", () => {
   const prompt = compile(fullAgent()).prompt.text;
   const names = section(prompt, "NAMES AND NUMBERS");
-  assert.match(names, /20878 is "two zero eight seven eight", never "twenty thousand eight hundred seventy-eight"/);
+  assert.match(names, /20878 is "two\s+zero eight seven eight", never "twenty thousand eight hundred seventy-eight"/);
+  assert.match(names, /10321 Main Street is\s+"one zero three two one Main Street"\. Always say "zero", never "oh"/);
   assert.match(names, /get their first and last name\. If you can't tell which part is the first name, ask - never guess/);
   assert.match(names, /"Dr\. Patel"/);
   assert.match(names, /"just call me Peter" is Peter for the rest of the call/);
   assert.match(section(prompt, "BOOKING FLOW"), /first and last name for the appointment/);
-  assert.match(section(prompt, FINAL), /Phone numbers and ZIP codes: one digit at a time/);
+  assert.match(section(prompt, FINAL), /Phone numbers, ZIP codes, and street numbers: one digit at a time, and "zero", never "oh"/);
 });
 
 test("off-topic callers get a final boundary after about three attempts, not an endless redirect", () => {
@@ -313,4 +314,45 @@ test("end to end: a contradicting edit is rejected before anything reaches Retel
     (thrown) => thrown.statusCode === 422);
   assert.equal(fake.requests.length, requestCount);
   assert.equal(fake.answering(PHONE).llm.general_prompt, before);
+});
+
+// --- Cascade Spring - C.W.R. (2026-10-07): open 24/7, Independence Day closed,
+// based in Beltsville MD, serving the DC metro area, no booking. --------------
+
+const CASCADE_PROFILE = {
+  ...fullAgent().configuration.businessProfile,
+  address: "10901 Rhode Island Ave, Beltsville, MD 20705",
+  businessHours: Object.fromEntries(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    .map((day) => [day, { closed: false, allDay: true, intervals: [] }])),
+  holidaysEnabled: true,
+  holidays: [{ id: "h", name: "Independence Day", date: "2027-07-04", closed: true }],
+  serviceAreas: ["Washington D.C. Metro area", "Maryland", "Northern Virginia"],
+};
+const cascade = () => compile(fullAgent({ businessProfile: CASCADE_PROFILE, booking: false }));
+
+test("a closed holiday overrides open-24-hours weekly hours, with a spelled-out date", () => {
+  const info = section(cascade().prompt.text, "BUSINESS INFO");
+  assert.match(info, /- Holidays \(these override the weekly hours\): Independence Day \(Sunday, July 4, 2027\): closed/);
+  assert.match(info, /a closed holiday is closed even if the business is normally open that day or open 24 hours/);
+  assert.match(info, /"July 4th" is Independence Day/);
+});
+
+test("without booking, the agent says it can't schedule - never that the business doesn't", () => {
+  const prompt = cascade().prompt.text;
+  assert.match(section(prompt, "TAKING A MESSAGE"),
+    /"I'm not authorized\s+to schedule appointments, but I can take a message and have someone call you back to set one up\."/);
+  assert.match(section(prompt, "TAKING A MESSAGE"), /Never say "we don't set\s+appointments over the phone"/);
+  assert.match(section(prompt, FINAL), /You can't schedule appointments yourself, but the business can/);
+  const booking = compile(fullAgent({ businessProfile: CASCADE_PROFILE })).prompt.text;
+  assert.doesNotMatch(booking, /I'm not authorized\s+to schedule appointments/);
+});
+
+test("service area: the business's own town is covered, regions are judged by geography, and the tool knows the address", () => {
+  const compiled = cascade();
+  const area = section(compiled.prompt.text, "SERVICE AREA");
+  assert.match(area, /The business itself is at 10901 Rhode Island Ave, Beltsville, MD 20705 - that town and the places around it are always covered/);
+  assert.match(area, /a metro area includes its suburbs and nearby towns, and a state includes every\s+town in it/);
+  assert.match(area, /Not matched only means no exact text match/);
+  const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
+  assert.equal(tool.parameters.properties.businessAddress.const, "10901 Rhode Island Ave, Beltsville, MD 20705");
 });

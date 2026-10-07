@@ -43,7 +43,7 @@ const GUIDANCE = {
     "This is a restaurant. Callers ask about the menu, hours, parking, and private events - answer from the knowledge base and summarize menus rather than reading them item by item.",
     ...(booking
       ? ["For a reservation, also ask the party size before checking availability, and put the party size and any dietary notes in the booking note."]
-      : ["You can't take reservations on this line: take a message with the party size, date, and time they'd like, so the team can confirm."]),
+      : ["You can't take reservations yourself - the restaurant does: take a message with the party size, date, and time they'd like, so the team can call back to confirm."]),
     "For large parties, catering, or private events, take their details for the events team rather than quoting anything.",
   ],
   "salon-spa": ({ booking }) => [
