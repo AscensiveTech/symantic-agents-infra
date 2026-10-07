@@ -77,9 +77,9 @@ Stored = `agent.configuration.<field>`; profile fields live in `agent.configurat
 | Company Website | profile `website` | P | BUSINESS INFO | Never crawled. |
 | Timezone | profile `timezone` | P, N, B, DV | prompt clock `{{current_time_<zone>}}` and Timezone line; agent `timezone`; tools time parsing and hours enforcement | New activation rejects an invalid IANA zone. Legacy invalid values consistently fall back to UTC in the prompt, Retell (`Etc/UTC`) and calendar tools (diagnostic). |
 | Emails + labels | profile `contactEmails[]` | P | BUSINESS INFO, "share only if asked" | |
-| Service Area Coverage | profile `serviceAreas[]` | P, T | SERVICE AREA section + `check_service_area` tool (list baked in as `const`) | Absent: neither exists. |
+| Service Area Coverage | profile `serviceAreas[]` | P, T | SERVICE AREA section + `check_service_area` tool (list and the business address baked in as `const`) | Absent: neither exists. The business's own town/ZIP always matches; a state entry ("Maryland") matches a place given with that state ("Beltsville, MD"). Anything else unmatched returns a `hint` to judge metro areas and states by geography - the prompt says the same. |
 | Business Hours / closed days / Open 24 Hours / multiple ranges | profile `businessHours` (+ free-text `hours`) | P, B | BUSINESS INFO, SCHEDULING RULES; **enforced** by availability/create/reschedule | Structured hours win; free text shown as-is and not enforced. |
-| Holidays (toggle + list) | profile `holidaysEnabled`, `holidays[]` | P, B | BUSINESS INFO, SCHEDULING RULES; closed holidays **enforced** | Toggle off means the list is ignored. Disabled entries are ignored. Special-hours text is prompt only. |
+| Holidays (toggle + list) | profile `holidaysEnabled`, `holidays[]` | P, B | BUSINESS INFO, SCHEDULING RULES; closed holidays **enforced** | Toggle off means the list is ignored. Disabled entries are ignored. Special-hours text is prompt only. Dates are spelled out with the weekday, and the prompt states holidays override the weekly hours (including open 24 hours). |
 
 ### Template & Voice
 
@@ -176,9 +176,11 @@ character, message completeness) stay. The inspector's Checks tab lists every re
 Booking/transfer lines the customer edited can't be recognised, so they would reach Retell and
 contradict the settings. Two layers prevent that:
 
-- The wizard (`withoutStaleGuardrailAddenda`, `agent-wizard.tsx`) swaps or removes its own seeded
-  booking/transfer lines, verbatim and wherever they sit in the text, on every Booking or Call
-  Transfers change on any step. Customer-written text is never touched.
+- The wizard (`syncGuardrailAddenda`, `agent-wizard.tsx`) adds, swaps, or removes its own seeded
+  booking/transfer blocks, verbatim and wherever they sit in the text, on every Booking or Call
+  Transfers change on any step. The industry-template paragraphs never mention appointments; the
+  booking block (which opens with the receptionist's appointment role) is the only appointment text,
+  and it's present only while booking is on. Customer-written text is never touched.
 - Publishing rejects (422) a retained line that rules out an enabled capability outright -
   `custom_instructions_forbid_enabled_transfers` ("This agent never transfers a call" with a
   transfer tool) and `custom_instructions_forbid_enabled_scheduling` ("You can't book

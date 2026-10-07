@@ -227,7 +227,7 @@ test("fully configured agent: every setting reaches its one destination", () => 
   // Prompt sections from structured settings.
   assert.match(prompt, /You are Nora, the AI receptionist for Brightwater Plumbing & Heating/);
   assert.match(section(prompt, "BUSINESS INFO"), /Mon–Tue 8:00 AM–12:00 PM, 1:00 PM–6:00 PM; Wed closed; Thu–Fri 8:00 AM–12:00 PM, 1:00 PM–6:00 PM; Sat–Sun Open 24 hours/);
-  assert.match(section(prompt, "BUSINESS INFO"), /Thanksgiving \(2026-11-26\): closed, Christmas Eve \(2026-12-24\): open 8 AM - 12 PM/);
+  assert.match(section(prompt, "BUSINESS INFO"), /Thanksgiving \(Thursday, November 26, 2026\): closed; Christmas Eve \(Thursday, December 24, 2026\): open 8 AM - 12 PM/);
   assert.doesNotMatch(prompt, /Labor Day/);
   assert.match(section(prompt, "BUSINESS INFO"), /Mailing address: PO Box 88/);
   assert.match(section(prompt, "BUSINESS INFO"), /Billing: billing@brightwater\.example/);
@@ -453,7 +453,7 @@ test("holidays reach the prompt only while the holiday setting is on", () => {
   const off = compile(minimalAgent(), { profile: { ...workspaceProfile, holidays, holidaysEnabled: false } }).prompt.text;
   assert.doesNotMatch(off, /New Year/);
   const on = compile(minimalAgent({ booking: true }), { profile: { ...workspaceProfile, holidays, holidaysEnabled: true } }).prompt.text;
-  assert.match(on, /New Year's Day \(2027-01-01\): closed/);
+  assert.match(on, /New Year's Day \(Friday, January 1, 2027\): closed/);
   assert.match(on, /Never offer or book a holiday the business is closed/);
 });
 

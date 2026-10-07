@@ -310,6 +310,9 @@ export function buildUsage(allCalls, { now, timezone, plan }) {
       period,
       startsOn: startsOn.toISOString(),
       endsOn: endsOn.toISOString(),
+      // The zone the cycle boundaries are computed in, so a client can show
+      // the renewal date the way billing counts it.
+      timezone: tz,
       daysInCycle,
       daysElapsed,
       minutes: cycleMinutes,

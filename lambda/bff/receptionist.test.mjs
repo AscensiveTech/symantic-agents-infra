@@ -219,7 +219,7 @@ test("holidays never reach the prompt while the holidays toggle is off or was ne
   const holidays = [{ id: "h1", name: "Thanksgiving", date: "2026-11-26", closed: true }];
   for (const holidaysEnabled of [false, undefined]) {
     const prompt = buildReceptionistPrompt(agent, { ...profile, holidays, holidaysEnabled });
-    assert.doesNotMatch(prompt, /- Holidays:/);
+    assert.doesNotMatch(prompt, /- Holidays/);
     assert.doesNotMatch(prompt, /Thanksgiving/);
   }
 });
@@ -641,7 +641,8 @@ test("business info: structured hours win over free text, the call clock is auth
   });
   const info = section(withAll, "BUSINESS INFO");
   assert.doesNotMatch(info, /ignored free text/);
-  assert.match(info, /- Holidays: Thanksgiving \(2026-11-26\): closed$/m);
+  assert.match(info, /- Holidays \(these override the weekly hours\): Thanksgiving \(Thursday, November 26, 2026\): closed$/m);
+  assert.match(info, /Holidays come first: on a date listed under Holidays, its entry replaces the weekly hours/);
   assert.doesNotMatch(info, /Labor Day/);
   assert.match(info, /Billing \/ AR: billing@example\.com/);
   assert.match(info, /weekends included/);

@@ -174,7 +174,7 @@ const CORE_TOOLS = [
 // whole list travels with the tool definition as a `const` property, the
 // same way workspaceId/agentId/callId are baked in. No database access at
 // call time.
-function serviceAreaTool(serviceAreas) {
+function serviceAreaTool(serviceAreas, businessAddress) {
   return {
     name: TOOL.serviceArea,
     kind: "webhook",
@@ -185,6 +185,8 @@ function serviceAreaTool(serviceAreas) {
     properties: {
       location: { type: "string", description: "The city, region, or ZIP code the caller mentioned." },
       serviceAreas: { type: "string", const: JSON.stringify(serviceAreas) },
+      // The business's own town is always covered.
+      ...(businessAddress ? { businessAddress: { type: "string", const: businessAddress } } : {}),
     },
     required: ["location", "serviceAreas"],
     speakable: "Whether the place is within the published area.",
@@ -212,7 +214,7 @@ export function buildToolPlan(cfg) {
   const tools = [
     ...(cfg.scheduling.enabled ? CALENDAR_TOOLS : []),
     ...CORE_TOOLS,
-    ...(cfg.business.serviceAreas.length ? [serviceAreaTool(cfg.business.serviceAreas)] : []),
+    ...(cfg.business.serviceAreas.length ? [serviceAreaTool(cfg.business.serviceAreas, cfg.business.address)] : []),
     // If transfers are not allowed there are no rules here at all, so no
     // transfer tool exists - a guarantee rather than a prompt instruction
     // the model could ignore.

@@ -34,6 +34,8 @@ const SEEDED_LINES = [
   ["- Never make the caller repeat anything they've already given you.", "always", "CRITICAL RULES"],
   ["- Names, cities, addresses, and anything else spelled out or easy to mishear: read it back and ask the caller to confirm it's right. If they correct you, read the corrected version back once more. If it's still not confidently right after two rounds of this, stop asking, move on with what you have, and let the caller know someone will follow up to double-check it. When you report what you collected (a message, a summary, anything passed along), note which details were unconfirmed so whoever follows up knows exactly what to verify.", "always", "ONE THING AT A TIME"],
   // Role Instructions - BOOKING_ROLE_INSTRUCTIONS_ADDENDUM
+  ["Your role as the AI receptionist is to answer caller questions and assist with booking, modifying, or canceling appointments.", "booking", "ROLE"],
+  // Pre-2026-10-07 heading of the same block.
   ["When this agent can book, reschedule, or cancel appointments:", "booking", "BOOKING FLOW"],
   ["- The caller's phone number is the only key to look up, change, or cancel an appointment. Never look anything up by name, and never confirm or deny that an appointment exists based on a name alone. The moment a caller wants to change or cancel something, look up their number automatically - don't ask them to confirm it first.", "booking", "RESCHEDULING AND CANCELLING"],
   ["- After looking a caller up, read back what was found before asking what they want to do with it - the appointment type, day, date, and time for each one on file under that number. If there's more than one, read all of them and have the caller say which one they mean before touching anything - never guess which appointment a caller means when there's more than one.", "booking", "RESCHEDULING AND CANCELLING"],
@@ -47,6 +49,7 @@ const SEEDED_LINES = [
   // Role Instructions - CALL_TRANSFER / NO_TRANSFER addenda (and the Home &
   // Field Services emergency suffix, which the wizard appends to the same line)
   ["- Transfer a call only when the caller's words match one of this agent's transfer phrases, using that rule's transfer. Anyone else asking for a person gets a message taken instead.", "transfers", "CALL TRANSFERS"],
+  ["- Transfer a call only when the caller's words match one of this agent's transfer phrases, using that rule's transfer. Anyone else asking for a person gets a message taken instead. For a safety emergency, you may also offer an immediate transfer to the team.", "transfers", "CALL TRANSFERS"],
   ["- Transfer a call only when the caller's words match one of this agent's transfer phrases, using that rule's transfer. Anyone else asking for a person gets a message taken instead. For a safety emergency, you may also offer an immediate transfer instead of waiting for the soonest slot.", "transfers", "CALL TRANSFERS"],
   ["- This agent never transfers a call, under any circumstance. If a caller wants to talk to a person, say: \"I'm not authorized to make transfers, but I can make sure someone from the business gets your message and calls you back as soon as they're available.\" Then take a message.", "noTransfer", "CALL TRANSFERS"],
   // Restrictions - DEFAULT_RESTRICTIONS (only the lines a section covers)
@@ -73,6 +76,14 @@ const SEEDED_LINES = [
 // If the frontend seed text changes, add the new hash alongside the old one
 // (agents saved earlier still carry the old text).
 export const SEEDED_TEMPLATE_PARAGRAPHS = Object.freeze({
+  // 2026-10-07: appointment wording removed from the template paragraphs.
+  "c38291c6e84ac1265d26a9633315eae6": "medical-dental",
+  "92642e7e809a02ec40ccba3401480ace": "restaurant",
+  "cc983c367026225288969c19d71e7ab9": "salon-spa",
+  "e4fb55a198b502182a0c419720fe8f8c": "home-field-services",
+  "211b97b0874bb95b04db6ac6707b1e99": "professional-services",
+  "fb17f6f5bce9d042b3dc1112d8e7a556": "customer-support",
+  // Earlier wording - saved agents still carry it.
   cc95da3075603e2cb10a05a16a7b5d4b: "general",
   ce10a2795029d0da1072a8bbff78c49f: "medical-dental",
   e82f931836e04a89b0996dc83752d462: "restaurant",
