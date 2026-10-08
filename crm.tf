@@ -253,10 +253,12 @@ resource "aws_iam_role_policy" "crm_runtime" {
         Resource = aws_dynamodb_table.crm_links.arn
       },
       {
-        # Retry-failed lists this workspace's failed calls and re-arms them.
+        # Retry-failed lists this workspace's failed calls and re-arms them;
+        # sync-follow-up reads the call (GetItem) before pushing a follow-up
+        # edited in Symantic to its Monday row.
         Sid      = "RequeueFailedCalls"
         Effect   = "Allow"
-        Action   = ["dynamodb:Query", "dynamodb:UpdateItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
         Resource = aws_dynamodb_table.control_plane["calls"].arn
       },
       {

@@ -404,9 +404,12 @@ test("service area: the tool's status decides, the business's own town is covere
   const compiled = cascade();
   const area = section(compiled.prompt.text, "SERVICE AREA");
   assert.match(area, /The business itself is at 10901 Rhode Island Ave, Beltsville, MD 20705 - that town and ZIP are always covered/);
-  assert.match(area, /city, town, county, state, ZIP code, metro area\s+or region/);
-  assert.match(area, /as they said it, including the state or ZIP/);
-  assert.match(area, /don't judge coverage from your own sense of geography/);
+  assert.match(area, /Whenever the caller asks whether you serve a place, or gives a city, town, county, state, ZIP code, metro\s+area or region for any reason/);
+  assert.match(area, /as they said it, including the state\s+or ZIP if given - before you answer/);
+  assert.match(area, /never answer coverage from memory or your own sense of geography/);
+  // The Gaithersburg call: "couldn't verify", then a contradicting guess.
+  assert.match(area, /keep it for the rest of the call - never\s+contradict it/);
+  assert.match(area, /don't say you couldn't verify it: say "Our team will confirm\s+coverage for your address"/);
   assert.match(area, /A state covers every place in it; a metro area or region covers its cities,\s+towns, counties and ZIPs even when they aren't listed/);
   assert.match(area, /ambiguous: ask exactly its clarificationQuestion/);
   assert.match(area, /unresolved: the place wasn't recognized/);
@@ -426,4 +429,22 @@ test("service area: no configured areas means no tool and no SERVICE AREA sectio
   assert.equal(section(compiled.prompt.text, "SERVICE AREA"), null);
   assert.ok(!compiled.retell.llm.general_tools.some((item) => item.name === "check_service_area"));
   assert.doesNotMatch(compiled.prompt.text, /check_service_area/);
+});
+
+test("the coverage check says a quick \"let me check\" in the call's language while it runs", () => {
+  const compiled = cascade();
+  const check = compiled.retell.llm.general_tools.find((tool) => tool.name === "check_service_area");
+  assert.equal(check.url.endsWith("/retell/tools/service-area.check"), true);
+  assert.equal(check.speak_during_execution, true);
+  assert.equal(check.execution_message_type, "prompt");
+  assert.match(check.execution_message_description, /Let me check that for you/);
+  // Other webhook tools keep Retell's default (no execution message of ours).
+  const message = compiled.retell.llm.general_tools.find((tool) => tool.name === "take_message");
+  assert.equal(message?.execution_message_type, undefined);
+});
+
+test("after the greeting the agent says \"we\" and \"our\", not the business name over and over", () => {
+  const prompt = cascade().prompt.text;
+  assert.match(section(prompt, "ROLE"), /Otherwise talk about the business in the first person - "we", "us", "our services", "our team" - not by name\s+over and over/);
+  assert.match(prompt, /I'm here for questions about our services\./);
 });

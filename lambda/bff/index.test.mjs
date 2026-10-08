@@ -10412,7 +10412,7 @@ function inspectorStore(agent, knowledgeBases = {}) {
   };
 }
 
-test("GET generated-config: admins see the prompt, Retell requests and checks; read-only, no storage keys", async () => {
+test("GET generated-config: Symantic support sees the prompt, Retell requests and checks; read-only, no storage keys", async () => {
   const agent = {
     ...receptionistAgent(),
     status: "active",
@@ -10437,7 +10437,7 @@ test("GET generated-config: admins see the prompt, Retell requests and checks; r
     toolBaseUrl: "https://api.example.com",
   });
 
-  const saved = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
+  const saved = await handler(superAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
   assert.equal(saved.statusCode, 200);
   const body = JSON.parse(saved.body);
   assert.equal(body.source, "saved");
@@ -10450,12 +10450,12 @@ test("GET generated-config: admins see the prompt, Retell requests and checks; r
   assert.doesNotMatch(saved.body, /private\.pdf|Bearer|apiKey/);
   assert.equal(writes, 0, "the inspector never writes");
 
-  const pending = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config", undefined, { source: "pending" }));
+  const pending = await handler(superAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config", undefined, { source: "pending" }));
   assert.equal(JSON.parse(pending.body).source, "pending");
   assert.match(JSON.parse(pending.body).prompt.text, /PENDING-ONLY-RULE/);
 });
 
-test("GET generated-config is refused for non-admins and 404s for a deleted agent", async () => {
+test("GET generated-config is refused for non-admins and company admins, and 404s for a deleted agent", async () => {
   const { createHandler } = await loadBff();
   const nonAdmin = createHandler({
     getStore: async () => ({
@@ -10467,8 +10467,14 @@ test("GET generated-config is refused for non-admins and 404s for a deleted agen
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "quotation-builder";
   assert.equal((await nonAdmin(event)).statusCode, 403);
 
+  // A customer's own company admin doesn't see it either - support only.
+  const companyAdmin = createHandler({ getStore: async () => inspectorStore(receptionistAgent()) });
+  const refused = await companyAdmin(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
+  assert.equal(refused.statusCode, 403);
+  assert.match(JSON.parse(refused.body).message, /Symantic support/);
+
   const deleted = createHandler({ getStore: async () => inspectorStore({ ...receptionistAgent(), status: "deleted" }) });
-  assert.equal((await deleted(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"))).statusCode, 404);
+  assert.equal((await deleted(superAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"))).statusCode, 404);
 });
 
 test("GET generated-config still renders when provider settings can't resolve the voice", async () => {
@@ -10478,7 +10484,7 @@ test("GET generated-config still renders when provider settings can't resolve th
     getProviders: async () => { throw new Error("secrets unavailable"); },
     toolBaseUrl: "https://api.example.com",
   });
-  const response = await handler(companyAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
+  const response = await handler(superAdminEvent("GET", "/workspaces/me/agents/agent-123/generated-config"));
   assert.equal(response.statusCode, 200);
   assert.ok(JSON.parse(response.body).diagnostics.some((item) => item.code === "voice_unresolved"));
 });

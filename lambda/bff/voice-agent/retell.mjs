@@ -51,6 +51,11 @@ export function toRetellTools(toolPlan, { workspaceId, agentId, toolBaseUrl }) {
           required: ["workspaceId", "agentId", "callId", ...tool.required],
         },
         speak_during_execution: true,
+        // A webhook tool with its own executionMessage (the service-area
+        // check's "Let me check") says it in the call's language.
+        ...(tool.executionMessage
+          ? { execution_message_type: "prompt", execution_message_description: tool.executionMessage }
+          : {}),
         speak_after_execution: true,
         timeout_ms: CUSTOM_TOOL_TIMEOUT_MS,
         max_retry: CUSTOM_TOOL_MAX_RETRY,
