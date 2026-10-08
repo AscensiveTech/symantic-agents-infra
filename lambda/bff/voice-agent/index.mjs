@@ -55,6 +55,7 @@ export function compileVoiceAgent({
     ambientSound: cfg.voice.ambientSound,
     ambientSoundVolume: cfg.voice.ambientSoundVolume,
     pronunciationDictionary: cfg.voice.pronunciations,
+    spokenForms: cfg.voice.spokenForms,
     ...(Array.isArray(knowledgeBases) ? { knowledgeBaseIds } : {}),
   };
 

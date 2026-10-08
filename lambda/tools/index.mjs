@@ -14,6 +14,7 @@ import { handleMessageTake } from "./handlers/message.mjs";
 import { handleServiceArea } from "./handlers/service-area.mjs";
 import { handleTransfer } from "./handlers/transfer.mjs";
 import { createDynamoToolsStore } from "./store.mjs";
+import { resolveSpokenForms, toWrittenDeep } from "./spoken-forms.mjs";
 
 const ROUTES = new Set([
   "/retell/tools/calendar.findAppointment",
@@ -126,6 +127,17 @@ export function createHandler({
     try {
       const store = await getStore();
       const context = { store, notifyOffice, now };
+      // "Say It As" pronunciations: the agent speaks a name the way it's
+      // pronounced ("See Double-You Are") and can write it that way in a
+      // message or lead too - store the real word ("C.W.R.") instead.
+      if ((path === "/retell/tools/lead.capture" || path === "/retell/tools/message.take") && typeof store.getAgent === "function") {
+        try {
+          const forms = resolveSpokenForms(await store.getAgent(input.workspaceId, input.agentId));
+          if (forms.length) input = toWrittenDeep(input, forms);
+        } catch (error) {
+          console.error("Spoken-form lookup failed; saving as written", { name: error?.name, message: error?.message });
+        }
+      }
       let result;
       if (path === "/retell/tools/lead.capture") {
         result = await handleLeadCapture(input, context);

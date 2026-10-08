@@ -782,6 +782,23 @@ test("lead.capture and message.take return their original records for duplicate 
   assert.equal(JSON.parse(messageA.body).message, "We will notify the office.");
 });
 
+test("a message written with a \"Say It As\" spoken form is saved with the real word", async () => {
+  const messages = new Map();
+  const store = createStore({
+    getAgent: async () => ({ configuration: { pronunciationDictionary: [{ word: "C.W.R.", alphabet: "plain", phoneme: "See Double-You Are" }] } }),
+    getMessage: async (_workspaceId, id) => clone(messages.get(id)),
+    putMessage: async (record) => putOnce(messages, record.messageId, record),
+  });
+  const handler = toolHandler({ store });
+  await handler(event("/retell/tools/message.take", requiredBody({
+    idempotencyKey: "message-say-as",
+    name: "Tom Reyes",
+    phone: "+17035550123",
+    message: "Wants See Double-You Are Solutions to call back about a leak.",
+  })));
+  assert.equal([...messages.values()][0].message, "Wants C.W.R. Solutions to call back about a leak.");
+});
+
 test("service-area.check is reachable through the signed dispatcher and needs no store access", async () => {
   const handler = toolHandler({
     // No store methods this route could plausibly call are stubbed - any

@@ -14,6 +14,7 @@
 import { AMBIENT_SOUNDS, PRONUNCIATION_ALPHABETS } from "./configuration.mjs";
 import { DEFAULT_DYNAMIC_VARIABLES, unknownVariables } from "./dynamic-variables.mjs";
 import { buildPostCallAnalysis } from "./post-call.mjs";
+import { spokenFormsRule, toSpokenText } from "./spoken-forms.mjs";
 
 // Never surfaced in the UI - the agent nudges a silent caller once, then the
 // silence timeout ends the call.
@@ -82,7 +83,7 @@ export function toRetellTools(toolPlan, { workspaceId, agentId, toolBaseUrl }) {
 export function buildRetellLlmPayload({ cfg, prompt, tools, knowledgeBaseIds }) {
   return buildRetellLlmBody({
     greeting: cfg.conversation.greeting,
-    config: { startSpeaker: cfg.conversation.startSpeaker, prompt, tools, knowledgeBaseIds },
+    config: { startSpeaker: cfg.conversation.startSpeaker, prompt, tools, knowledgeBaseIds, spokenForms: cfg.voice.spokenForms },
   });
 }
 
@@ -90,10 +91,16 @@ export function buildRetellLlmPayload({ cfg, prompt, tools, knowledgeBaseIds }) 
 // buildReceptionistConfig returns. Every field is always sent, so a save
 // replaces exactly the fields Symantic owns.
 export function buildRetellLlmBody({ greeting, config }) {
+  // "Say It As" words are written the way they're spoken only here, in what
+  // Retell reads aloud; everything people read keeps the real word.
+  const forms = config.spokenForms ?? [];
+  const rule = spokenFormsRule(forms);
   return {
     start_speaker: config.startSpeaker === "user" ? "user" : "agent",
-    begin_message: greeting,
-    general_prompt: config.prompt,
+    begin_message: toSpokenText(greeting, forms),
+    general_prompt: rule ? `${toSpokenText(config.prompt, forms)}
+
+${rule}` : config.prompt,
     general_tools: config.tools,
     knowledge_base_ids: config.knowledgeBaseIds ?? [],
     default_dynamic_variables: DEFAULT_DYNAMIC_VARIABLES,

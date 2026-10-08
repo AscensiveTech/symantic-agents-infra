@@ -1,5 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
+import { resolveSpokenForms, toWrittenDeep } from "./spoken-forms.mjs";
+
 const ROUTE = "/retell/webhooks/call-ended";
 export const MAX_MARSHALLED_CALL_ITEM_BYTES = 380 * 1024;
 
@@ -131,7 +133,7 @@ export function createHandler({
     if (eventType !== "call_started" && eventType !== "call_ended" && eventType !== "call_analyzed") {
       return json(400, { message: "A call_started, call_ended, or call_analyzed payload is required" });
     }
-    const call = payload.call;
+    let call = payload.call;
     if (!call || typeof call !== "object" || Array.isArray(call)) {
       return json(400, { message: "A call payload is required" });
     }
@@ -144,11 +146,27 @@ export function createHandler({
       return noContent();
     }
 
+    let store;
+    // "Say It As" pronunciations: Retell spoke - and transcribed - the
+    // spoken form ("See Double-You Are"), so the real word ("C.W.R.") is put
+    // back before anything is stored. Call History, messages, emails and the
+    // CRM all read what's stored here.
+    if (eventType !== "call_started" && stringValue(call.agent_id)) {
+      try {
+        store = await getStore();
+        const forms = resolveSpokenForms(await store.findAgentByRetellAgentId(call.agent_id));
+        if (forms.length) call = toWrittenDeep(call, forms);
+      } catch (error) {
+        console.error("Spoken-form lookup failed; storing the call as transcribed", {
+          name: error?.name,
+          message: error?.message,
+        });
+      }
+    }
     const toolLog = normalizeToolLog(call.transcript_with_tool_calls);
     let workspaceId = callContextValue(call, toolLog, "workspaceId");
     const retellCallId = stringValue(call.call_id);
     let agentId = callContextValue(call, toolLog, "agentId");
-    let store;
     if (!workspaceId && stringValue(call.agent_id)) {
       try {
         store = await getStore();

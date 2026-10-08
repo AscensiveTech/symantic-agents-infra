@@ -619,6 +619,48 @@ test("call_ended resolves workspace from the Retell agent FK when metadata is ab
   assert.equal(persistedCall.agentId, "agent-123");
 });
 
+test("a \"Say It As\" name is stored as the real word in the transcript and summary, never as how it was spoken", async () => {
+  let persistedCall;
+  const store = {
+    async findAgentByRetellAgentId() {
+      return {
+        workspaceId: "workspace-123",
+        agentId: "agent-123",
+        configuration: { pronunciationDictionary: [{ id: "p1", word: "C.W.R.", alphabet: "plain", phoneme: "See Double-You Are" }] },
+      };
+    },
+    async upsertCall(record) {
+      persistedCall = structuredClone(record);
+    },
+  };
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => store,
+    getRecordingStore: async () => ({ async putRecording() {} }),
+    fetchImpl: async () => new Response("audio"),
+  });
+
+  const response = await handler(callAnalyzedEvent({
+    call_id: "retell-call-123",
+    agent_id: "retell-agent-123",
+    call_status: "ended",
+    transcript_object: [
+      { role: "agent", content: "Thanks for calling See Double-You Are Solutions." },
+      { role: "user", content: "Hi, is this see double you are?" },
+    ],
+    transcript_with_tool_calls: [],
+    call_analysis: { call_summary: "The caller reached See Double-You Are Solutions about a leak." },
+  }));
+
+  assert.equal(response.statusCode, 204);
+  const transcript = JSON.stringify(persistedCall.transcript);
+  assert.match(transcript, /Thanks for calling C\.W\.R\. Solutions\./);
+  assert.match(transcript, /is this C\.W\.R\.\?/);
+  assert.doesNotMatch(transcript, /double/i);
+  assert.equal(persistedCall.callSummary, "The caller reached C.W.R. Solutions about a leak.");
+});
+
 test("oversized transcript content is truncated instead of failing call ingest", async () => {
   let persistedCall;
   const handler = createHandler({
