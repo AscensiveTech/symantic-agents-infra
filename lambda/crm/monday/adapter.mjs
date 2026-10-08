@@ -177,6 +177,30 @@ export function createMondayCrmAdapter({ graphql }) {
       return withMatchCount(toContact(data?.items?.[0], mapping), 1);
     },
 
+    // Reads the two columns needed when a Follow-Up cell changes on the
+    // generated calls board. This board is not session.mapping (that is the
+    // customer's contact board), so its ids are passed explicitly.
+    async getCallsFollowUp(session, boardId, externalId, { callIdColumnId, followUpColumnId }) {
+      const columns = [callIdColumnId, followUpColumnId].filter(Boolean);
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "get_calls_follow_up",
+        timeoutMs: session.timeoutMs,
+        query: `query ($ids: [ID!], $columns: [String!]) {
+          items(ids: $ids) { id state board { id } column_values(ids: $columns) { id text value } }
+        }`,
+        variables: { ids: [String(externalId)], columns },
+      });
+      const item = data?.items?.[0];
+      if (!item || item.state !== "active" || String(item.board?.id ?? "") !== String(boardId)) return null;
+      const values = new Map((item.column_values ?? []).map((value) => [value.id, value]));
+      return {
+        externalId: String(item.id),
+        callId: textOf(values.get(callIdColumnId)),
+        followUp: textOf(values.get(followUpColumnId)) ?? "",
+      };
+    },
+
     // Creates a new lead row for a caller with no row yet, with the mapped
     // fields and New Lead label.
     async createLead(session, input, { idempotencyKey } = {}) {

@@ -650,6 +650,17 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       });
     },
 
+    // A Follow-Up cell edited on the generated Monday calls board. The
+    // caller first compares timestamps and cell text, so this narrow write
+    // does not echo a Symantic-originated edit back into Symantic.
+    updateCallFollowUpFromCrm(workspaceId, callId, followUp) {
+      return update(tables.calls, { workspaceId, callId }, {
+        set: { followUp },
+        condition: "attribute_exists(workspaceId)",
+        conditional: true,
+      });
+    },
+
     // Re-arm a call for sync unless it already synced. Returns false when it
     // had (so the caller doesn't enqueue it).
     async markCallQueued(workspaceId, callId, provider) {

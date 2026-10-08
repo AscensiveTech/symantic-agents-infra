@@ -78,6 +78,7 @@ export function composeRuntime({
       ...crmSync,
       registerNameWebhooks: nameSync.registerWebhooks,
       applyNameFromMonday: nameSync.applyFromMonday,
+      applyBoardChangeFromMonday: nameSync.applyBoardChange,
       pushNameToMonday: nameSync.pushToMonday,
       catchUpNames: nameSync.catchUp,
     },

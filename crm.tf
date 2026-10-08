@@ -536,6 +536,7 @@ resource "aws_iam_role_policy" "crm_worker_runtime" {
           "sqs:DeleteMessage",
           "sqs:ChangeMessageVisibility",
           "sqs:GetQueueAttributes",
+          "sqs:SendMessage",
         ]
         Resource = aws_sqs_queue.crm_sync.arn
       },

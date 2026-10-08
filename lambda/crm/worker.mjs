@@ -23,6 +23,9 @@ const BACKGROUND_JOBS = {
   "name-from-monday": (sync, m) => sync.applyNameFromMonday({
     workspaceId: m.workspaceId, provider: m.provider, boardId: m.boardId, itemId: m.itemId, name: m.name, at: m.at, phoneE164: m.phoneE164 ?? null,
   }),
+  "board-change-from-monday": (sync, m) => sync.applyBoardChangeFromMonday({
+    workspaceId: m.workspaceId, provider: m.provider, boardId: m.boardId, itemId: m.itemId, name: m.name, at: m.at,
+  }),
   "name-to-monday": (sync, m) => sync.pushNameToMonday({ workspaceId: m.workspaceId, phone: m.phone, name: m.name }),
   "name-catch-up": (sync, m) => sync.catchUpNames({ workspaceId: m.workspaceId, provider: m.provider }),
   // Customer board set up or changed: Client link column + link past calls.
