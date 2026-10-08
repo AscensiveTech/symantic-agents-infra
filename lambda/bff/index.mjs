@@ -1453,8 +1453,14 @@ export function createHandler({
         if (method === "PUT") {
           const parsed = readNegativeSentimentAlertSettings(readBody(event));
           if (parsed.error) return json(400, { message: parsed.error });
+          const previous = (await store.getWorkspace(workspaceId))?.negativeSentimentAlert;
           await store.saveNegativeSentimentAlert(workspaceId, {
             ...parsed.settings,
+            // The digest Lambda skips calls analyzed before this, so turning
+            // alerts on doesn't flush every negative call flagged while off.
+            ...(parsed.settings.enabled
+              ? { enabledAt: previous?.enabled === true && previous.enabledAt ? previous.enabledAt : new Date().toISOString() }
+              : {}),
             updatedAt: new Date().toISOString(),
             updatedBy: actorDisplayName(event, actor),
           });

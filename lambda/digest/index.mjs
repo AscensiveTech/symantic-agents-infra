@@ -1,4 +1,4 @@
-import { describeSendFailure, getDefaultSender, normalizeEmail } from "./email.mjs";
+import { describeSendFailure, getDefaultSender, normalizeEmail, redactEmails } from "./email.mjs";
 import { renderDigest, renderNegativeSentimentAlert, renderBookingAlert, renderUsageThresholdAlert } from "./render.mjs";
 import { isDigestDue, normalizeDigestSettings, normalizeNegativeSentimentSettings, normalizeUsageThresholdSettings } from "./schedule.mjs";
 // Reused rather than duplicated - see lambda_digest.tf for how the whole
@@ -7,6 +7,9 @@ import { isDigestDue, normalizeDigestSettings, normalizeNegativeSentimentSetting
 import { buildUsage, resolveAccountPlan } from "../bff/receptionist-billing.mjs";
 
 const TEST_WINDOW_MS = 24 * 3_600_000;
+
+// Fully-failed sends retry on each 5-minute tick, giving up after ~30 min.
+const NEGATIVE_SENTIMENT_MAX_ATTEMPTS = 6;
 
 function senderAddress() {
   return process.env.EMAIL_FROM ?? "";
@@ -149,11 +152,22 @@ export function createDigestHandler({
 
     const send = await getSender();
     let sentCount = 0;
+    let skippedCount = 0;
     // Tracked locally and threaded through each appendNotification call
     // below - two alerts sent in the same tick must not each overwrite the
     // other by both prepending onto the same stale pre-loop snapshot.
     let notifications = workspace.notifications ?? [];
     for (const call of pending) {
+      const context = { workspaceId: workspace.workspaceId, callId: call.callId };
+      // Calls flagged while alerts were off are closed out rather than sent
+      // as a burst of stale alerts the moment someone turns them on.
+      const analyzedAt = call.analyzedAt ?? call.createdAt;
+      if (settings.enabledAt && analyzedAt && analyzedAt < settings.enabledAt) {
+        await store.markNegativeSentimentAlerted(workspace.workspaceId, call.callId, "skipped_before_enabled");
+        skippedCount += 1;
+        log.info("Negative sentiment alert skipped", { ...context, reason: "analyzed_before_enabled" });
+        continue;
+      }
       const message = renderNegativeSentimentAlert({
         workspaceName: workspace.name,
         call,
@@ -161,39 +175,65 @@ export function createDigestHandler({
         timezone: normalizeDigestSettings(workspace.callDigest).timezone,
         dashboardUrl: links.dashboardUrl,
       });
-      let anySent = false;
-      for (const to of recipients) {
+      let deliveredTo = 0;
+      for (const [index, to] of recipients.entries()) {
         try {
-          await send({ to, ...message });
-          anySent = true;
+          const result = await send({ to, ...message, tag: "negative_sentiment" });
+          deliveredTo += 1;
+          // SES acceptance only - bounces/deliveries show up per message id
+          // in the configuration set's CloudWatch metrics (see ses.tf).
+          log.info("Negative sentiment alert email accepted", {
+            ...context,
+            recipientIndex: index,
+            sesMessageId: result?.messageId ?? null,
+          });
         } catch (error) {
           log.error("Negative sentiment alert email failed", {
-            workspaceId: workspace.workspaceId,
-            callId: call.callId,
+            ...context,
+            recipientIndex: index,
             name: error?.name,
-            message: error?.message,
+            message: redactEmails(error?.message),
           });
         }
       }
-      // Marked once anyone got it - a fully-failed send (e.g. every address
-      // rejected) is left pending so the next tick retries it, same
-      // "hand the window back on total failure" idea as the digest above.
-      if (anySent) {
-        await store.markNegativeSentimentAlerted(workspace.workspaceId, call.callId);
-        sentCount += 1;
-        const entry = {
-          id: `${workspace.workspaceId}-negative-sentiment-${call.callId}`,
-          sentAt: now().toISOString(),
-          sender: senderAddress(),
-          recipients,
-          content: message.text ?? message.subject,
-          read: false,
-        };
-        await store.appendNotification(workspace.workspaceId, entry, notifications);
-        notifications = [entry, ...notifications];
+      if (!deliveredTo) {
+        // Left pending so the next tick retries it - but only a bounded
+        // number of times, so a permanently-rejected address can't retry
+        // (and log an error) every 5 minutes forever.
+        const attempts = await store.recordNegativeSentimentAlertFailure(workspace.workspaceId, call.callId);
+        if (attempts >= NEGATIVE_SENTIMENT_MAX_ATTEMPTS) {
+          await store.markNegativeSentimentAlerted(workspace.workspaceId, call.callId, "failed");
+          log.error("Negative sentiment alert abandoned after repeated failures", { ...context, attempts });
+        }
+        continue;
       }
+      // Marked once anyone got it. If marking fails after a send, the next
+      // tick would send it again - say so plainly rather than silently.
+      try {
+        await store.markNegativeSentimentAlerted(workspace.workspaceId, call.callId, "sent");
+      } catch (error) {
+        log.error("Negative sentiment alert sent but not marked; it may be re-sent", {
+          ...context,
+          name: error?.name,
+          message: redactEmails(error?.message),
+        });
+        throw error;
+      }
+      log.info("Negative sentiment alert sent", { ...context, recipients: recipients.length, accepted: deliveredTo });
+      sentCount += 1;
+      const entry = {
+        id: `${workspace.workspaceId}-negative-sentiment-${call.callId}`,
+        sentAt: now().toISOString(),
+        sender: senderAddress(),
+        recipients,
+        content: message.text ?? message.subject,
+        read: false,
+      };
+      await store.appendNotification(workspace.workspaceId, entry, notifications);
+      notifications = [entry, ...notifications];
     }
-    return sentCount > 0 ? "sent" : "failed";
+    if (sentCount > 0) return "sent";
+    return skippedCount === pending.length ? "skipped_before_enabled" : "failed";
   }
 
   // Same independent-of-digest-schedule pattern as runNegativeSentimentAlerts
@@ -502,7 +542,8 @@ export function createDigestHandler({
       dashboardUrl: links.dashboardUrl,
     });
     try {
-      await (await getSender())({ to, ...message });
+      const result = await (await getSender())({ to, ...message, tag: "negative_sentiment_test" });
+      log.info("Test negative sentiment alert email accepted", { workspaceId, sesMessageId: result?.messageId ?? null });
       await store.appendNotification(workspaceId, {
         id: `${workspaceId}-negative-sentiment-test-${windowEnd.getTime()}`,
         sentAt: windowEnd.toISOString(),
@@ -517,7 +558,7 @@ export function createDigestHandler({
       log.error("Test negative sentiment alert email failed", {
         workspaceId,
         name: error?.name,
-        message: error?.message,
+        message: redactEmails(error?.message),
       });
       return { sent: false, to, error: describeSendFailure(error) };
     }
@@ -755,13 +796,27 @@ export function createDynamoDigestStore(client, commands, tableNames) {
       }));
     },
 
-    markNegativeSentimentAlerted(workspaceId, callId) {
+    // outcome is "sent", "skipped_before_enabled" or "failed" - every one
+    // closes the alert out; the outcome just records why.
+    markNegativeSentimentAlerted(workspaceId, callId, outcome = "sent") {
       return client.send(new commands.UpdateItemCommand({
         TableName: tableNames.calls,
         Key: marshall({ workspaceId, callId }),
-        UpdateExpression: "SET negativeSentimentAlertedAt = :now",
-        ExpressionAttributeValues: marshall({ ":now": new Date().toISOString() }),
+        UpdateExpression: "SET negativeSentimentAlertedAt = :now, negativeSentimentAlertOutcome = :outcome",
+        ExpressionAttributeValues: marshall({ ":now": new Date().toISOString(), ":outcome": outcome }),
       }));
+    },
+
+    // Returns the attempt count after this failure.
+    async recordNegativeSentimentAlertFailure(workspaceId, callId) {
+      const result = await client.send(new commands.UpdateItemCommand({
+        TableName: tableNames.calls,
+        Key: marshall({ workspaceId, callId }),
+        UpdateExpression: "ADD negativeSentimentAlertAttempts :one",
+        ExpressionAttributeValues: marshall({ ":one": 1 }),
+        ReturnValues: "UPDATED_NEW",
+      }));
+      return Number(result.Attributes?.negativeSentimentAlertAttempts?.N ?? 1);
     },
 
     // Same pattern as listPendingNegativeSentimentCalls/

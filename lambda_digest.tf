@@ -87,6 +87,15 @@ resource "aws_iam_role_policy" "digest_runtime" {
         ]
       },
       {
+        # Negative-sentiment and booking alerts are closed out on the call
+        # row once sent. Without this every send is followed by an
+        # AccessDenied mark, and the next tick sends the same alert again.
+        Sid      = "MarkCallAlerts"
+        Effect   = "Allow"
+        Action   = ["dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.control_plane["calls"].arn
+      },
+      {
         Sid      = "ReadAdminRecipients"
         Effect   = "Allow"
         Action   = ["dynamodb:Query"]

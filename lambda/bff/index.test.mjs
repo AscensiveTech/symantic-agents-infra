@@ -7778,6 +7778,27 @@ test("PUT negative-sentiment-alert saves enabled + recipients, deduped and case-
   assert.equal(store.saved[0].negativeSentimentAlert.enabled, true);
 });
 
+test("PUT negative-sentiment-alert stamps enabledAt when turned on, keeps it on re-save, and drops it when turned off", async () => {
+  const store = callDigestStore();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const put = (enabled, recipients = ["dana@arcdental.com"]) => handler(
+    companyAdminEvent("PUT", "/workspaces/me/negative-sentiment-alert", { enabled, recipients }),
+  );
+
+  await put(true);
+  const firstEnabledAt = store.saved[0].negativeSentimentAlert.enabledAt;
+  assert.match(firstEnabledAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  const resave = await put(true, ["dana@arcdental.com", "sam@arcdental.com"]);
+  assert.equal(store.saved[1].negativeSentimentAlert.enabledAt, firstEnabledAt);
+  // Internal bookkeeping only - the response shape is unchanged.
+  assert.equal(Object.hasOwn(JSON.parse(resave.body), "enabledAt"), false);
+
+  await put(false);
+  assert.equal(Object.hasOwn(store.saved[2].negativeSentimentAlert, "enabledAt"), false);
+});
+
 test("PUT negative-sentiment-alert rejects an invalid email, a missing enabled flag, or too many recipients", async () => {
   const { createHandler } = await loadBff();
   const handler = createHandler({ getStore: async () => callDigestStore() });
