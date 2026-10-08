@@ -146,6 +146,13 @@ const AGENT_STATUSES = new Set(["active", "draft", "preview", "planned", "disabl
 // "deleted" is only ever set by the DELETE-agent teardown itself, never by
 // a client PUT - a deleted agent is done, not editable back into existence.
 const CLIENT_SETTABLE_AGENT_STATUSES = new Set(["active", "draft", "preview", "planned", "disabled"]);
+// What the wizard sends for an agent that isn't live yet. Saved as "draft":
+// a failed publish used to leave "preview", which the roster treated as a
+// published agent (Disable/Reactivate, "Active").
+const NOT_YET_LIVE_STATUSES = new Set(["active", "preview"]);
+// Disabling or reactivating only means something for an agent that was
+// really published to the voice service.
+const NEVER_PUBLISHED_MESSAGE = "This agent was never published, so it can't be disabled or reactivated. Finish setup and click Create AI Voice Agent to publish it, or delete the draft.";
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CALL_ID_PATTERN = /^call-[A-Za-z0-9_-]{1,123}$/;
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -1062,7 +1069,9 @@ export function createHandler({
         const agent = candidate
           ? {
             ...candidate,
-            status: candidate.status === "active" ? "draft" : candidate.status,
+            // Only the activate flow can make an agent live; until then a
+            // wizard save ("preview") is a draft.
+            status: NOT_YET_LIVE_STATUSES.has(candidate.status) ? "draft" : candidate.status,
             createdAt: new Date().toISOString(),
           }
           : null;
@@ -2103,6 +2112,7 @@ export function createHandler({
         if (agent.status === "deleted") {
           return json(409, { message: "This agent has been deleted" });
         }
+        if (!agent.retellAgentId) return json(409, { code: "agent_never_published", message: NEVER_PUBLISHED_MESSAGE });
         // No Retell/Telnyx calls here on purpose - the inbound-lookup
         // webhook already rejects every call the instant status isn't
         // "active" (see the call_inbound handler below), so flipping
@@ -2138,6 +2148,8 @@ export function createHandler({
         if (agent.status !== "disabled") {
           return json(409, { message: "This agent isn't disabled" });
         }
+        // Reactivating restores a live agent; it never publishes one.
+        if (!agent.retellAgentId) return json(409, { code: "agent_never_published", message: NEVER_PUBLISHED_MESSAGE });
         const updatedAt = new Date().toISOString();
         try {
           const updated = await store.updateAgentRuntime(workspaceId, agentAction.agentId, {
@@ -2315,7 +2327,7 @@ export function createHandler({
                 ? "active"
                 : wasDisabled
                   ? "disabled"
-                  : agent.status === "active" ? "draft" : agent.status,
+                  : NOT_YET_LIVE_STATUSES.has(agent.status) ? "draft" : agent.status,
             // A real, explicit save always publishes - any unpublished draft
             // this configuration supersedes is cleared here too.
             pendingConfiguration: null,
@@ -7487,7 +7499,9 @@ function toPublicAgent(item) {
     telnyxPhoneNumber: _telnyxPhoneNumber,
     ...agent
   } = item;
-  return { id: agentId, ...agent, everPublished };
+  // Whether it's on the voice service right now - the roster shows an
+  // agent without it as Never Published, whatever its stored status says.
+  return { id: agentId, ...agent, everPublished, published: Boolean(item.retellAgentId) };
 }
 
 function toPublicPhoneNumber(item) {

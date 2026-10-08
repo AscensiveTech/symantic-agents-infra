@@ -795,6 +795,36 @@ test("PUT agent with ?draft=true on a DISABLED agent also stages pendingConfigur
   assert.equal(body.status, "disabled");
 });
 
+test("PUT agent saved by the wizard as \"preview\" before it's published is stored as a draft, and reads back as not published", async () => {
+  let stored;
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() {
+      return { id: "agent-123", name: "Snowfall", status: "draft", capabilities: [], configuration: {} };
+    },
+    async putAgent(workspaceId, agentId, patch) {
+      stored = { agentId, ...patch };
+      return stored;
+    },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => store,
+    getProviders: async () => { throw new Error("a save must not publish"); },
+  });
+
+  const response = await handler(authenticatedEvent(
+    "PUT",
+    "/workspaces/me/agents/agent-123",
+    { id: "agent-123", name: "Snowfall", role: "Phone operations", description: "Answers calls", status: "preview", capabilities: [], configuration: { greeting: "Hi" } },
+  ));
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(stored.status, "draft");
+  const body = JSON.parse(response.body);
+  assert.equal(body.status, "draft");
+});
+
 test("PUT agent (real save, no ?draft=true) on a disabled agent without ?reactivate=true stays disabled and never calls Retell", async () => {
   const store = {
     async ensureWorkspace() {},
@@ -1341,7 +1371,7 @@ test("POST disable is refused for a non-admin", async () => {
 });
 
 test("POST disable flips status without touching Retell/Telnyx", async () => {
-  const agent = { id: "agent-123", status: "active" };
+  const agent = { id: "agent-123", status: "active", retellAgentId: "retell-123" };
   const updates = [];
   const store = {
     async ensureWorkspace() {},
@@ -1357,6 +1387,9 @@ test("POST disable flips status without touching Retell/Telnyx", async () => {
   const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/disable"));
   assert.equal(response.statusCode, 200);
   assert.equal(JSON.parse(response.body).status, "disabled");
+  // The roster reads this to tell a published agent from one that never was.
+  assert.equal(JSON.parse(response.body).published, true);
+  assert.equal(JSON.parse(response.body).retellAgentId, undefined);
   assert.deepEqual(updates, [{ status: "disabled", updatedAt: updates[0].updatedAt }]);
 });
 
@@ -1367,7 +1400,9 @@ test("POST enable reactivates a disabled agent but refuses a deleted one", async
     async getAgent(workspaceId, agentId) {
       return agentId === "agent-deleted"
         ? { id: "agent-deleted", status: "deleted" }
-        : { id: "agent-123", status: "disabled" };
+        : agentId === "agent-never-published"
+          ? { id: "agent-never-published", status: "disabled" }
+          : { id: "agent-123", status: "disabled", retellAgentId: "retell-123" };
     },
     async updateAgentRuntime(workspaceId, agentId, patch) {
       updates.push(patch);
@@ -1380,10 +1415,31 @@ test("POST enable reactivates a disabled agent but refuses a deleted one", async
   const deleted = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-deleted/enable"));
   assert.equal(deleted.statusCode, 409);
 
+  // Reactivating restores a live agent - it never publishes one.
+  const neverPublished = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-never-published/enable"));
+  assert.equal(neverPublished.statusCode, 409);
+  assert.equal(JSON.parse(neverPublished.body).code, "agent_never_published");
+  assert.deepEqual(updates, []);
+
   const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/enable"));
   assert.equal(response.statusCode, 200);
   assert.equal(JSON.parse(response.body).status, "active");
   assert.deepEqual(updates, [{ status: "active", updatedAt: updates[0].updatedAt, everPublished: true }]);
+});
+
+test("POST disable refuses an agent that was never published (a failed Create left it unpublished)", async () => {
+  const updates = [];
+  const store = {
+    async ensureWorkspace() {},
+    async getAgent() { return { id: "agent-123", status: "preview" }; },
+    async updateAgentRuntime(workspaceId, agentId, patch) { updates.push(patch); return { id: agentId, ...patch }; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const response = await handler(companyAdminEvent("POST", "/workspaces/me/agents/agent-123/disable"));
+  assert.equal(response.statusCode, 409);
+  assert.match(JSON.parse(response.body).message, /never published/);
+  assert.deepEqual(updates, []);
 });
 
 test("DELETE agent returns 404 when the agent is missing", async () => {
