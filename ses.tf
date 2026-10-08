@@ -14,11 +14,13 @@ locals {
 
   # Shared by every Lambda that sends. In the sandbox SES also authorizes the
   # recipient identity, hence identity/*; the From condition keeps this role
-  # from sending as anyone but the configured address.
+  # from sending as anyone but the configured address. SES v2 authorizes a
+  # Raw-content send (any email with an attachment, e.g. the transcript on a
+  # negative-sentiment alert) as ses:SendRawEmail, not ses:SendEmail.
   ses_send_statement = {
     Sid    = "SendNotificationEmail"
     Effect = "Allow"
-    Action = ["ses:SendEmail"]
+    Action = ["ses:SendEmail", "ses:SendRawEmail"]
     Resource = [
       "arn:aws:ses:${var.aws_region}:${data.aws_caller_identity.current.account_id}:identity/*",
       aws_sesv2_configuration_set.notifications.arn,
@@ -54,6 +56,28 @@ resource "aws_sesv2_configuration_set" "notifications" {
   # protects the sender's reputation without any code in the Lambdas.
   suppression_options {
     suppressed_reasons = ["BOUNCE", "COMPLAINT"]
+  }
+}
+
+# SES accepting a message is not delivery. This publishes per-outcome counts
+# (AWS/SES namespace, dimension "notification" from the message tag the
+# senders set; untagged mail such as calendar invites counts as "other") so
+# bounces and rejects for alert emails are visible in CloudWatch.
+resource "aws_sesv2_configuration_set_event_destination" "notifications_cloudwatch" {
+  configuration_set_name = aws_sesv2_configuration_set.notifications.configuration_set_name
+  event_destination_name = "cloudwatch-delivery"
+
+  event_destination {
+    enabled              = true
+    matching_event_types = ["SEND", "REJECT", "BOUNCE", "COMPLAINT", "DELIVERY", "DELIVERY_DELAY", "RENDERING_FAILURE"]
+
+    cloud_watch_destination {
+      dimension_configuration {
+        dimension_name          = "notification"
+        dimension_value_source  = "MESSAGE_TAG"
+        default_dimension_value = "other"
+      }
+    }
   }
 }
 

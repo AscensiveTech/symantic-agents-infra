@@ -70,6 +70,10 @@ export function normalizeNegativeSentimentSettings(value) {
     recipients: Array.isArray(source.recipients)
       ? source.recipients.filter((item) => typeof item === "string").slice(0, NEGATIVE_SENTIMENT_MAX_RECIPIENTS)
       : [],
+    // Set by the BFF when alerts go from off to on. Calls analyzed before it
+    // are skipped rather than sent as a backlog. Absent on settings saved
+    // before this field existed - no cutoff then.
+    enabledAt: typeof source.enabledAt === "string" ? source.enabledAt : null,
   };
 }
 

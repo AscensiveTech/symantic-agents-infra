@@ -74,10 +74,16 @@ function memoryStore({ workspaces = [], calls = [], admins = [], agents = [], cl
       log.push(["listPendingNegativeSentimentCalls", workspaceId]);
       return [...pendingAlerts.values()].filter((item) => item.workspaceId === workspaceId);
     },
-    async markNegativeSentimentAlerted(workspaceId, callId) {
-      log.push(["markNegativeSentimentAlerted", workspaceId, callId]);
+    async markNegativeSentimentAlerted(workspaceId, callId, outcome) {
+      log.push(["markNegativeSentimentAlerted", workspaceId, callId, outcome]);
       pendingAlerts.delete(`${workspaceId}:${callId}`);
       return true;
+    },
+    async recordNegativeSentimentAlertFailure(workspaceId, callId) {
+      const call = pendingAlerts.get(`${workspaceId}:${callId}`);
+      call.attempts = (call.attempts ?? 0) + 1;
+      log.push(["recordNegativeSentimentAlertFailure", workspaceId, callId, call.attempts]);
+      return call.attempts;
     },
     async listPendingBookingAlerts(workspaceId) {
       log.push(["listPendingBookingAlerts", workspaceId]);
@@ -610,6 +616,156 @@ test("a fully-failed negative-sentiment send leaves the call pending for the nex
 
   assert.deepEqual(results.negativeSentimentAlerts, { failed: 1 });
   assert.equal(store.pendingAlerts.size, 1);
+});
+
+test("a fully-failed negative-sentiment alert is retried a bounded number of times, then closed out as failed", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"] },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall()],
+  });
+  const sender = recordingSender({ failFor: ["dana@arcdental.com"] });
+  const errors = [];
+  const handler = createDigestHandler({
+    getStore: async () => store,
+    getSender: sender.getSender,
+    appUrl: "https://agents.example.com",
+    now: () => NOW,
+    log: { info() {}, error: (msg, fields) => errors.push([msg, fields]) },
+  });
+
+  for (let tick = 0; tick < 5; tick += 1) await handler({});
+  assert.equal(store.pendingAlerts.size, 1);
+
+  await handler({});
+  assert.equal(store.pendingAlerts.size, 0);
+  assert.deepEqual(store.log.find((entry) => entry[0] === "markNegativeSentimentAlerted"), ["markNegativeSentimentAlerted", "ws-1", "call-neg-1", "failed"]);
+  assert.ok(errors.some(([msg, fields]) => msg.includes("abandoned") && fields.attempts === 6));
+
+  // A seventh tick has nothing left to retry.
+  await handler({});
+  assert.equal(errors.filter(([msg]) => msg === "Negative sentiment alert email failed").length, 6);
+});
+
+test("negative-sentiment failure logs never carry recipient addresses", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"] },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall()],
+  });
+  const sender = {
+    getSender: async () => async () => {
+      const error = new Error("Email address is not verified: dana@arcdental.com");
+      error.name = "MessageRejected";
+      throw error;
+    },
+  };
+  const lines = [];
+  const capture = (msg, fields) => lines.push(JSON.stringify([msg, fields]));
+  await createDigestHandler({
+    getStore: async () => store, getSender: sender.getSender, now: () => NOW, log: { info: capture, error: capture },
+  })({});
+
+  assert.ok(lines.some((line) => line.includes("Negative sentiment alert email failed")));
+  assert.ok(lines.every((line) => !line.includes("dana@arcdental.com")));
+});
+
+test("negative-sentiment alerts tag each send and log the SES message id for delivery tracing", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"] },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall()],
+  });
+  const sender = recordingSender();
+  const infos = [];
+  await createDigestHandler({
+    getStore: async () => store, getSender: sender.getSender, now: () => NOW,
+    log: { info: (msg, fields) => infos.push([msg, fields]), error() {} },
+  })({});
+
+  assert.equal(sender.sent[0].tag, "negative_sentiment");
+  const accepted = infos.find(([msg]) => msg === "Negative sentiment alert email accepted");
+  assert.deepEqual(accepted[1], { workspaceId: "ws-1", callId: "call-neg-1", recipientIndex: 0, sesMessageId: "m-1" });
+  assert.deepEqual(store.log.find((entry) => entry[0] === "markNegativeSentimentAlerted"), ["markNegativeSentimentAlerted", "ws-1", "call-neg-1", "sent"]);
+});
+
+test("calls analyzed before alerts were turned on are closed out without an email, later ones still send", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"], enabledAt: hoursBefore(1) },
+      }),
+    ],
+    negativeSentimentCalls: [
+      negativeCall({ callId: "call-old", analyzedAt: hoursBefore(240) }),
+      negativeCall({ callId: "call-new", analyzedAt: hoursBefore(0.1) }),
+    ],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results.negativeSentimentAlerts, { sent: 1 });
+  assert.equal(sender.sent.length, 1);
+  assert.equal(store.pendingAlerts.size, 0);
+  assert.ok(store.log.some((entry) => entry[2] === "call-old" && entry[3] === "skipped_before_enabled"));
+  assert.ok(store.log.some((entry) => entry[2] === "call-new" && entry[3] === "sent"));
+});
+
+test("a backlog made only of pre-enable calls reports skipped, not failed", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"], enabledAt: hoursBefore(1) },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall({ analyzedAt: hoursBefore(48) })],
+  });
+  const sender = recordingSender();
+
+  const results = await handlerFor(store, sender)({});
+
+  assert.deepEqual(results.negativeSentimentAlerts, { skipped_before_enabled: 1 });
+  assert.equal(sender.sent.length, 0);
+});
+
+test("a failed mark after a successful send is logged and surfaces as a run error", async () => {
+  const store = memoryStore({
+    workspaces: [
+      workspace({
+        callDigest: settings({ enabled: false }),
+        negativeSentimentAlert: { enabled: true, recipients: ["dana@arcdental.com"] },
+      }),
+    ],
+    negativeSentimentCalls: [negativeCall()],
+  });
+  store.markNegativeSentimentAlerted = async () => {
+    const error = new Error("User is not authorized to perform: dynamodb:UpdateItem");
+    error.name = "AccessDeniedException";
+    throw error;
+  };
+  const errors = [];
+  const results = await createDigestHandler({
+    getStore: async () => store, getSender: recordingSender().getSender, now: () => NOW,
+    log: { info() {}, error: (msg) => errors.push(msg) },
+  })({});
+
+  assert.deepEqual(results.negativeSentimentAlerts, { error: 1 });
+  assert.ok(errors.includes("Negative sentiment alert sent but not marked; it may be re-sent"));
 });
 
 test("a partial failure across multiple recipients still marks the call sent", async () => {

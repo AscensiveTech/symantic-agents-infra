@@ -17,6 +17,11 @@ export function singleLine(value, max = 200) {
 
 const EMAIL_PATTERN = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]{2,}$/;
 
+// SES error messages can quote the rejected address; logs must not.
+export function redactEmails(value) {
+  return String(value ?? "").replace(/[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+/g, "[email]");
+}
+
 export function normalizeEmail(value) {
   if (typeof value !== "string") return null;
   const trimmed = value.trim().toLowerCase();
@@ -70,7 +75,9 @@ function buildRawMimeMessage({ from, to, subject, html, text, attachment }) {
 
 export function createSesSender({ client, SendEmailCommand, from, configurationSet }) {
   if (!from) throw new Error("EMAIL_FROM is required");
-  return async function send({ to, subject, html, text, attachment }) {
+  // tag names the notification type; the configuration set's CloudWatch
+  // event destination (ses.tf) uses it as the metric dimension.
+  return async function send({ to, subject, html, text, attachment, tag }) {
     const content = attachment
       ? {
         Raw: {
@@ -90,6 +97,7 @@ export function createSesSender({ client, SendEmailCommand, from, configurationS
       FromEmailAddress: from,
       Destination: { ToAddresses: [to] },
       ...(configurationSet ? { ConfigurationSetName: configurationSet } : {}),
+      ...(tag ? { EmailTags: [{ Name: "notification", Value: tag }] } : {}),
       Content: content,
     }));
     return { messageId: result?.MessageId ?? null };
