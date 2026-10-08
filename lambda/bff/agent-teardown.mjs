@@ -90,7 +90,7 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
       try {
         await services.retell.deleteAgentAndLlm(agent.retellAgentId);
       } catch (error) {
-        if (!isGone(error)) return { status: "failed", ...providerFailure("Retell", "the AI agent's removal", error, agentId) };
+        if (!isGone(error)) return { status: "failed", ...providerFailure("Our voice service", "the AI agent's removal", error, agentId) };
       }
       return { status: "done" };
     },
@@ -101,7 +101,7 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
       try {
         await services.retell.deletePhoneNumber(phoneNumber.retellPhoneNumberId);
       } catch (error) {
-        if (!isGone(error)) return { status: "failed", ...providerFailure("Retell", "unlinking the phone number", error, agentId) };
+        if (!isGone(error)) return { status: "failed", ...providerFailure("Our voice service", "disconnecting the phone number", error, agentId) };
       }
       return { status: "done", phoneNumber: phoneNumber.telnyxPhoneNumber ?? null };
     },
@@ -112,7 +112,7 @@ export async function runAgentTeardown({ workspaceId, agent, phoneNumber, previo
       try {
         await services.telnyx.releaseNumber(phoneNumber.telnyxNumberId);
       } catch (error) {
-        if (!isGone(error)) return { status: "failed", phoneNumber: phoneNumber.telnyxPhoneNumber ?? null, ...providerFailure("Telnyx", `releasing ${phoneNumber.telnyxPhoneNumber ?? "the phone number"}`, error, agentId) };
+        if (!isGone(error)) return { status: "failed", phoneNumber: phoneNumber.telnyxPhoneNumber ?? null, ...providerFailure("Our phone provider", `releasing ${phoneNumber.telnyxPhoneNumber ?? "the phone number"}`, error, agentId) };
       }
       return { status: "done", phoneNumber: phoneNumber.telnyxPhoneNumber ?? null };
     },
