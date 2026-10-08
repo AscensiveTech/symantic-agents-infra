@@ -386,7 +386,7 @@ test("scheduling off rejects affirmative scheduling instructions but permits exp
       agent,
       profile: workspaceProfile,
       knowledgeBases: [],
-    }), /Custom instructions tell the agent to schedule or confirm appointments/);
+    }), /The Example Dialogues box has an appointment-booking example, but appointment booking is turned off. Where: Conversation Rules & Guardrails step → Example Dialogues box./);
   }
   const prohibition = compile(minimalAgent({
     booking: false,
