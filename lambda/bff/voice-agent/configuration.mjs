@@ -10,6 +10,7 @@
 // Nothing in here knows Retell's field names. See retell.mjs for that.
 
 import { isBusinessHours } from "../business-hours.mjs";
+import { resolveSpokenForms } from "./spoken-forms.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
 
@@ -356,6 +357,7 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
       ambientSound: resolveAmbientSound(agent),
       ambientSoundVolume: resolveAmbientSoundVolume(agent),
       pronunciations: resolvePronunciationDictionary(agent),
+      spokenForms: resolveSpokenForms(agent),
     },
     conversation: {
       startSpeaker: resolveStartSpeaker(agent),
