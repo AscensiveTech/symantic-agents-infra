@@ -190,3 +190,22 @@ export function followUpText(followUp) {
   ].filter(Boolean);
   return parts.length ? parts.join(" - ") : null;
 }
+
+// Reverse of followUpText for edits made directly in Monday. Free-form text
+// is still useful: when it does not start with one of our status labels, keep
+// the entire cell as the comment and mark it in progress.
+export function parseFollowUpText(value) {
+  const text = typeof value === "string" ? value.trim().slice(0, 5000) : "";
+  if (!text) return null;
+  const parts = text.split(" - ");
+  const statuses = Object.entries(FOLLOW_UP_STATUS_LABELS);
+  const matched = statuses.find(([, label]) => label.toLowerCase() === parts[0]?.trim().toLowerCase());
+  const status = matched?.[0] ?? "in_progress";
+  if (matched) parts.shift();
+  let assigneeName = null;
+  if (/^assigned to\s+/i.test(parts[0] ?? "")) {
+    assigneeName = parts.shift().replace(/^assigned to\s+/i, "").trim().slice(0, 120) || null;
+  }
+  const comment = parts.join(" - ").trim().slice(0, 4000) || null;
+  return { status, assigneeUserId: null, assigneeName, comment };
+}

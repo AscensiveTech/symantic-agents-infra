@@ -480,6 +480,11 @@ export function createCrmSync({
       if (error instanceof CrmError && !error.retryable) return { status: "refused", code: error.code };
       throw error;
     }
+    // The calls board may have just been created or replaced, so refresh the
+    // Follow-Up webhook alongside the contact-board webhooks.
+    if (enqueue) {
+      await enqueue({ kind: "name-webhooks", workspaceId, provider: connectionKey });
+    }
     const queued = rebuild ? await rebuildCallsBoard({ workspaceId, provider: connectionKey }) : 0;
     return { status: "ready", queued };
   }

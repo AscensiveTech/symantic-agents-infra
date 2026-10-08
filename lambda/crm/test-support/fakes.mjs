@@ -103,6 +103,13 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
       }
       return count;
     },
+    async updateCallFollowUpFromCrm(workspaceId, callId, followUp) {
+      const row = callRows.get(key(workspaceId, callId));
+      if (!row) return null;
+      if (followUp === null) delete row.followUp;
+      else row.followUp = structuredClone(followUp);
+      return clone(row);
+    },
     contacts,
     async listWorkspaceConnections(workspaceId) {
       return [...connections.values()].filter((row) => row.workspaceId === workspaceId).map(clone);
@@ -765,7 +772,7 @@ export function createFakeMonday({ now = Date.now, accountId: initialAccountId =
       case "create_webhook": {
         const board = boards.get(String(v.board));
         if (!board || board.deleted) return errorBody("InvalidBoardIdException", "Board not found");
-        if (!["change_name", "change_specific_column_value"].includes(v.event)) return errorBody("InvalidArgumentException", "Bad event");
+        if (!["change_name", "change_specific_column_value", "create_item"].includes(v.event)) return errorBody("InvalidArgumentException", "Bad event");
         const webhook = { id: id(), boardId: board.id, url: v.url, event: v.event, config: v.config ? JSON.parse(v.config) : null };
         webhooks.set(webhook.id, webhook);
         return { data: { create_webhook: { id: webhook.id } } };

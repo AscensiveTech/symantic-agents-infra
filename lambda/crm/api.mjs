@@ -340,8 +340,8 @@ export function createCrmApi({
           connection = await revalidate(workspaceId, connection);
         }
         await queueCallsBoard(connection);
-        // A renewal may have granted webhooks: (re)register the name-sync ones.
-        if (connection.mapping) await enqueue({ kind: "name-webhooks", workspaceId, provider: key }).catch(() => {});
+        // A renewal may have granted webhooks: refresh contact and Follow-Up watchers.
+        await enqueue({ kind: "name-webhooks", workspaceId, provider: key }).catch(() => {});
         // Reconnecting after a disconnect: calls taken meanwhile were never
         // queued. Send only those (each checked by Call ID, so nothing already
         // on the board is added again).
@@ -370,7 +370,7 @@ export function createCrmApi({
       return json(200, toPublicConnection(saved, now));
     },
 
-    // Monday name-sync webhook (public). The URL's signature proves which
+    // Monday board-sync webhook (public). The URL's signature proves which
     // workspace and agent it's for; Monday's one-time challenge is echoed
     // back. Deliveries are queued for the worker, so this answers at once.
     async "POST /crm/monday/webhook"(event) {
@@ -385,18 +385,18 @@ export function createCrmApi({
       const change = body?.event;
       const name = nameFromWebhookEvent(change);
       const itemId = change?.pulseId ?? change?.itemId;
-      if (name && itemId && change?.boardId && AGENT_ID_PATTERN.test(query.a)) {
+      if (itemId && change?.boardId && AGENT_ID_PATTERN.test(query.a)) {
         await enqueue({
-          kind: "name-from-monday",
+          kind: "board-change-from-monday",
           workspaceId: query.w,
           provider: connectionKeyFor(PROVIDER, query.a),
           boardId: String(change.boardId),
           itemId: String(itemId),
-          name,
+          ...(name ? { name } : {}),
           at: typeof change.triggerTime === "string" ? change.triggerTime : new Date(Number(now())).toISOString(),
         });
       }
-      metrics?.count("Webhook", { Provider: PROVIDER, Outcome: "name_change" });
+      metrics?.count("Webhook", { Provider: PROVIDER, Outcome: "board_change" });
       return json(200, { ok: true });
     },
 

@@ -979,7 +979,7 @@ test("agent deletion: disconnect-agent revokes and clears this agent's Monday on
   assert.deepEqual(await h.runtime.disconnectAgent({ workspaceId: "ws-a", agentId: "agent-a" }), { status: "none" }, "safe to run twice");
 });
 
-test("connect: the OAuth callback only queues the calls board, so it returns fast; the worker builds it", async () => {
+test("connect: the OAuth callback only queues background setup, so it returns fast; the worker builds the calls board", async () => {
   const h = createHarness();
   const start = await h.api("POST", "/crm/monday/start", { sub: "sub-admin-a", body: { returnTo: "/integrations" } });
   const url = new URL(JSON.parse(start.body).authorizeUrl);
@@ -987,7 +987,7 @@ test("connect: the OAuth callback only queues the calls board, so it returns fas
   const callback = await h.api("GET", "/crm/oauth/monday/callback", { query: { code, state: url.searchParams.get("state") } });
   assert.match(callback.headers.location, /crm=connected/);
   assert.equal(h.monday.count("create_board"), 0, "no board work inside the callback");
-  assert.equal(h.queue.messages.length, 1);
+  assert.equal(h.queue.messages.length, 2, "calls-board setup and webhook refresh are both asynchronous");
   await h.drain();
   assert.equal(h.monday.count("create_board"), 1);
   assert.equal(h.store.connections.get("ws-a\0monday#agent-a").callsBoard.status, "active");
@@ -1448,9 +1448,12 @@ async function syncedJane(h) {
   return { call, item };
 }
 function renameEvent(h, item, name, at = new Date(h.clock()).toISOString()) {
+  const previousName = item.name;
+  item.name = name;
+  item.updatedAt = at;
   return h.api("POST", "/crm/monday/webhook", {
     query: webhookQuery(h, h.board.id),
-    body: { event: { type: "update_name", boardId: Number(h.board.id), pulseId: Number(item.id), value: { name }, previousValue: { name: item.name }, triggerTime: at } },
+    body: { event: { type: "update_name", boardId: Number(h.board.id), pulseId: Number(item.id), value: { name }, previousValue: { name: previousName }, triggerTime: at } },
   });
 }
 
@@ -1458,21 +1461,21 @@ test("saving a mapping watches that board for renames; turning board sync off or
   const h = createHarness();
   await h.connectAndMap();
   const hooks = webhooksOn(h, h.board.id);
-  assert.equal(hooks.length, 1);
+  assert.equal(hooks.length, 3);
   assert.equal(hooks[0].event, "change_name");
   assert.match(hooks[0].url, /\/crm\/monday\/webhook\?w=ws-a&a=agent-a&s=/);
   const callsBoardId = conn(h).callsBoard.id;
-  assert.equal(webhooksOn(h, callsBoardId).length, 0, "never the Symantic AI Calls board");
+  assert.equal(webhooksOn(h, callsBoardId).length, 1, "watches Follow-Up on the Symantic AI Calls board");
   assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "instant");
 
   await h.api("PUT", "/crm/board-sync", { sub: "sub-admin-a", body: { enabled: false } });
   await h.drain();
-  assert.equal(h.monday.webhooks.size, 0);
+  assert.equal(h.monday.webhooks.size, 1, "the independent calls-board Follow-Up watcher stays on");
   assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "off");
 
   await h.api("PUT", "/crm/board-sync", { sub: "sub-admin-a", body: { enabled: true } });
   await h.drain();
-  assert.equal(h.monday.webhooks.size, 1);
+  assert.equal(h.monday.webhooks.size, 4);
   await h.api("DELETE", "/crm/connection", { sub: "sub-admin-a" });
   assert.equal(h.monday.webhooks.size, 0, "removed before the tokens were deleted");
 });
@@ -1507,7 +1510,7 @@ test("renamed in Monday: the contact and every call from that number take the ne
   }
 });
 
-test("name sync ignores our own write echoing back, older changes, and numbers Symantic never heard from", async () => {
+test("name sync ignores our own write echoing back and older changes, and imports new Monday contacts", async () => {
   const h = createHarness();
   await h.connectAndMap();
   const { item } = await syncedJane(h);
@@ -1522,11 +1525,11 @@ test("name sync ignores our own write echoing back, older changes, and numbers S
   await h.drain();
   assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Janet");
 
-  // A row whose number never called is not added to Contacts.
+  // A valid new row on the selected contact board is imported to Contacts.
   const stranger = h.monday.addItem(h.board.id, { name: "Stranger", phone: "+12025550777" });
   await renameEvent(h, stranger, "Stranger Danger");
   await h.drain();
-  assert.equal(h.store.contacts["ws-a\0+12025550777"], undefined);
+  assert.equal(h.store.contacts["ws-a\0+12025550777"].name, "Stranger Danger");
 });
 
 test("renamed in Symantic: the caller's row is renamed on each mapped board once, and its echo is ignored", async () => {
@@ -1555,6 +1558,35 @@ test("the BFF's contact-renamed notice queues the push to Monday", async () => {
   assert.equal(h.monday.items.get(String(item.id)).name, "Jane Renamed");
 });
 
+test("a new Symantic contact creates a row on the selected Monday contact board", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  await h.runtime.enqueue({
+    kind: "name-to-monday",
+    workspaceId: "ws-a",
+    provider: "monday",
+    phone: "+12025550991",
+    name: "New Symantic Contact",
+  });
+  await h.drain();
+  const matches = [...h.monday.items.values()].filter((item) => item.boardId === h.board.id && item.name === "New Symantic Contact");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].values.phone_mkx1.text, "+12025550991");
+});
+
+test("a new Monday row is imported to Symantic after its create webhook", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const item = h.monday.addItem(h.board.id, { name: "Monday Only", phone: "+12025550992" });
+  const response = await h.api("POST", "/crm/monday/webhook", {
+    query: webhookQuery(h, h.board.id),
+    body: { event: { type: "create_pulse", boardId: Number(h.board.id), pulseId: Number(item.id), triggerTime: new Date(h.clock()).toISOString() } },
+  });
+  assert.equal(response.statusCode, 200);
+  await h.drain();
+  assert.equal(h.store.contacts["ws-a\0+12025550992"].name, "Monday Only");
+});
+
 test("a connection without the webhook permission: no webhooks, but a reconnect catches up names", async () => {
   const h = createHarness();
   h.monday.grantScope("me:read account:read boards:read boards:write updates:write users:read");
@@ -1573,7 +1605,7 @@ test("a connection without the webhook permission: no webhooks, but a reconnect 
   h.monday.grantScope("me:read account:read boards:read boards:write updates:write users:read webhooks:write");
   await h.connect();
   await h.drain();
-  assert.equal(webhooksOn(h, h.board.id).length, 1);
+  assert.equal(webhooksOn(h, h.board.id).length, 3);
   assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Later");
   assert.equal(h.store.callRows.get(`ws-a\0${call.callId}`).callerName, "Jane Later");
 });
@@ -1632,7 +1664,7 @@ test("the daily check re-creates a webhook removed in Monday and catches up what
     await h.runtime.refreshTokens();
   }
   await h.drain();
-  assert.equal(webhooksOn(h, h.board.id).length, 1, "re-created");
+  assert.equal(webhooksOn(h, h.board.id).length, 3, "re-created");
   assert.equal(h.store.contacts["ws-a\0+12025550198"].name, "Jane Unheard");
 });
 
@@ -1791,6 +1823,40 @@ test("a follow-up edited after the call updates the calls board only", async () 
   assert.match(callsRow.values[connection.callsBoard.columns.followUp].text, /Call back Friday/);
 });
 
+test("a Follow-Up cell edited on Monday updates Call History in Symantic", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall();
+  h.enqueueCall(call);
+  await h.drain();
+  const connection = conn(h);
+  const savedCall = h.store.callRows.get(`ws-a\0${call.callId}`);
+  const callsRow = h.monday.items.get(String(savedCall.crmCallsItemId));
+  const columnId = connection.callsBoard.columns.followUp;
+  callsRow.values[columnId] = { text: "Resolved - Assigned to Priya - Customer called back", value: "{}" };
+  h.clock.advance(60_000);
+  const response = await h.api("POST", "/crm/monday/webhook", {
+    query: webhookQuery(h, connection.callsBoard.id),
+    body: { event: {
+      type: "update_column_value",
+      boardId: Number(connection.callsBoard.id),
+      pulseId: Number(callsRow.id),
+      columnId,
+      triggerTime: new Date(h.clock()).toISOString(),
+    } },
+  });
+  assert.equal(response.statusCode, 200);
+  await h.drain();
+  assert.deepEqual(h.store.callRows.get(`ws-a\0${call.callId}`).followUp, {
+    status: "resolved",
+    assigneeUserId: null,
+    assigneeName: "Priya",
+    comment: "Customer called back",
+    updatedAt: new Date(h.clock()).toISOString(),
+    updatedBy: "Monday.com",
+  });
+});
+
 test("the phone column deleted in Monday is flagged within the hour; restoring it re-sends the calls it missed", async () => {
   const h = createHarness();
   await h.connectAndMap();
@@ -1884,11 +1950,12 @@ test("the name column must exist and be text; the extra AI details are capped at
   assert.deepEqual(conn(h).mapping.readColumns.map((c) => c.id), ["person"]);
 });
 
-test("Keep Contact Names in Sync set to No: no webhooks, and renames are ignored both ways", async () => {
+test("Keep Contact Names in Sync set to No: only the Follow-Up webhook remains, and renames are ignored both ways", async () => {
   const h = createHarness();
   await h.connect();
   await saveSetup(h, { syncNames: false });
-  assert.equal(h.monday.webhooks.size, 0);
+  assert.equal(webhooksOn(h, h.board.id).length, 0);
+  assert.equal(webhooksOn(h, conn(h).callsBoard.id).length, 1);
   assert.equal(JSON.parse((await h.api("GET", "/crm/connection", { sub: "sub-admin-a" })).body).nameSync, "off");
   const { item } = await syncedJane(h);
   await h.runtime.enqueue({ kind: "name-to-monday", workspaceId: "ws-a", provider: "monday", phone: "+12025550198", name: "Renamed In Symantic" });
@@ -1896,5 +1963,5 @@ test("Keep Contact Names in Sync set to No: no webhooks, and renames are ignored
   assert.equal(h.monday.items.get(String(item.id)).name, "Jane Doe");
   // Turning it back on registers the webhook again.
   await saveSetup(h, { syncNames: true });
-  assert.equal(webhooksOn(h, h.board.id).length, 1);
+  assert.equal(webhooksOn(h, h.board.id).length, 3);
 });
