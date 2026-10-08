@@ -315,23 +315,25 @@ function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
     lines: [
       `Published coverage: ${cfg.business.serviceAreas.join(", ")}`,
       ...(cfg.business.address
-        ? [`- The business itself is at ${cfg.business.address} - that town and the places around it are always covered.`]
+        ? [`- The business itself is at ${cfg.business.address} - that town and ZIP are always covered.`]
         : []),
-      "- Entries can be whole regions: a metro area includes its suburbs and nearby towns, and a state includes every "
-        + "town in it. Use what you know about where a place is.",
-      `- The moment a caller gives a city, region, or ZIP, call ${tool(TOOL.serviceArea)} with it (and the state, if they `
-        + "said it) before deciding anything. Matched: say it's within the area and the team will confirm the exact "
-        + "address. Not matched only means no exact text match - decide with the rules above; a place inside one of "
-        + "those regions is covered.",
-      "- Clearly outside: don't refuse and don't confirm. Say the team confirms coverage for addresses out that way "
-        + "and take a message so they can follow up. Never quote a mileage, radius, or travel time.",
-      "- Speech-to-text mangles place names. If what you heard isn't a real place, it's a mishearing - never accept it "
-        + "or read it back as real. Try twice, varying the approach: first offer the closest real place (\"Sorry, did "
-        + "you say Stafford?\"), then ask them to spell it. If it's still unclear, move on and reconfirm it later in "
-        + "the call.",
+      `- As soon as the caller gives a city, town, county, state, ZIP code, metro area or region that matters to an `
+        + `on-site visit, call ${tool(TOOL.serviceArea)} with it as they said it, including the state or ZIP if `
+        + "given. Its status decides - don't judge coverage from your own sense of geography:",
+      "  - covered: it's in the area. A state covers every place in it; a metro area or region covers its cities, "
+        + "towns, counties and ZIPs even when they aren't listed. A covered town or ZIP doesn't promise every "
+        + "street address, so say the team will confirm the exact address.",
+      "  - ambiguous: ask exactly its clarificationQuestion, then check again with the answer.",
+      "  - unresolved: the place wasn't recognized - likely misheard. Never accept or read it back as real. Ask "
+        + "its clarificationQuestion (it offers the closest real place when there is one), then ask them to spell "
+        + "it or give the ZIP. Two tries at most; then move on and reconfirm it later in the call.",
+      "  - outside: don't refuse. Say \"Our team confirms coverage for addresses out that way. I can take your "
+        + "details and have them follow up.\" and take a message.",
+      "- Never quote a mileage, radius, or travel time.",
       ...(hasOnSiteTypes
-        ? ["- For a visit at the caller's location, if the town still can't be identified after that, don't book the "
-          + "visit - we can't locate it. Take a message instead so the team can call back and sort it out."]
+        ? ["- For a visit at the caller's location, book only after a covered result; outside means a message, not a "
+          + "booking. If the town still can't be identified, don't book the visit - we can't locate it. Take a message "
+          + "instead so the team can call back and sort it out."]
         : []),
     ],
   };

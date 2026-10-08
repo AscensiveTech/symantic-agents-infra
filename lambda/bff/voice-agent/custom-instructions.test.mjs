@@ -347,12 +347,30 @@ test("without booking, the agent says it can't schedule - never that the busines
   assert.doesNotMatch(booking, /I'm not authorized\s+to schedule appointments/);
 });
 
-test("service area: the business's own town is covered, regions are judged by geography, and the tool knows the address", () => {
+test("service area: the tool's status decides, the business's own town is covered, and the tool knows the address", () => {
   const compiled = cascade();
   const area = section(compiled.prompt.text, "SERVICE AREA");
-  assert.match(area, /The business itself is at 10901 Rhode Island Ave, Beltsville, MD 20705 - that town and the places around it are always covered/);
-  assert.match(area, /a metro area includes its suburbs and nearby towns, and a state includes every\s+town in it/);
-  assert.match(area, /Not matched only means no exact text match/);
+  assert.match(area, /The business itself is at 10901 Rhode Island Ave, Beltsville, MD 20705 - that town and ZIP are always covered/);
+  assert.match(area, /city, town, county, state, ZIP code, metro area\s+or region/);
+  assert.match(area, /as they said it, including the state or ZIP/);
+  assert.match(area, /don't judge coverage from your own sense of geography/);
+  assert.match(area, /A state covers every place in it; a metro area or region covers its cities,\s+towns, counties and ZIPs even when they aren't listed/);
+  assert.match(area, /ambiguous: ask exactly its clarificationQuestion/);
+  assert.match(area, /unresolved: the place wasn't recognized/);
+  assert.match(area, /"Our team confirms coverage for addresses out that way\. I can take your\s+details and have them follow up\."/);
+  assert.match(area, /team will confirm the exact address/);
+  assert.match(area, /Never quote a mileage, radius, or travel time/);
+  // The model is never told to fall back on its own geography.
+  assert.doesNotMatch(area, /what you know about|Not matched only means/);
   const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
   assert.equal(tool.parameters.properties.businessAddress.const, "10901 Rhode Island Ave, Beltsville, MD 20705");
+  assert.equal(tool.parameters.properties.serviceAreas.const, JSON.stringify(CASCADE_PROFILE.serviceAreas));
+  assert.match(tool.parameters.properties.location.description, /as they said it, including the state or ZIP code/);
+});
+
+test("service area: no configured areas means no tool and no SERVICE AREA section", () => {
+  const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [] }, booking: false }));
+  assert.equal(section(compiled.prompt.text, "SERVICE AREA"), null);
+  assert.ok(!compiled.retell.llm.general_tools.some((item) => item.name === "check_service_area"));
+  assert.doesNotMatch(compiled.prompt.text, /check_service_area/);
 });

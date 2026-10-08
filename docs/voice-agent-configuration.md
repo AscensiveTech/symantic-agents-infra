@@ -77,7 +77,7 @@ Stored = `agent.configuration.<field>`; profile fields live in `agent.configurat
 | Company Website | profile `website` | P | BUSINESS INFO | Never crawled. |
 | Timezone | profile `timezone` | P, N, B, DV | prompt clock `{{current_time_<zone>}}` and Timezone line; agent `timezone`; tools time parsing and hours enforcement | New activation rejects an invalid IANA zone. Legacy invalid values consistently fall back to UTC in the prompt, Retell (`Etc/UTC`) and calendar tools (diagnostic). |
 | Emails + labels | profile `contactEmails[]` | P | BUSINESS INFO, "share only if asked" | |
-| Service Area Coverage | profile `serviceAreas[]` | P, T | SERVICE AREA section + `check_service_area` tool (list and the business address baked in as `const`) | Absent: neither exists. The business's own town/ZIP always matches; a state entry ("Maryland") matches a place given with that state ("Beltsville, MD"). Anything else unmatched returns a `hint` to judge metro areas and states by geography - the prompt says the same. |
+| Service Area Coverage | profile `serviceAreas[]` | P, T, B | SERVICE AREA section + `check_service_area` tool (list and the business address baked in as `const`) | Absent: neither exists. One area per line in the wizard (a comma-separated line keeps "City, ST" together). The tools Lambda resolves the caller's words and every entry against a local Census/OMB dataset and returns `status` covered / outside / ambiguous / unresolved; the prompt follows the status and never judges geography itself. States, counties, metro areas and named regions cover their towns and ZIPs; the business's own town/ZIP always matches. See [service-area-geography.md](service-area-geography.md). |
 | Business Hours / closed days / Open 24 Hours / multiple ranges | profile `businessHours` (+ free-text `hours`) | P, B | BUSINESS INFO, SCHEDULING RULES; **enforced** by availability/create/reschedule | Structured hours win; free text shown as-is and not enforced. |
 | Holidays (toggle + list) | profile `holidaysEnabled`, `holidays[]` | P, B | BUSINESS INFO, SCHEDULING RULES; closed holidays **enforced** | Toggle off means the list is ignored. Disabled entries are ignored. Special-hours text is prompt only. Dates are spelled out with the weekday, and the prompt states holidays override the weekly hours (including open 24 hours). |
 
@@ -202,7 +202,7 @@ still carry them) and regenerate `voice-agent/golden/frontend-seeds.json`.
 | `calendar_cancel_booking` | booking on | after explicit confirmation; then say exactly what was cancelled | what was cancelled | appointmentId |
 | `message_take` | always | caller wants a person / can't be done on the call | "passed along" | messageId |
 | `lead_capture` | always | prospect interested in services | "passed along" | leadId |
-| `check_service_area` | service areas set | the moment a caller names a place | in area or not | - |
+| `check_service_area` | service areas set | as soon as a caller names a place that matters to an on-site visit; follow `status` | covered / clarificationQuestion / outside line | matchedBy, matchedArea, confidence, canonicalLocation |
 | `transfer_call_N` | transfers allowed + usable rule | caller's meaning matches the rule | fixed line | number never spoken |
 | `end_call` | always | in the same turn as the closing line; spam/abuse/no-progress closes | - | - |
 

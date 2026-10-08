@@ -1,0 +1,72 @@
+{
+  "datasetVersion": "2026.1",
+  "file": "us-geo.txt.gz",
+  "sha256": "753a55618f036084a7cfa4ea0cbf68ff30ad4a23c3d06533a54b0f218f2a0e62",
+  "uncompressedBytes": 1750274,
+  "counts": {
+    "counties": 3144,
+    "cbsas": 925,
+    "metropolitanAreas": 387,
+    "csas": 181,
+    "places": 32071,
+    "towns": 13006,
+    "placesWithCountyFromNearestZcta": 516,
+    "zips": 33642
+  },
+  "sources": [
+    {
+      "key": "places",
+      "description": "Census 2026 Gazetteer - places (incorporated places and CDPs)",
+      "url": "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2026_Gazetteer/2026_Gaz_place_national.zip",
+      "sha256": "af678e2d990827c89ee39b98c82de6e90b693c7361ff0e559ae3076670dd2863"
+    },
+    {
+      "key": "counties",
+      "description": "Census 2026 Gazetteer - counties and county equivalents (CT planning regions)",
+      "url": "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2026_Gazetteer/2026_Gaz_counties_national.zip",
+      "sha256": "6a99ca00efbc0be5112e225d4102704c51d5ce3b16e3afd6e4159460595fd12a"
+    },
+    {
+      "key": "cousubs",
+      "description": "Census 2026 Gazetteer - county subdivisions (towns and townships with an active government)",
+      "url": "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2026_Gazetteer/2026_Gaz_cousubs_national.zip",
+      "sha256": "9d528b39b70a27075c863b1572f27eadaf24484d5435fac17fc3b4cdd36434c2"
+    },
+    {
+      "key": "zctas",
+      "description": "Census 2026 Gazetteer - ZIP Code Tabulation Areas (2020 ZCTA5)",
+      "url": "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2026_Gazetteer/2026_Gaz_zcta_national.zip",
+      "sha256": "f1e9046b91f6e60686a99343cb2752834c02b0764939403b331c78c017e2c54c"
+    },
+    {
+      "key": "placeByCounty",
+      "description": "Census 2020 place-by-county reference file",
+      "url": "https://www2.census.gov/geo/docs/reference/codes2020/national_place_by_county2020.txt",
+      "sha256": "9996494d33cf6ee4527491508aa1b8dae85dcff3a979886e19b0b375e5d06ec6"
+    },
+    {
+      "key": "zctaCounty",
+      "description": "Census 2020 ZCTA-to-county relationship file",
+      "url": "https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_county20_natl.txt",
+      "sha256": "3ed41278d637dc249e0323306f68be8a6c234e3090f4de88ef328dee71aeaaaf"
+    },
+    {
+      "key": "zctaPlace",
+      "description": "Census 2020 ZCTA-to-place relationship file",
+      "url": "https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_place20_natl.txt",
+      "sha256": "698a5dad71ed419411677d0ffd8ecd9331067f59c472cdd239b92c12f698285d"
+    },
+    {
+      "key": "ctZctaCousub",
+      "description": "Census 2022 Connecticut county-subdivision-to-ZCTA relationship file (planning regions)",
+      "url": "https://www2.census.gov/geo/docs/maps-data/data/rel2022/acs22_cousub22_zcta520_st09.txt",
+      "sha256": "1ef973388b3c3f9e9553b60aa7db0ee47762d3cb2b3d03f5b7796165590f1820"
+    },
+    {
+      "key": "cbsa",
+      "description": "OMB Bulletin 23-01 (July 2023) CBSA and CSA delineation, Census list 1",
+      "url": "https://www2.census.gov/programs-surveys/metro-micro/geographies/reference-files/2023/delineation-files/list1_2023.xlsx",
+      "sha256": "952c4b1e78acbb54e6ec9412434b7602fedacbf021736351a63c181bdb753629"
+    }
+  ]
+}

@@ -799,7 +799,19 @@ test("service-area.check is reachable through the signed dispatcher and needs no
   assert.deepEqual(JSON.parse(response.body), {
     ok: true,
     matched: true,
+    status: "covered",
+    canonicalLocation: {
+      place: "Arlington",
+      state: "VA",
+      zip: null,
+      county: "Arlington County",
+      metro: "Washington-Arlington-Alexandria, DC-VA-MD-WV",
+    },
+    matchedBy: "place",
+    matchedArea: "Arlington, VA",
+    confidence: "exact",
     message: "That location is within our published service area.",
+    clarificationQuestion: "",
   });
 });
 

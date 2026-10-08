@@ -173,24 +173,30 @@ const CORE_TOOLS = [
 // Only registered when the business has configured a service area - the
 // whole list travels with the tool definition as a `const` property, the
 // same way workspaceId/agentId/callId are baked in. No database access at
-// call time.
+// call time; the tools Lambda resolves places against a local Census
+// dataset (lambda/tools/geo/) and returns a status the prompt follows.
 function serviceAreaTool(serviceAreas, businessAddress) {
   return {
     name: TOOL.serviceArea,
     kind: "webhook",
     path: "/retell/tools/service-area.check",
     description:
-      "Check whether a location the caller mentioned is in the published service area list - call this "
-      + "before relying on your own judgment, whenever a caller states a city, region, or ZIP code.",
+      "Decide whether a place the caller named is inside the service area. Call it whenever the caller gives a "
+      + "city, town, county, state, ZIP code, metro area or region that matters to an on-site visit. Returns "
+      + "status covered, outside, ambiguous or unresolved.",
     properties: {
-      location: { type: "string", description: "The city, region, or ZIP code the caller mentioned." },
+      location: {
+        type: "string",
+        description: "The caller's location as they said it, including the state or ZIP code if they gave one "
+          + "(\"Silver Spring, Maryland\", \"20910\", \"Arlington\").",
+      },
       serviceAreas: { type: "string", const: JSON.stringify(serviceAreas) },
       // The business's own town is always covered.
       ...(businessAddress ? { businessAddress: { type: "string", const: businessAddress } } : {}),
     },
     required: ["location", "serviceAreas"],
-    speakable: "Whether the place is within the published area.",
-    internal: "nothing else.",
+    speakable: "Whether the place is covered, the clarificationQuestion to ask, or the outside message.",
+    internal: "matchedBy, matchedArea, confidence and canonicalLocation - never read them out.",
   };
 }
 
