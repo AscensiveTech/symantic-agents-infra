@@ -175,6 +175,10 @@ locals {
     "POST /retell/tools/lead.capture",
     "POST /retell/tools/message.take",
     "POST /retell/tools/call.transfer",
+    # Must list every webhook tool path the prompt builder registers
+    # (lambda/bff/voice-agent/tools.mjs) - a missing route is a 404 on every
+    # call. lambda/bff/voice-agent/tool-routes.test.mjs enforces it.
+    "POST /retell/tools/service-area.check",
   ])
 }
 

@@ -181,9 +181,11 @@ function serviceAreaTool(serviceAreas, businessAddress) {
     kind: "webhook",
     path: "/retell/tools/service-area.check",
     description:
-      "Decide whether a place the caller named is inside the service area. Call it whenever the caller gives a "
-      + "city, town, county, state, ZIP code, metro area or region that matters to an on-site visit. Returns "
-      + "status covered, outside, ambiguous or unresolved.",
+      "Decide whether a place the caller named is inside the service area. Call it before answering whenever the "
+      + "caller asks whether a place is served, or gives a city, town, county, state, ZIP code, metro area or region "
+      + "for any reason. Returns status covered, outside, ambiguous or unresolved.",
+    // Said while the check runs (generated in the call's language).
+    executionMessage: "Tell the caller in a few words that you're checking, e.g. \"Let me check that for you.\"",
     properties: {
       location: {
         type: "string",

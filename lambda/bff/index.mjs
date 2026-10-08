@@ -2486,8 +2486,11 @@ export function createHandler({
       // active agent's unpublished draft instead of what's live.
       const generatedConfigMatch = path.match(/^\/workspaces\/me\/agents\/([^/]+)\/generated-config$/);
       if (generatedConfigMatch && method === "GET") {
-        if (!isWorkspaceAdmin(actor)) {
-          return json(403, { message: "Only a workspace admin can view the generated configuration" });
+        // Symantic support only: it shows the provider requests (and any
+        // "Say It As" respellings), which customers - company admins
+        // included - never see.
+        if (!actor.roles.includes("super-admin")) {
+          return json(403, { message: "Only Symantic support can view the generated configuration" });
         }
         const store = await getStore();
         await store.ensureWorkspace(workspaceId);
