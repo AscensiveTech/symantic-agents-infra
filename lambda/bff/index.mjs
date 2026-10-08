@@ -2033,6 +2033,7 @@ export function createHandler({
               status: "active",
               retellAgentId: synced.retellAgentId,
               activatedAt,
+              lastPublishedAt: activatedAt,
               updatedAt: activatedAt,
               everPublished: true,
               // The activate response already returns the provisioned
@@ -2392,6 +2393,17 @@ export function createHandler({
                 toolBaseUrl,
               });
               retellSync = synced.retellSync;
+              // When this configuration went live - the roster shows it as
+              // "Last Published". Only after Retell accepted it.
+              const lastPublishedAt = new Date().toISOString();
+              if (typeof store.updateAgentRuntime === "function") {
+                try {
+                  await store.updateAgentRuntime(workspaceId, agentId, { lastPublishedAt });
+                  responseAgent = { ...responseAgent, lastPublishedAt };
+                } catch (stampError) {
+                  console.error("Failed to record when the agent was published", { agentId, stampError });
+                }
+              }
               if (planChanged) {
                 try {
                   await recordAgentPlanChange(store, workspaceId, agent.name, nextPlan, actor.userId);
