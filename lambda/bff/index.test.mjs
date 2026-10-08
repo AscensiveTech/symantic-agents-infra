@@ -1839,7 +1839,11 @@ test("Save Changes reports a live publish and stores the published version's fin
   // One-way: nothing the caller of the route sends changes what's pushed.
   assert.equal("promptSource" in retellCalls[0], false);
   assert.equal("retellEditsDecision" in retellCalls[0], false);
-  assert.deepEqual(runtimeUpdates.at(-1), { retellAgentId: "retell-agent-123", retellFingerprints: { "llm.general_prompt": "h1" } });
+  assert.deepEqual(runtimeUpdates.at(-2), { retellAgentId: "retell-agent-123", retellFingerprints: { "llm.general_prompt": "h1" } });
+  // Once Retell accepted it, the roster's "Last Published" time is stamped.
+  assert.deepEqual(Object.keys(runtimeUpdates.at(-1)), ["lastPublishedAt"]);
+  assert.ok(Date.parse(runtimeUpdates.at(-1).lastPublishedAt) > Date.now() - 60_000);
+  assert.equal(body.lastPublishedAt, runtimeUpdates.at(-1).lastPublishedAt);
   assert.deepEqual(body.retellSync, { status: "live", publishedVersion: 4 });
 });
 
