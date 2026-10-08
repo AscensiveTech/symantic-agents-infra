@@ -15,6 +15,19 @@ import { handleServiceArea } from "./handlers/service-area.mjs";
 import { handleTransfer } from "./handlers/transfer.mjs";
 import { createDynamoToolsStore } from "./store.mjs";
 import { resolveSpokenForms, toWrittenDeep } from "./spoken-forms.mjs";
+import { loadGeography } from "./geo/resolver.mjs";
+
+// Load the service-area dataset while the Lambda starts (provisioned
+// instances do this ahead of time), not on a caller's first "do you serve
+// ...?" - loading it inside the request once took past the 10s timeout and
+// left the caller in silence while Retell retried.
+if (process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  try {
+    loadGeography();
+  } catch (error) {
+    console.error("Service-area dataset preload failed; it loads on first use instead", { name: error?.name, message: error?.message });
+  }
+}
 
 const ROUTES = new Set([
   "/retell/tools/calendar.findAppointment",

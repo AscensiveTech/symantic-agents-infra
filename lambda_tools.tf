@@ -109,9 +109,11 @@ resource "aws_lambda_function" "tools" {
   runtime       = "nodejs20.x"
   handler       = "index.handler"
   architectures = ["arm64"]
-  memory_size   = 256
-  timeout       = 10
-  publish       = true
+  # 512 MB: more CPU so a fresh instance loads the service-area dataset
+  # (at startup, see lambda/tools/index.mjs) in about a second.
+  memory_size = 512
+  timeout     = 10
+  publish     = true
 
   filename         = data.archive_file.tools.output_path
   source_code_hash = data.archive_file.tools.output_base64sha256
