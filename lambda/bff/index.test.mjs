@@ -1161,7 +1161,8 @@ test("DELETE agent: if Telnyx fails, the agent is NOT deleted; the reason and fi
   assert.equal(body.code, "deletion_incomplete");
   const telnyx = body.deletion.steps.find((step) => step.id === "telnyx_number");
   assert.equal(telnyx.status, "failed");
-  assert.match(telnyx.reason, /Telnyx didn't respond/);
+  assert.match(telnyx.reason, /Our phone provider didn't respond/);
+  assert.doesNotMatch(telnyx.reason, /Telnyx|Retell/);
   assert.match(telnyx.fix, /Retry Deletion/);
   assert.notEqual(fixture.getAgent().status, "deleted");
   assert.equal(fixture.calls.filter(([name]) => name === "deletePhoneNumberRecord").length, 0, "phone record kept");
@@ -1188,7 +1189,7 @@ test("DELETE agent: already-gone resources (404) count as done, and a rejected r
   const response = await deleteWith(rejected);
   assert.equal(response.statusCode, 409);
   const step = JSON.parse(response.body).deletion.steps.find((item) => item.id === "retell_agent");
-  assert.match(step.reason, /Retell rejected the request \(401\)/);
+  assert.match(step.reason, /Our voice service rejected the request \(401\)/);
   assert.match(step.fix, /Contact support and mention reference agent-123/);
   const later = JSON.parse(response.body).deletion.steps.find((item) => item.id === "telnyx_number");
   assert.equal(later.status, "pending", "nothing after a failure is touched");
@@ -3443,7 +3444,8 @@ test("POST activate returns an actionable 422 for a prompt/tool capability contr
 
   assert.equal(response.statusCode, 422);
   assert.equal(body.code, "invalid_voice_agent_configuration");
-  assert.match(body.message, /scheduling is disabled/i);
+  assert.match(body.message, /appointment booking is turned off/i);
+  assert.match(body.message, /Where: Conversation Rules & Guardrails step → /);
   assert.ok(body.diagnostics.some((item) => item.code === "disabled_scheduling_in_examples"));
   assert.equal(retellCalled, false);
 });

@@ -101,6 +101,12 @@ export const SEEDED_TEMPLATE_EXAMPLES = Object.freeze({
   "9dd67fd71fe5c6d2ae12dee6c12e2bc0": "home-field-services",
   "2905236f7db4328620aebae1f6b4cfb1": "professional-services",
   bcf23f7367f90e962226a67f6742ee8d: "customer-support",
+  // The same examples for an agent without appointment booking.
+  "2165d4cddaed51f47c681c68b62eeffd": "medical-dental",
+  "2cdc13957062b66690def45409c6ac28": "restaurant",
+  "6658bb4a35d3d3558f999fa069921bf3": "salon-spa",
+  ca61027a4b39f8abb7af45a117e24098: "home-field-services",
+  "440dcfbd1e5dab0019d1e568c6d097da": "professional-services",
 });
 
 export function normalizeLine(line) {

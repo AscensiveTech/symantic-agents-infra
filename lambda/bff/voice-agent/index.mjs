@@ -84,30 +84,59 @@ export function diagnose(cfg, toolPlan, prompt) {
     add("error", "prompt_mentions_unregistered_tool",
       `The prompt mentions ${unregistered.join(", ")}, which this agent doesn't have - check the business's own instructions.`);
   }
-  if (!cfg.scheduling.enabled && customInstructionsClaimCapability(retainedCustomInstructions, "scheduling")) {
-    add("error", "disabled_scheduling_in_examples",
-      "Custom instructions tell the agent to schedule or confirm appointments, but scheduling is disabled - remove that instruction or enable a calendar.");
+  // Each conflict names the box (as labeled in the wizard), quotes the lines,
+  // and says both ways to fix it. `field` and `lines` let the wizard jump
+  // straight to the box.
+  const addConflicts = (code, found, describe) => {
+    for (const [field, lines] of groupByField(found)) {
+      const { problem, fix } = describe(field);
+      const box = FIELD_LABELS[field];
+      out.push({
+        level: "error",
+        code,
+        field,
+        step: "guardrails",
+        lines,
+        message: `${problem} Where: Conversation Rules & Guardrails step → ${box} box. `
+          + `${lines.length === 1 ? "Line" : "Lines"}: ${lines.map((line) => `"${line}"`).join("; ")}. To fix: ${fix}`,
+      });
+    }
+  };
+  if (!cfg.scheduling.enabled) {
+    addConflicts("disabled_scheduling_in_examples", customInstructionsClaimCapability(retainedCustomInstructions, "scheduling"), (field) => ({
+      problem: field === "exampleDialogues"
+        ? "The Example Dialogues box has an appointment-booking example, but appointment booking is turned off."
+        : `The ${FIELD_LABELS[field]} box tells the agent to book or confirm appointments, but appointment booking is turned off.`,
+      fix: `delete or reword ${field === "exampleDialogues" ? "those lines" : "that text"} in the ${FIELD_LABELS[field]} box `
+        + "(for example, \"I'll pass this to the team and they'll call you to set up a time\"), "
+        + "or turn on appointment booking and connect a calendar on the Calendar & CRM step.",
+    }));
   }
-  if (!toolPlan.some((tool) => tool.kind === "transfer")
-    && customInstructionsClaimCapability(retainedCustomInstructions, "transfer")) {
-    add("error", "disabled_transfers_in_custom_instructions",
-      "Custom instructions tell the agent to transfer calls, but no transfer tool is configured - remove that instruction or add an enabled transfer rule.");
+  if (!toolPlan.some((tool) => tool.kind === "transfer")) {
+    addConflicts("disabled_transfers_in_custom_instructions", customInstructionsClaimCapability(retainedCustomInstructions, "transfer"), (field) => ({
+      problem: field === "exampleDialogues"
+        ? "The Example Dialogues box has a call-transfer example, but Call Transfers are turned off."
+        : `The ${FIELD_LABELS[field]} box tells the agent to transfer calls, but Call Transfers are turned off.`,
+      fix: `delete or reword ${field === "exampleDialogues" ? "those lines" : "that text"} in the ${FIELD_LABELS[field]} box `
+        + "(for example, \"I'll take a message and make sure the team gets it\"), "
+        + "or turn on Call Transfers and add a transfer rule on the Call Handling step.",
+    }));
   }
   // The reverse: a retained line that rules out a capability the settings
   // turned on. Untouched seeded lines like this are already left out
   // (seeded-defaults.mjs); this catches edited or hand-written ones, which
   // would otherwise contradict the generated sections in the live prompt.
   if (toolPlan.some((tool) => tool.kind === "transfer")) {
-    for (const { field, line } of customInstructionsForbidCapability(retainedCustomInstructions, "transfer")) {
-      add("error", "custom_instructions_forbid_enabled_transfers",
-        `${FIELD_LABELS[field]} say the agent never transfers calls, but Call Transfers are on: "${line}" - remove or reword that line, or turn Call Transfers off.`);
-    }
+    addConflicts("custom_instructions_forbid_enabled_transfers", customInstructionsForbidCapability(retainedCustomInstructions, "transfer"), (field) => ({
+      problem: `The ${FIELD_LABELS[field]} box says the agent never transfers calls, but Call Transfers are turned on.`,
+      fix: `delete or reword that text in the ${FIELD_LABELS[field]} box, or turn off Call Transfers on the Call Handling step.`,
+    }));
   }
   if (cfg.scheduling.enabled) {
-    for (const { field, line } of customInstructionsForbidCapability(retainedCustomInstructions, "scheduling")) {
-      add("error", "custom_instructions_forbid_enabled_scheduling",
-        `${FIELD_LABELS[field]} say the agent can't book appointments, but booking is on: "${line}" - remove or reword that line, or turn booking off.`);
-    }
+    addConflicts("custom_instructions_forbid_enabled_scheduling", customInstructionsForbidCapability(retainedCustomInstructions, "scheduling"), (field) => ({
+      problem: `The ${FIELD_LABELS[field]} box says the agent can't book appointments, but appointment booking is turned on.`,
+      fix: `delete or reword that text in the ${FIELD_LABELS[field]} box, or turn off appointment booking on the Calendar & CRM step.`,
+    }));
   }
   const customText = [retainedCustomInstructions.roleInstructions, retainedCustomInstructions.restrictions,
     retainedCustomInstructions.exampleDialogues, retainedCustomInstructions.finalReminders].join("\n");
@@ -190,22 +219,30 @@ function customInstructionsForbidCapability(customInstructions, capability) {
 // Customer-authored text is intentionally flexible, but it must not promise
 // an operation for which this agent has no tool. Check instruction/assistant
 // lines only (not caller examples), and ignore explicitly negative rules such
-// as "never transfer" or "we cannot book appointments".
+// as "never transfer" or "we cannot book appointments". Returns each
+// offending line as it appears in its box, so the customer can find it.
 function customInstructionsClaimCapability(customInstructions, capability) {
-  const fields = [
-    customInstructions.roleInstructions,
-    customInstructions.restrictions,
-    customInstructions.exampleDialogues,
-    customInstructions.finalReminders,
-  ];
   const capabilityPattern = capability === "transfer"
     ? /\btransfer(?:red|ring|s)?\b|\b(?:connect(?:ed|ing|s)?|route(?:d|ing|s)?|send(?:ing|s)?|pass(?:ed|ing|es)?|put)\b.{0,50}\b(?:caller|call|person|human|owner|staff|team|department|representative|agent)\b|\b(?:caller|call)\b.{0,50}\b(?:connect(?:ed|ing|s)?|route(?:d|ing|s)?|send(?:ing|s)?|pass(?:ed|ing|es)?|put\s+through)\b/i
     : /\b(?:book|booked|books|schedul(?:e|ed|ing|es)|reschedul(?:e|ed|ing|es)|cancel(?:led|ing|s)?)\b|\b(?:check|consult|search|use|open|look\s+at)\b.{0,40}\b(?:calendar|availability)\b|\b(?:offer|find|give|provide|have|found)\b.{0,40}\b(?:availability|openings?|time slots?)\b|\ball set\b|\b(?:make|set\s*up|arrang(?:e|ed|ing|es)|creat(?:e|ed|ing|es)|reserv(?:e|ed|ing|es)|confirm(?:ed|ing|s)?)\b.{0,50}\b(?:appointment|booking|reservation|visit|time slot)\b|\b(?:appointment|booking|reservation|visit|time slot)\b.{0,50}\b(?:make|set\s*up|arrang(?:e|ed|ing|es)|creat(?:e|ed|ing|es)|reserv(?:e|ed|ing|es)|confirm(?:ed|ing|s)?)\b/i;
   const nonCapabilityPattern = /\b(?:never|not|do not|don't|cannot|can't|unable|not able|not authorized|must not|without)\b|\b(?:take|capture|leave|record)\b.{0,30}\bmessage\b/i;
-  return fields.some((field) => String(field ?? "")
-    .replace(/\r\n?/g, "\n")
-    .split(/\n|(?<=[.!?;])\s+|,\s*(?:(?:but|however|instead|then)\s+)|\bbut\s+|\band\s+then\s+/i)
-    .map((line) => line.trim())
-    .filter((line) => line && !/^caller\s*:/i.test(line))
-    .some((line) => capabilityPattern.test(line) && !nonCapabilityPattern.test(line)));
+  const found = [];
+  for (const field of Object.keys(FIELD_LABELS)) {
+    for (const line of String(customInstructions[field] ?? "").replace(/\r\n?/g, "\n").split("\n")) {
+      if (!line.trim() || /^\s*caller\s*:/i.test(line)) continue;
+      const claims = line
+        .split(/(?<=[.!?;])\s+|,\s*(?:(?:but|however|instead|then)\s+)|\bbut\s+|\band\s+then\s+/i)
+        .map((clause) => clause.trim())
+        .some((clause) => clause && capabilityPattern.test(clause) && !nonCapabilityPattern.test(clause));
+      if (claims) found.push({ field, line: line.trim() });
+    }
+  }
+  return found;
+}
+
+// [field, lines] pairs in box order, one entry per box with conflicts.
+function groupByField(found) {
+  const grouped = new Map();
+  for (const { field, line } of found) grouped.set(field, [...(grouped.get(field) ?? []), line]);
+  return [...grouped];
 }

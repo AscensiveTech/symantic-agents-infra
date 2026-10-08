@@ -13,6 +13,7 @@ import { createRetellClient } from "../providers.mjs";
 import { buildReceptionistConfig } from "../receptionist.mjs";
 import { createFakeRetell } from "../test-support/fake-retell.mjs";
 import { compileVoiceAgent } from "./index.mjs";
+import { seededExampleTemplate } from "./seeded-defaults.mjs";
 import { inspectVoiceAgent } from "./inspect.mjs";
 import { BUILD, fullAgent, knowledgeBases, minimalAgent, workspaceProfile } from "./test-fixtures.mjs";
 
@@ -127,8 +128,12 @@ test("a line saying the agent never transfers blocks publishing while transfers 
   const compiled = compile(fullAgent({ roleInstructions: `- My own rule.\n${line}` }));
   const [error] = errors(compiled);
   assert.equal(error?.code, "custom_instructions_forbid_enabled_transfers");
-  assert.match(error.message, /^Role Instructions say the agent never transfers calls/);
-  assert.ok(error.message.includes(line), "the message quotes the offending line");
+  assert.match(error.message, /^The Role Instructions box says the agent never transfers calls, but Call Transfers are turned on\./);
+  assert.match(error.message, /Where: Conversation Rules & Guardrails step → Role Instructions box\./);
+  assert.ok(error.message.includes(line.trim()), "the message quotes the offending line");
+  assert.match(error.message, /To fix: .*turn off Call Transfers on the Call Handling step/);
+  assert.equal(error.field, "roleInstructions");
+  assert.deepEqual(error.lines, [line]);
   assert.throws(
     () => buildReceptionistConfig({ ...BUILD, agent: fullAgent({ roleInstructions: line }), profile: workspaceProfile }),
     (thrown) => thrown.statusCode === 422 && thrown.payload.diagnostics.some((item) => item.code === error.code),
@@ -137,10 +142,58 @@ test("a line saying the agent never transfers blocks publishing while transfers 
   assert.deepEqual(errors(compile(fullAgent({ roleInstructions: line, allowCallTransfers: false }))), []);
 });
 
+test("a booking example with booking off names the Example Dialogues box, quotes each line, and says how to fix it", () => {
+  // The home-services example with only its greeting edited, as on a real agent.
+  const exampleDialogues = [
+    "You: Thanks for calling, this is AI receptionist Gina - how can I help you today?",
+    "Caller: Hi, my kitchen sink has been leaking under the cabinet since this morning.",
+    "You: Got it. I have an opening tomorrow between 1 and 3 PM, or Thursday morning - which works better?",
+    "Caller: Tomorrow afternoon is fine.",
+    "You: Perfect, you're scheduled for tomorrow between 1 and 3 PM at 142 Birch Lane.",
+  ].join("\n");
+  const [error, ...rest] = errors(compile(fullAgent({ exampleDialogues, booking: false })));
+  assert.deepEqual(rest, []);
+  assert.equal(error.code, "disabled_scheduling_in_examples");
+  assert.equal(error.field, "exampleDialogues");
+  assert.deepEqual(error.lines, [
+    "You: Got it. I have an opening tomorrow between 1 and 3 PM, or Thursday morning - which works better?",
+    "You: Perfect, you're scheduled for tomorrow between 1 and 3 PM at 142 Birch Lane.",
+  ]);
+  assert.match(error.message, /^The Example Dialogues box has an appointment-booking example, but appointment booking is turned off\./);
+  assert.match(error.message, /Where: Conversation Rules & Guardrails step → Example Dialogues box\. Lines: "You: Got it\./);
+  assert.match(error.message, /To fix: delete or reword those lines in the Example Dialogues box .*or turn on appointment booking and connect a calendar on the Calendar & CRM step\./);
+  // Caller lines are never quoted, even when they mention a time.
+  assert.ok(!error.message.includes("Tomorrow afternoon is fine"));
+});
+
+test("each template's booking-free example is recognised as untouched and never flagged with booking off", () => {
+  const variants = Object.entries(SEEDS.templates).filter(([, seed]) => seed.exampleDialoguesWithoutBooking);
+  assert.ok(variants.length >= 5, "the booking templates carry a booking-free example");
+  for (const [id, seed] of variants) {
+    assert.equal(seededExampleTemplate(seed.exampleDialoguesWithoutBooking), id);
+    assert.deepEqual(errors(compile(fullAgent({ exampleDialogues: seed.exampleDialoguesWithoutBooking, booking: false }))), [], id);
+    // Edited (so it's kept as the customer's own text), it still has nothing that books.
+    const edited = seed.exampleDialoguesWithoutBooking.replace("this is the AI receptionist", "this is AI receptionist Gina");
+    assert.deepEqual(errors(compile(fullAgent({ exampleDialogues: edited, booking: false }))), [], `${id} (edited)`);
+  }
+});
+
+test("conflicts in two boxes give one error per box", () => {
+  const compiled = compile(fullAgent({
+    booking: false,
+    roleInstructions: "- Book the caller's appointment on the spot.",
+    finalReminders: "- Always confirm the appointment time before hanging up.",
+  }));
+  const scheduling = errors(compiled).filter((item) => item.code === "disabled_scheduling_in_examples");
+  assert.deepEqual(scheduling.map((item) => item.field), ["roleInstructions", "finalReminders"]);
+  assert.match(scheduling[0].message, /^The Role Instructions box tells the agent to book or confirm appointments/);
+});
+
 test("a line saying the agent can't book blocks publishing while booking is on", () => {
   const compiled = compile(fullAgent({ finalReminders: "- We don't take reservations over the phone." }));
   assert.deepEqual(errors(compiled).map((item) => item.code), ["custom_instructions_forbid_enabled_scheduling"]);
-  assert.match(errors(compiled)[0].message, /^Final Reminders say the agent can't book appointments/);
+  assert.match(errors(compiled)[0].message, /^The Final Reminders box says the agent can't book appointments/);
+  assert.equal(errors(compiled)[0].field, "finalReminders");
   assert.deepEqual(errors(compile(fullAgent({ finalReminders: "- We don't take reservations over the phone.", booking: false }))), []);
 });
 
