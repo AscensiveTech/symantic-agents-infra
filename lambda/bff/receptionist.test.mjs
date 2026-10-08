@@ -453,7 +453,13 @@ test("the context line explains why the AI is answering, and the message flow as
 
   assert.match(section(prompt, "CONTEXT (never read aloud)"), /busy - on other calls or out serving customers/);
   const message = section(prompt, "TAKING A MESSAGE");
-  assert.match(message, /Everyone's busy helping other customers/);
+  // No "everyone's busy" opener: one short line only when they asked for a
+  // person, nothing extra when they asked to leave a message, never twice.
+  assert.doesNotMatch(message, /Everyone's busy/);
+  assert.match(message, /If they asked to speak with someone, say once: "No one's available to come to the phone right now/);
+  assert.match(message, /If they asked to leave a message or a note, skip this/);
+  assert.match(message, /Never repeat this line in the same call, and let the caller finish before you reply/);
+  assert.match(message, /save it in their\s+own words \(lightly tidied\), every point they made/);
   assert.ok(message.indexOf("name first") < message.indexOf("what the call is about"));
   assert.match(message, /If they ask\s+what it is, tell them/);
   assert.match(message, /message_take/);

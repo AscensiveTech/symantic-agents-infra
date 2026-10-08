@@ -409,11 +409,14 @@ test("service area: the tool's status decides, the business's own town is covere
   assert.match(area, /never answer coverage from memory or your own sense of geography/);
   // The Gaithersburg call: "couldn't verify", then a contradicting guess.
   assert.match(area, /keep it for the rest of the call - never\s+contradict it/);
-  assert.match(area, /don't say you couldn't verify it: say "Our team will confirm\s+coverage for your address"/);
+  // The Gaithersburg call: the caller spoke while the check was still running.
+  assert.match(area, /Until the check has answered, give no coverage answer at all/);
+  assert.match(area, /"Still checking, one moment\."/);
+  assert.match(area, /Only if the check comes back with an error \(not\s+while it's still running\)/);
   assert.match(area, /A state covers every place in it; a metro area or region covers its cities,\s+towns, counties and ZIPs even when they aren't listed/);
   assert.match(area, /ambiguous: ask exactly its clarificationQuestion/);
   assert.match(area, /unresolved: the place wasn't recognized/);
-  assert.match(area, /"Our team confirms coverage for addresses out that way\. I can take your\s+details and have them follow up\."/);
+  assert.match(area, /outside: say it's outside first, then offer - never the other way around: "We don't currently serve\s+\[the place\] - it's outside our service area\. If you'd like, I can take your address/);
   assert.match(area, /team will confirm the exact address/);
   assert.match(area, /Never quote a mileage, radius, or travel time/);
   // The model is never told to fall back on its own geography.

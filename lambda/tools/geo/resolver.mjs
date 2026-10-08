@@ -25,8 +25,9 @@ import { STATE_BY_ABBR, STATE_BY_FIPS, STATES } from "./states.mjs";
 
 const DATA_FILE = new URL("./data/us-geo.txt.gz", import.meta.url);
 
-export const OUTSIDE_MESSAGE = "Our team confirms coverage for addresses out that way. I can take your details and "
-  + "have them follow up.";
+// Say it's outside first, then offer - never the other way around.
+export const OUTSIDE_MESSAGE = "We don't currently serve that area - it's outside our service area. If you'd like, I "
+  + "can take your address and have the team review it.";
 export const COVERED_MESSAGE = "That location is within our published service area.";
 const ASK_STATE_OR_ZIP = "Which state is that in, or what's the ZIP code?";
 const ASK_ZIP = "What's the ZIP code there?";

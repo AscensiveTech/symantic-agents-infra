@@ -238,12 +238,14 @@ test("a likely mishearing of a nearby place offers the real place instead of an 
   assert.equal(typo.clarificationQuestion, "Sorry, did you say Gaithersburg?");
 });
 
-test("an outside location gets the team-confirmation line, never a refusal", async () => {
+test("an outside location is said to be outside first, then the address is offered to the team", async () => {
   const result = await check("Seattle, WA", ["Arlington, VA", "Alexandria, VA", "22201"]);
   assert.equal(result.status, "outside");
   assert.equal(result.matched, false);
   assert.equal(result.message, OUTSIDE_MESSAGE);
-  assert.equal(result.message, "Our team confirms coverage for addresses out that way. I can take your details and have them follow up.");
+  assert.equal(result.message, "We don't currently serve that area - it's outside our service area. If you'd like, I can take your address and have the team review it.");
+  // The "outside" statement comes before the offer.
+  assert.ok(result.message.indexOf("outside our service area") < result.message.indexOf("take your address"));
   assert.equal(result.clarificationQuestion, "");
 });
 
