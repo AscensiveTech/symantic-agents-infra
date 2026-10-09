@@ -160,6 +160,7 @@ test("PUT profile keeps holidays, the holidays toggle, contact emails, and servi
     ],
     contactEmails: [{ label: "Billing", email: "billing@example.com" }, { label: "no email" }],
     serviceAreas: [" Arlington, VA ", "", 42],
+    serviceAreaSummary: `  ${"x".repeat(3100)}`,
   }));
 
   assert.equal(response.statusCode, 200);
@@ -171,6 +172,7 @@ test("PUT profile keeps holidays, the holidays toggle, contact emails, and servi
   ]);
   assert.deepEqual(saved.contactEmails, [{ label: "Billing", email: "billing@example.com" }]);
   assert.deepEqual(saved.serviceAreas, ["Arlington, VA"]);
+  assert.equal(saved.serviceAreaSummary, "x".repeat(3000));
 });
 
 test("GET profile ensures the workspace and returns its profile", async () => {

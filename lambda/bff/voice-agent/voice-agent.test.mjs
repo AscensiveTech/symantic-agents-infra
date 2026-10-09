@@ -238,7 +238,7 @@ test("fully configured agent: every setting reaches its one destination", () => 
   assert.match(types, /- Phone Consultation \(15 minutes, must be booked at least 1 hour in advance\)/);
   assert.match(types, /- In-Home Estimate \(45 minutes, must be booked at least 1 day in advance, held at the caller's location\)/);
   assert.doesNotMatch(types, /30 minutes/, "buffers are never spoken");
-  assert.match(section(prompt, "SERVICE AREA"), /Published coverage: Dayton, OH, Kettering, OH, 45402/);
+  assert.match(section(prompt, "SERVICE AREA"), /When asked where you serve, say: Dayton, OH, Kettering, OH, 45402/);
   assert.match(section(prompt, "BOOKING FLOW"), /what city are you in\?" Apply SERVICE AREA\./);
   assert.match(section(prompt, "CALL TRANSFERS"), /"gas leak" or "flooding": use transfer_call_1\./);
 
@@ -491,6 +491,39 @@ test("service area: tool and section only when configured", () => {
   const some = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceAreas: ["Dayton, OH"] } });
   assert.equal(some.retell.llm.general_tools.find((tool) => tool.name === "check_service_area").parameters.properties.serviceAreas.const, "[\"Dayton, OH\"]");
   assert.match(section(some.prompt.text, "SERVICE AREA"), /call check_service_area/);
+});
+
+test("service area: callers hear the summary word for word; the check uses Exact Coverage when filled", () => {
+  const summary = "We serve the greater Dayton area, including Kettering and Centerville.";
+  const both = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceAreaSummary: summary, serviceAreas: ["45402", "45429"] } });
+  const text = section(both.prompt.text, "SERVICE AREA");
+  assert.match(text, new RegExp(`When asked where you serve, say: ${summary.replace(/[.]/g, "\.")}`));
+  assert.match(text, /Never add to it or read out any other list/);
+  // Exact Coverage is never read aloud or put in the prompt.
+  assert.doesNotMatch(both.prompt.text, /45429/);
+  const tool = (compiled) => compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
+  assert.equal(tool(both).parameters.properties.serviceAreas.const, JSON.stringify(["45402", "45429"]));
+});
+
+test("service area: with Exact Coverage blank, the check uses the places in What Callers Hear - never both", () => {
+  const onlySummary = compile(minimalAgent(), {
+    profile: { ...workspaceProfile, serviceAreaSummary: ["Dayton, OH", "Kettering, OH", "Montgomery County, OH"].join(String.fromCharCode(10)), serviceAreas: [] },
+  });
+  const tool = onlySummary.retell.llm.general_tools.find((item) => item.name === "check_service_area");
+  assert.equal(tool.parameters.properties.serviceAreas.const, JSON.stringify(["Dayton, OH", "Kettering, OH", "Montgomery County, OH"]));
+  const commaLine = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreaSummary: "Arlington, VA, Alexandria, VA, Washington DC metro area", serviceAreas: [] });
+  assert.deepEqual(commaLine.business.coverageAreas, ["Arlington, VA", "Alexandria, VA", "Washington DC metro area"]);
+  assert.equal(commaLine.business.serviceAreaSummary, "Arlington, VA, Alexandria, VA, Washington DC metro area");
+});
+
+test("service area: an agent saved before the summary existed says its old list and checks the same list", () => {
+  const legacy = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreas: ["Dayton, OH", "45402"] });
+  assert.equal(legacy.business.serviceAreaSummary, "Dayton, OH, 45402");
+  assert.deepEqual(legacy.business.coverageAreas, ["Dayton, OH", "45402"]);
+  // A list longer than the new 3,000-character cap still works in full.
+  const long = Array.from({ length: 400 }, (_, index) => String(10000 + index));
+  const big = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreas: long });
+  assert.equal(big.business.coverageAreas.length, 400);
 });
 
 // --- Transfers -------------------------------------------------------------------
