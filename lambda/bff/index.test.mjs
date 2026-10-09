@@ -10459,6 +10459,32 @@ test("GET generated-config: Symantic support sees the prompt, Retell requests an
   assert.match(JSON.parse(pending.body).prompt.text, /PENDING-ONLY-RULE/);
 });
 
+test("agent sub-routes still reach their own handler when API Gateway sets pathParameters.agentId", async () => {
+  // API Gateway puts {agentId} in pathParameters for every
+  // /workspaces/me/agents/{agentId}/... route; the plain "get agent" handler
+  // used to take that and answer the sub-route with the agent record.
+  const agent = { ...receptionistAgent(), status: "active", retellAgentId: "retell-agent-123" };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({
+    getStore: async () => inspectorStore(agent, {}),
+    getProviders: async () => ({ resolveVoiceId: (voice) => `11labs-${voice.replace(/\s+/g, "")}` }),
+    toolBaseUrl: "https://api.example.com",
+  });
+  const viaGateway = (path) => {
+    const event = superAdminEvent("GET", path);
+    event.pathParameters = { agentId: "agent-123" };
+    return event;
+  };
+
+  const generated = await handler(viaGateway("/workspaces/me/agents/agent-123/generated-config"));
+  assert.equal(generated.statusCode, 200);
+  assert.match(JSON.parse(generated.body).prompt.text, /^# ROLE/);
+
+  const plain = await handler(viaGateway("/workspaces/me/agents/agent-123"));
+  assert.equal(plain.statusCode, 200);
+  assert.equal(JSON.parse(plain.body).prompt, undefined);
+});
+
 test("GET generated-config is refused for non-admins and company admins, and 404s for a deleted agent", async () => {
   const { createHandler } = await loadBff();
   const nonAdmin = createHandler({
