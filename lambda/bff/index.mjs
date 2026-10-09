@@ -3174,8 +3174,9 @@ async function handlePlatformCompanies(event, {
       const directory = await getUserDirectory();
       const block = await memberRemovalBlock(store, directory, target.workspaceId, membership, actor.userId);
       if (block) return json(block.status, { message: block.message });
-      await removeWorkspaceMember(store, directory, target.workspaceId, membership);
-      return json(200, { ok: true });
+      const newAssignee = await removalAssignee(store, target.workspaceId, membership, actor, event, { asSupport: true });
+      const result = await removeWorkspaceMember(store, directory, target.workspaceId, membership, { newAssignee, event, actor });
+      return json(200, { ok: true, ...result });
     }
 
     return json(404, { message: "Not found" });
@@ -3439,6 +3440,15 @@ async function getProposalStorageBytes(workspaceId) {
     console.warn("[proposals] storage size lookup failed", { workspaceId, error: error?.message });
     return null;
   }
+}
+
+// Signed, completed (closed by hand) or canceled: the work is done, so the
+// person it was assigned to stays on it even after they leave the company.
+function isFinishedProposal(proposal) {
+  return Boolean(proposal?.canceledAt)
+    || proposal?.status === "completed"
+    || proposal?.status === "signed"
+    || proposal?.signatureRequest?.status === "completed";
 }
 
 // Which "document state" bucket a proposal's stored bytes count towards on
@@ -4339,17 +4349,54 @@ async function memberRemovalBlock(store, directory, workspaceId, target, actorUs
   return null;
 }
 
-// The removal itself: drop the Cognito account, drop the membership, and blank
-// the assignee on anything they created (proposals keep their work — assignedTo
-// is a plain name/email string, not a live account reference).
-async function removeWorkspaceMember(store, directory, workspaceId, target) {
+// The removal itself: drop the Cognito account and the membership. Their
+// work stays: finished proposals (signed, completed, canceled) keep their
+// name, and unfinished ones move to `newAssignee` - whoever removed them, or
+// the company's Org Admin when a Symantic super admin did it as support
+// (see removalAssignee). Nothing in the activity log is ever edited; a
+// reassignment adds one entry. Returns what moved, for the remover's pop-up.
+async function removeWorkspaceMember(store, directory, workspaceId, target, { newAssignee, event, actor } = {}) {
   await directory.deleteUser(target.cognitoUsername ?? target.email);
   await store.deleteMembership(target.userId);
-  if (typeof store.unassignProposalsFrom === "function") {
-    await store.unassignProposalsFrom(workspaceId, [target.name, target.email]).catch((error) => {
-      console.warn("Failed to unassign a removed member's proposals", { userId: target.userId, error: String(error) });
-    });
+  const removedLabel = memberLabel(target);
+  let reassignedCount = 0;
+  if (newAssignee && typeof store.reassignOpenProposalsFrom === "function") {
+    try {
+      reassignedCount = await store.reassignOpenProposalsFrom(workspaceId, [target.name, target.email], newAssignee);
+    } catch (error) {
+      console.warn("Failed to reassign a removed member's proposals", { userId: target.userId, error: String(error) });
+    }
   }
+  if (reassignedCount > 0 && typeof store.recordActivity === "function") {
+    await store.recordActivity(workspaceId, {
+      eventType: "proposals_reassigned",
+      page: `Reassigned ${reassignedCount} unfinished proposal${reassignedCount === 1 ? "" : "s"} from ${removedLabel} (removed) to ${newAssignee}`,
+      userId: actor?.userId,
+      userName: actor ? actorDisplayName(event, actor) : undefined,
+      userEmail: actor?.membership?.email,
+      ...(actor?.supporting || actor?.roles?.includes("super-admin") ? { support: true } : {}),
+    }).catch((error) => console.warn("Failed to log a proposal reassignment", { error: String(error) }));
+  }
+  return { reassignedCount, reassignedTo: reassignedCount > 0 ? newAssignee : null, removedName: removedLabel };
+}
+
+// How a member shows on a proposal's "Assigned To": their name, else email
+// (the same label the builder's picker writes).
+function memberLabel(member) {
+  return (typeof member?.name === "string" && member.name.trim()) || (typeof member?.email === "string" && member.email.trim()) || "";
+}
+
+// Who inherits a removed member's unfinished proposals. A company's own admin
+// removing someone gets them. A Symantic super admin (support mode or Manage
+// Company Accounts) never does: they go to the company's first active Org
+// Admin instead.
+async function removalAssignee(store, workspaceId, target, actor, event, { asSupport }) {
+  if (!asSupport) return actorDisplayName(event, actor);
+  const members = await store.listMemberships(workspaceId);
+  const admin = members
+    .filter((member) => member.role === "company-admin" && member.status !== "disabled" && member.userId !== target.userId)
+    .sort((left, right) => String(left.createdAt ?? "").localeCompare(String(right.createdAt ?? "")))[0];
+  return admin ? memberLabel(admin) : "";
 }
 
 async function handleWorkspaceUsers(event, {
@@ -4480,8 +4527,10 @@ async function handleWorkspaceUsers(event, {
     const directory = await getUserDirectory();
     const block = await memberRemovalBlock(store, directory, actor.workspaceId, target, actor.userId);
     if (block) return json(block.status, { message: block.message });
-    await removeWorkspaceMember(store, directory, actor.workspaceId, target);
-    return json(200, { ok: true });
+    const asSupport = Boolean(actor.supporting) || !actor.roles.includes("company-admin");
+    const newAssignee = await removalAssignee(store, actor.workspaceId, target, actor, event, { asSupport });
+    const result = await removeWorkspaceMember(store, directory, actor.workspaceId, target, { newAssignee, event, actor });
+    return json(200, { ok: true, ...result });
   }
 
   return json(404, { message: "Not found" });
@@ -8811,29 +8860,31 @@ export function createDynamoStore(client, commands, tableNames) {
       return deleteRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
     },
 
-    // Clear the assignee on every proposal in a workspace currently assigned to
-    // any of `names` (a removed member's name / email). The work itself is
-    // untouched - only `assignedTo` is blanked, so the proposal just becomes
-    // "Unassigned".
-    async unassignProposalsFrom(workspaceId, names) {
-      const wanted = new Set(names.map((value) => String(value).trim().toLowerCase()).filter(Boolean));
-      if (wanted.size === 0) return 0;
+    // Move every unfinished proposal assigned to any of `names` (a removed
+    // member's name / email) to `newAssignee`. Finished ones - signed,
+    // completed, or canceled - keep the name, as the record of who did the
+    // work. Returns how many moved.
+    async reassignOpenProposalsFrom(workspaceId, names, newAssignee) {
+      const wanted = new Set(names.map((value) => String(value ?? "").trim().toLowerCase()).filter(Boolean));
+      if (wanted.size === 0 || !newAssignee) return 0;
       const rows = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
-        expression: "proposalId, assignedTo",
+        expression: "proposalId, assignedTo, #status, canceledAt, signatureRequest",
+        names: { "#status": "status" },
       });
-      let cleared = 0;
+      let moved = 0;
       for (const row of rows) {
         if (!wanted.has(String(row.assignedTo ?? "").trim().toLowerCase())) continue;
+        if (isFinishedProposal(row)) continue;
         await client.send(new commands.UpdateItemCommand({
           TableName: tableNames.proposals,
           Key: marshall({ workspaceId, proposalId: row.id }),
-          UpdateExpression: "SET assignedTo = :empty, updatedAt = :now",
+          UpdateExpression: "SET assignedTo = :assignee, updatedAt = :now",
           ConditionExpression: "attribute_exists(proposalId)",
-          ExpressionAttributeValues: marshall({ ":empty": "", ":now": new Date().toISOString() }),
+          ExpressionAttributeValues: marshall({ ":assignee": newAssignee, ":now": new Date().toISOString() }),
         }));
-        cleared += 1;
+        moved += 1;
       }
-      return cleared;
+      return moved;
     },
 
     async listProposalTemplates(workspaceId) {

@@ -5496,11 +5496,13 @@ test("maintenance notice platform routes are super-admin only", async () => {
 });
 
 function removalStore(overrides = {}) {
-  const unassignCalls = [];
+  const reassignCalls = [];
   const deleted = [];
+  const activity = [];
   return {
-    unassignCalls,
+    reassignCalls,
     deleted,
+    activity,
     async getWorkspace() { return { workspaceId: "ws-1", name: "Acme", tier: "repository" }; },
     async getMembership(userId) {
       if (userId === "user-123") return { userId, workspaceId: "ws-1", role: "company-admin", status: "active" };
@@ -5509,18 +5511,20 @@ function removalStore(overrides = {}) {
     },
     async listMemberships() {
       return [
-        { userId: "user-123", workspaceId: "ws-1", role: "company-admin", status: "active" },
-        { userId: "admin-2", workspaceId: "ws-1", role: "company-admin", status: "active" },
+        { userId: "user-123", workspaceId: "ws-1", role: "company-admin", status: "active", name: "Sam Lee", createdAt: "2026-02-01T00:00:00Z" },
+        { userId: "admin-2", workspaceId: "ws-1", role: "company-admin", status: "active", name: "Olivia Owner", createdAt: "2026-01-01T00:00:00Z" },
+        { userId: "admin-off", workspaceId: "ws-1", role: "company-admin", status: "disabled", name: "Old Admin", createdAt: "2025-01-01T00:00:00Z" },
         { userId: "member-x", workspaceId: "ws-1", role: "quotation-builder", status: "active" },
       ];
     },
     async deleteMembership(userId) { deleted.push(userId); },
-    async unassignProposalsFrom(workspaceId, names) { unassignCalls.push([workspaceId, names]); return 3; },
+    async reassignOpenProposalsFrom(workspaceId, names, newAssignee) { reassignCalls.push([workspaceId, names, newAssignee]); return 3; },
+    async recordActivity(workspaceId, entry) { activity.push([workspaceId, entry]); },
     ...overrides,
   };
 }
 
-test("removing a member unassigns their proposals instead of deleting the work", async () => {
+test("an org admin removing a member gets their unfinished proposals, logs it once, and is told how many", async () => {
   const store = removalStore();
   const directory = { async deleteUser() {} };
   const { createHandler } = await loadBff();
@@ -5528,12 +5532,31 @@ test("removing a member unassigns their proposals instead of deleting the work",
   const event = authenticatedEvent("DELETE", "/workspaces/me/users/member-x");
   event.pathParameters = { userId: "member-x" };
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  event.requestContext.authorizer.jwt.claims.name = "Sam Lee";
 
   const response = await handler(event);
 
   assert.equal(response.statusCode, 200);
   assert.deepEqual(store.deleted, ["member-x"]);
-  assert.deepEqual(store.unassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"]]]);
+  assert.deepEqual(store.reassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"], "Sam Lee"]]);
+  assert.deepEqual(JSON.parse(response.body), { ok: true, reassignedCount: 3, reassignedTo: "Sam Lee", removedName: "Pat Leaver" });
+  assert.equal(store.activity.length, 1);
+  assert.equal(store.activity[0][1].eventType, "proposals_reassigned");
+  assert.equal(store.activity[0][1].page, "Reassigned 3 unfinished proposals from Pat Leaver (removed) to Sam Lee");
+});
+
+test("removing a member with no unfinished proposals reports zero and writes no log entry", async () => {
+  const store = removalStore({ async reassignOpenProposalsFrom() { return 0; } });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => ({ async deleteUser() {} }) });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/users/member-x");
+  event.pathParameters = { userId: "member-x" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { ok: true, reassignedCount: 0, reassignedTo: null, removedName: "Pat Leaver" });
+  assert.deepEqual(store.activity, []);
 });
 
 test("the org-admin remove path blocks the last remaining Org Admin with an actionable message", async () => {
@@ -5589,11 +5612,45 @@ test("a super admin removes a user from a company via Manage Company Accounts", 
   const event = authenticatedEvent("DELETE", "/platform/companies/ws-1/users/member-x");
   event.pathParameters = { workspaceId: "ws-1", userId: "member-x" };
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  event.requestContext.authorizer.jwt.claims.name = "Symantic Support";
 
   const response = await handler(event);
   assert.equal(response.statusCode, 200);
   assert.deepEqual(store.deleted, ["member-x"]);
-  assert.deepEqual(store.unassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"]]]);
+  // Never the super admin: the company's first active Org Admin (by join date).
+  assert.deepEqual(store.reassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"], "Olivia Owner"]]);
+  assert.equal(JSON.parse(response.body).reassignedTo, "Olivia Owner");
+  assert.equal(store.activity[0][1].support, true);
+});
+
+test("Dynamo reassignOpenProposalsFrom moves only the removed member's unfinished proposals", async () => {
+  class QueryCommand { constructor(input) { this.input = input; } }
+  class UpdateItemCommand { constructor(input) { this.input = input; } }
+  const updates = [];
+  const row = (id, assignedTo, extra = {}) => ({ workspaceId: { S: "ws-1" }, proposalId: { S: id }, assignedTo: { S: assignedTo }, ...extra });
+  const client = {
+    async send(command) {
+      if (command instanceof UpdateItemCommand) { updates.push(command.input); return {}; }
+      return {
+        Items: [
+          row("draft", "Pat Leaver", { status: { S: "draft" } }),
+          row("sent", "leaver@example.com", { status: { S: "sent" }, signatureRequest: { M: { status: { S: "sent" } } } }),
+          row("signed", "Pat Leaver", { signatureRequest: { M: { status: { S: "completed" } } } }),
+          row("completed", "Pat Leaver", { status: { S: "completed" } }),
+          row("canceled", "Pat Leaver", { canceledAt: { S: "2026-09-01T00:00:00Z" } }),
+          row("someone-else", "Jamie", { status: { S: "draft" } }),
+        ],
+      };
+    },
+  };
+  const { createDynamoStore } = await loadBff();
+  const store = createDynamoStore(client, { QueryCommand, UpdateItemCommand }, { proposals: "proposals-table" });
+
+  const moved = await store.reassignOpenProposalsFrom("ws-1", ["Pat Leaver", "leaver@example.com"], "Sam Lee");
+
+  assert.equal(moved, 2);
+  assert.deepEqual(updates.map((input) => input.Key.proposalId.S), ["draft", "sent"]);
+  assert.ok(updates.every((input) => input.ExpressionAttributeValues[":assignee"].S === "Sam Lee"));
 });
 
 test("Manage Company Accounts remove is 403 for a non-super-admin and 403 on a super-admin target", async () => {
