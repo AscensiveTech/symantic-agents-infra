@@ -6435,7 +6435,10 @@ function demoContactOverrides(records) {
     const phoneNumber = record.callerNumber;
     if (!phoneNumber || seen.has(phoneNumber)) continue;
     seen.add(phoneNumber);
-    if (Math.random() < 0.1) continue;
+    // Every 10th caller is left without a company, so some contacts show a
+    // blank Company Name. Counted, not random: a random 10% sometimes
+    // dropped below the demo's (and its test's) expected contact count.
+    if (seen.size % 10 === 0) continue;
     rows.push({
       phoneNumber,
       companyName: DEMO_COMPANY_NAMES[company % DEMO_COMPANY_NAMES.length],
