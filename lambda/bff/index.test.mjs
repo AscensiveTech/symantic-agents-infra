@@ -7598,7 +7598,7 @@ test("GET call-digest returns safe defaults", async () => {
   assert.equal(response.statusCode, 200);
   assert.deepEqual(body.settings, {
     enabled: false,
-    frequency: "every_10_minutes",
+    frequency: "every_30_minutes",
     sendHour: 8,
     weekday: 1,
     timezone: "UTC",

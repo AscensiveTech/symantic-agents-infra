@@ -612,21 +612,26 @@ function isWorkspaceAdmin(actor) {
 // the BFF only stores the settings and brokers a "send me a test" request.
 // Keep the defaults and bounds in step with lambda/digest/schedule.mjs.
 const CALL_DIGEST_FREQUENCIES = new Set([
-  "every_5_minutes",
-  "every_10_minutes",
   "every_30_minutes",
   "hourly",
-  "every_6_hours",
+  "every_8_hours",
   "daily",
   "weekly",
 ]);
+// Retired intervals read back as the nearest one still offered, so a
+// workspace saved with one shows (and runs) a real choice.
+const CALL_DIGEST_LEGACY_FREQUENCIES = Object.freeze({
+  every_5_minutes: "every_30_minutes",
+  every_10_minutes: "every_30_minutes",
+  every_6_hours: "every_8_hours",
+});
 // Up to 6 people total receive notifications - a self-service list the
 // admin fully controls, including removing their own account email if they
 // don't want it. No more automatic "every company admin" fan-out.
 const CALL_DIGEST_MAX_RECIPIENTS = 6;
 const CALL_DIGEST_DEFAULTS = Object.freeze({
   enabled: false,
-  frequency: "every_10_minutes",
+  frequency: "every_30_minutes",
   sendHour: 8,
   weekday: 1,
   timezone: "UTC",
@@ -654,10 +659,11 @@ function normalizeDigestEmail(value) {
 
 function publicCallDigest(stored) {
   const value = stored && typeof stored === "object" ? stored : {};
+  const frequency = CALL_DIGEST_LEGACY_FREQUENCIES[value.frequency] ?? value.frequency;
   return {
     enabled: value.enabled === true,
-    frequency: CALL_DIGEST_FREQUENCIES.has(value.frequency)
-      ? value.frequency
+    frequency: CALL_DIGEST_FREQUENCIES.has(frequency)
+      ? frequency
       : CALL_DIGEST_DEFAULTS.frequency,
     sendHour: Number.isInteger(value.sendHour) && value.sendHour >= 0 && value.sendHour <= 23
       ? value.sendHour

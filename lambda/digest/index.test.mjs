@@ -4,7 +4,7 @@ import test from "node:test";
 import { createDigestHandler } from "./index.mjs";
 import { createSesSender, describeSendFailure, normalizeEmail } from "./email.mjs";
 import { renderNegativeSentimentAlert } from "./render.mjs";
-import { isDigestDue, normalizeDigestSettings } from "./schedule.mjs";
+import { isDigestDue, localParts, normalizeDigestSettings } from "./schedule.mjs";
 
 const HOUR = 3_600_000;
 // 08:00 in Asia/Kolkata (UTC+5:30), a Tuesday.
@@ -183,13 +183,28 @@ function workspace(overrides = {}) {
 
 // --- scheduling -------------------------------------------------------------
 
-test("hourly and six-hourly summaries are due once their interval has passed", () => {
+test("hourly summaries are due once their interval has passed", () => {
   assert.equal(isDigestDue(settings(), hoursBefore(1), NOW), true);
   // EventBridge jitter: a tick a couple of minutes early still counts.
   assert.equal(isDigestDue(settings(), hoursBefore(0.97), NOW), true);
   assert.equal(isDigestDue(settings(), hoursBefore(0.5), NOW), false);
-  assert.equal(isDigestDue(settings({ frequency: "every_6_hours" }), hoursBefore(6), NOW), true);
-  assert.equal(isDigestDue(settings({ frequency: "every_6_hours" }), hoursBefore(3), NOW), false);
+});
+
+test("eight-hourly summaries go out at the start hour and every 8 hours after it", () => {
+  const { hour } = localParts(NOW, "Asia/Kolkata");
+  const eightHourly = (sendHour) => settings({ frequency: "every_8_hours", sendHour });
+  assert.equal(isDigestDue(eightHourly(hour), hoursBefore(8), NOW), true);
+  assert.equal(isDigestDue(eightHourly((hour + 16) % 24), hoursBefore(8), NOW), true);
+  assert.equal(isDigestDue(eightHourly((hour + 8) % 24), hoursBefore(8), NOW), true);
+  assert.equal(isDigestDue(eightHourly((hour + 1) % 24), hoursBefore(8), NOW), false);
+  // Never twice within the same matching hour.
+  assert.equal(isDigestDue(eightHourly(hour), hoursBefore(0.1), NOW), false);
+});
+
+test("retired intervals read as the nearest interval still offered", () => {
+  assert.equal(normalizeDigestSettings({ frequency: "every_5_minutes" }).frequency, "every_30_minutes");
+  assert.equal(normalizeDigestSettings({ frequency: "every_10_minutes" }).frequency, "every_30_minutes");
+  assert.equal(normalizeDigestSettings({ frequency: "every_6_hours" }).frequency, "every_8_hours");
 });
 
 test("daily summaries go out at the chosen hour in the business's own timezone", () => {
