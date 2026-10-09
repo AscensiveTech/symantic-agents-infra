@@ -189,6 +189,11 @@ const PROPOSAL_SECTION_KINDS = [
   "closing",
 ];
 const PROPOSAL_SECTION_SET = new Set(PROPOSAL_SECTION_KINDS);
+// The sections that existed before Work With Us! was added. A company saved
+// with an older allow-list (allowedProposalSections) could only choose among
+// these, so anything outside it was never turned off - it simply didn't
+// exist yet.
+const LEGACY_PROPOSAL_SECTION_KINDS = PROPOSAL_SECTION_KINDS.filter((section) => section !== "workWithUs");
 const COMPANY_TIERS = new Set(["basic", "repository", "signing"]);
 
 function json(statusCode, body) {
@@ -998,10 +1003,7 @@ export function createHandler({
         }
         const workspace = await store.getWorkspace(workspaceId);
         return json(200, {
-          allowedProposalSections: normalizeProposalSections(
-            workspace?.allowedProposalSections,
-            PROPOSAL_SECTION_KINDS,
-          ),
+          allowedProposalSections: enabledProposalSections(workspace),
           tier: normalizeCompanyTier(workspace?.tier),
         });
       }
@@ -2689,12 +2691,24 @@ export function createHandler({
 // template. Shared by the workspace's own /workspaces/me/proposal-templates
 // routes and the super-admin /platform/companies/{id}/proposal-templates
 // routes, so both behave exactly the same. Null when the method isn't handled.
+// A template holds at most as many Custom Pages as a proposal can
+// (MAX_STATIC_PAGES_PER_PROPOSAL in the frontend), so every proposal made
+// from it stays valid.
+const MAX_TEMPLATE_CUSTOM_PAGES = 10;
+const TEMPLATE_CUSTOM_PAGE_LIMIT_MESSAGE = `A template can have up to ${MAX_TEMPLATE_CUSTOM_PAGES} Custom Pages.`;
+
+function tooManyTemplateCustomPages(template) {
+  const items = Array.isArray(template?.items) ? template.items : [];
+  return items.filter((item) => item?.kind === "staticPage").length > MAX_TEMPLATE_CUSTOM_PAGES;
+}
+
 async function handleProposalTemplateRequest(event, { method, store, workspaceId, templateId }) {
   if (!templateId) {
     if (method === "GET") return json(200, await store.listProposalTemplates(workspaceId));
     if (method === "POST") {
       const template = pickEntity(readBody(event), "id");
       if (!template) return json(400, { message: "Invalid proposal template" });
+      if (tooManyTemplateCustomPages(template)) return json(400, { message: TEMPLATE_CUSTOM_PAGE_LIMIT_MESSAGE });
       try {
         return json(201, await store.createProposalTemplate(workspaceId, template));
       } catch (error) {
@@ -2711,6 +2725,7 @@ async function handleProposalTemplateRequest(event, { method, store, workspaceId
   if (method === "PATCH") {
     const template = pickEntity(readBody(event), "id", templateId);
     if (!template) return json(400, { message: "Invalid proposal template" });
+    if (tooManyTemplateCustomPages(template)) return json(400, { message: TEMPLATE_CUSTOM_PAGE_LIMIT_MESSAGE });
     // Same optimistic concurrency as proposals: a save only lands on the rev
     // it was loaded from, so two admins editing one template can't silently
     // overwrite each other. (A client that sends no rev keeps the old
@@ -3256,7 +3271,9 @@ async function handlePlatformCompanies(event, {
     ...(officeAddress ? { officeAddress } : {}),
     ...(phone ? { phone } : {}),
     ...(phoneExtension ? { phoneExtension } : {}),
-    allowedProposalSections: allowedSections,
+    // Stored as what's turned OFF, so a section added later is on for
+    // every company by default.
+    disabledProposalSections: PROPOSAL_SECTION_KINDS.filter((section) => !(allowedSections ?? PROPOSAL_SECTION_KINDS).includes(section)),
     billingAnchorDate,
     createdAt: now,
     createdBy: actor.userId,
@@ -3870,10 +3887,7 @@ async function platformCompanySummary(store, workspace) {
     phone: workspace.phone || "",
     phoneExtension: workspace.phoneExtension || "",
     createdAt: workspace.createdAt ?? null,
-    allowedProposalSections: normalizeProposalSections(
-      workspace.allowedProposalSections,
-      PROPOSAL_SECTION_KINDS,
-    ),
+    allowedProposalSections: enabledProposalSections(workspace),
     entitlements: workspaceEntitlements(workspace),
     tier: normalizeCompanyTier(workspace.tier),
     userCount: members.filter((member) => member.status !== "disabled").length,
@@ -4217,6 +4231,18 @@ function companyLogoResponse(workspace, url = null) {
       ...(url ? { url } : {}),
     },
   };
+}
+
+// The sections a company can use: every section except those a super admin
+// turned off. New companies store disabledProposalSections; an older one with
+// only an allow-list turns off just the legacy sections missing from it.
+function enabledProposalSections(workspace) {
+  const disabled = Array.isArray(workspace?.disabledProposalSections)
+    ? workspace.disabledProposalSections
+    : Array.isArray(workspace?.allowedProposalSections) && workspace.allowedProposalSections.length
+      ? LEGACY_PROPOSAL_SECTION_KINDS.filter((section) => !workspace.allowedProposalSections.includes(section))
+      : [];
+  return PROPOSAL_SECTION_KINDS.filter((section) => !disabled.includes(section));
 }
 
 function normalizeProposalSections(value, fallback = null) {
