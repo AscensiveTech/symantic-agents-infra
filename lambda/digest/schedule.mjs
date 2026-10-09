@@ -1,16 +1,23 @@
 export const DIGEST_FREQUENCIES = [
-  "every_5_minutes",
-  "every_10_minutes",
   "every_30_minutes",
   "hourly",
-  "every_6_hours",
+  "every_8_hours",
   "daily",
   "weekly",
 ];
 
+// Intervals no longer offered. Settings saved with them keep working by
+// reading as the nearest interval that is still offered. Keep in step with
+// CALL_DIGEST_LEGACY_FREQUENCIES in lambda/bff/index.mjs.
+export const LEGACY_DIGEST_FREQUENCIES = Object.freeze({
+  every_5_minutes: "every_30_minutes",
+  every_10_minutes: "every_30_minutes",
+  every_6_hours: "every_8_hours",
+});
+
 export const DEFAULT_DIGEST_SETTINGS = Object.freeze({
   enabled: false,
-  frequency: "every_10_minutes",
+  frequency: "every_30_minutes",
   sendHour: 8,
   weekday: 1,
   timezone: "America/New_York",
@@ -42,10 +49,11 @@ export function normalizeDigestSettings(value) {
   const source = value && typeof value === "object" ? value : {};
   const hour = Number(source.sendHour);
   const weekday = Number(source.weekday);
+  const frequency = LEGACY_DIGEST_FREQUENCIES[source.frequency] ?? source.frequency;
   return {
     enabled: source.enabled === true,
-    frequency: DIGEST_FREQUENCIES.includes(source.frequency)
-      ? source.frequency
+    frequency: DIGEST_FREQUENCIES.includes(frequency)
+      ? frequency
       : DEFAULT_DIGEST_SETTINGS.frequency,
     sendHour: Number.isInteger(hour) && hour >= 0 && hour <= 23
       ? hour
@@ -118,16 +126,18 @@ export function isDigestDue(settings, cursorIso, now) {
   if (!Number.isFinite(cursor)) return false;
   const elapsed = now.getTime() - cursor;
   switch (settings.frequency) {
-    case "every_5_minutes":
-      return elapsed >= 5 * MINUTE_MS - SHORT_SLACK_MS;
-    case "every_10_minutes":
-      return elapsed >= 10 * MINUTE_MS - SHORT_SLACK_MS;
     case "every_30_minutes":
       return elapsed >= 30 * MINUTE_MS - SHORT_SLACK_MS;
     case "hourly":
       return elapsed >= HOUR_MS - SLACK_MS;
-    case "every_6_hours":
-      return elapsed >= 6 * HOUR_MS - SLACK_MS;
+    // Three sends a day, anchored to the chosen start hour (8 AM start ->
+    // 8 AM, 4 PM, midnight) in the business's own timezone, so the times
+    // stay put across daylight saving changes. The elapsed floor stops a
+    // second send within the same matching hour.
+    case "every_8_hours": {
+      const { hour } = localParts(now, settings.timezone);
+      return (hour - settings.sendHour + 24) % 8 === 0 && elapsed >= 4 * HOUR_MS;
+    }
     case "daily": {
       const { hour } = localParts(now, settings.timezone);
       return hour === settings.sendHour && elapsed >= 12 * HOUR_MS;
