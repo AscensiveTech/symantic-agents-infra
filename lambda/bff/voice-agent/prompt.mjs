@@ -312,11 +312,12 @@ function businessInfoSection({ cfg, booking, business }) {
 }
 
 function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
-  if (!cfg.business.serviceAreas.length) return null;
+  if (!cfg.business.coverageAreas.length) return null;
   return {
     title: "SERVICE AREA",
     lines: [
-      `Published coverage: ${cfg.business.serviceAreas.join(", ")}`,
+      `When asked where you serve, say: ${cfg.business.serviceAreaSummary}`,
+      "- Say it as written. Never add to it or read out any other list of towns, counties or ZIP codes.",
       ...(cfg.business.address
         ? [`- The business itself is at ${cfg.business.address} - that town and ZIP are always covered.`]
         : []),
@@ -436,7 +437,7 @@ function bookingFlowSection({ tool, booking, hasOnSiteTypes, cfg }) {
       + "that is, tell them ({{user_number}}). If not, take the one they give.",
     ...(hasOnSiteTypes
       ? ["City (visits at the caller's location only - every time, before checking availability): \"And what "
-        + "city are you in?\"" + (cfg.business.serviceAreas.length ? " Apply SERVICE AREA." : "")]
+        + "city are you in?\"" + (cfg.business.coverageAreas.length ? " Apply SERVICE AREA." : "")]
       : []),
     "Preference: \"What day works best, and do you prefer mornings or afternoons?\" This "
       + "narrows the search - it is not a booking.",

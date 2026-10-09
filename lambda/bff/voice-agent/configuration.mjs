@@ -11,6 +11,7 @@
 
 import { isBusinessHours } from "../business-hours.mjs";
 import { resolveSpokenForms } from "./spoken-forms.mjs";
+import { parseServiceAreaText, SERVICE_AREA_TEXT_LIMIT } from "./service-areas.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
 
@@ -35,6 +36,7 @@ export const AGENT_PROFILE_FIELDS = Object.freeze([
   "timezone",
   "contactEmails",
   "serviceAreas",
+  "serviceAreaSummary",
   "businessHours",
   "hours",
   "holidays",
@@ -345,7 +347,7 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
           .filter((entry) => text(entry?.email))
           .map((entry) => ({ label: text(entry.label) || null, email: text(entry.email) }))
         : [],
-      serviceAreas: Array.isArray(profile.serviceAreas) ? profile.serviceAreas.map(text).filter(Boolean) : [],
+      ...resolveServiceArea(profile),
       defaultTransferNumber,
     },
     voice: {
@@ -412,6 +414,26 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
 
 // Off (or never set) means the business keeps its normal hours on every
 // holiday. Disabled entries are suggestions the owner didn't add.
+// Service Area has two halves:
+// - serviceAreaSummary ("What Callers Hear"): said word for word when a
+//   caller asks where the business serves. Never a list read aloud.
+// - serviceAreas ("Exact Coverage"): optional; when it has any entry, only
+//   these places count as covered.
+// coverageAreas is what the coverage check uses: Exact Coverage when filled,
+// otherwise the places named in the summary. Never both. Agents saved
+// before the summary existed say their old list, joined.
+function resolveServiceArea(profile) {
+  // Not re-capped here: input is capped on save, and an older, longer list
+  // must keep working exactly as before.
+  const serviceAreas = Array.isArray(profile.serviceAreas) ? profile.serviceAreas.map(text).filter(Boolean) : [];
+  const summaryRaw = typeof profile.serviceAreaSummary === "string"
+    ? profile.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT)
+    : "";
+  const serviceAreaSummary = summaryRaw || (serviceAreas.length ? serviceAreas.join(", ") : null);
+  const coverageAreas = serviceAreas.length ? serviceAreas : parseServiceAreaText(summaryRaw);
+  return { serviceAreaSummary, serviceAreas, coverageAreas };
+}
+
 function resolveHolidays(profile) {
   if (profile?.holidaysEnabled !== true || !Array.isArray(profile?.holidays)) return [];
   return profile.holidays

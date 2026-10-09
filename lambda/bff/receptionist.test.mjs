@@ -686,7 +686,7 @@ test("an agent's own Business Profile replaces the workspace's - two agents in o
   assert.match(config.prompt, /the AI receptionist for Arc Dental Maryland/);
   assert.match(config.prompt, /Tue-Thu, 9:00 AM-1:00 PM/);
   assert.doesNotMatch(config.prompt, /Mon-Fri, 8:00 AM-5:00 PM/);
-  assert.match(config.prompt, /Published coverage: Bethesda, MD/);
+  assert.match(config.prompt, /When asked where you serve, say: Bethesda, MD/);
   assert.doesNotMatch(config.prompt, /Charleston/);
   // The rule has no number of its own, so it uses this agent's Default Transfer Number.
   assert.deepEqual(config.tools.filter((tool) => tool.type === "transfer_call").map((tool) => tool.transfer_destination.number), ["+13015550111"]);
