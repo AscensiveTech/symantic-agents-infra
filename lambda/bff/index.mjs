@@ -426,8 +426,14 @@ function isValidKnowledgeConfiguration(configuration) {
   return totalBytes <= MAX_KNOWLEDGE_TOTAL_BYTES;
 }
 
+// Only the bare /workspaces/me/agents/{agentId} path. API Gateway also sets
+// pathParameters.agentId on every sub-route (/generated-config,
+// /retell-status, ...), so the path itself must match before that is used -
+// otherwise the plain "get agent" handler answers those GETs instead.
 function getAgentId(event, path) {
-  const value = event?.pathParameters?.agentId ?? path.match(/^\/workspaces\/me\/agents\/([^/]+)$/)?.[1];
+  const match = path.match(/^\/workspaces\/me\/agents\/([^/]+)$/);
+  if (!match) return null;
+  const value = event?.pathParameters?.agentId ?? match[1];
   if (!value) return null;
   try {
     const decoded = decodeURIComponent(value);
