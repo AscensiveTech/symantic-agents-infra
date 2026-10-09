@@ -5668,8 +5668,10 @@ test("super administrators onboard a company with an isolated default template",
   assert.equal(bundle.workspace.tier, "repository");
   assert.deepEqual(bundle.workspace.entitlements, { receptionist: false, rapidProposal: true });
   assert.deepEqual(body.entitlements, { receptionist: false, rapidProposal: true });
-  // "Work With Us!" is a recognised section like the rest.
-  assert.deepEqual(bundle.workspace.allowedProposalSections, ["cover", "agenda", "parts", "workWithUs", "closing"]);
+  // Stored as what's turned off, so sections added later are on by default.
+  assert.deepEqual(bundle.workspace.disabledProposalSections, ["companyIntro", "summary", "scope", "agreement", "payment"]);
+  assert.equal(bundle.workspace.allowedProposalSections, undefined);
+  assert.deepEqual(body.allowedProposalSections, ["cover", "agenda", "parts", "workWithUs", "closing"]);
   assert.equal(bundle.membership.email, "ajm@technovate.design");
   assert.equal(bundle.membership.role, "company-admin");
   assert.equal(bundle.template.name, "Default");
@@ -5832,7 +5834,7 @@ test("company onboarding requires an email, and a receptionist-only company can 
 
   assert.equal(response.statusCode, 201);
   assert.equal(JSON.parse(response.body).email, "owner@mapledental.test");
-  assert.ok(bundle.workspace.allowedProposalSections.length > 0);
+  assert.deepEqual(bundle.workspace.disabledProposalSections, []);
 });
 
 test("only super administrators can access company onboarding", async () => {
@@ -6785,10 +6787,31 @@ test("company administrators receive their allowed proposal sections", async () 
   const response = await handler(event);
 
   assert.equal(response.statusCode, 200);
+  // An older allow-list turns off only the sections that existed then; Work
+  // With Us! (added later) is available.
   assert.deepEqual(JSON.parse(response.body), {
-    allowedProposalSections: ["cover", "parts", "closing"],
+    allowedProposalSections: ["cover", "parts", "workWithUs", "closing"],
     tier: "repository",
   });
+});
+
+test("Work With Us! is available to a company whose saved list predates it, and new sections are on by default", async () => {
+  const settingsFor = async (workspace) => {
+    const store = {
+      async getMembership(userId) { return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" }; },
+      async getWorkspace(workspaceId) { return { workspaceId, tier: "repository", ...workspace }; },
+    };
+    const { createHandler } = await loadBff();
+    const event = authenticatedEvent("GET", "/workspaces/me/proposal-settings");
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+    return JSON.parse((await createHandler({ getStore: async () => store })(event)).body).allowedProposalSections;
+  };
+  const all = ["cover", "agenda", "companyIntro", "parts", "summary", "scope", "agreement", "payment", "workWithUs", "closing"];
+  // Ascensive Tech's shape: every section that existed before Work With Us!.
+  assert.deepEqual(await settingsFor({ allowedProposalSections: all.filter((kind) => kind !== "workWithUs") }), all);
+  assert.deepEqual(await settingsFor({}), all);
+  assert.deepEqual(await settingsFor({ disabledProposalSections: ["payment"] }), all.filter((kind) => kind !== "payment"));
+  assert.deepEqual(await settingsFor({ disabledProposalSections: ["workWithUs"] }), all.filter((kind) => kind !== "workWithUs"));
 });
 
 test("Cognito directory rejects an existing email regardless of capitalization", async () => {
@@ -10539,4 +10562,23 @@ test("syncPhoneNumber (activation path) sends the normalised country list, not t
   });
   assert.deepEqual(updates, [["+17035550177", { allowed_inbound_country_list: ["US", "CA"] }]]);
   assert.deepEqual(stored.allowedInboundCountries, ["US", "CA"]);
+});
+
+test("a template can hold at most 10 Custom Pages", async () => {
+  let saved = null;
+  const store = {
+    async ensureWorkspace() {},
+    async createProposalTemplate(workspaceId, template) { saved = template; return template; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const pages = (count) => Array.from({ length: count }, (_, index) => ({ id: `page-${index}`, kind: "staticPage", label: `Page ${index + 1}` }));
+  const post = (count) => {
+    return handler(authenticatedEvent("POST", "/workspaces/me/proposal-templates", { id: `template-${count}`, name: "T", items: [{ id: "cover", kind: "cover" }, ...pages(count)] }));
+  };
+  assert.equal((await post(10)).statusCode, 201);
+  assert.equal(saved.items.filter((item) => item.kind === "staticPage").length, 10);
+  const refused = await post(11);
+  assert.equal(refused.statusCode, 400);
+  assert.match(JSON.parse(refused.body).message, /up to 10 Custom Pages/);
 });
