@@ -110,7 +110,7 @@ export function diagnose(cfg, toolPlan, prompt) {
         : `The ${FIELD_LABELS[field]} box tells the agent to book or confirm appointments, but appointment booking is turned off.`,
       fix: `delete or reword ${field === "exampleDialogues" ? "those lines" : "that text"} in the ${FIELD_LABELS[field]} box `
         + "(for example, \"I'll pass this to the team and they'll call you to set up a time\"), "
-        + "or turn on appointment booking and connect a calendar on the Calendar & CRM step.",
+        + "or turn on appointment booking and connect a calendar on the Calendar Integration step.",
     }));
   }
   if (!toolPlan.some((tool) => tool.kind === "transfer")) {
@@ -136,7 +136,7 @@ export function diagnose(cfg, toolPlan, prompt) {
   if (cfg.scheduling.enabled) {
     addConflicts("custom_instructions_forbid_enabled_scheduling", customInstructionsForbidCapability(retainedCustomInstructions, "scheduling"), (field) => ({
       problem: `The ${FIELD_LABELS[field]} box says the agent can't book appointments, but appointment booking is turned on.`,
-      fix: `delete or reword that text in the ${FIELD_LABELS[field]} box, or turn off appointment booking on the Calendar & CRM step.`,
+      fix: `delete or reword that text in the ${FIELD_LABELS[field]} box, or turn off appointment booking on the Calendar Integration step.`,
     }));
   }
   const customText = [retainedCustomInstructions.roleInstructions, retainedCustomInstructions.restrictions,
