@@ -12,7 +12,7 @@ import {
 } from "./providers.mjs";
 import { buildReceptionistConfig, buildReceptionistPrompt, effectiveProfile, legacyDefaultGreeting, looksAppGeneratedPrompt, resolveAllowedInboundCountries, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
 import { inspectVoiceAgent } from "./voice-agent/inspect.mjs";
-import { boundServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./voice-agent/service-areas.mjs";
+import { boundServiceAreas, repairServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./voice-agent/service-areas.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
@@ -278,7 +278,7 @@ function pickProfile(value) {
     ...(Array.isArray(value.holidays) ? { holidays: pickHolidays(value.holidays) } : {}),
     ...(typeof value.holidaysEnabled === "boolean" ? { holidaysEnabled: value.holidaysEnabled } : {}),
     ...(Array.isArray(value.contactEmails) ? { contactEmails: pickContactEmails(value.contactEmails) } : {}),
-    ...(Array.isArray(value.serviceAreas) ? { serviceAreas: boundServiceAreas(value.serviceAreas) } : {}),
+    ...(Array.isArray(value.serviceAreas) ? { serviceAreas: boundServiceAreas(repairServiceAreas(value.serviceAreas)) } : {}),
     ...(typeof value.serviceAreaSummary === "string"
       ? { serviceAreaSummary: value.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT) }
       : {}),

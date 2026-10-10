@@ -31,12 +31,37 @@ const STATE_SEGMENT = new RegExp(
 const ENDS_WITH_STATE = new RegExp(`(?:^|[\\s,])(?:${STATE_ALTERNATIVES})\\.?$`, "i");
 const REGION_ENTRY = /\b(?:metro|metropolitan|area|areas|region|coast|states|dmv|nova|socal|norcal|midwest|mid ?west|northeast|southeast|southwest|northwest|new england|bay area|mid-?atlantic)\b|\d{5}/i;
 
+// Places are separated by new lines, semicolons and colons (full-width forms
+// too - NFKC folds them); commas also separate, except that "City, ST" stays
+// one place. Symbols that can't be part of a place name are ignored; the
+// rest is used as typed. Mirror of the frontend's parseServiceAreaInput.
 export function parseServiceAreaText(text) {
   const source = typeof text === "string" ? text.slice(0, SERVICE_AREA_TEXT_LIMIT) : "";
-  const entries = source.includes("\n") ? source.split("\n") : joinCityState(source.split(","));
-  return entries
-    .map((value) => value.trim().replace(/\s+/g, " "))
-    .filter(Boolean);
+  return source
+    .normalize("NFKC")
+    .split(/[\n;:]/)
+    .flatMap((line) => joinCityState(line.split(",").map(cleanEntry)))
+    .filter((entry) => /[\p{L}\p{N}]/u.test(entry));
+}
+
+// Drops list markers ("1.", "2)", "-", "*") and characters that can't be part
+// of a place name. Keeps letters (any language), numbers, spaces, hyphens,
+// periods, apostrophes and "&".
+function cleanEntry(value) {
+  return value
+    .replace(/^\s*(?:\d{1,2}[.)]|[-*])\s+/, "")
+    .replace(/[^\p{L}\p{M}\p{N}\s.'’&-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Lists saved before semicolons and colons were separators were split on
+// commas only ("D.C.; Arlington"). Joining the pieces back with ", "
+// restores the text as typed, which then splits correctly.
+export function repairServiceAreas(list) {
+  return Array.isArray(list) && list.some((entry) => typeof entry === "string" && /[;:]/.test(entry))
+    ? parseServiceAreaText(list.filter((entry) => typeof entry === "string").join(", "))
+    : list;
 }
 
 // Exact Coverage entries as saved: trimmed, blanks dropped, and kept only
