@@ -729,3 +729,13 @@ test("inspector says when the next publish will migrate legacy per-agent knowled
   const migrated = inspectVoiceAgent({ ...BUILD, agent: minimalAgent({ knowledgeBaseText: "Old notes", legacyKnowledgeMigrated: true }), profile: workspaceProfile, source: "saved" });
   assert.ok(!migrated.diagnostics.some((item) => item.code === "legacy_knowledge_pending"));
 });
+
+test("service area: semicolons, colons and stray symbols split places the same way as the wizard", async () => {
+  const { parseServiceAreaText, repairServiceAreas } = await import("./service-areas.mjs");
+  assert.deepEqual(parseServiceAreaText("Washington, D.C.; Arlington, VA; • Bethesda, MD: 20910"), ["Washington, D.C.", "Arlington, VA", "Bethesda, MD", "20910"]);
+  assert.deepEqual(parseServiceAreaText("1. Winston-Salem, NC\n- Coeur d'Alene, ID\narlington, va, alexandria, va"), ["Winston-Salem, NC", "Coeur d'Alene, ID", "arlington, va", "alexandria, va"]);
+  assert.deepEqual(repairServiceAreas(["Washington", "D.C.; Arlington", "VA; Myrtle Beach", "SC"]), ["Washington, D.C.", "Arlington, VA", "Myrtle Beach, SC"]);
+  // A list saved with the old splitting publishes the right places.
+  const cfg = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreaSummary: "DC and Myrtle Beach", serviceAreas: ["Washington", "D.C.; Arlington", "VA; Myrtle Beach", "SC"] });
+  assert.deepEqual(cfg.business.coverageAreas, ["Washington, D.C.", "Arlington, VA", "Myrtle Beach, SC"]);
+});

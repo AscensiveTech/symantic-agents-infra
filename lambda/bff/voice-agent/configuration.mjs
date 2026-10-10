@@ -11,7 +11,7 @@
 
 import { isBusinessHours } from "../business-hours.mjs";
 import { resolveSpokenForms } from "./spoken-forms.mjs";
-import { parseServiceAreaText, SERVICE_AREA_TEXT_LIMIT } from "./service-areas.mjs";
+import { parseServiceAreaText, repairServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./service-areas.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
 
@@ -425,7 +425,9 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
 function resolveServiceArea(profile) {
   // Not re-capped here: input is capped on save, and an older, longer list
   // must keep working exactly as before.
-  const serviceAreas = Array.isArray(profile.serviceAreas) ? profile.serviceAreas.map(text).filter(Boolean) : [];
+  // Lists saved before semicolons/colons separated places are re-split.
+  const savedAreas = repairServiceAreas(profile.serviceAreas);
+  const serviceAreas = Array.isArray(savedAreas) ? savedAreas.map(text).filter(Boolean) : [];
   const summaryRaw = typeof profile.serviceAreaSummary === "string"
     ? profile.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT)
     : "";
