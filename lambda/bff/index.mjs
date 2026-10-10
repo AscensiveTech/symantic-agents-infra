@@ -12,6 +12,7 @@ import {
 } from "./providers.mjs";
 import { buildReceptionistConfig, buildReceptionistPrompt, effectiveProfile, legacyDefaultGreeting, looksAppGeneratedPrompt, resolveAllowedInboundCountries, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
 import { inspectVoiceAgent } from "./voice-agent/inspect.mjs";
+import { boundServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./voice-agent/service-areas.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
@@ -188,6 +189,11 @@ const PROPOSAL_SECTION_KINDS = [
   "closing",
 ];
 const PROPOSAL_SECTION_SET = new Set(PROPOSAL_SECTION_KINDS);
+// The sections that existed before Work With Us! was added. A company saved
+// with an older allow-list (allowedProposalSections) could only choose among
+// these, so anything outside it was never turned off - it simply didn't
+// exist yet.
+const LEGACY_PROPOSAL_SECTION_KINDS = PROPOSAL_SECTION_KINDS.filter((section) => section !== "workWithUs");
 const COMPANY_TIERS = new Set(["basic", "repository", "signing"]);
 
 function json(statusCode, body) {
@@ -272,13 +278,15 @@ function pickProfile(value) {
     ...(Array.isArray(value.holidays) ? { holidays: pickHolidays(value.holidays) } : {}),
     ...(typeof value.holidaysEnabled === "boolean" ? { holidaysEnabled: value.holidaysEnabled } : {}),
     ...(Array.isArray(value.contactEmails) ? { contactEmails: pickContactEmails(value.contactEmails) } : {}),
-    ...(Array.isArray(value.serviceAreas) ? { serviceAreas: pickServiceAreas(value.serviceAreas) } : {}),
+    ...(Array.isArray(value.serviceAreas) ? { serviceAreas: boundServiceAreas(value.serviceAreas) } : {}),
+    ...(typeof value.serviceAreaSummary === "string"
+      ? { serviceAreaSummary: value.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT) }
+      : {}),
   };
 }
 
 const MAX_HOLIDAYS = 50;
 const MAX_CONTACT_EMAILS = 20;
-const MAX_SERVICE_AREAS = 200;
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 function boundedString(candidate, maxLength) {
@@ -306,12 +314,6 @@ function pickContactEmails(contactEmails) {
     .map((item) => ({ label: boundedString(item.label, 80), email: boundedString(item.email, 320) }));
 }
 
-function pickServiceAreas(serviceAreas) {
-  return serviceAreas
-    .filter((item) => typeof item === "string" && item.trim())
-    .slice(0, MAX_SERVICE_AREAS)
-    .map((item) => item.trim().slice(0, 120));
-}
 
 
 // Each agent picks its own plan independently (see resolveAgentPlan) - this
@@ -1001,10 +1003,7 @@ export function createHandler({
         }
         const workspace = await store.getWorkspace(workspaceId);
         return json(200, {
-          allowedProposalSections: normalizeProposalSections(
-            workspace?.allowedProposalSections,
-            PROPOSAL_SECTION_KINDS,
-          ),
+          allowedProposalSections: enabledProposalSections(workspace),
           tier: normalizeCompanyTier(workspace?.tier),
         });
       }
@@ -2692,12 +2691,24 @@ export function createHandler({
 // template. Shared by the workspace's own /workspaces/me/proposal-templates
 // routes and the super-admin /platform/companies/{id}/proposal-templates
 // routes, so both behave exactly the same. Null when the method isn't handled.
+// A template holds at most as many Custom Pages as a proposal can
+// (MAX_STATIC_PAGES_PER_PROPOSAL in the frontend), so every proposal made
+// from it stays valid.
+const MAX_TEMPLATE_CUSTOM_PAGES = 10;
+const TEMPLATE_CUSTOM_PAGE_LIMIT_MESSAGE = `A template can have up to ${MAX_TEMPLATE_CUSTOM_PAGES} Custom Pages.`;
+
+function tooManyTemplateCustomPages(template) {
+  const items = Array.isArray(template?.items) ? template.items : [];
+  return items.filter((item) => item?.kind === "staticPage").length > MAX_TEMPLATE_CUSTOM_PAGES;
+}
+
 async function handleProposalTemplateRequest(event, { method, store, workspaceId, templateId }) {
   if (!templateId) {
     if (method === "GET") return json(200, await store.listProposalTemplates(workspaceId));
     if (method === "POST") {
       const template = pickEntity(readBody(event), "id");
       if (!template) return json(400, { message: "Invalid proposal template" });
+      if (tooManyTemplateCustomPages(template)) return json(400, { message: TEMPLATE_CUSTOM_PAGE_LIMIT_MESSAGE });
       try {
         return json(201, await store.createProposalTemplate(workspaceId, template));
       } catch (error) {
@@ -2714,6 +2725,7 @@ async function handleProposalTemplateRequest(event, { method, store, workspaceId
   if (method === "PATCH") {
     const template = pickEntity(readBody(event), "id", templateId);
     if (!template) return json(400, { message: "Invalid proposal template" });
+    if (tooManyTemplateCustomPages(template)) return json(400, { message: TEMPLATE_CUSTOM_PAGE_LIMIT_MESSAGE });
     // Same optimistic concurrency as proposals: a save only lands on the rev
     // it was loaded from, so two admins editing one template can't silently
     // overwrite each other. (A client that sends no rev keeps the old
@@ -3180,8 +3192,9 @@ async function handlePlatformCompanies(event, {
       const directory = await getUserDirectory();
       const block = await memberRemovalBlock(store, directory, target.workspaceId, membership, actor.userId);
       if (block) return json(block.status, { message: block.message });
-      await removeWorkspaceMember(store, directory, target.workspaceId, membership);
-      return json(200, { ok: true });
+      const newAssignee = await removalAssignee(store, target.workspaceId, membership, actor, event, { asSupport: true });
+      const result = await removeWorkspaceMember(store, directory, target.workspaceId, membership, { newAssignee, event, actor });
+      return json(200, { ok: true, ...result });
     }
 
     return json(404, { message: "Not found" });
@@ -3258,7 +3271,9 @@ async function handlePlatformCompanies(event, {
     ...(officeAddress ? { officeAddress } : {}),
     ...(phone ? { phone } : {}),
     ...(phoneExtension ? { phoneExtension } : {}),
-    allowedProposalSections: allowedSections,
+    // Stored as what's turned OFF, so a section added later is on for
+    // every company by default.
+    disabledProposalSections: PROPOSAL_SECTION_KINDS.filter((section) => !(allowedSections ?? PROPOSAL_SECTION_KINDS).includes(section)),
     billingAnchorDate,
     createdAt: now,
     createdBy: actor.userId,
@@ -3445,6 +3460,15 @@ async function getProposalStorageBytes(workspaceId) {
     console.warn("[proposals] storage size lookup failed", { workspaceId, error: error?.message });
     return null;
   }
+}
+
+// Signed, completed (closed by hand) or canceled: the work is done, so the
+// person it was assigned to stays on it even after they leave the company.
+function isFinishedProposal(proposal) {
+  return Boolean(proposal?.canceledAt)
+    || proposal?.status === "completed"
+    || proposal?.status === "signed"
+    || proposal?.signatureRequest?.status === "completed";
 }
 
 // Which "document state" bucket a proposal's stored bytes count towards on
@@ -3863,10 +3887,7 @@ async function platformCompanySummary(store, workspace) {
     phone: workspace.phone || "",
     phoneExtension: workspace.phoneExtension || "",
     createdAt: workspace.createdAt ?? null,
-    allowedProposalSections: normalizeProposalSections(
-      workspace.allowedProposalSections,
-      PROPOSAL_SECTION_KINDS,
-    ),
+    allowedProposalSections: enabledProposalSections(workspace),
     entitlements: workspaceEntitlements(workspace),
     tier: normalizeCompanyTier(workspace.tier),
     userCount: members.filter((member) => member.status !== "disabled").length,
@@ -4212,6 +4233,18 @@ function companyLogoResponse(workspace, url = null) {
   };
 }
 
+// The sections a company can use: every section except those a super admin
+// turned off. New companies store disabledProposalSections; an older one with
+// only an allow-list turns off just the legacy sections missing from it.
+function enabledProposalSections(workspace) {
+  const disabled = Array.isArray(workspace?.disabledProposalSections)
+    ? workspace.disabledProposalSections
+    : Array.isArray(workspace?.allowedProposalSections) && workspace.allowedProposalSections.length
+      ? LEGACY_PROPOSAL_SECTION_KINDS.filter((section) => !workspace.allowedProposalSections.includes(section))
+      : [];
+  return PROPOSAL_SECTION_KINDS.filter((section) => !disabled.includes(section));
+}
+
 function normalizeProposalSections(value, fallback = null) {
   if (value === undefined && fallback) return [...fallback];
   if (!Array.isArray(value) || value.length === 0) return null;
@@ -4345,17 +4378,54 @@ async function memberRemovalBlock(store, directory, workspaceId, target, actorUs
   return null;
 }
 
-// The removal itself: drop the Cognito account, drop the membership, and blank
-// the assignee on anything they created (proposals keep their work — assignedTo
-// is a plain name/email string, not a live account reference).
-async function removeWorkspaceMember(store, directory, workspaceId, target) {
+// The removal itself: drop the Cognito account and the membership. Their
+// work stays: finished proposals (signed, completed, canceled) keep their
+// name, and unfinished ones move to `newAssignee` - whoever removed them, or
+// the company's Org Admin when a Symantic super admin did it as support
+// (see removalAssignee). Nothing in the activity log is ever edited; a
+// reassignment adds one entry. Returns what moved, for the remover's pop-up.
+async function removeWorkspaceMember(store, directory, workspaceId, target, { newAssignee, event, actor } = {}) {
   await directory.deleteUser(target.cognitoUsername ?? target.email);
   await store.deleteMembership(target.userId);
-  if (typeof store.unassignProposalsFrom === "function") {
-    await store.unassignProposalsFrom(workspaceId, [target.name, target.email]).catch((error) => {
-      console.warn("Failed to unassign a removed member's proposals", { userId: target.userId, error: String(error) });
-    });
+  const removedLabel = memberLabel(target);
+  let reassignedCount = 0;
+  if (newAssignee && typeof store.reassignOpenProposalsFrom === "function") {
+    try {
+      reassignedCount = await store.reassignOpenProposalsFrom(workspaceId, [target.name, target.email], newAssignee);
+    } catch (error) {
+      console.warn("Failed to reassign a removed member's proposals", { userId: target.userId, error: String(error) });
+    }
   }
+  if (reassignedCount > 0 && typeof store.recordActivity === "function") {
+    await store.recordActivity(workspaceId, {
+      eventType: "proposals_reassigned",
+      page: `Reassigned ${reassignedCount} unfinished proposal${reassignedCount === 1 ? "" : "s"} from ${removedLabel} (removed) to ${newAssignee}`,
+      userId: actor?.userId,
+      userName: actor ? actorDisplayName(event, actor) : undefined,
+      userEmail: actor?.membership?.email,
+      ...(actor?.supporting || actor?.roles?.includes("super-admin") ? { support: true } : {}),
+    }).catch((error) => console.warn("Failed to log a proposal reassignment", { error: String(error) }));
+  }
+  return { reassignedCount, reassignedTo: reassignedCount > 0 ? newAssignee : null, removedName: removedLabel };
+}
+
+// How a member shows on a proposal's "Assigned To": their name, else email
+// (the same label the builder's picker writes).
+function memberLabel(member) {
+  return (typeof member?.name === "string" && member.name.trim()) || (typeof member?.email === "string" && member.email.trim()) || "";
+}
+
+// Who inherits a removed member's unfinished proposals. A company's own admin
+// removing someone gets them. A Symantic super admin (support mode or Manage
+// Company Accounts) never does: they go to the company's first active Org
+// Admin instead.
+async function removalAssignee(store, workspaceId, target, actor, event, { asSupport }) {
+  if (!asSupport) return actorDisplayName(event, actor);
+  const members = await store.listMemberships(workspaceId);
+  const admin = members
+    .filter((member) => member.role === "company-admin" && member.status !== "disabled" && member.userId !== target.userId)
+    .sort((left, right) => String(left.createdAt ?? "").localeCompare(String(right.createdAt ?? "")))[0];
+  return admin ? memberLabel(admin) : "";
 }
 
 async function handleWorkspaceUsers(event, {
@@ -4486,8 +4556,10 @@ async function handleWorkspaceUsers(event, {
     const directory = await getUserDirectory();
     const block = await memberRemovalBlock(store, directory, actor.workspaceId, target, actor.userId);
     if (block) return json(block.status, { message: block.message });
-    await removeWorkspaceMember(store, directory, actor.workspaceId, target);
-    return json(200, { ok: true });
+    const asSupport = Boolean(actor.supporting) || !actor.roles.includes("company-admin");
+    const newAssignee = await removalAssignee(store, actor.workspaceId, target, actor, event, { asSupport });
+    const result = await removeWorkspaceMember(store, directory, actor.workspaceId, target, { newAssignee, event, actor });
+    return json(200, { ok: true, ...result });
   }
 
   return json(404, { message: "Not found" });
@@ -6435,7 +6507,10 @@ function demoContactOverrides(records) {
     const phoneNumber = record.callerNumber;
     if (!phoneNumber || seen.has(phoneNumber)) continue;
     seen.add(phoneNumber);
-    if (Math.random() < 0.1) continue;
+    // Every 10th caller is left without a company, so some contacts show a
+    // blank Company Name. Counted, not random: a random 10% sometimes
+    // dropped below the demo's (and its test's) expected contact count.
+    if (seen.size % 10 === 0) continue;
     rows.push({
       phoneNumber,
       companyName: DEMO_COMPANY_NAMES[company % DEMO_COMPANY_NAMES.length],
@@ -8817,29 +8892,31 @@ export function createDynamoStore(client, commands, tableNames) {
       return deleteRecord(tableNames.proposals, "proposalId", workspaceId, proposalId);
     },
 
-    // Clear the assignee on every proposal in a workspace currently assigned to
-    // any of `names` (a removed member's name / email). The work itself is
-    // untouched - only `assignedTo` is blanked, so the proposal just becomes
-    // "Unassigned".
-    async unassignProposalsFrom(workspaceId, names) {
-      const wanted = new Set(names.map((value) => String(value).trim().toLowerCase()).filter(Boolean));
-      if (wanted.size === 0) return 0;
+    // Move every unfinished proposal assigned to any of `names` (a removed
+    // member's name / email) to `newAssignee`. Finished ones - signed,
+    // completed, or canceled - keep the name, as the record of who did the
+    // work. Returns how many moved.
+    async reassignOpenProposalsFrom(workspaceId, names, newAssignee) {
+      const wanted = new Set(names.map((value) => String(value ?? "").trim().toLowerCase()).filter(Boolean));
+      if (wanted.size === 0 || !newAssignee) return 0;
       const rows = await listRecords(tableNames.proposals, "proposalId", workspaceId, {
-        expression: "proposalId, assignedTo",
+        expression: "proposalId, assignedTo, #status, canceledAt, signatureRequest",
+        names: { "#status": "status" },
       });
-      let cleared = 0;
+      let moved = 0;
       for (const row of rows) {
         if (!wanted.has(String(row.assignedTo ?? "").trim().toLowerCase())) continue;
+        if (isFinishedProposal(row)) continue;
         await client.send(new commands.UpdateItemCommand({
           TableName: tableNames.proposals,
           Key: marshall({ workspaceId, proposalId: row.id }),
-          UpdateExpression: "SET assignedTo = :empty, updatedAt = :now",
+          UpdateExpression: "SET assignedTo = :assignee, updatedAt = :now",
           ConditionExpression: "attribute_exists(proposalId)",
-          ExpressionAttributeValues: marshall({ ":empty": "", ":now": new Date().toISOString() }),
+          ExpressionAttributeValues: marshall({ ":assignee": newAssignee, ":now": new Date().toISOString() }),
         }));
-        cleared += 1;
+        moved += 1;
       }
-      return cleared;
+      return moved;
     },
 
     async listProposalTemplates(workspaceId) {

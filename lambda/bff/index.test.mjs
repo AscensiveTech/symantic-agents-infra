@@ -160,6 +160,7 @@ test("PUT profile keeps holidays, the holidays toggle, contact emails, and servi
     ],
     contactEmails: [{ label: "Billing", email: "billing@example.com" }, { label: "no email" }],
     serviceAreas: [" Arlington, VA ", "", 42],
+    serviceAreaSummary: `  ${"x".repeat(3100)}`,
   }));
 
   assert.equal(response.statusCode, 200);
@@ -171,6 +172,7 @@ test("PUT profile keeps holidays, the holidays toggle, contact emails, and servi
   ]);
   assert.deepEqual(saved.contactEmails, [{ label: "Billing", email: "billing@example.com" }]);
   assert.deepEqual(saved.serviceAreas, ["Arlington, VA"]);
+  assert.equal(saved.serviceAreaSummary, "x".repeat(3000));
 });
 
 test("GET profile ensures the workspace and returns its profile", async () => {
@@ -5496,11 +5498,13 @@ test("maintenance notice platform routes are super-admin only", async () => {
 });
 
 function removalStore(overrides = {}) {
-  const unassignCalls = [];
+  const reassignCalls = [];
   const deleted = [];
+  const activity = [];
   return {
-    unassignCalls,
+    reassignCalls,
     deleted,
+    activity,
     async getWorkspace() { return { workspaceId: "ws-1", name: "Acme", tier: "repository" }; },
     async getMembership(userId) {
       if (userId === "user-123") return { userId, workspaceId: "ws-1", role: "company-admin", status: "active" };
@@ -5509,18 +5513,20 @@ function removalStore(overrides = {}) {
     },
     async listMemberships() {
       return [
-        { userId: "user-123", workspaceId: "ws-1", role: "company-admin", status: "active" },
-        { userId: "admin-2", workspaceId: "ws-1", role: "company-admin", status: "active" },
+        { userId: "user-123", workspaceId: "ws-1", role: "company-admin", status: "active", name: "Sam Lee", createdAt: "2026-02-01T00:00:00Z" },
+        { userId: "admin-2", workspaceId: "ws-1", role: "company-admin", status: "active", name: "Olivia Owner", createdAt: "2026-01-01T00:00:00Z" },
+        { userId: "admin-off", workspaceId: "ws-1", role: "company-admin", status: "disabled", name: "Old Admin", createdAt: "2025-01-01T00:00:00Z" },
         { userId: "member-x", workspaceId: "ws-1", role: "quotation-builder", status: "active" },
       ];
     },
     async deleteMembership(userId) { deleted.push(userId); },
-    async unassignProposalsFrom(workspaceId, names) { unassignCalls.push([workspaceId, names]); return 3; },
+    async reassignOpenProposalsFrom(workspaceId, names, newAssignee) { reassignCalls.push([workspaceId, names, newAssignee]); return 3; },
+    async recordActivity(workspaceId, entry) { activity.push([workspaceId, entry]); },
     ...overrides,
   };
 }
 
-test("removing a member unassigns their proposals instead of deleting the work", async () => {
+test("an org admin removing a member gets their unfinished proposals, logs it once, and is told how many", async () => {
   const store = removalStore();
   const directory = { async deleteUser() {} };
   const { createHandler } = await loadBff();
@@ -5528,12 +5534,31 @@ test("removing a member unassigns their proposals instead of deleting the work",
   const event = authenticatedEvent("DELETE", "/workspaces/me/users/member-x");
   event.pathParameters = { userId: "member-x" };
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+  event.requestContext.authorizer.jwt.claims.name = "Sam Lee";
 
   const response = await handler(event);
 
   assert.equal(response.statusCode, 200);
   assert.deepEqual(store.deleted, ["member-x"]);
-  assert.deepEqual(store.unassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"]]]);
+  assert.deepEqual(store.reassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"], "Sam Lee"]]);
+  assert.deepEqual(JSON.parse(response.body), { ok: true, reassignedCount: 3, reassignedTo: "Sam Lee", removedName: "Pat Leaver" });
+  assert.equal(store.activity.length, 1);
+  assert.equal(store.activity[0][1].eventType, "proposals_reassigned");
+  assert.equal(store.activity[0][1].page, "Reassigned 3 unfinished proposals from Pat Leaver (removed) to Sam Lee");
+});
+
+test("removing a member with no unfinished proposals reports zero and writes no log entry", async () => {
+  const store = removalStore({ async reassignOpenProposalsFrom() { return 0; } });
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => ({ async deleteUser() {} }) });
+  const event = authenticatedEvent("DELETE", "/workspaces/me/users/member-x");
+  event.pathParameters = { userId: "member-x" };
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+
+  const response = await handler(event);
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { ok: true, reassignedCount: 0, reassignedTo: null, removedName: "Pat Leaver" });
+  assert.deepEqual(store.activity, []);
 });
 
 test("the org-admin remove path blocks the last remaining Org Admin with an actionable message", async () => {
@@ -5589,11 +5614,45 @@ test("a super admin removes a user from a company via Manage Company Accounts", 
   const event = authenticatedEvent("DELETE", "/platform/companies/ws-1/users/member-x");
   event.pathParameters = { workspaceId: "ws-1", userId: "member-x" };
   event.requestContext.authorizer.jwt.claims["cognito:groups"] = "super-admin";
+  event.requestContext.authorizer.jwt.claims.name = "Symantic Support";
 
   const response = await handler(event);
   assert.equal(response.statusCode, 200);
   assert.deepEqual(store.deleted, ["member-x"]);
-  assert.deepEqual(store.unassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"]]]);
+  // Never the super admin: the company's first active Org Admin (by join date).
+  assert.deepEqual(store.reassignCalls, [["ws-1", ["Pat Leaver", "leaver@example.com"], "Olivia Owner"]]);
+  assert.equal(JSON.parse(response.body).reassignedTo, "Olivia Owner");
+  assert.equal(store.activity[0][1].support, true);
+});
+
+test("Dynamo reassignOpenProposalsFrom moves only the removed member's unfinished proposals", async () => {
+  class QueryCommand { constructor(input) { this.input = input; } }
+  class UpdateItemCommand { constructor(input) { this.input = input; } }
+  const updates = [];
+  const row = (id, assignedTo, extra = {}) => ({ workspaceId: { S: "ws-1" }, proposalId: { S: id }, assignedTo: { S: assignedTo }, ...extra });
+  const client = {
+    async send(command) {
+      if (command instanceof UpdateItemCommand) { updates.push(command.input); return {}; }
+      return {
+        Items: [
+          row("draft", "Pat Leaver", { status: { S: "draft" } }),
+          row("sent", "leaver@example.com", { status: { S: "sent" }, signatureRequest: { M: { status: { S: "sent" } } } }),
+          row("signed", "Pat Leaver", { signatureRequest: { M: { status: { S: "completed" } } } }),
+          row("completed", "Pat Leaver", { status: { S: "completed" } }),
+          row("canceled", "Pat Leaver", { canceledAt: { S: "2026-09-01T00:00:00Z" } }),
+          row("someone-else", "Jamie", { status: { S: "draft" } }),
+        ],
+      };
+    },
+  };
+  const { createDynamoStore } = await loadBff();
+  const store = createDynamoStore(client, { QueryCommand, UpdateItemCommand }, { proposals: "proposals-table" });
+
+  const moved = await store.reassignOpenProposalsFrom("ws-1", ["Pat Leaver", "leaver@example.com"], "Sam Lee");
+
+  assert.equal(moved, 2);
+  assert.deepEqual(updates.map((input) => input.Key.proposalId.S), ["draft", "sent"]);
+  assert.ok(updates.every((input) => input.ExpressionAttributeValues[":assignee"].S === "Sam Lee"));
 });
 
 test("Manage Company Accounts remove is 403 for a non-super-admin and 403 on a super-admin target", async () => {
@@ -5668,8 +5727,10 @@ test("super administrators onboard a company with an isolated default template",
   assert.equal(bundle.workspace.tier, "repository");
   assert.deepEqual(bundle.workspace.entitlements, { receptionist: false, rapidProposal: true });
   assert.deepEqual(body.entitlements, { receptionist: false, rapidProposal: true });
-  // "Work With Us!" is a recognised section like the rest.
-  assert.deepEqual(bundle.workspace.allowedProposalSections, ["cover", "agenda", "parts", "workWithUs", "closing"]);
+  // Stored as what's turned off, so sections added later are on by default.
+  assert.deepEqual(bundle.workspace.disabledProposalSections, ["companyIntro", "summary", "scope", "agreement", "payment"]);
+  assert.equal(bundle.workspace.allowedProposalSections, undefined);
+  assert.deepEqual(body.allowedProposalSections, ["cover", "agenda", "parts", "workWithUs", "closing"]);
   assert.equal(bundle.membership.email, "ajm@technovate.design");
   assert.equal(bundle.membership.role, "company-admin");
   assert.equal(bundle.template.name, "Default");
@@ -5832,7 +5893,7 @@ test("company onboarding requires an email, and a receptionist-only company can 
 
   assert.equal(response.statusCode, 201);
   assert.equal(JSON.parse(response.body).email, "owner@mapledental.test");
-  assert.ok(bundle.workspace.allowedProposalSections.length > 0);
+  assert.deepEqual(bundle.workspace.disabledProposalSections, []);
 });
 
 test("only super administrators can access company onboarding", async () => {
@@ -6785,10 +6846,31 @@ test("company administrators receive their allowed proposal sections", async () 
   const response = await handler(event);
 
   assert.equal(response.statusCode, 200);
+  // An older allow-list turns off only the sections that existed then; Work
+  // With Us! (added later) is available.
   assert.deepEqual(JSON.parse(response.body), {
-    allowedProposalSections: ["cover", "parts", "closing"],
+    allowedProposalSections: ["cover", "parts", "workWithUs", "closing"],
     tier: "repository",
   });
+});
+
+test("Work With Us! is available to a company whose saved list predates it, and new sections are on by default", async () => {
+  const settingsFor = async (workspace) => {
+    const store = {
+      async getMembership(userId) { return { userId, workspaceId: "workspace-123", role: "company-admin", status: "active" }; },
+      async getWorkspace(workspaceId) { return { workspaceId, tier: "repository", ...workspace }; },
+    };
+    const { createHandler } = await loadBff();
+    const event = authenticatedEvent("GET", "/workspaces/me/proposal-settings");
+    event.requestContext.authorizer.jwt.claims["cognito:groups"] = "company-admin";
+    return JSON.parse((await createHandler({ getStore: async () => store })(event)).body).allowedProposalSections;
+  };
+  const all = ["cover", "agenda", "companyIntro", "parts", "summary", "scope", "agreement", "payment", "workWithUs", "closing"];
+  // Ascensive Tech's shape: every section that existed before Work With Us!.
+  assert.deepEqual(await settingsFor({ allowedProposalSections: all.filter((kind) => kind !== "workWithUs") }), all);
+  assert.deepEqual(await settingsFor({}), all);
+  assert.deepEqual(await settingsFor({ disabledProposalSections: ["payment"] }), all.filter((kind) => kind !== "payment"));
+  assert.deepEqual(await settingsFor({ disabledProposalSections: ["workWithUs"] }), all.filter((kind) => kind !== "workWithUs"));
 });
 
 test("Cognito directory rejects an existing email regardless of capitalization", async () => {
@@ -10539,4 +10621,23 @@ test("syncPhoneNumber (activation path) sends the normalised country list, not t
   });
   assert.deepEqual(updates, [["+17035550177", { allowed_inbound_country_list: ["US", "CA"] }]]);
   assert.deepEqual(stored.allowedInboundCountries, ["US", "CA"]);
+});
+
+test("a template can hold at most 10 Custom Pages", async () => {
+  let saved = null;
+  const store = {
+    async ensureWorkspace() {},
+    async createProposalTemplate(workspaceId, template) { saved = template; return template; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store });
+  const pages = (count) => Array.from({ length: count }, (_, index) => ({ id: `page-${index}`, kind: "staticPage", label: `Page ${index + 1}` }));
+  const post = (count) => {
+    return handler(authenticatedEvent("POST", "/workspaces/me/proposal-templates", { id: `template-${count}`, name: "T", items: [{ id: "cover", kind: "cover" }, ...pages(count)] }));
+  };
+  assert.equal((await post(10)).statusCode, 201);
+  assert.equal(saved.items.filter((item) => item.kind === "staticPage").length, 10);
+  const refused = await post(11);
+  assert.equal(refused.statusCode, 400);
+  assert.match(JSON.parse(refused.body).message, /up to 10 Custom Pages/);
 });

@@ -161,7 +161,7 @@ test("a booking example with booking off names the Example Dialogues box, quotes
   ]);
   assert.match(error.message, /^The Example Dialogues box has an appointment-booking example, but appointment booking is turned off\./);
   assert.match(error.message, /Where: Conversation Rules & Guardrails step → Example Dialogues box\. Lines: "You: Got it\./);
-  assert.match(error.message, /To fix: delete or reword those lines in the Example Dialogues box .*or turn on appointment booking and connect a calendar on the Calendar & CRM step\./);
+  assert.match(error.message, /To fix: delete or reword those lines in the Example Dialogues box .*or turn on appointment booking and connect a calendar on the Calendar Integration step\./);
   // Caller lines are never quoted, even when they mention a time.
   assert.ok(!error.message.includes("Tomorrow afternoon is fine"));
 });

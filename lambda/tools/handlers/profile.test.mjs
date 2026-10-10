@@ -18,3 +18,12 @@ test("effectiveProfile normalizes invalid legacy timezones to UTC for calendar t
   );
   assert.equal(profile.timezone, "UTC");
 });
+
+test("effectiveProfile takes the agent's own Service Area summary and Exact Coverage over the workspace's", () => {
+  const profile = effectiveProfile(
+    { configuration: { businessProfile: { serviceAreaSummary: "Greater Dayton", serviceAreas: ["45402"] } } },
+    { serviceAreaSummary: "Workspace summary", serviceAreas: ["Charleston, SC"] },
+  );
+  assert.equal(profile.serviceAreaSummary, "Greater Dayton");
+  assert.deepEqual(profile.serviceAreas, ["45402"]);
+});

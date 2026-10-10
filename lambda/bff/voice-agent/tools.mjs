@@ -222,7 +222,9 @@ export function buildToolPlan(cfg) {
   const tools = [
     ...(cfg.scheduling.enabled ? CALENDAR_TOOLS : []),
     ...CORE_TOOLS,
-    ...(cfg.business.serviceAreas.length ? [serviceAreaTool(cfg.business.serviceAreas, cfg.business.address)] : []),
+    // Exact Coverage when filled, otherwise the places in the summary - see
+    // resolveServiceArea in configuration.mjs.
+    ...(cfg.business.coverageAreas.length ? [serviceAreaTool(cfg.business.coverageAreas, cfg.business.address)] : []),
     // If transfers are not allowed there are no rules here at all, so no
     // transfer tool exists - a guarantee rather than a prompt instruction
     // the model could ignore.
