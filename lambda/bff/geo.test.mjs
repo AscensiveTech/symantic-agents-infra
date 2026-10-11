@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createGeoService, handleGeoRoute, toZonePlace } from "./geo.mjs";
+import { createGeoService, createRateLimiter, handleGeoRoute, toZonePlace } from "./geo.mjs";
 import { MAX_POLYGON_VERTICES, MAX_RADIUS_METERS, MAX_ZONES, sanitizeServiceZones } from "./voice-agent/service-zones.mjs";
 
 function fakeSend(responses) {
@@ -146,4 +146,18 @@ test("service zones are shape-checked and bounded", () => {
 
   assert.equal(sanitizeServiceZones([{ type: "polygon", coordinates: Array.from({ length: MAX_POLYGON_VERTICES + 1 }, (_, i) => [i / 1000, (i % 2) / 1000]) }]).length, 0);
   assert.equal(sanitizeServiceZones(Array.from({ length: MAX_ZONES + 5 }, () => ({ type: "radius", center: [0, 0], radiusMeters: 1000 }))).length, MAX_ZONES);
+});
+
+test("map search is rate limited per workspace; the map config never is", async () => {
+  let clock = 0;
+  const allow = createRateLimiter({ limit: 2, windowMs: 1000, now: () => clock });
+  const geo = { search: async () => [], config: async () => ({ region: "us-east-1", mapStyleUrl: "x" }) };
+  const call = (path, workspaceId, method = "POST") => handleGeoRoute({ path, method, body: { text: "a" }, geo, json, workspaceId, allow });
+  assert.equal((await call("/workspaces/me/geo/search", "ws-a")).statusCode, 200);
+  assert.equal((await call("/workspaces/me/geo/search", "ws-a")).statusCode, 200);
+  assert.equal((await call("/workspaces/me/geo/search", "ws-a")).statusCode, 429);
+  assert.equal((await call("/workspaces/me/geo/search", "ws-b")).statusCode, 200);
+  assert.equal((await call("/workspaces/me/geo/config", "ws-a", "GET")).statusCode, 200);
+  clock = 1001;
+  assert.equal((await call("/workspaces/me/geo/search", "ws-a")).statusCode, 200);
 });

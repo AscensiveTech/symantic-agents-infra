@@ -15,23 +15,36 @@ const AREA_TYPES = new Set(["Country", "Region", "SubRegion", "Locality", "Distr
 const MAX_QUERY = 200;
 const KEY_TTL_MS = 60 * 60 * 1000;
 
-let sdkPromise;
+import { awsRequest } from "./aws-request.mjs";
 
+const REQUEST_TIMEOUT_MS = 6000;
+
+// Amazon Location over its REST API, SigV4-signed with the Lambda's role
+// (aws-request.mjs) - no SDK in the deployment package.
 async function defaultSend(operation, input) {
-  sdkPromise ??= Promise.all([import("@aws-sdk/client-geo-places"), import("@aws-sdk/client-location")]).then(([places, location]) => ({
-    places: new places.GeoPlacesClient({}),
-    location: new location.LocationClient({}),
-    commands: {
-      Suggest: places.SuggestCommand,
-      Autocomplete: places.AutocompleteCommand,
-      GetPlace: places.GetPlaceCommand,
-      ReverseGeocode: places.ReverseGeocodeCommand,
-      DescribeKey: location.DescribeKeyCommand,
-    },
-  }));
-  const sdk = await sdkPromise;
-  const client = operation === "DescribeKey" ? sdk.location : sdk.places;
-  return client.send(new sdk.commands[operation](input));
+  const region = process.env.AWS_REGION;
+  const places = `places.geo.${region}.amazonaws.com`;
+  const call = (options) => awsRequest({ region, timeoutMs: REQUEST_TIMEOUT_MS, ...options });
+  switch (operation) {
+    case "Suggest":
+      return call({ service: "geo-places", host: places, path: "/v2/suggest", body: input });
+    case "Autocomplete":
+      return call({ service: "geo-places", host: places, path: "/v2/autocomplete", body: input });
+    case "ReverseGeocode":
+      return call({ service: "geo-places", host: places, path: "/v2/reverse-geocode", body: input });
+    case "GetPlace":
+      return call({
+        service: "geo-places",
+        host: places,
+        method: "GET",
+        path: `/v2/place/${input.PlaceId}`,
+        query: { "intended-use": input.IntendedUse, language: input.Language },
+      });
+    case "DescribeKey":
+      return call({ service: "geo", host: `cp.metadata.geo.${region}.amazonaws.com`, method: "GET", path: `/metadata/v0/keys/${input.KeyName}` });
+    default:
+      throw new Error(`Unsupported operation ${operation}`);
+  }
 }
 
 export function createGeoService({
@@ -192,8 +205,31 @@ function isPosition(value) {
     && Math.abs(value[0]) <= 180 && Math.abs(value[1]) <= 90;
 }
 
+// Map search is billed per request: a search box typing at full speed is
+// ~4 a second, so 120 a minute per workspace leaves plenty of room for real
+// use while capping what a runaway client could spend.
+export function createRateLimiter({ limit = 120, windowMs = 60_000, now = () => Date.now() } = {}) {
+  const windows = new Map();
+  return (key) => {
+    const time = now();
+    const window = windows.get(key);
+    if (!window || window.resetAt <= time) {
+      if (windows.size > 5000) windows.clear();
+      windows.set(key, { count: 1, resetAt: time + windowMs });
+      return true;
+    }
+    window.count += 1;
+    return window.count <= limit;
+  };
+}
+
+const defaultLimiter = createRateLimiter();
+
 // Route handler, called from index.mjs for /workspaces/me/geo/*.
-export async function handleGeoRoute({ path, method, body, geo, json }) {
+export async function handleGeoRoute({ path, method, body, geo, json, workspaceId, allow = defaultLimiter }) {
+  if (path !== "/workspaces/me/geo/config" && workspaceId && !allow(workspaceId)) {
+    return json(429, { message: "Too many map searches - wait a moment and try again" });
+  }
   try {
     if (path === "/workspaces/me/geo/config" && method === "GET") {
       const config = await geo.config();
@@ -214,6 +250,7 @@ export async function handleGeoRoute({ path, method, body, geo, json }) {
   } catch (error) {
     if (error?.name === "ThrottlingException") return json(429, { message: "Map search is busy - try again in a moment" });
     if (error?.name === "ValidationException") return json(400, { message: "That search couldn't be run" });
+    if (error?.name === "ResourceNotFoundException") return json(404, { message: "That place is no longer available - search for it again" });
     console.error("Map search failed", { path, name: error?.name, message: error?.message });
     return json(502, { message: "Map search is unavailable right now" });
   }

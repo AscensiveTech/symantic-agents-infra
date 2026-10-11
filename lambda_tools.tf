@@ -17,7 +17,7 @@ data "archive_file" "tools" {
   type        = "zip"
   source_dir  = "${path.module}/lambda/tools"
   output_path = "${path.module}/.terraform/tools.zip"
-  excludes    = ["index.test.mjs", "handlers/business-hours.test.mjs", "geo/coverage.test.mjs", "geo/test-fixtures.mjs"]
+  excludes    = ["index.test.mjs", "handlers/business-hours.test.mjs", "geo/coverage.test.mjs", "geo/aws-request.test.mjs", "geo/test-fixtures.mjs"]
 }
 
 resource "aws_iam_role" "tools_lambda" {

@@ -1756,7 +1756,7 @@ export function createHandler({
 
       // Map search for the Service Area editor (geo.mjs).
       if (path.startsWith("/workspaces/me/geo/")) {
-        return await handleGeoRoute({ path, method, body: readBody(event), geo, json });
+        return await handleGeoRoute({ path, method, body: readBody(event), geo, json, workspaceId });
       }
 
       if (path === "/workspaces/me/blocked-numbers" || path.startsWith("/workspaces/me/blocked-numbers/")) {

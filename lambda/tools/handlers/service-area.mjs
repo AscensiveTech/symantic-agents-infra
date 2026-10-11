@@ -72,8 +72,18 @@ export async function handleServiceArea(input, { store, places = defaultPlaces }
   });
 }
 
+// For the business address and older text entries: a failed lookup leaves
+// that one item out rather than failing the caller's check. (A failure on the
+// caller's own words does fail the check - the prompt then says the team will
+// confirm coverage, never a guess.)
 async function geocodeBest(places, text, options) {
-  const items = await places.geocode({ text, maxResults: 1, ...options });
+  let items;
+  try {
+    items = await places.geocode({ text, maxResults: 1, ...options });
+  } catch (error) {
+    console.error("Service-area lookup skipped", { name: error?.name, message: error?.message });
+    return null;
+  }
   const [first] = items.map(normalizeGeocodeItem).filter((result) => result.placeType !== "PointOfInterest");
   return first && first.score >= 0.9 ? first : null;
 }

@@ -1,7 +1,7 @@
 # Amazon Location Service - maps and place search for the Service Area
 # editor, and the call-time coverage check (docs/service-areas.md).
 #
-# - The browser gets one API key, limited to map tiles/styles and to this
+# - The browser gets one API key, limited to map rendering (geo-maps) and to this
 #   app's own pages. It's public by design (it ships in page requests), so
 #   the restrictions are the protection.
 # - Place search and lookups go through the BFF, signed with its role, so no
@@ -30,7 +30,9 @@ resource "aws_cloudcontrolapi_resource" "location_maps_key" {
     Description = "Service Area editor map tiles (browser). Tiles and styles only, this app's pages only."
     NoExpiry    = true
     Restrictions = {
-      AllowActions   = ["geo-maps:GetTile", "geo-maps:GetStaticMap"]
+      # Read-only map rendering: tiles plus the style, glyph and sprite files
+      # MapLibre fetches. No places, routes or other services.
+      AllowActions   = ["geo-maps:*"]
       AllowResources = [local.location_maps_arn]
       AllowReferers  = local.location_maps_referers
     }

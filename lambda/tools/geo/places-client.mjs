@@ -1,14 +1,18 @@
-// Amazon Location Service (Places v2) for the call-time coverage check.
-// The AWS SDK client ships with the Lambda Node.js runtime, so it is
-// imported on first use rather than bundled. Results are never stored -
+// Amazon Location Service (Places v2) for the call-time coverage check,
+// called over its REST API with a SigV4-signed request (aws-request.mjs) -
+// no SDK needed in the deployment package. Results are never stored -
 // Geocode runs with the default IntendedUse (SingleUse) - and only kept in
 // this container's memory for an hour so a caller repeating a place, or the
 // business address on every check, doesn't cost a second request.
 
+import { awsRequest } from "./aws-request.mjs";
+
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const CACHE_LIMIT = 500;
 
-let clientPromise;
+// A coverage check has to answer inside the tool's 10 s budget, with room
+// for the caller's lookup and the business address.
+const GEOCODE_TIMEOUT_MS = 4000;
 
 export function createPlacesClient({ send } = {}) {
   const cache = new Map();
@@ -36,10 +40,14 @@ export function createPlacesClient({ send } = {}) {
 }
 
 async function defaultSend(operation, input) {
-  clientPromise ??= import("@aws-sdk/client-geo-places").then((sdk) => ({
-    client: new sdk.GeoPlacesClient({}),
-    commands: { Geocode: sdk.GeocodeCommand },
-  }));
-  const { client, commands } = await clientPromise;
-  return client.send(new commands[operation](input));
+  if (operation !== "Geocode") throw new Error(`Unsupported operation ${operation}`);
+  const region = process.env.AWS_REGION;
+  return awsRequest({
+    service: "geo-places",
+    host: `places.geo.${region}.amazonaws.com`,
+    path: "/v2/geocode",
+    body: input,
+    region,
+    timeoutMs: GEOCODE_TIMEOUT_MS,
+  });
 }
