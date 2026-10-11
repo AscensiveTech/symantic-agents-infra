@@ -7701,6 +7701,22 @@ function toPublicEntity(item, keyField) {
 }
 
 export function createDynamoStore(client, commands, tableNames) {
+  // A Query returns at most 1 MB per call - every page is read, or a large
+  // enough workspace would silently lose rows past the first.
+  async function queryAllItems(input) {
+    const items = [];
+    let exclusiveStartKey;
+    do {
+      const result = await client.send(new commands.QueryCommand({
+        ...input,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }));
+      items.push(...(result.Items ?? []));
+      exclusiveStartKey = result.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return items;
+  }
+
   async function listRecords(tableName, keyField, workspaceId, projection) {
     // Eventually-consistent: these list reads back the workspace's own
     // dashboards, where a sub-second lag on a just-written row is invisible
@@ -7909,13 +7925,13 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async listMemberships(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.workspaceMemberships,
         IndexName: "workspaceId-index",
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
-      }));
-      return (result.Items ?? [])
+      });
+      return items
         .map((item) => unmarshall(item))
         .sort((left, right) => String(left.email).localeCompare(String(right.email)));
     },
@@ -7965,13 +7981,13 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async listCalls(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.calls,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
         ConsistentRead: true,
-      }));
-      return (result.Items ?? [])
+      });
+      return items
         .map((item) => unmarshall(item))
         .sort((left, right) => callTimestamp(right) - callTimestamp(left));
     },
@@ -8080,16 +8096,16 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async clearDemoCalls(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.calls,
         KeyConditionExpression: "workspaceId = :workspaceId",
         FilterExpression: "demoSeed = :true",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":true": true }),
         ConsistentRead: true,
-      }));
-      const items = (result.Items ?? []).map((item) => unmarshall(item));
-      await batchDeleteItems(client, commands, tableNames.calls, items.map((item) => ({ workspaceId, callId: item.callId })));
-      return items.length;
+      });
+      const rows = items.map((item) => unmarshall(item));
+      await batchDeleteItems(client, commands, tableNames.calls, rows.map((item) => ({ workspaceId, callId: item.callId })));
+      return rows.length;
     },
 
     // Lean projection of the full call history for usage aggregation. Paginated;
@@ -8302,13 +8318,13 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async listBlockedNumbers(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.blockedNumbers,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
         ConsistentRead: false,
-      }));
-      return (result.Items ?? [])
+      });
+      return items
         .map((item) => unmarshall(item))
         .sort((left, right) =>
           String(right.blockedAt ?? "").localeCompare(String(left.blockedAt ?? "")));
@@ -8375,13 +8391,13 @@ export function createDynamoStore(client, commands, tableNames) {
     // import), or a delete (hidden: true, a tombstone rather than an
     // actual row removal so a rename doesn't resurrect it).
     async listContacts(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.contacts,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
         ConsistentRead: false,
-      }));
-      return (result.Items ?? []).map((item) => unmarshall(item));
+      });
+      return items.map((item) => unmarshall(item));
     },
 
     // Companion to seedDemoCalls - attaches company names to a batch of demo
@@ -8405,16 +8421,16 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async clearDemoContacts(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.contacts,
         KeyConditionExpression: "workspaceId = :workspaceId",
         FilterExpression: "demoSeed = :true",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId, ":true": true }),
         ConsistentRead: true,
-      }));
-      const items = (result.Items ?? []).map((item) => unmarshall(item));
-      await batchDeleteItems(client, commands, tableNames.contacts, items.map((item) => ({ workspaceId, phoneNumber: item.phoneNumber })));
-      return items.length;
+      });
+      const rows = items.map((item) => unmarshall(item));
+      await batchDeleteItems(client, commands, tableNames.contacts, rows.map((item) => ({ workspaceId, phoneNumber: item.phoneNumber })));
+      return rows.length;
     },
 
     async putContact(workspaceId, phoneNumber, patch) {
@@ -8483,13 +8499,13 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async listAgents(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.agents,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
         ConsistentRead: true,
-      }));
-      return (result.Items ?? []).map((item) => toPublicAgent(unmarshall(item)));
+      });
+      return items.map((item) => toPublicAgent(unmarshall(item)));
     },
 
     async getAgent(workspaceId, agentId) {
@@ -8598,13 +8614,13 @@ export function createDynamoStore(client, commands, tableNames) {
     },
 
     async listKnowledgeBases(workspaceId) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.knowledgeBases,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
         ConsistentRead: true,
-      }));
-      return (result.Items ?? []).map((item) => unmarshall(item));
+      });
+      return items.map((item) => unmarshall(item));
     },
 
     async getKnowledgeBase(workspaceId, knowledgeBaseId) {
@@ -8665,12 +8681,12 @@ export function createDynamoStore(client, commands, tableNames) {
     // this table doubles as the cost ledger, capped so a long history
     // doesn't force reading it all on every page load.
     async listMostAskedDigests(workspaceId, limit = 50) {
-      const result = await client.send(new commands.QueryCommand({
+      const items = await queryAllItems({
         TableName: tableNames.mostAskedDigests,
         KeyConditionExpression: "workspaceId = :workspaceId",
         ExpressionAttributeValues: marshall({ ":workspaceId": workspaceId }),
-      }));
-      return (result.Items ?? [])
+      });
+      return items
         .map((item) => unmarshall(item))
         .sort((left, right) => Date.parse(right.generatedAt ?? "") - Date.parse(left.generatedAt ?? ""))
         .slice(0, limit);

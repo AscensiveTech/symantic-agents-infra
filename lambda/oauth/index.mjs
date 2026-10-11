@@ -1799,7 +1799,9 @@ export function createDynamoConnectionStore(client, commands, tableName) {
   };
 }
 
-let awsRuntimePromise;
+let dynamoRuntimePromise;
+let kmsRuntimePromise;
+let secretsRuntimePromise;
 let stateStorePromise;
 let connectionStorePromise;
 let membershipStorePromise;
@@ -1808,24 +1810,36 @@ let workspaceStorePromise;
 let tokenCryptoPromise;
 const secretPromises = new Map();
 
-async function getAwsRuntime() {
-  awsRuntimePromise ??= Promise.all([
-    import("@aws-sdk/client-dynamodb"),
-    import("@aws-sdk/client-kms"),
-    import("@aws-sdk/client-secrets-manager"),
-  ]).then(([dynamodb, kms, secrets]) => ({
+// Each SDK client is loaded only when a route first needs it. Loading all
+// three up front made every cold container's first request pay for KMS and
+// Secrets Manager too - seconds at this memory size - even on the plain
+// DynamoDB reads (GET /calendars/connection) that most traffic is.
+async function getDynamoRuntime() {
+  dynamoRuntimePromise ??= import("@aws-sdk/client-dynamodb").then((dynamodb) => ({
     dynamodb,
-    kms,
-    secrets,
     dynamoClient: new dynamodb.DynamoDBClient({}),
+  }));
+  return dynamoRuntimePromise;
+}
+
+async function getKmsRuntime() {
+  kmsRuntimePromise ??= import("@aws-sdk/client-kms").then((kms) => ({
+    kms,
     kmsClient: new kms.KMSClient({}),
+  }));
+  return kmsRuntimePromise;
+}
+
+async function getSecretsRuntime() {
+  secretsRuntimePromise ??= import("@aws-sdk/client-secrets-manager").then((secrets) => ({
+    secrets,
     secretsClient: new secrets.SecretsManagerClient({}),
   }));
-  return awsRuntimePromise;
+  return secretsRuntimePromise;
 }
 
 async function getDefaultStateStore() {
-  stateStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) => {
+  stateStorePromise ??= getDynamoRuntime().then(({ dynamodb, dynamoClient }) => {
     if (!process.env.OAUTH_STATES_TABLE) {
       throw new Error("OAUTH_STATES_TABLE is required");
     }
@@ -1839,7 +1853,7 @@ async function getDefaultStateStore() {
 }
 
 async function getDefaultConnectionStore() {
-  connectionStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) => {
+  connectionStorePromise ??= getDynamoRuntime().then(({ dynamodb, dynamoClient }) => {
     if (!process.env.CALENDAR_CONNECTIONS_TABLE) {
       throw new Error("CALENDAR_CONNECTIONS_TABLE is required");
     }
@@ -1856,7 +1870,7 @@ async function getDefaultConnectionStore() {
 // which makes resolveIdentity fall back to the raw Cognito sub.
 async function getDefaultMembershipStore() {
   if (!process.env.WORKSPACE_MEMBERSHIPS_TABLE) return null;
-  membershipStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) =>
+  membershipStorePromise ??= getDynamoRuntime().then(({ dynamodb, dynamoClient }) =>
     createDynamoMembershipStore(
       dynamoClient,
       dynamodb,
@@ -1867,7 +1881,7 @@ async function getDefaultMembershipStore() {
 }
 
 async function getDefaultInviteStore() {
-  inviteStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) => {
+  inviteStorePromise ??= getDynamoRuntime().then(({ dynamodb, dynamoClient }) => {
     if (!process.env.CALENDAR_INVITES_TABLE) {
       throw new Error("CALENDAR_INVITES_TABLE is required");
     }
@@ -1883,7 +1897,7 @@ async function getDefaultInviteStore() {
 // Read-only, and only for the workspace's display name on the invite page.
 async function getDefaultWorkspaceStore() {
   if (!process.env.WORKSPACES_TABLE) return null;
-  workspaceStorePromise ??= getAwsRuntime().then(({ dynamodb, dynamoClient }) => ({
+  workspaceStorePromise ??= getDynamoRuntime().then(({ dynamodb, dynamoClient }) => ({
     async getWorkspace(workspaceId) {
       const result = await dynamoClient.send(new dynamodb.GetItemCommand({
         TableName: process.env.WORKSPACES_TABLE,
@@ -1896,7 +1910,7 @@ async function getDefaultWorkspaceStore() {
 }
 
 async function getDefaultTokenCrypto() {
-  tokenCryptoPromise ??= getAwsRuntime().then(({ kms, kmsClient }) => {
+  tokenCryptoPromise ??= getKmsRuntime().then(({ kms, kmsClient }) => {
     if (!process.env.CALENDAR_TOKENS_KMS_KEY_ID) {
       throw new Error("CALENDAR_TOKENS_KMS_KEY_ID is required");
     }
@@ -1921,7 +1935,7 @@ async function getDefaultOAuthSecret(provider) {
   const secretId = process.env[environmentName];
   if (!secretId) throw new Error(`${environmentName} is required`);
   if (!secretPromises.has(secretId)) {
-    secretPromises.set(secretId, getAwsRuntime().then(async ({ secrets, secretsClient }) => {
+    secretPromises.set(secretId, getSecretsRuntime().then(async ({ secrets, secretsClient }) => {
       const result = await secretsClient.send(new secrets.GetSecretValueCommand({
         SecretId: secretId,
       }));
