@@ -10668,3 +10668,36 @@ test("a template can hold at most 10 Custom Pages", async () => {
   assert.equal(refused.statusCode, 400);
   assert.match(JSON.parse(refused.body).message, /up to 10 Custom Pages/);
 });
+
+test("Dynamo list reads follow LastEvaluatedKey past DynamoDB's 1 MB page", async () => {
+  class QueryCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  const page = (items, last) => ({ Items: items, ...(last ? { LastEvaluatedKey: last } : {}) });
+  const cases = [
+    ["listCalls", "calls", (id) => ({ workspaceId: { S: "ws-1" }, callId: { S: id }, startedAt: { S: "2026-10-01T00:00:00Z" } }), (row) => row.callId],
+    ["listAgents", "agents", (id) => ({ workspaceId: { S: "ws-1" }, agentId: { S: id }, name: { S: id } }), (row) => row.id],
+    ["listContacts", "contacts", (id) => ({ workspaceId: { S: "ws-1" }, phoneNumber: { S: id } }), (row) => row.phoneNumber],
+    ["listKnowledgeBases", "knowledgeBases", (id) => ({ workspaceId: { S: "ws-1" }, knowledgeBaseId: { S: id } }), (row) => row.knowledgeBaseId],
+    ["listBlockedNumbers", "blockedNumbers", (id) => ({ workspaceId: { S: "ws-1" }, phoneNumber: { S: id } }), (row) => row.phoneNumber],
+  ];
+  const { createDynamoStore } = await loadBff();
+  for (const [method, table, item, idOf] of cases) {
+    const inputs = [];
+    const pages = [page([item("a")], { key: { S: "a" } }), page([item("b")], { key: { S: "b" } }), page([item("c")])];
+    const client = {
+      async send(command) {
+        inputs.push(command.input);
+        return pages[inputs.length - 1] ?? { Items: [] };
+      },
+    };
+    const store = createDynamoStore(client, { QueryCommand }, { [table]: `${table}-table` });
+    const rows = await store[method]("ws-1");
+    assert.deepEqual(rows.map(idOf).sort(), ["a", "b", "c"], method);
+    assert.equal(inputs.length, 3, method);
+    assert.equal(inputs[0].ExclusiveStartKey, undefined, method);
+    assert.deepEqual(inputs[2].ExclusiveStartKey, { key: { S: "b" } }, method);
+  }
+});

@@ -149,7 +149,9 @@ resource "aws_apigatewayv2_api" "bff" {
     allow_headers     = ["authorization", "content-type", "x-retell-signature", "x-product", "x-support-workspace"]
     allow_methods     = ["DELETE", "GET", "PATCH", "POST", "PUT", "OPTIONS"]
     allow_origins     = distinct(compact(["http://localhost:3000", var.app_url]))
-    max_age           = 300
+    # Browsers cache each URL's CORS preflight this long (Chrome caps at
+    # 7200 s), so repeat API calls skip the extra OPTIONS round trip.
+    max_age = 7200
   }
 
   tags = {
@@ -202,10 +204,32 @@ resource "aws_apigatewayv2_route" "signwell_webhook" {
   target             = "integrations/${aws_apigatewayv2_integration.bff.id}"
 }
 
+# One line per request: which route, how long, and the outcome - for
+# finding slow routes. No caller IP, user agent or identity is logged.
+resource "aws_cloudwatch_log_group" "bff_api_access" {
+  name              = "/aws/apigateway/${local.name_prefix}-bff-access"
+  retention_in_days = 14
+}
+
 resource "aws_apigatewayv2_stage" "bff" {
   api_id      = aws_apigatewayv2_api.bff.id
   name        = "$default"
   auto_deploy = true
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.bff_api_access.arn
+    format = jsonencode({
+      requestId          = "$context.requestId"
+      time               = "$context.requestTime"
+      routeKey           = "$context.routeKey"
+      status             = "$context.status"
+      responseLength     = "$context.responseLength"
+      responseLatency    = "$context.responseLatency"
+      integrationLatency = "$context.integrationLatency"
+      integrationStatus  = "$context.integrationStatus"
+      integrationError   = "$context.integrationErrorMessage"
+    })
+  }
 
   default_route_settings {
     detailed_metrics_enabled = true

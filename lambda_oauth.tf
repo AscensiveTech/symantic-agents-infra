@@ -172,8 +172,12 @@ resource "aws_lambda_function" "oauth" {
   runtime       = "nodejs20.x"
   handler       = "index.handler"
   architectures = ["arm64"]
-  memory_size   = 256
-  timeout       = 20
+  # Lambda CPU scales with memory. At 256 MB a cold container's first
+  # request took ~4.3 s (p50) vs ~0.15 s warm, and 59% of requests were cold
+  # because Overview fans out one GET /calendars/connection per agent.
+  # Matches the BFF's size.
+  memory_size = 1024
+  timeout     = 20
 
   filename         = data.archive_file.oauth.output_path
   source_code_hash = data.archive_file.oauth.output_base64sha256
