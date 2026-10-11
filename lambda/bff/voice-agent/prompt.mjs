@@ -312,26 +312,28 @@ function businessInfoSection({ cfg, booking, business }) {
 }
 
 function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
-  if (!cfg.business.coverageAreas.length) return null;
+  if (!cfg.business.hasServiceArea) return null;
   return {
     title: "SERVICE AREA",
     lines: [
-      `When asked where you serve, say: ${cfg.business.serviceAreaSummary}`,
+      cfg.business.serviceAreaSummary
+        ? `When asked where you serve, say: ${cfg.business.serviceAreaSummary}`
+        : "When asked where you serve, say you cover the local area and offer to check their town or postal code.",
       "- Say it as written. Never add to it or read out any other list of towns, counties or ZIP codes.",
       ...(cfg.business.address
-        ? [`- The business itself is at ${cfg.business.address} - that town and ZIP are always covered.`]
+        ? [`- The business itself is at ${cfg.business.address} - that town and postal code are always covered.`]
         : []),
-      `- Whenever the caller asks whether you serve a place, or gives a city, town, county, state, ZIP code, metro `
-        + `area or region for any reason, call ${tool(TOOL.serviceArea)} with it as they said it, including the state `
-        + "or ZIP if given - before you answer. A quick \"Let me check\" while it runs is fine here. Its status decides - "
+      `- Whenever the caller asks whether you serve a place, or gives a city, town, county, state, province, postal or `
+        + `ZIP code, or region for any reason, call ${tool(TOOL.serviceArea)} with it as they said it, including the `
+        + "state, province or postal code if given - before you answer. A quick \"Let me check\" while it runs is fine here. Its status decides - "
         + "never answer coverage from memory or your own sense of geography:",
-      "  - covered: it's in the area. A state covers every place in it; a metro area or region covers its cities, "
-        + "towns, counties and ZIPs even when they aren't listed. A covered town or ZIP doesn't promise every "
-        + "street address, so say the team will confirm the exact address.",
+      "  - covered: it's in the area, even when the place isn't listed by name - a region covers every town in it. A "
+        + "covered town or postal code doesn't promise every street address, so say the team will confirm the exact "
+        + "address.",
       "  - ambiguous: ask exactly its clarificationQuestion, then check again with the answer.",
       "  - unresolved: the place wasn't recognized - likely misheard. Never accept or read it back as real. Ask "
         + "its clarificationQuestion (it offers the closest real place when there is one), then ask them to spell "
-        + "it or give the ZIP. Two tries at most; then move on and reconfirm it later in the call.",
+        + "it or give the postal code. Two tries at most; then move on and reconfirm it later in the call.",
       "  - outside: say it's outside first, then offer - never the other way around: \"We don't currently serve "
         + "[the place] - it's outside our service area. If you'd like, I can take your address and have the team "
         + "review it.\" If they want that, take a message.",
@@ -437,7 +439,7 @@ function bookingFlowSection({ tool, booking, hasOnSiteTypes, cfg }) {
       + "that is, tell them ({{user_number}}). If not, take the one they give.",
     ...(hasOnSiteTypes
       ? ["City (visits at the caller's location only - every time, before checking availability): \"And what "
-        + "city are you in?\"" + (cfg.business.coverageAreas.length ? " Apply SERVICE AREA." : "")]
+        + "city are you in?\"" + (cfg.business.hasServiceArea ? " Apply SERVICE AREA." : "")]
       : []),
     "Preference: \"What day works best, and do you prefer mornings or afternoons?\" This "
       + "narrows the search - it is not a booking.",

@@ -799,16 +799,35 @@ test("a message written with a \"Say It As\" spoken form is saved with the real 
   assert.equal([...messages.values()][0].message, "Wants C.W.R. Solutions to call back about a leak.");
 });
 
-test("service-area.check is reachable through the signed dispatcher and needs no store access", async () => {
+test("service-area.check is reachable through the signed dispatcher and reads zones from the published agent", async () => {
+  const geocodeRequests = [];
   const handler = toolHandler({
-    // No store methods this route could plausibly call are stubbed - any
-    // store access at all would throw and fail this test.
-    store: {},
+    store: createStore({
+      async getAgent() {
+        return {
+          configuration: {
+            businessProfile: {
+              serviceZones: [{ id: "va", type: "place", label: "Virginia", place: { placeType: "Region", countryCode: "USA", regionCode: "VA", regionName: "Virginia" } }],
+            },
+          },
+        };
+      },
+    }),
+    places: {
+      async geocode(request) {
+        geocodeRequests.push(request);
+        return [{
+          PlaceId: "arlington",
+          PlaceType: "Locality",
+          Title: "Arlington, VA, United States",
+          Address: { Country: { Code3: "USA", Name: "United States" }, Region: { Code: "VA", Name: "Virginia" }, SubRegion: { Name: "Arlington" }, Locality: "Arlington" },
+          Position: [-77.10428, 38.88101],
+          MatchScores: { Overall: 1 },
+        }];
+      },
+    },
   });
-  const body = requiredBody({
-    location: "Arlington, VA",
-    serviceAreas: JSON.stringify(["Arlington, VA", "Alexandria, VA"]),
-  });
+  const body = requiredBody({ agentId: "agent-1", location: "Arlington, VA" });
 
   const response = await handler(event("/retell/tools/service-area.check", body));
 
@@ -818,18 +837,23 @@ test("service-area.check is reachable through the signed dispatcher and needs no
     matched: true,
     status: "covered",
     canonicalLocation: {
+      label: "Arlington, VA, United States",
       place: "Arlington",
-      state: "VA",
-      zip: null,
-      county: "Arlington County",
-      metro: "Washington-Arlington-Alexandria, DC-VA-MD-WV",
+      locality: "Arlington",
+      county: "Arlington",
+      region: "Virginia",
+      regionCode: "VA",
+      country: "United States",
+      countryCode: "USA",
+      postalCode: null,
     },
-    matchedBy: "place",
-    matchedArea: "Arlington, VA",
+    matchedBy: "region",
+    matchedArea: "Virginia",
     confidence: "exact",
     message: "That location is within our published service area.",
     clarificationQuestion: "",
   });
+  assert.deepEqual(geocodeRequests.map((request) => request.countries), [["USA"]]);
 });
 
 test("call.transfer matches emergencyRules phrases to a transfer target", async () => {
@@ -1350,8 +1374,10 @@ function toolHandler({
     },
   },
   now = () => new Date("2026-08-16T12:00:00.000Z"),
+  places,
 } = {}) {
   return createHandler({
+    places,
     verifySignature: async (_rawBody, apiKey, value) =>
       apiKey === "retell-key" && value === signature,
     getRetellApiKey: async () => "retell-key",

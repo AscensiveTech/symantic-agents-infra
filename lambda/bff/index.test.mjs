@@ -161,6 +161,10 @@ test("PUT profile keeps holidays, the holidays toggle, contact emails, and servi
     contactEmails: [{ label: "Billing", email: "billing@example.com" }, { label: "no email" }],
     serviceAreas: [" Arlington, VA ", "", 42],
     serviceAreaSummary: `  ${"x".repeat(3100)}`,
+    serviceZones: [
+      { id: "z1", type: "radius", label: "Arlington", center: [-77.1, 38.88], radiusMeters: 20000, unit: "mi", extra: "dropped" },
+      { type: "polygon", coordinates: [[0, 0]] },
+    ],
   }));
 
   assert.equal(response.statusCode, 200);
@@ -173,6 +177,7 @@ test("PUT profile keeps holidays, the holidays toggle, contact emails, and servi
   assert.deepEqual(saved.contactEmails, [{ label: "Billing", email: "billing@example.com" }]);
   assert.deepEqual(saved.serviceAreas, ["Arlington, VA"]);
   assert.equal(saved.serviceAreaSummary, "x".repeat(3000));
+  assert.deepEqual(saved.serviceZones, [{ id: "z1", type: "radius", label: "Arlington", center: [-77.1, 38.88], radiusMeters: 20000, unit: "mi" }]);
 });
 
 test("GET profile ensures the workspace and returns its profile", async () => {
@@ -8701,6 +8706,28 @@ function blocklistStore(overrides = {}) {
     ...overrides,
   };
 }
+
+test("map search routes reach the geo service for a signed-in receptionist workspace", async () => {
+  const { createHandler } = await loadBff();
+  const store = blocklistStore();
+  const searches = [];
+  const geo = {
+    async config() { return { region: "us-east-1", mapStyleUrl: "https://maps.example/style" }; },
+    async search(body) { searches.push(body); return [{ placeId: "p", placeType: "Locality", title: "Silver Spring" }]; },
+    async place() { return null; },
+    async reverse() { return null; },
+  };
+  const handler = createHandler({ getStore: async () => store, geo });
+  const config = await handler(authenticatedEvent("GET", "/workspaces/me/geo/config"));
+  assert.equal(config.statusCode, 200);
+  assert.equal(JSON.parse(config.body).mapStyleUrl, "https://maps.example/style");
+  const search = await handler(authenticatedEvent("POST", "/workspaces/me/geo/search", { text: "Silver" }));
+  assert.equal(search.statusCode, 200);
+  assert.deepEqual(JSON.parse(search.body).results.map((item) => item.title), ["Silver Spring"]);
+  assert.deepEqual(searches, [{ text: "Silver" }]);
+  const missing = await handler(authenticatedEvent("POST", "/workspaces/me/geo/place", { placeId: "poi" }));
+  assert.equal(missing.statusCode, 404);
+});
 
 test("blocked-numbers routes 403 when the premium feature is off", async () => {
   const { createHandler } = await loadBff();

@@ -13,6 +13,8 @@ import {
 import { buildReceptionistConfig, buildReceptionistPrompt, effectiveProfile, legacyDefaultGreeting, looksAppGeneratedPrompt, resolveAllowedInboundCountries, resolveConfiguredVoiceId, resolveGreeting } from "./receptionist.mjs";
 import { inspectVoiceAgent } from "./voice-agent/inspect.mjs";
 import { boundServiceAreas, repairServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./voice-agent/service-areas.mjs";
+import { sanitizeServiceZones } from "./voice-agent/service-zones.mjs";
+import { createGeoService, handleGeoRoute } from "./geo.mjs";
 import { formatCurrentTime, isBusinessHours } from "./business-hours.mjs";
 import {
   PLAN_KEYS,
@@ -282,6 +284,7 @@ function pickProfile(value) {
     ...(typeof value.serviceAreaSummary === "string"
       ? { serviceAreaSummary: value.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT) }
       : {}),
+    ...(Array.isArray(value.serviceZones) ? { serviceZones: sanitizeServiceZones(value.serviceZones) } : {}),
   };
 }
 
@@ -856,6 +859,7 @@ function productForPath(path) {
     "/workspaces/me/knowledge-bases",
     "/workspaces/me/available-numbers",
     "/workspaces/me/most-asked-questions",
+    "/workspaces/me/geo/",
     "/calendars/",
   ].some((prefix) => path.startsWith(prefix))) {
     return "receptionist";
@@ -890,6 +894,7 @@ export function createHandler({
   lookupCrmContext = defaultLookupCrmContext,
   disconnectIntegrations = defaultDisconnectIntegrations,
   emailSenderAddress = process.env.EMAIL_SENDER_ADDRESS,
+  geo = createGeoService(),
 } = {}) {
   // A new handler may be backed by a different store (tests, or a config
   // reload) - don't let the per-container active-legal cache leak across.
@@ -1747,6 +1752,11 @@ export function createHandler({
         }
         await store.ensureWorkspace(workspaceId);
         return json(200, await loadProposalBilling(store, workspaceId));
+      }
+
+      // Map search for the Service Area editor (geo.mjs).
+      if (path.startsWith("/workspaces/me/geo/")) {
+        return await handleGeoRoute({ path, method, body: readBody(event), geo, json, workspaceId });
       }
 
       if (path === "/workspaces/me/blocked-numbers" || path.startsWith("/workspaces/me/blocked-numbers/")) {

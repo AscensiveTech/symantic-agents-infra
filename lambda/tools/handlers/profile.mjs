@@ -13,6 +13,7 @@ const AGENT_PROFILE_FIELDS = [
   "contactEmails",
   "serviceAreas",
   "serviceAreaSummary",
+  "serviceZones",
   "businessHours",
   "hours",
   "holidays",

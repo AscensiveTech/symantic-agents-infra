@@ -403,9 +403,9 @@ test("without booking, the agent says it can't schedule - never that the busines
 test("service area: the tool's status decides, the business's own town is covered, and the tool knows the address", () => {
   const compiled = cascade();
   const area = section(compiled.prompt.text, "SERVICE AREA");
-  assert.match(area, /The business itself is at 10901 Rhode Island Ave, Beltsville, MD 20705 - that town and ZIP are always covered/);
-  assert.match(area, /Whenever the caller asks whether you serve a place, or gives a city, town, county, state, ZIP code, metro\s+area or region for any reason/);
-  assert.match(area, /as they said it, including the state\s+or ZIP if given - before you answer/);
+  assert.match(area, /The business itself is at 10901 Rhode Island Ave, Beltsville, MD 20705 - that town and postal code are always covered/);
+  assert.match(area, /Whenever the caller asks whether you serve a place, or gives a city, town, county, state, province, postal or\s+ZIP code, or region for any reason/);
+  assert.match(area, /as they said it, including the\s+state, province or postal code if given - before you answer/);
   assert.match(area, /never answer coverage from memory or your own sense of geography/);
   // The Gaithersburg call: "couldn't verify", then a contradicting guess.
   assert.match(area, /keep it for the rest of the call - never\s+contradict it/);
@@ -413,7 +413,7 @@ test("service area: the tool's status decides, the business's own town is covere
   assert.match(area, /Until the check has answered, give no coverage answer at all/);
   assert.match(area, /"Still checking, one moment\."/);
   assert.match(area, /Only if the check comes back with an error \(not\s+while it's still running\)/);
-  assert.match(area, /A state covers every place in it; a metro area or region covers its cities,\s+towns, counties and ZIPs even when they aren't listed/);
+  assert.match(area, /covered: it's in the area, even when the place isn't listed by name - a region covers every town in it/);
   assert.match(area, /ambiguous: ask exactly its clarificationQuestion/);
   assert.match(area, /unresolved: the place wasn't recognized/);
   assert.match(area, /outside: say it's outside first, then offer - never the other way around: "We don't currently serve\s+\[the place\] - it's outside our service area\. If you'd like, I can take your address/);
@@ -424,7 +424,31 @@ test("service area: the tool's status decides, the business's own town is covere
   const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
   assert.equal(tool.parameters.properties.businessAddress.const, "10901 Rhode Island Ave, Beltsville, MD 20705");
   assert.equal(tool.parameters.properties.serviceAreas.const, JSON.stringify(CASCADE_PROFILE.serviceAreas));
-  assert.match(tool.parameters.properties.location.description, /as they said it, including the state or ZIP code/);
+  assert.match(tool.parameters.properties.location.description, /as they said it, including the state, province or postal code/);
+});
+
+test("service area: map zones decide coverage, are read at call time, and name the area when the summary is blank", () => {
+  const serviceZones = [
+    { id: "a", type: "place", label: "Montgomery County, MD", place: { placeType: "SubRegion", countryCode: "USA", regionCode: "MD", regionName: "Maryland", subRegionName: "Montgomery" } },
+    { id: "b", type: "radius", label: "Myrtle Beach", center: [-78.88, 33.69], radiusMeters: 40000, unit: "mi", area: { countryCode: "USA", regionCode: "SC" } },
+    { id: "c", type: "polygon", label: "Northern Virginia", coordinates: [[-77.5, 38.6], [-77.0, 38.6], [-77.0, 39.1], [-77.5, 39.1]], area: { countryCode: "USA", regionCode: "VA" } },
+  ];
+  const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [], serviceZones }, booking: false }));
+  const area = section(compiled.prompt.text, "SERVICE AREA");
+  assert.match(area, /When asked where you serve, say: Montgomery County, MD, Myrtle Beach, Northern Virginia/);
+  const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
+  // The zones stay out of the tool definition (and so out of every model turn).
+  assert.equal(tool.parameters.properties.serviceAreas, undefined);
+  assert.ok(!tool.parameters.required.includes("serviceAreas"));
+  // The handler reads the zones with these.
+  for (const field of ["workspaceId", "agentId", "location"]) assert.ok(tool.parameters.required.includes(field), field);
+  assert.doesNotMatch(JSON.stringify(compiled.retell), /-77\.5/);
+  // Zones win over an old text list.
+  const both = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceZones }, booking: false }));
+  assert.equal(both.retell.llm.general_tools.find((item) => item.name === "check_service_area").parameters.properties.serviceAreas, undefined);
+  // Malformed zones are dropped, not compiled.
+  const broken = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [], serviceZones: [{ type: "polygon", coordinates: [[0, 0]] }] }, booking: false }));
+  assert.equal(section(broken.prompt.text, "SERVICE AREA"), null);
 });
 
 test("service area: no configured areas means no tool and no SERVICE AREA section", () => {

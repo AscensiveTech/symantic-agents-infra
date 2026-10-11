@@ -12,6 +12,7 @@
 import { isBusinessHours } from "../business-hours.mjs";
 import { resolveSpokenForms } from "./spoken-forms.mjs";
 import { parseServiceAreaText, repairServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./service-areas.mjs";
+import { sanitizeServiceZones } from "./service-zones.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
 
@@ -37,6 +38,7 @@ export const AGENT_PROFILE_FIELDS = Object.freeze([
   "contactEmails",
   "serviceAreas",
   "serviceAreaSummary",
+  "serviceZones",
   "businessHours",
   "hours",
   "holidays",
@@ -417,12 +419,14 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
 // Service Area has two halves:
 // - serviceAreaSummary ("What Callers Hear"): said word for word when a
 //   caller asks where the business serves. Never a list read aloud.
-// - serviceAreas ("Exact Coverage"): optional; when it has any entry, only
-//   these places count as covered.
-// coverageAreas is what the coverage check uses: Exact Coverage when filled,
-// otherwise the places named in the summary. Never both. Agents saved
-// before the summary existed say their old list, joined.
+// - serviceZones ("Exact Coverage" on the map): places, radius circles and
+//   drawn outlines. When there are any, they alone decide coverage - the
+//   tools Lambda reads them from the published agent at call time.
+// Older profiles hold Exact Coverage as text (serviceAreas); with no zones,
+// that text - or, failing that, the places named in the summary - is sent
+// with the tool as coverageAreas and geocoded at call time, as before.
 function resolveServiceArea(profile) {
+  const serviceZones = sanitizeServiceZones(profile.serviceZones);
   // Not re-capped here: input is capped on save, and an older, longer list
   // must keep working exactly as before.
   // Lists saved before semicolons/colons separated places are re-split.
@@ -431,9 +435,19 @@ function resolveServiceArea(profile) {
   const summaryRaw = typeof profile.serviceAreaSummary === "string"
     ? profile.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT)
     : "";
-  const serviceAreaSummary = summaryRaw || (serviceAreas.length ? serviceAreas.join(", ") : null);
-  const coverageAreas = serviceAreas.length ? serviceAreas : parseServiceAreaText(summaryRaw);
-  return { serviceAreaSummary, serviceAreas, coverageAreas };
+  const zoneNames = serviceZones.map((zone) => zone.label).filter(Boolean);
+  const serviceAreaSummary = summaryRaw
+    || (serviceZones.length ? (zoneNames.length ? zoneNames.join(", ") : null) : (serviceAreas.length ? serviceAreas.join(", ") : null));
+  const coverageAreas = serviceZones.length
+    ? []
+    : serviceAreas.length ? serviceAreas : parseServiceAreaText(summaryRaw);
+  return {
+    serviceAreaSummary,
+    serviceAreas,
+    serviceZones,
+    coverageAreas,
+    hasServiceArea: serviceZones.length > 0 || coverageAreas.length > 0,
+  };
 }
 
 function resolveHolidays(profile) {
