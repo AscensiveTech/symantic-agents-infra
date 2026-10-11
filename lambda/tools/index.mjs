@@ -15,19 +15,6 @@ import { handleServiceArea } from "./handlers/service-area.mjs";
 import { handleTransfer } from "./handlers/transfer.mjs";
 import { createDynamoToolsStore } from "./store.mjs";
 import { resolveSpokenForms, toWrittenDeep } from "./spoken-forms.mjs";
-import { loadGeography } from "./geo/resolver.mjs";
-
-// Load the service-area dataset while the Lambda starts (provisioned
-// instances do this ahead of time), not on a caller's first "do you serve
-// ...?" - loading it inside the request once took past the 10s timeout and
-// left the caller in silence while Retell retried.
-if (process.env.AWS_LAMBDA_FUNCTION_NAME) {
-  try {
-    loadGeography();
-  } catch (error) {
-    console.error("Service-area dataset preload failed; it loads on first use instead", { name: error?.name, message: error?.message });
-  }
-}
 
 const ROUTES = new Set([
   "/retell/tools/calendar.findAppointment",
@@ -79,6 +66,7 @@ export function createHandler({
   getCalendar = getDefaultCalendarAdapter,
   notifyOffice = defaultNotifyOffice,
   now = () => new Date(),
+  places,
 } = {}) {
   return async function handle(event) {
     const method = event?.requestContext?.http?.method;
@@ -139,7 +127,7 @@ export function createHandler({
 
     try {
       const store = await getStore();
-      const context = { store, notifyOffice, now };
+      const context = { store, notifyOffice, now, ...(places ? { places } : {}) };
       // "Say It As" pronunciations: the agent speaks a name the way it's
       // pronounced ("See Double-You Are") and can write it that way in a
       // message or lead too - store the real word ("C.W.R.") instead.
@@ -159,7 +147,7 @@ export function createHandler({
       } else if (path === "/retell/tools/call.transfer") {
         result = await handleTransfer(input, context);
       } else if (path === "/retell/tools/service-area.check") {
-        result = await handleServiceArea(input);
+        result = await handleServiceArea(input, context);
       } else {
         const calendar = await getCalendar();
         const calendarContext = { ...context, calendar };

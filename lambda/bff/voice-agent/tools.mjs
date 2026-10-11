@@ -170,33 +170,32 @@ const CORE_TOOLS = [
   },
 ];
 
-// Only registered when the business has configured a service area - the
-// whole list travels with the tool definition as a `const` property, the
-// same way workspaceId/agentId/callId are baked in. No database access at
-// call time; the tools Lambda resolves places against a local Census
-// dataset (lambda/tools/geo/) and returns a status the prompt follows.
-function serviceAreaTool(serviceAreas, businessAddress) {
+// Only registered when the business has a service area. Map zones are read
+// by the tools Lambda from the published agent at call time (a drawn outline
+// is too big to put in a tool definition the model sees every turn); only an
+// older text list travels with the tool as a `const`.
+function serviceAreaTool(business) {
   return {
     name: TOOL.serviceArea,
     kind: "webhook",
     path: "/retell/tools/service-area.check",
     description:
       "Decide whether a place the caller named is inside the service area. Call it before answering whenever the "
-      + "caller asks whether a place is served, or gives a city, town, county, state, ZIP code, metro area or region "
-      + "for any reason. Returns status covered, outside, ambiguous or unresolved.",
+      + "caller asks whether a place is served, or gives a city, town, county, state, province, postal or ZIP code, "
+      + "or region for any reason. Returns status covered, outside, ambiguous or unresolved.",
     // Said while the check runs (generated in the call's language).
     executionMessage: "Tell the caller in a few words that you're checking, e.g. \"Let me check that for you.\"",
     properties: {
       location: {
         type: "string",
-        description: "The caller's location as they said it, including the state or ZIP code if they gave one "
-          + "(\"Silver Spring, Maryland\", \"20910\", \"Arlington\").",
+        description: "The caller's location as they said it, including the state, province or postal code if they "
+          + "gave one (\"Silver Spring, Maryland\", \"20910\", \"Manchester M1\").",
       },
-      serviceAreas: { type: "string", const: JSON.stringify(serviceAreas) },
+      ...(business.coverageAreas.length ? { serviceAreas: { type: "string", const: JSON.stringify(business.coverageAreas) } } : {}),
       // The business's own town is always covered.
-      ...(businessAddress ? { businessAddress: { type: "string", const: businessAddress } } : {}),
+      ...(business.address ? { businessAddress: { type: "string", const: business.address } } : {}),
     },
-    required: ["location", "serviceAreas"],
+    required: ["location"],
     speakable: "Whether the place is covered, the clarificationQuestion to ask, or the outside message.",
     internal: "matchedBy, matchedArea, confidence and canonicalLocation - never read them out.",
   };
@@ -222,9 +221,9 @@ export function buildToolPlan(cfg) {
   const tools = [
     ...(cfg.scheduling.enabled ? CALENDAR_TOOLS : []),
     ...CORE_TOOLS,
-    // Exact Coverage when filled, otherwise the places in the summary - see
-    // resolveServiceArea in configuration.mjs.
-    ...(cfg.business.coverageAreas.length ? [serviceAreaTool(cfg.business.coverageAreas, cfg.business.address)] : []),
+    // Map zones, or an older text list - see resolveServiceArea in
+    // configuration.mjs.
+    ...(cfg.business.hasServiceArea ? [serviceAreaTool(cfg.business)] : []),
     // If transfers are not allowed there are no rules here at all, so no
     // transfer tool exists - a guarantee rather than a prompt instruction
     // the model could ignore.

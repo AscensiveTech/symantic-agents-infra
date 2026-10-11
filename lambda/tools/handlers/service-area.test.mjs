@@ -1,275 +1,124 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { OUTSIDE_MESSAGE } from "../geo/resolver.mjs";
+import { OUTSIDE_MESSAGE } from "../geo/coverage.mjs";
+import { item, PLACES, ZONES } from "../geo/test-fixtures.mjs";
 import { handleServiceArea } from "./service-area.mjs";
 
-function input(overrides = {}) {
+const BUSINESS_ADDRESS = "10901 Rhode Island Ave, Beltsville, MD 20705";
+const BUSINESS = item({
+  type: "PointAddress",
+  title: BUSINESS_ADDRESS,
+  region: ["MD", "Maryland"],
+  subRegion: "Prince George's",
+  locality: "Beltsville",
+  postalCode: "20705",
+  position: [-76.9286, 39.0348],
+});
+
+// Fake Amazon Location: answers by query text, records every request.
+function fakePlaces(answers) {
+  const calls = [];
   return {
-    location: "Arlington, VA",
-    serviceAreas: JSON.stringify(["Arlington, VA", "Alexandria, VA", "22201"]),
-    ...overrides,
+    calls,
+    async geocode(request) {
+      calls.push(request);
+      const answer = answers[request.text];
+      if (answer instanceof Error) throw answer;
+      return (answer ?? []).slice(0, request.maxResults ?? 5);
+    },
   };
 }
 
-const check = (location, serviceAreas, businessAddress) =>
-  handleServiceArea({ location, serviceAreas: JSON.stringify(serviceAreas), ...(businessAddress ? { businessAddress } : {}) });
+function storeWith({ configuration = {}, pendingConfiguration, workspaceProfile = {} } = {}) {
+  return {
+    async getAgent() {
+      return { agentId: "agent-1", configuration, ...(pendingConfiguration ? { pendingConfiguration } : {}) };
+    },
+    async getBusinessProfile() {
+      return workspaceProfile;
+    },
+  };
+}
 
-// --- existing exact matching keeps working -----------------------------------
+const call = (location, { store, places, ...input } = {}) =>
+  handleServiceArea({ workspaceId: "ws-1", agentId: "agent-1", location, ...input }, { store, places });
 
-test("exact city match", async () => {
-  const result = await handleServiceArea(input({ location: "Alexandria, VA" }));
-  assert.equal(result.matched, true);
-  assert.equal(result.ok, true);
-  assert.equal(result.status, "covered");
-  assert.equal(result.matchedBy, "place");
-  assert.equal(result.confidence, "exact");
-  assert.equal(result.matchedArea, "Alexandria, VA");
+test("zones come from the agent's published configuration, not the autosaved draft", async () => {
+  const store = storeWith({
+    configuration: { businessProfile: { address: BUSINESS_ADDRESS, serviceZones: [ZONES.montgomeryCounty] } },
+    pendingConfiguration: { businessProfile: { serviceZones: [ZONES.virginia] } },
+  });
+  const places = fakePlaces({ [BUSINESS_ADDRESS]: [BUSINESS], "Silver Spring": [PLACES.silverSpringMd, PLACES.silverSpringPa] });
+  const response = await call("Silver Spring", { store, places });
+  assert.equal(response.status, "covered");
+  assert.equal(response.matchedArea, "Montgomery County, MD");
+  assert.equal(response.canonicalLocation.region, "Maryland");
 });
 
-test("case and whitespace insensitive", async () => {
-  const result = await handleServiceArea(input({ location: "  ARLINGTON,   va " }));
-  assert.equal(result.matched, true);
+test("the caller's words are geocoded near the business, within the countries it serves", async () => {
+  const store = storeWith({
+    configuration: { language: "es-419", businessProfile: { address: BUSINESS_ADDRESS, serviceZones: [ZONES.montgomeryCounty, ZONES.northernVirginia] } },
+  });
+  const places = fakePlaces({ [BUSINESS_ADDRESS]: [BUSINESS], "Arlington": [PLACES.arlingtonVa] });
+  await call("Arlington", { store, places });
+  const request = places.calls.find((entry) => entry.text === "Arlington");
+  assert.deepEqual(request.biasPosition, [-76.9286, 39.0348]);
+  assert.deepEqual(request.countries, ["USA"]);
+  assert.equal(request.language, "es");
 });
 
-test("caller phrasing with extra words around a listed city still matches (whole-word)", async () => {
-  const result = await handleServiceArea(input({ location: "I'm calling from near Arlington today" }));
-  assert.equal(result.matched, true);
-  assert.equal(result.canonicalLocation.state, "VA");
+test("the business's own town and postal code are always covered", async () => {
+  const store = storeWith({ configuration: { businessProfile: { address: BUSINESS_ADDRESS, serviceZones: [ZONES.virginia] } } });
+  const beltsville = item({ title: "Beltsville, MD, United States", region: ["MD", "Maryland"], subRegion: "Prince George's", locality: "Beltsville", position: [-76.907, 39.03], mapView: [-76.95, 39.0, -76.86, 39.07] });
+  const zip = item({ type: "PostalCode", title: "20705, Beltsville, MD, United States", region: ["MD", "Maryland"], locality: "Beltsville", postalCode: "20705", position: [-76.92, 39.04] });
+  const places = fakePlaces({ [BUSINESS_ADDRESS]: [BUSINESS], Beltsville: [beltsville], "20705": [zip], Baltimore: [PLACES.baltimore] });
+  for (const location of ["Beltsville", "20705"]) {
+    const response = await call(location, { store, places });
+    assert.equal(response.status, "covered", location);
+    assert.equal(response.matchedBy, "business_location", location);
+  }
+  assert.equal((await call("Baltimore", { store, places })).status, "outside");
 });
 
-test("a listed city that's a substring of another word does not false-positive", async () => {
-  // "Arlington" must not match inside an unrelated longer word.
-  const result = await handleServiceArea(input({ location: "Darlingtonville" }));
-  assert.equal(result.matched, false);
-  assert.equal(result.status, "unresolved");
+test("an agent published before map zones existed: its text list is geocoded and still works", async () => {
+  const store = storeWith({ configuration: { businessProfile: { serviceAreas: ["Maryland", "Capitol Hill"] } } });
+  const places = fakePlaces({
+    Maryland: [PLACES.maryland],
+    "Capitol Hill": [item({ type: "PointOfInterest", title: "Capitol Hill Bistro", region: ["DC", "District of Columbia"], position: [-77.0, 38.89] })],
+    "Silver Spring": [PLACES.silverSpringMd],
+    "Capitol Hill please": [],
+    "Richmond, VA": [PLACES.richmondVa],
+  });
+  const serviceAreas = JSON.stringify(["Maryland", "Capitol Hill"]);
+  assert.equal((await call("Silver Spring", { store, places, serviceAreas })).status, "covered");
+  // Not a place the map knows - matched by the words, as before.
+  assert.equal((await call("Capitol Hill please", { store, places, serviceAreas })).matchedArea, "Capitol Hill");
+  const outside = await call("Richmond, VA", { store, places, serviceAreas });
+  assert.equal(outside.status, "outside");
+  assert.equal(outside.message, OUTSIDE_MESSAGE);
 });
 
-test("ZIP exact match", async () => {
-  const result = await handleServiceArea(input({ location: "22201" }));
-  assert.equal(result.matched, true);
-  assert.equal(result.matchedBy, "zip");
-  assert.equal(result.canonicalLocation.zip, "22201");
+test("map zones replace an older text list", async () => {
+  const store = storeWith({ configuration: { businessProfile: { serviceZones: [ZONES.virginia] } } });
+  const places = fakePlaces({ "Silver Spring": [PLACES.silverSpringMd] });
+  const response = await call("Silver Spring", { store, places, serviceAreas: JSON.stringify(["Maryland"]) });
+  assert.equal(response.status, "outside");
+  assert.ok(!places.calls.some((entry) => entry.text === "Maryland"));
 });
 
-test("ZIP+4 on the configured side still matches the caller's plain 5-digit ZIP", async () => {
-  const result = await handleServiceArea(input({ location: "22201", serviceAreas: JSON.stringify(["22201-1234"]) }));
-  assert.equal(result.matched, true);
+test("malformed zones are skipped rather than failing the call", async () => {
+  const store = storeWith({ configuration: { businessProfile: { serviceZones: [{ type: "polygon", coordinates: [[0, 0]] }, null, ZONES.maryland] } } });
+  const places = fakePlaces({ Baltimore: [PLACES.baltimore] });
+  assert.equal((await call("Baltimore", { store, places })).status, "covered");
 });
 
-test("ZIP+4 spoken by the caller matches its five-digit base", async () => {
-  const result = await handleServiceArea(input({ location: "22201-1234", serviceAreas: JSON.stringify(["22201"]) }));
-  assert.equal(result.matched, true);
-  assert.equal(result.matchedBy, "zip");
-  assert.equal(result.canonicalLocation.zip, "22201");
+test("a failed lookup is an error, never a guess", async () => {
+  const store = storeWith({ configuration: { businessProfile: { serviceZones: [ZONES.maryland] } } });
+  const places = fakePlaces({ Baltimore: Object.assign(new Error("throttled"), { name: "ThrottlingException" }) });
+  await assert.rejects(() => call("Baltimore", { store, places }), /throttled/);
 });
 
 test("location is required", async () => {
-  await assert.rejects(
-    () => handleServiceArea({ serviceAreas: JSON.stringify(["Arlington, VA"]) }),
-    /location is required/,
-  );
-});
-
-test("malformed serviceAreas JSON is treated as an empty list, not a crash", async () => {
-  const result = await handleServiceArea({ location: "Arlington, VA", serviceAreas: "not json" });
-  assert.equal(result.matched, false);
-});
-
-test("the business's own town and ZIP are always covered", async () => {
-  const businessAddress = "10901 Rhode Island Ave, Beltsville, MD 20705";
-  const serviceAreas = ["Charleston, SC"];
-  const town = await check("Beltsville", serviceAreas, businessAddress);
-  assert.equal(town.status, "covered");
-  assert.equal(town.matchedBy, "business_location");
-  assert.equal((await check("20705", serviceAreas, businessAddress)).matchedBy, "business_location");
-  // The street number is not mistaken for the ZIP.
-  assert.equal((await check("10901", serviceAreas, businessAddress)).matched, false);
-  // Agents published before businessAddress existed still work.
-  assert.equal((await check("Beltsville", serviceAreas)).matched, false);
-});
-
-// --- states ------------------------------------------------------------------
-
-test("a state entry covers places given with that state's name or abbreviation", async () => {
-  const serviceAreas = ["Maryland", "Northern Virginia", "Washington DC"];
-  for (const location of ["Beltsville, MD", "Beltsville, Maryland", "Beltsville MD 20705"]) {
-    assert.equal((await check(location, serviceAreas)).matched, true, location);
-  }
-});
-
-test("a configured whole state covers an unlisted town in it", async () => {
-  const result = await check("Hagerstown", ["Maryland"]);
-  assert.equal(result.status, "covered");
-  assert.equal(result.matchedBy, "state");
-  assert.equal(result.canonicalLocation.state, "MD");
-});
-
-test("Virginia does not match West Virginia, Washington DC is not Washington state, and 'in' is not Indiana", async () => {
-  const wv = await check("Morgantown, West Virginia", ["Virginia"]);
-  assert.equal(wv.status, "outside");
-  assert.equal(wv.canonicalLocation.state, "WV");
-  const wa = await check("Seattle, Washington", ["Washington DC"]);
-  assert.equal(wa.status, "outside");
-  assert.equal(wa.canonicalLocation.state, "WA");
-  const dc = await check("Washington, D.C.", ["Washington State"]);
-  assert.equal(dc.status, "outside");
-  assert.equal(dc.canonicalLocation.state, "DC");
-  assert.equal((await check("calling in from Ohio", ["IN"])).matched, false);
-  assert.equal((await check("Muncie IN", ["Indiana"])).matched, true);
-});
-
-// --- Silver Spring --------------------------------------------------------------
-
-test("Silver Spring is covered by the Washington DC metro area", async () => {
-  const result = await check("Silver Spring", ["Washington DC metro area"]);
-  assert.equal(result.status, "covered");
-  assert.equal(result.matchedBy, "metro");
-  assert.equal(result.matchedArea, "Washington DC metro area");
-  assert.equal(result.confidence, "contextual");
-  assert.deepEqual(result.canonicalLocation, {
-    place: "Silver Spring",
-    state: "MD",
-    zip: null,
-    county: "Montgomery County",
-    metro: "Washington-Arlington-Alexandria, DC-VA-MD-WV",
-  });
-});
-
-test("Silver Spring is covered by Maryland; 'Silver Spring, MD', 'Silver Spring Maryland' and 20910 resolve to the same place", async () => {
-  assert.equal((await check("Silver Spring", ["Maryland"])).status, "covered");
-  const exact = await check("Silver Spring, MD", ["MD"]);
-  assert.equal(exact.status, "covered");
-  assert.equal(exact.confidence, "exact");
-  for (const location of ["Silver Spring, MD", "Silver Spring Maryland", "20910"]) {
-    const result = await check(location, ["Washington D.C. Metro area"]);
-    assert.equal(result.status, "covered", location);
-    assert.equal(result.canonicalLocation.place, "Silver Spring", location);
-    assert.equal(result.canonicalLocation.state, "MD", location);
-    assert.equal(result.canonicalLocation.county, "Montgomery County", location);
-  }
-});
-
-test("a metro area covers an unlisted suburb in a member county", async () => {
-  // Leesburg is in Loudoun County, part of the Washington metro area.
-  const result = await check("Leesburg, VA", ["DC metro area"]);
-  assert.equal(result.status, "covered");
-  assert.equal(result.matchedBy, "metro");
-  assert.equal(result.canonicalLocation.county, "Loudoun County");
-});
-
-// --- named regions ------------------------------------------------------------------
-
-test("Arlington, VA is in Northern Virginia, and a state-less Alexandria is too when context makes it unambiguous", async () => {
-  const arlington = await check("Arlington, VA", ["Northern Virginia"]);
-  assert.equal(arlington.status, "covered");
-  assert.equal(arlington.matchedBy, "region");
-  const alexandria = await check("Alexandria", ["NoVA"]);
-  assert.equal(alexandria.status, "covered");
-  assert.equal(alexandria.confidence, "contextual");
-  assert.equal(alexandria.canonicalLocation.state, "VA");
-  assert.equal((await check("Fairfax", ["North Virginia"])).status, "covered");
-});
-
-test("San Diego is in Southern California and San Francisco in Northern California (documented defaults)", async () => {
-  assert.equal((await check("San Diego", ["Southern California"])).status, "covered");
-  assert.equal((await check("San Diego", ["SoCal"])).status, "covered");
-  assert.equal((await check("San Diego", ["Northern California"])).status, "outside");
-  assert.equal((await check("San Francisco", ["Northern California"])).status, "covered");
-  assert.equal((await check("San Francisco", ["NorCal"])).status, "covered");
-  assert.equal((await check("San Francisco", ["South California"])).status, "outside");
-});
-
-test("an Ohio city is in the Midwest and a Pennsylvania city in the Northeast, however the region is spelled", async () => {
-  for (const region of ["Midwest", "Mid West", "midwestern US"]) {
-    assert.equal((await check("Columbus, Ohio", [region])).status, "covered", region);
-  }
-  for (const region of ["Northeast", "North East"]) {
-    const result = await check("Scranton, PA", [region]);
-    assert.equal(result.status, "covered", region);
-    assert.equal(result.matchedBy, "region");
-  }
-});
-
-test("Mid-Atlantic, East Coast and West Coast follow the registry", async () => {
-  for (const region of ["Mid Atlantic", "Mid-Atlantic", "Middle Atlantic"]) {
-    assert.equal((await check("Baltimore, MD", [region])).status, "covered", region);
-  }
-  assert.equal((await check("Savannah, GA", ["East Coast"])).status, "covered");
-  assert.equal((await check("Portland, OR", ["West Coast"])).status, "covered");
-  assert.equal((await check("Denver, CO", ["West Coast"])).status, "outside");
-});
-
-// --- ambiguity, unresolved, outside -------------------------------------------------
-
-test("a genuinely ambiguous state-less city asks for the state or ZIP", async () => {
-  // Arlington, VA is covered; Arlington, TX is where the business is.
-  const result = await check("Arlington", ["Northern Virginia"], "100 Main St, Dallas, TX 75201");
-  assert.equal(result.status, "ambiguous");
-  assert.equal(result.matched, false);
-  assert.equal(result.confidence, "ambiguous");
-  assert.equal(result.clarificationQuestion, "Which state is that in, or what's the ZIP code?");
-  assert.equal(result.matchedBy, null);
-});
-
-test("a place only partly inside the area asks for the ZIP", async () => {
-  const result = await check("Kansas City, MO", ["Jackson County, MO"]);
-  assert.equal(result.status, "ambiguous");
-  assert.equal(result.clarificationQuestion, "What's the ZIP code there?");
-});
-
-test("an unknown or mangled place is unresolved - never covered by guessing", async () => {
-  for (const location of ["Blorpville", "Flibbertown", "the place by the lake"]) {
-    const result = await check(location, ["Maryland", "Washington DC metro area"]);
-    assert.equal(result.status, "unresolved", location);
-    assert.equal(result.matched, false, location);
-    assert.equal(result.matchedBy, null, location);
-    assert.ok(result.clarificationQuestion, location);
-  }
-});
-
-test("a likely mishearing of a nearby place offers the real place instead of an answer", async () => {
-  const plural = await check("Silver Springs", ["Maryland"]);
-  assert.equal(plural.status, "ambiguous");
-  assert.equal(plural.suggestion, "Silver Spring, MD");
-  assert.match(plural.clarificationQuestion, /^Did you mean Silver Spring, Maryland\?/);
-  const typo = await check("Gaithersberg", ["Montgomery County, MD"]);
-  assert.equal(typo.status, "unresolved");
-  assert.equal(typo.clarificationQuestion, "Sorry, did you say Gaithersburg?");
-});
-
-test("an outside location is said to be outside first, then the address is offered to the team", async () => {
-  const result = await check("Seattle, WA", ["Arlington, VA", "Alexandria, VA", "22201"]);
-  assert.equal(result.status, "outside");
-  assert.equal(result.matched, false);
-  assert.equal(result.message, OUTSIDE_MESSAGE);
-  assert.equal(result.message, "We don't currently serve that area - it's outside our service area. If you'd like, I can take your address and have the team review it.");
-  // The "outside" statement comes before the offer.
-  assert.ok(result.message.indexOf("outside our service area") < result.message.indexOf("take your address"));
-  assert.equal(result.clarificationQuestion, "");
-});
-
-test("the screenshot configuration: comma-split entries, Charleston resolved to South Carolina", async () => {
-  const serviceAreas = ["Washington D.C. Metro area", "Maryland", "Northern Virginia", "Washington DC", "Charleston",
-    "South Carolina and surrounding areas"];
-  const businessAddress = "10901 Rhode Island Ave, Beltsville, MD 20705";
-  for (const location of ["Silver Spring", "Rockville", "Arlington", "Georgetown, DC", "Mount Pleasant, SC", "Charleston"]) {
-    assert.equal((await check(location, serviceAreas, businessAddress)).status, "covered", location);
-  }
-  assert.equal((await check("Charleston, West Virginia", serviceAreas, businessAddress)).status, "outside");
-  assert.equal((await check("Richmond, VA", serviceAreas, businessAddress)).status, "outside");
-});
-
-test("one 'City, State and surrounding areas' entry (the wizard's new comma handling) covers that metro area", async () => {
-  const serviceAreas = ["Charleston, South Carolina and surrounding areas"];
-  const suburb = await check("Summerville, SC", serviceAreas);
-  assert.equal(suburb.status, "covered");
-  assert.equal(suburb.matchedBy, "metro");
-  assert.equal((await check("Columbia, SC", serviceAreas)).status, "outside");
-});
-
-test("a configured entry the dataset doesn't know still matches the same words", async () => {
-  const result = await check("Capitol Hill", ["Capitol Hill"]);
-  assert.equal(result.status, "covered");
-  assert.equal(result.matchedArea, "Capitol Hill");
+  await assert.rejects(() => handleServiceArea({ workspaceId: "ws-1" }, { store: storeWith(), places: fakePlaces({}) }), /location is required/);
 });
