@@ -82,6 +82,9 @@ test("a picked place is fetched for storage and turned into zone fields", async 
     mapView: [-77.52745, 38.93443, -76.88783, 39.35414],
   });
   assert.equal(toZonePlace({ ...MONTGOMERY, PlaceType: "PointOfInterest" }), null);
+  // An address can't be a place zone, but its position can center a radius.
+  const address = await createGeoService({ send: fakeSend({ GetPlace: { PlaceId: "a", PlaceType: "PointAddress", Title: "10901 Rhode Island Ave, Beltsville, MD 20705", Position: [-76.93, 39.03] } }).send }).place({ placeId: "a" });
+  assert.deepEqual(address, { label: "10901 Rhode Island Ave, Beltsville, MD 20705", place: null, position: [-76.93, 39.03], mapView: null });
   // A terse Title ("MD, United States") is replaced by the spelled-out name.
   assert.equal(toZonePlace({ PlaceId: "md", PlaceType: "Region", Title: "MD, United States", Address: { Country: { Code3: "USA", Name: "United States" }, Region: { Code: "MD", Name: "Maryland" } } }).label, "Maryland, United States");
 });

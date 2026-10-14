@@ -133,7 +133,9 @@ export function createGeoService({
       IntendedUse: "Storage",
       ...(language ? { Language: language } : {}),
     });
-    return toZonePlace(response);
+    // An address (or anything that isn't an area) can't be a place zone, but
+    // its position can center a radius.
+    return toZonePlace(response) ?? toPoint(response);
   }
 
   async function reverse({ position, language }) {
@@ -200,6 +202,17 @@ function zoneLabel(placeType, address) {
   return parts?.[0] ? parts.filter(Boolean).join(", ") : "";
 }
 
+// A street address or point: where it is, with no zone fields.
+function toPoint(item) {
+  if (!item || !isPosition(item.Position)) return null;
+  return {
+    label: item.Title ?? item.Address?.Label ?? "",
+    place: null,
+    position: item.Position,
+    mapView: Array.isArray(item.MapView) && item.MapView.length === 4 ? item.MapView : null,
+  };
+}
+
 function isPosition(value) {
   return Array.isArray(value) && value.length === 2 && value.every(Number.isFinite)
     && Math.abs(value[0]) <= 180 && Math.abs(value[1]) <= 90;
@@ -240,7 +253,7 @@ export async function handleGeoRoute({ path, method, body, geo, json, workspaceI
     }
     if (path === "/workspaces/me/geo/place" && method === "POST") {
       const result = await geo.place(body ?? {});
-      return result ? json(200, result) : json(404, { message: "That place can't be used as a service area" });
+      return result ? json(200, result) : json(404, { message: "That place couldn't be found on the map" });
     }
     if (path === "/workspaces/me/geo/reverse" && method === "POST") {
       const result = await geo.reverse(body ?? {});
