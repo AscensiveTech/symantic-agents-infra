@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createGeoService, createRateLimiter, handleGeoRoute, toZonePlace } from "./geo.mjs";
-import { MAX_POLYGON_VERTICES, MAX_RADIUS_METERS, MAX_ZONES, sanitizeServiceZones } from "./voice-agent/service-zones.mjs";
+import { formatDistance, MAX_POLYGON_VERTICES, MAX_RADIUS_METERS, MAX_ZONES, sanitizeServiceZones, spokenZoneName } from "./voice-agent/service-zones.mjs";
 
 function fakeSend(responses) {
   const calls = [];
@@ -65,7 +65,7 @@ test("a picked place is fetched for storage and turned into zone fields", async 
   const result = await createGeoService({ send }).place({ placeId: "montgomery" });
   assert.equal(calls[0].input.IntendedUse, "Storage");
   assert.deepEqual(result, {
-    label: "Montgomery, Maryland",
+    label: "Montgomery County, Maryland",
     place: {
       placeId: "montgomery",
       placeType: "SubRegion",
@@ -82,6 +82,14 @@ test("a picked place is fetched for storage and turned into zone fields", async 
     mapView: [-77.52745, 38.93443, -76.88783, 39.35414],
   });
   assert.equal(toZonePlace({ ...MONTGOMERY, PlaceType: "PointOfInterest" }), null);
+  // An address can't be a place zone, but its position can center a radius.
+  const address = await createGeoService({ send: fakeSend({ GetPlace: { PlaceId: "a", PlaceType: "PointAddress", Title: "10901 Rhode Island Ave, Beltsville, MD 20705", Position: [-76.93, 39.03] } }).send }).place({ placeId: "a" });
+  assert.deepEqual(address, { label: "10901 Rhode Island Ave, Beltsville, MD 20705", place: null, position: [-76.93, 39.03], mapView: null });
+  // US counties say what they are; Louisiana parishes and other countries' names as given.
+  const county = (name, code, country = "USA") => toZonePlace({ PlaceId: "c", PlaceType: "SubRegion", Title: name, Address: { Country: { Code3: country, Name: "X" }, Region: { Code: code, Name: "R" }, SubRegion: { Name: name } } }).label;
+  assert.equal(county("Orleans", "LA"), "Orleans Parish, R");
+  assert.equal(county("Baltimore (City)", "MD"), "Baltimore (City), R");
+  assert.equal(county("Lancashire", "ENG", "GBR"), "Lancashire, R");
   // A terse Title ("MD, United States") is replaced by the spelled-out name.
   assert.equal(toZonePlace({ PlaceId: "md", PlaceType: "Region", Title: "MD, United States", Address: { Country: { Code3: "USA", Name: "United States" }, Region: { Code: "MD", Name: "Maryland" } } }).label, "Maryland, United States");
 });
@@ -160,4 +168,16 @@ test("map search is rate limited per workspace; the map config never is", async 
   assert.equal((await call("/workspaces/me/geo/config", "ws-a", "GET")).statusCode, 200);
   clock = 1001;
   assert.equal((await call("/workspaces/me/geo/search", "ws-a")).statusCode, 200);
+});
+
+test("a zone is spoken with a radius's distance; placeholder outline names say nothing", () => {
+  assert.equal(spokenZoneName({ type: "place", label: "Montgomery County, Maryland", place: {} }), "Montgomery County, Maryland");
+  assert.equal(spokenZoneName({ type: "radius", label: "Silver Spring", radiusMeters: 16093, unit: "mi" }), "within 10 miles of Silver Spring");
+  assert.equal(spokenZoneName({ type: "radius", label: "Lyon", radiusMeters: 2500, unit: "km" }), "within 2.5 km of Lyon");
+  assert.equal(spokenZoneName({ type: "polygon", label: "Northern Virginia" }), "Northern Virginia");
+  assert.equal(spokenZoneName({ type: "polygon", label: "Drawn area 2" }), "");
+  assert.equal(spokenZoneName({ type: "radius", label: "" }), "");
+  assert.equal(formatDistance(1609, "mi"), "1 mile");
+  assert.equal(formatDistance(40234, "mi"), "25 miles");
+  assert.equal(formatDistance(500_000, "km"), "500 km");
 });

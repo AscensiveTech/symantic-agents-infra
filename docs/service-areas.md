@@ -141,8 +141,14 @@ prompt then says the team will confirm coverage. It never guesses.
 ## Older text lists
 
 Before zones, Exact Coverage was a text list (`serviceAreas`). When there are
-no zones, coverage comes from that list, or failing that, from the places
-named in What Callers Hear. These entries are geocoded at call time.
+no zones, coverage comes from that list, and those entries are geocoded at
+call time. The retired What Callers Hear text (`serviceAreaSummary`) is never
+read, for coverage or for what callers hear. When asked where the business
+serves, the receptionist names the zones (a radius with its distance, "within
+10 miles of Silver Spring"; unnamed or placeholder-named drawn areas are
+skipped) or the older list. An agent with a radius may state that radius if
+asked how far the business goes, but never estimates a caller's distance or
+drive time.
 Entries that resolve to a real area are used as named places. Others, such as
 "DC metro area", are kept as words: a caller saying exactly those words is
 covered.

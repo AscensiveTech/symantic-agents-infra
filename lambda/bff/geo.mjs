@@ -133,7 +133,9 @@ export function createGeoService({
       IntendedUse: "Storage",
       ...(language ? { Language: language } : {}),
     });
-    return toZonePlace(response);
+    // An address (or anything that isn't an area) can't be a place zone, but
+    // its position can center a radius.
+    return toZonePlace(response) ?? toPoint(response);
   }
 
   async function reverse({ position, language }) {
@@ -191,13 +193,35 @@ function zoneLabel(placeType, address) {
   const parts = {
     Country: [country],
     Region: [region, country],
-    SubRegion: [address.SubRegion?.Name, region],
+    SubRegion: [usCountyName(address), region],
     Locality: [address.Locality, region ?? country],
     District: [address.District, address.Locality ?? region],
     SubDistrict: [address.SubDistrict ?? address.District, address.Locality ?? region],
     PostalCode: [address.PostalCode, address.Locality ?? region],
   }[placeType];
   return parts?.[0] ? parts.filter(Boolean).join(", ") : "";
+}
+
+// Amazon names a US county by its bare name ("Montgomery"), which on a call
+// sounds like the city. US counties get their kind back: County, or Parish in
+// Louisiana and Borough in Alaska. Independent cities ("Baltimore (City)")
+// and other countries keep their names as given.
+function usCountyName(address) {
+  const name = address.SubRegion?.Name;
+  if (!name || address.Country?.Code3 !== "USA" || /\(|\b(county|parish|borough|census area|municipality)$/i.test(name)) return name;
+  const kind = address.Region?.Code === "LA" ? "Parish" : address.Region?.Code === "AK" ? "Borough" : "County";
+  return `${name} ${kind}`;
+}
+
+// A street address or point: where it is, with no zone fields.
+function toPoint(item) {
+  if (!item || !isPosition(item.Position)) return null;
+  return {
+    label: item.Title ?? item.Address?.Label ?? "",
+    place: null,
+    position: item.Position,
+    mapView: Array.isArray(item.MapView) && item.MapView.length === 4 ? item.MapView : null,
+  };
 }
 
 function isPosition(value) {
@@ -240,7 +264,7 @@ export async function handleGeoRoute({ path, method, body, geo, json, workspaceI
     }
     if (path === "/workspaces/me/geo/place" && method === "POST") {
       const result = await geo.place(body ?? {});
-      return result ? json(200, result) : json(404, { message: "That place can't be used as a service area" });
+      return result ? json(200, result) : json(404, { message: "That place couldn't be found on the map" });
     }
     if (path === "/workspaces/me/geo/reverse" && method === "POST") {
       const result = await geo.reverse(body ?? {});

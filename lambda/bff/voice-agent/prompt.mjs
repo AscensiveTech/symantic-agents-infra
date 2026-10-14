@@ -316,10 +316,10 @@ function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
   return {
     title: "SERVICE AREA",
     lines: [
-      cfg.business.serviceAreaSummary
-        ? `When asked where you serve, say: ${cfg.business.serviceAreaSummary}`
+      cfg.business.serviceAreaNames.length
+        ? `When asked where you serve, say you cover ${cfg.business.serviceAreaNames.join("; ")} - then offer to check `
+          + "their town or postal code. Name only these, in natural speech - never list the towns, counties or ZIP codes inside them."
         : "When asked where you serve, say you cover the local area and offer to check their town or postal code.",
-      "- Say it as written. Never add to it or read out any other list of towns, counties or ZIP codes.",
       ...(cfg.business.address
         ? [`- The business itself is at ${cfg.business.address} - that town and postal code are always covered.`]
         : []),
@@ -341,7 +341,10 @@ function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
         + "running, just say \"Still checking, one moment.\" Once it has answered for a place, give that answer and "
         + "keep it for the rest of the call - never contradict it. Only if the check comes back with an error (not "
         + "while it's still running): say \"Our team will confirm coverage for your address\" - never also guess.",
-      "- Never quote a mileage, radius, or travel time.",
+      cfg.business.hasRadiusZones
+        ? "- A distance in the line above (\"within 10 miles of ...\") is the business's own radius - say it if asked how "
+          + "far you go. Never estimate how far away the caller is or how long the drive is; the check decides coverage."
+        : "- Never quote a mileage, radius, or travel time.",
       ...(hasOnSiteTypes
         ? ["- For a visit at the caller's location, book only after a covered result; outside means a message, not a "
           + "booking. If the town still can't be identified, don't book the visit - we can't locate it. Take a message "

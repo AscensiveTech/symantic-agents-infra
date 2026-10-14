@@ -144,3 +144,23 @@ function samePosition(a, b) {
 function randomId() {
   return `zone-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+// How one zone is said when a caller asks where the business serves. A
+// radius is said with its distance ("within 10 miles of Silver Spring") -
+// never as just its center town, which would undersell it. A drawn area
+// still named with the editor's placeholder ("Drawn area 2") says nothing.
+export function spokenZoneName(zone) {
+  if (!zone?.label) return "";
+  if (zone.type === "radius") return `within ${formatDistance(zone.radiusMeters, zone.unit)} of ${zone.label}`;
+  if (zone.type === "polygon" && /^drawn area\s*\d*$/i.test(zone.label)) return "";
+  return zone.label;
+}
+
+// 16093 m in miles -> "10 miles"; 2500 m in km -> "2.5 km".
+export function formatDistance(meters, unit) {
+  const value = unit === "mi" ? meters / 1609.344 : meters / 1000;
+  const rounded = value >= 10 ? Math.round(value) : Math.round(value * 10) / 10;
+  if (unit === "mi") return `${rounded} ${rounded === 1 ? "mile" : "miles"}`;
+  return `${rounded} km`;
+}
+
