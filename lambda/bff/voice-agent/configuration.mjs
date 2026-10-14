@@ -12,7 +12,7 @@
 import { isBusinessHours } from "../business-hours.mjs";
 import { resolveSpokenForms } from "./spoken-forms.mjs";
 import { parseServiceAreaText, repairServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./service-areas.mjs";
-import { sanitizeServiceZones } from "./service-zones.mjs";
+import { sanitizeServiceZones, spokenZoneSummary } from "./service-zones.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
 
@@ -435,9 +435,8 @@ function resolveServiceArea(profile) {
   const summaryRaw = typeof profile.serviceAreaSummary === "string"
     ? profile.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT)
     : "";
-  const zoneNames = serviceZones.map((zone) => zone.label).filter(Boolean);
   const serviceAreaSummary = summaryRaw
-    || (serviceZones.length ? (zoneNames.length ? zoneNames.join(", ") : null) : (serviceAreas.length ? serviceAreas.join(", ") : null));
+    || (serviceZones.length ? spokenZoneSummary(serviceZones) : (serviceAreas.length ? serviceAreas.join(", ") : null));
   const coverageAreas = serviceZones.length
     ? []
     : serviceAreas.length ? serviceAreas : parseServiceAreaText(summaryRaw);
@@ -447,6 +446,8 @@ function resolveServiceArea(profile) {
     serviceZones,
     coverageAreas,
     hasServiceArea: serviceZones.length > 0 || coverageAreas.length > 0,
+    // A radius the business set may be said; other distances never.
+    hasRadiusZones: serviceZones.some((zone) => zone.type === "radius"),
   };
 }
 

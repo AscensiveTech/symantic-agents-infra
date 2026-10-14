@@ -341,7 +341,10 @@ function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
         + "running, just say \"Still checking, one moment.\" Once it has answered for a place, give that answer and "
         + "keep it for the rest of the call - never contradict it. Only if the check comes back with an error (not "
         + "while it's still running): say \"Our team will confirm coverage for your address\" - never also guess.",
-      "- Never quote a mileage, radius, or travel time.",
+      cfg.business.hasRadiusZones
+        ? "- A distance in the line above (\"within 10 miles of ...\") is the business's own radius - say it if asked how "
+          + "far you go. Never estimate how far away the caller is or how long the drive is; the check decides coverage."
+        : "- Never quote a mileage, radius, or travel time.",
       ...(hasOnSiteTypes
         ? ["- For a visit at the caller's location, book only after a covered result; outside means a message, not a "
           + "booking. If the town still can't be identified, don't book the visit - we can't locate it. Take a message "

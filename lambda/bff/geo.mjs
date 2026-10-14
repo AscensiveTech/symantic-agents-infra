@@ -193,13 +193,24 @@ function zoneLabel(placeType, address) {
   const parts = {
     Country: [country],
     Region: [region, country],
-    SubRegion: [address.SubRegion?.Name, region],
+    SubRegion: [usCountyName(address), region],
     Locality: [address.Locality, region ?? country],
     District: [address.District, address.Locality ?? region],
     SubDistrict: [address.SubDistrict ?? address.District, address.Locality ?? region],
     PostalCode: [address.PostalCode, address.Locality ?? region],
   }[placeType];
   return parts?.[0] ? parts.filter(Boolean).join(", ") : "";
+}
+
+// Amazon names a US county by its bare name ("Montgomery"), which on a call
+// sounds like the city. US counties get their kind back: County, or Parish in
+// Louisiana and Borough in Alaska. Independent cities ("Baltimore (City)")
+// and other countries keep their names as given.
+function usCountyName(address) {
+  const name = address.SubRegion?.Name;
+  if (!name || address.Country?.Code3 !== "USA" || /\(|\b(county|parish|borough|census area|municipality)$/i.test(name)) return name;
+  const kind = address.Region?.Code === "LA" ? "Parish" : address.Region?.Code === "AK" ? "Borough" : "County";
+  return `${name} ${kind}`;
 }
 
 // A street address or point: where it is, with no zone fields.

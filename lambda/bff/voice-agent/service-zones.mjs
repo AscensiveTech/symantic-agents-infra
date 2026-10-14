@@ -144,3 +144,30 @@ function samePosition(a, b) {
 function randomId() {
   return `zone-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+// What the agent says when asked where the business serves and no "What
+// Callers Hear" text is set: "Montgomery, Maryland, within 10 miles of Silver
+// Spring and Northern Virginia". A radius is said as its distance - never as
+// just the center town, which would undersell it - and a drawn area keeps
+// its name unless it's still the editor's placeholder ("Drawn area 2").
+export function spokenZoneSummary(zones) {
+  const parts = zones.map((zone) => {
+    if (zone.type === "radius") {
+      const distance = formatDistance(zone.radiusMeters, zone.unit);
+      return zone.label ? `within ${distance} of ${zone.label}` : null;
+    }
+    if (zone.type === "polygon" && /^drawn area\s*\d*$/i.test(zone.label ?? "")) return null;
+    return zone.label || null;
+  }).filter(Boolean);
+  if (!parts.length) return null;
+  return parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+// 16093 m in miles -> "10 miles"; 2500 m in km -> "2.5 km".
+export function formatDistance(meters, unit) {
+  const value = unit === "mi" ? meters / 1609.344 : meters / 1000;
+  const rounded = value >= 10 ? Math.round(value) : Math.round(value * 10) / 10;
+  if (unit === "mi") return `${rounded} ${rounded === 1 ? "mile" : "miles"}`;
+  return `${rounded} km`;
+}
+

@@ -430,12 +430,17 @@ test("service area: the tool's status decides, the business's own town is covere
 test("service area: map zones decide coverage, are read at call time, and name the area when the summary is blank", () => {
   const serviceZones = [
     { id: "a", type: "place", label: "Montgomery County, MD", place: { placeType: "SubRegion", countryCode: "USA", regionCode: "MD", regionName: "Maryland", subRegionName: "Montgomery" } },
-    { id: "b", type: "radius", label: "Myrtle Beach", center: [-78.88, 33.69], radiusMeters: 40000, unit: "mi", area: { countryCode: "USA", regionCode: "SC" } },
+    { id: "b", type: "radius", label: "Myrtle Beach", center: [-78.88, 33.69], radiusMeters: 40234, unit: "mi", area: { countryCode: "USA", regionCode: "SC" } },
     { id: "c", type: "polygon", label: "Northern Virginia", coordinates: [[-77.5, 38.6], [-77.0, 38.6], [-77.0, 39.1], [-77.5, 39.1]], area: { countryCode: "USA", regionCode: "VA" } },
   ];
   const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [], serviceZones }, booking: false }));
   const area = section(compiled.prompt.text, "SERVICE AREA");
-  assert.match(area, /When asked where you serve, say: Montgomery County, MD, Myrtle Beach, Northern Virginia/);
+  // A radius is said as its distance, not just the center town.
+  assert.match(area, /When asked where you serve, say: Montgomery County, MD, within 25 miles of Myrtle Beach and Northern Virginia/);
+  // The business's own radius may be said; nothing else about distance.
+  assert.match(area, /A distance in the line above \("within 10 miles of \.\.\."\) is the business's own radius - say it if asked how\s+far you go/);
+  assert.match(area, /Never estimate how far away the caller is or how long the drive is/);
+  assert.doesNotMatch(area, /Never quote a mileage, radius/);
   const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
   // The zones stay out of the tool definition (and so out of every model turn).
   assert.equal(tool.parameters.properties.serviceAreas, undefined);
