@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createGeoService, createRateLimiter, handleGeoRoute, toZonePlace } from "./geo.mjs";
-import { formatDistance, MAX_POLYGON_VERTICES, MAX_RADIUS_METERS, MAX_ZONES, sanitizeServiceZones, spokenZoneSummary } from "./voice-agent/service-zones.mjs";
+import { formatDistance, MAX_POLYGON_VERTICES, MAX_RADIUS_METERS, MAX_ZONES, sanitizeServiceZones, spokenZoneName } from "./voice-agent/service-zones.mjs";
 
 function fakeSend(responses) {
   const calls = [];
@@ -170,15 +170,13 @@ test("map search is rate limited per workspace; the map config never is", async 
   assert.equal((await call("/workspaces/me/geo/search", "ws-a")).statusCode, 200);
 });
 
-test("the spoken service area says a radius as its distance and skips placeholder outline names", () => {
-  const place = { type: "place", label: "Montgomery, Maryland", place: {} };
-  const radius = (meters, unit, label = "Silver Spring") => ({ type: "radius", label, radiusMeters: meters, unit });
-  assert.equal(spokenZoneSummary([place]), "Montgomery, Maryland");
-  assert.equal(spokenZoneSummary([radius(16093, "mi")]), "within 10 miles of Silver Spring");
-  assert.equal(spokenZoneSummary([place, radius(2500, "km", "Lyon"), { type: "polygon", label: "Northern Virginia" }]),
-    "Montgomery, Maryland, within 2.5 km of Lyon and Northern Virginia");
-  assert.equal(spokenZoneSummary([{ type: "polygon", label: "Drawn area 2" }]), null);
-  assert.equal(spokenZoneSummary([place, { type: "polygon", label: "Drawn area 1" }]), "Montgomery, Maryland");
+test("a zone is spoken with a radius's distance; placeholder outline names say nothing", () => {
+  assert.equal(spokenZoneName({ type: "place", label: "Montgomery County, Maryland", place: {} }), "Montgomery County, Maryland");
+  assert.equal(spokenZoneName({ type: "radius", label: "Silver Spring", radiusMeters: 16093, unit: "mi" }), "within 10 miles of Silver Spring");
+  assert.equal(spokenZoneName({ type: "radius", label: "Lyon", radiusMeters: 2500, unit: "km" }), "within 2.5 km of Lyon");
+  assert.equal(spokenZoneName({ type: "polygon", label: "Northern Virginia" }), "Northern Virginia");
+  assert.equal(spokenZoneName({ type: "polygon", label: "Drawn area 2" }), "");
+  assert.equal(spokenZoneName({ type: "radius", label: "" }), "");
   assert.equal(formatDistance(1609, "mi"), "1 mile");
   assert.equal(formatDistance(40234, "mi"), "25 miles");
   assert.equal(formatDistance(500_000, "km"), "500 km");

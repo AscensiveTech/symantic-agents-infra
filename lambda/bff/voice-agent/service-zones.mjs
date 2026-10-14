@@ -145,22 +145,15 @@ function randomId() {
   return `zone-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-// What the agent says when asked where the business serves and no "What
-// Callers Hear" text is set: "Montgomery, Maryland, within 10 miles of Silver
-// Spring and Northern Virginia". A radius is said as its distance - never as
-// just the center town, which would undersell it - and a drawn area keeps
-// its name unless it's still the editor's placeholder ("Drawn area 2").
-export function spokenZoneSummary(zones) {
-  const parts = zones.map((zone) => {
-    if (zone.type === "radius") {
-      const distance = formatDistance(zone.radiusMeters, zone.unit);
-      return zone.label ? `within ${distance} of ${zone.label}` : null;
-    }
-    if (zone.type === "polygon" && /^drawn area\s*\d*$/i.test(zone.label ?? "")) return null;
-    return zone.label || null;
-  }).filter(Boolean);
-  if (!parts.length) return null;
-  return parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+// How one zone is said when a caller asks where the business serves. A
+// radius is said with its distance ("within 10 miles of Silver Spring") -
+// never as just its center town, which would undersell it. A drawn area
+// still named with the editor's placeholder ("Drawn area 2") says nothing.
+export function spokenZoneName(zone) {
+  if (!zone?.label) return "";
+  if (zone.type === "radius") return `within ${formatDistance(zone.radiusMeters, zone.unit)} of ${zone.label}`;
+  if (zone.type === "polygon" && /^drawn area\s*\d*$/i.test(zone.label)) return "";
+  return zone.label;
 }
 
 // 16093 m in miles -> "10 miles"; 2500 m in km -> "2.5 km".
