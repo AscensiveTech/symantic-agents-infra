@@ -83,7 +83,7 @@ Stored in the Business Profile as `serviceZones`, on the agent's own profile
 ]
 ```
 
-Limits: 50 zones, 250 points per outline, 2,000 points in total, and a
+Limits: 20 zones, 250 points per outline, 2,000 points in total, and a
 radius of 100 m to 500 km. They are enforced in the BFF; the editor stays
 within them.
 
