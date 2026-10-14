@@ -427,7 +427,7 @@ test("service area: the tool's status decides, the business's own town is covere
   assert.match(tool.parameters.properties.location.description, /as they said it, including the state, province or postal code/);
 });
 
-test("service area: map zones decide coverage, are read at call time, and name the area when the summary is blank", () => {
+test("service area: map zones decide coverage, are read at call time, and are named when callers ask", () => {
   const serviceZones = [
     { id: "a", type: "place", label: "Montgomery County, MD", place: { placeType: "SubRegion", countryCode: "USA", regionCode: "MD", regionName: "Maryland", subRegionName: "Montgomery" } },
     { id: "b", type: "radius", label: "Myrtle Beach", center: [-78.88, 33.69], radiusMeters: 40000, unit: "mi", area: { countryCode: "USA", regionCode: "SC" } },
@@ -435,7 +435,7 @@ test("service area: map zones decide coverage, are read at call time, and name t
   ];
   const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [], serviceZones }, booking: false }));
   const area = section(compiled.prompt.text, "SERVICE AREA");
-  assert.match(area, /When asked where you serve, say: Montgomery County, MD, Myrtle Beach, Northern Virginia/);
+  assert.match(area, /When asked where you serve, say you cover Montgomery County, MD; the area around Myrtle Beach; Northern Virginia - then offer/);
   const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
   // The zones stay out of the tool definition (and so out of every model turn).
   assert.equal(tool.parameters.properties.serviceAreas, undefined);

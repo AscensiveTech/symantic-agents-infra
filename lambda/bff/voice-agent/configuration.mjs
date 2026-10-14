@@ -11,7 +11,7 @@
 
 import { isBusinessHours } from "../business-hours.mjs";
 import { resolveSpokenForms } from "./spoken-forms.mjs";
-import { parseServiceAreaText, repairServiceAreas, SERVICE_AREA_TEXT_LIMIT } from "./service-areas.mjs";
+import { repairServiceAreas } from "./service-areas.mjs";
 import { sanitizeServiceZones } from "./service-zones.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
@@ -416,15 +416,15 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
 
 // Off (or never set) means the business keeps its normal hours on every
 // holiday. Disabled entries are suggestions the owner didn't add.
-// Service Area has two halves:
-// - serviceAreaSummary ("What Callers Hear"): said word for word when a
-//   caller asks where the business serves. Never a list read aloud.
-// - serviceZones ("Exact Coverage" on the map): places, radius circles and
-//   drawn outlines. When there are any, they alone decide coverage - the
-//   tools Lambda reads them from the published agent at call time.
-// Older profiles hold Exact Coverage as text (serviceAreas); with no zones,
-// that text - or, failing that, the places named in the summary - is sent
-// with the tool as coverageAreas and geocoded at call time, as before.
+// Service Area is Exact Coverage alone:
+// - serviceZones (the map): places, radius circles and drawn outlines. When
+//   there are any, they alone decide coverage - the tools Lambda reads them
+//   from the published agent at call time.
+// - Older profiles hold it as text (serviceAreas); with no zones, that list
+//   is sent with the tool as coverageAreas and geocoded at call time.
+// serviceAreaNames is what callers hear when they ask where the business
+// serves: the zones' names, or the older list. The retired "What Callers
+// Hear" text (serviceAreaSummary) is never read.
 function resolveServiceArea(profile) {
   const serviceZones = sanitizeServiceZones(profile.serviceZones);
   // Not re-capped here: input is capped on save, and an older, longer list
@@ -432,22 +432,24 @@ function resolveServiceArea(profile) {
   // Lists saved before semicolons/colons separated places are re-split.
   const savedAreas = repairServiceAreas(profile.serviceAreas);
   const serviceAreas = Array.isArray(savedAreas) ? savedAreas.map(text).filter(Boolean) : [];
-  const summaryRaw = typeof profile.serviceAreaSummary === "string"
-    ? profile.serviceAreaSummary.trim().slice(0, SERVICE_AREA_TEXT_LIMIT)
-    : "";
-  const zoneNames = serviceZones.map((zone) => zone.label).filter(Boolean);
-  const serviceAreaSummary = summaryRaw
-    || (serviceZones.length ? (zoneNames.length ? zoneNames.join(", ") : null) : (serviceAreas.length ? serviceAreas.join(", ") : null));
-  const coverageAreas = serviceZones.length
-    ? []
-    : serviceAreas.length ? serviceAreas : parseServiceAreaText(summaryRaw);
+  const coverageAreas = serviceZones.length ? [] : serviceAreas;
+  const serviceAreaNames = serviceZones.length
+    ? [...new Set(serviceZones.map(spokenZoneName).filter(Boolean))]
+    : coverageAreas;
   return {
-    serviceAreaSummary,
+    serviceAreaNames,
     serviceAreas,
     serviceZones,
     coverageAreas,
     hasServiceArea: serviceZones.length > 0 || coverageAreas.length > 0,
   };
+}
+
+// A radius is named by its center, so it's said as the area around it - its
+// size is never spoken. An unnamed drawn area has nothing to say.
+function spokenZoneName(zone) {
+  if (!zone.label) return "";
+  return zone.type === "radius" ? `the area around ${zone.label}` : zone.label;
 }
 
 function resolveHolidays(profile) {
