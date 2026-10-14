@@ -34,7 +34,9 @@ test("area search merges counties from Suggest with postal codes from Autocomple
       { Title: "montgomery county pizza", SuggestResultItemType: "Query" },
     ] },
     Autocomplete: { ResultItems: [
-      { PlaceId: "zip", PlaceType: "PostalCode", Title: "United States, MD, 20910, Silver Spring" },
+      { PlaceId: "zip", PlaceType: "PostalCode", Title: "United States, MD, 20910, Silver Spring", Address: { Label: "20910, Silver Spring, MD, United States" } },
+      { PlaceId: "liberia", PlaceType: "Locality", Title: "Liberia, Virginia", Address: { Label: "Virginia, Liberia" } },
+      { PlaceId: "va", PlaceType: "Region", Title: "United States, Virginia", Address: { Label: "VA, United States" } },
       { PlaceId: "montgomery", PlaceType: "SubRegion", Title: "duplicate" },
       { PlaceId: "street", PlaceType: "Street", Title: "Montgomery Ave" },
     ] },
@@ -43,7 +45,11 @@ test("area search merges counties from Suggest with postal codes from Autocomple
   const results = await geo.search({ text: " Montgomery ", biasPosition: [-77, 39], countries: ["USA", "bad"], language: "en" });
   assert.deepEqual(results, [
     { placeId: "montgomery", placeType: "SubRegion", title: "Montgomery, MD, United States" },
-    { placeId: "zip", placeType: "PostalCode", title: "United States, MD, 20910, Silver Spring" },
+    // Every title is name-first, whichever API it came from.
+    { placeId: "zip", placeType: "PostalCode", title: "20910, Silver Spring, MD, United States" },
+    { placeId: "liberia", placeType: "Locality", title: "Virginia, Liberia" },
+    // States are named, not coded.
+    { placeId: "va", placeType: "Region", title: "Virginia, United States" },
   ]);
   const autocomplete = calls.find((call) => call.operation === "Autocomplete").input;
   assert.equal(autocomplete.QueryText, "Montgomery");
@@ -180,4 +186,12 @@ test("a zone is spoken with a radius's distance; placeholder outline names say n
   assert.equal(formatDistance(1609, "mi"), "1 mile");
   assert.equal(formatDistance(40234, "mi"), "25 miles");
   assert.equal(formatDistance(500_000, "km"), "500 km");
+});
+
+test("a state found by both searches keeps its spelled-out name", async () => {
+  const { send } = fakeSend({
+    Suggest: { ResultItems: [{ Title: "VA, United States", Place: { PlaceId: "va", PlaceType: "Region", Address: { Label: "VA, United States" } } }] },
+    Autocomplete: { ResultItems: [{ PlaceId: "va", PlaceType: "Region", Title: "United States, Virginia", Address: { Label: "VA, United States" } }] },
+  });
+  assert.deepEqual(await createGeoService({ send }).search({ text: "Virginia" }), [{ placeId: "va", placeType: "Region", title: "Virginia, United States" }]);
 });

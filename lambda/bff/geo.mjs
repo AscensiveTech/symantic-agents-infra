@@ -94,7 +94,7 @@ export function createGeoService({
         MaxResults: 8,
         ...(countryFilter.length ? { Filter: { IncludeCountries: countryFilter } } : {}),
       });
-      return (response?.ResultItems ?? []).map((item) => ({ placeId: item.PlaceId, placeType: item.PlaceType, title: item.Title }));
+      return (response?.ResultItems ?? []).map((item) => ({ placeId: item.PlaceId, placeType: item.PlaceType, title: resultTitle(item) }));
     }
 
     const [suggested, completed] = await Promise.all([
@@ -115,14 +115,21 @@ export function createGeoService({
     const results = [];
     const seen = new Set();
     const add = (placeId, placeType, title) => {
-      if (!placeId || !AREA_TYPES.has(placeType) || seen.has(placeId)) return;
+      if (!placeId || !AREA_TYPES.has(placeType)) return;
+      if (seen.has(placeId)) {
+        // The same place from the other API: keep the spelled-out name
+        // ("Virginia, United States" over "VA, United States").
+        const existing = results.find((result) => result.placeId === placeId);
+        if (existing && /^[A-Z]{2,3}, /.test(existing.title) && !/^[A-Z]{2,3}, /.test(title)) existing.title = title;
+        return;
+      }
       seen.add(placeId);
       results.push({ placeId, placeType, title });
     };
     for (const item of suggested?.ResultItems ?? []) {
-      if (item.Place) add(item.Place.PlaceId, item.Place.PlaceType, item.Title);
+      if (item.Place) add(item.Place.PlaceId, item.Place.PlaceType, resultTitle(item.Place, item.Title));
     }
-    for (const item of completed?.ResultItems ?? []) add(item.PlaceId, item.PlaceType, item.Title);
+    for (const item of completed?.ResultItems ?? []) add(item.PlaceId, item.PlaceType, resultTitle(item));
     return results.slice(0, 10);
   }
 
@@ -182,6 +189,25 @@ export function toZonePlace(item) {
     position: isPosition(item.Position) ? item.Position : null,
     mapView: Array.isArray(item.MapView) && item.MapView.length === 4 ? item.MapView : null,
   };
+}
+
+// Autocomplete titles run country-first ("United States, MN, 55792,
+// Virginia") while Suggest's run name-first ("Virginia Beach, VA, United
+// States"); mixed in one list, a foreign "Liberia, Virginia" is easy to pick
+// by mistake. The address label is always name-first, so it's used for both.
+function resultTitle(item, fallback) {
+  const label = item?.Address?.Label || fallback || item?.Title || "";
+  // A state's label is just its code ("VA, United States"); the title
+  // ("United States, Virginia") has the name.
+  if (item?.PlaceType === "Region" && item.Title) {
+    const country = label.split(", ").pop();
+    const [first, second, ...rest] = item.Title.split(", ");
+    if (!rest.length && second) {
+      if (first === country && second.length > 3) return `${second}, ${first}`;
+      if (second === country && first.length > 3) return `${first}, ${second}`;
+    }
+  }
+  return label;
 }
 
 // "Maryland, United States", "Montgomery, Maryland", "Silver Spring, Maryland",
