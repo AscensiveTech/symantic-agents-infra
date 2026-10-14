@@ -11,7 +11,6 @@
 
 import { isBusinessHours } from "../business-hours.mjs";
 import { resolveSpokenForms } from "./spoken-forms.mjs";
-import { repairServiceAreas } from "./service-areas.mjs";
 import { sanitizeServiceZones } from "./service-zones.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
@@ -416,32 +415,18 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
 
 // Off (or never set) means the business keeps its normal hours on every
 // holiday. Disabled entries are suggestions the owner didn't add.
-// Service Area is Exact Coverage alone:
-// - serviceZones (the map): places, radius circles and drawn outlines. When
-//   there are any, they alone decide coverage - the tools Lambda reads them
-//   from the published agent at call time.
-// - Older profiles hold it as text (serviceAreas); with no zones, that list
-//   is sent with the tool as coverageAreas and geocoded at call time.
-// serviceAreaNames is what callers hear when they ask where the business
-// serves: the zones' names, or the older list. The retired "What Callers
-// Hear" text (serviceAreaSummary) is never read.
+// Service Area is the Exact Coverage map alone (serviceZones): places,
+// radius circles and drawn outlines. They decide coverage - the tools Lambda
+// reads them from the published agent at call time - and their names are
+// what callers hear when they ask where the business serves. The retired
+// "What Callers Hear" text (serviceAreaSummary) and the pre-map text list
+// (serviceAreas) are never read.
 function resolveServiceArea(profile) {
   const serviceZones = sanitizeServiceZones(profile.serviceZones);
-  // Not re-capped here: input is capped on save, and an older, longer list
-  // must keep working exactly as before.
-  // Lists saved before semicolons/colons separated places are re-split.
-  const savedAreas = repairServiceAreas(profile.serviceAreas);
-  const serviceAreas = Array.isArray(savedAreas) ? savedAreas.map(text).filter(Boolean) : [];
-  const coverageAreas = serviceZones.length ? [] : serviceAreas;
-  const serviceAreaNames = serviceZones.length
-    ? [...new Set(serviceZones.map(spokenZoneName).filter(Boolean))]
-    : coverageAreas;
   return {
-    serviceAreaNames,
-    serviceAreas,
+    serviceAreaNames: [...new Set(serviceZones.map(spokenZoneName).filter(Boolean))],
     serviceZones,
-    coverageAreas,
-    hasServiceArea: serviceZones.length > 0 || coverageAreas.length > 0,
+    hasServiceArea: serviceZones.length > 0,
   };
 }
 

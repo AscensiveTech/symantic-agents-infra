@@ -138,22 +138,21 @@ plus `ok`/`matched` for older agents. `matchedBy` is one of `postal_code`,
 A Geocode failure (throttling, outage) is returned as a tool error. The
 prompt then says the team will confirm coverage. It never guesses.
 
-## Older text lists
+## Retired fields
 
-Before zones, Exact Coverage was a text list (`serviceAreas`). When there are
-no zones, coverage comes from that list, and those entries are geocoded at
-call time. The retired What Callers Hear text (`serviceAreaSummary`) is never
-read, for coverage or for what callers hear. When asked where the business
-serves, the receptionist names the zones (a radius as "the area around" its
-center, never its size; unnamed drawn areas are skipped) or the older list.
-Entries that resolve to a real area are used as named places. Others, such as
-"DC metro area", are kept as words: a caller saying exactly those words is
-covered.
+Before the map, Exact Coverage was a text list (`serviceAreas`), alongside a
+free-text What Callers Hear (`serviceAreaSummary`). Both are gone from the
+editor and are never read when an agent is published: only zones decide
+coverage and what callers hear. The wizard clears both when an agent loads,
+so the next save removes them. An agent with only the old fields has no
+SERVICE AREA section or `check_service_area` tool until zones are added.
 
-The editor lists these as **Earlier text entries**, each with a *Find on map*
-button that replaces it with a real place. Once any zone exists, the text list
-is ignored. Regional nicknames ("Northern Virginia", "the DMV", "SoCal") are
-not places on the map, so they are added as their counties or drawn.
+Agents published before this change still send their old list with the tool
+as a `const`; the tools Lambda keeps handling it until they're republished.
+
+When asked where the business serves, the receptionist names the zones: a
+radius as "the area around" its center (never its size), and unnamed drawn
+areas are skipped.
 
 ## What's not in this release
 

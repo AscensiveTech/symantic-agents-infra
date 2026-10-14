@@ -191,7 +191,6 @@ function serviceAreaTool(business) {
         description: "The caller's location as they said it, including the state, province or postal code if they "
           + "gave one (\"Silver Spring, Maryland\", \"20910\", \"Manchester M1\").",
       },
-      ...(business.coverageAreas.length ? { serviceAreas: { type: "string", const: JSON.stringify(business.coverageAreas) } } : {}),
       // The business's own town is always covered.
       ...(business.address ? { businessAddress: { type: "string", const: business.address } } : {}),
     },

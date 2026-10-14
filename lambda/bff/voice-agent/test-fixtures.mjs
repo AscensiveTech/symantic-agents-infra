@@ -24,6 +24,16 @@ export const SPLIT_HOURS_WITH_24H_WEEKEND = {
   sun: allDay,
 };
 
+// Exact Coverage map zones for named towns, as the wizard saves them.
+export function placeZones(...labels) {
+  return labels.map((label, index) => ({
+    id: `zone-${index}`,
+    type: "place",
+    label,
+    place: { placeType: "Locality", countryCode: "USA", locality: label.split(",")[0] },
+  }));
+}
+
 export const workspaceProfile = {
   businessName: "Brightwater Plumbing & Heating",
   businessType: "plumbing",
@@ -112,7 +122,7 @@ export function fullAgent(overrides = {}) {
           { id: "h3", name: "Labor Day", date: "2026-09-07", closed: true, disabled: true },
         ],
         contactEmails: [{ label: "Billing", email: "billing@brightwater.example" }],
-        serviceAreas: ["Dayton, OH", "Kettering, OH", "45402"],
+        serviceZones: placeZones("Dayton, OH", "Kettering, OH", "Centerville, OH"),
         ownerPhone: "(937) 555-0141",
       },
       // Legacy / internal fields that must not reach Retell.

@@ -17,6 +17,7 @@ import {
   resolveStartSpeaker,
   spokenAgentName,
 } from "./receptionist.mjs";
+import { placeZones } from "./voice-agent/test-fixtures.mjs";
 
 const profile = {
   businessName: "Arc Dental",
@@ -277,7 +278,7 @@ test("cloned voice mode uses the stored voiceId instead of the catalog map", () 
   );
 });
 
-test("check_service_area tool is omitted when no service area is configured, and included with the list baked in as a const when it is", () => {
+test("check_service_area tool is omitted when no service area is configured, and included - without the zones baked in - when it is", () => {
   const withoutAreas = buildReceptionistConfig({
     workspaceId: "workspace-123",
     agent,
@@ -290,17 +291,14 @@ test("check_service_area tool is omitted when no service area is configured, and
   const withAreas = buildReceptionistConfig({
     workspaceId: "workspace-123",
     agent,
-    profile: { ...profile, serviceAreas: ["Arlington, VA", "Alexandria, VA"] },
+    profile: { ...profile, serviceZones: placeZones("Arlington, VA", "Alexandria, VA") },
     toolBaseUrl: "https://api.example.com",
     voiceId: "retell-voice-1",
   });
   const serviceAreaTool = withAreas.tools.find(({ name }) => name === "check_service_area");
   assert.ok(serviceAreaTool);
   assert.equal(serviceAreaTool.url, "https://api.example.com/retell/tools/service-area.check");
-  assert.equal(
-    serviceAreaTool.parameters.properties.serviceAreas.const,
-    JSON.stringify(["Arlington, VA", "Alexandria, VA"]),
-  );
+  assert.equal(serviceAreaTool.parameters.properties.serviceAreas, undefined);
   assert.ok(serviceAreaTool.parameters.required.includes("location"));
 });
 
@@ -597,7 +595,7 @@ test("booking on: types (no buffers), scheduling window, full booking and resche
       ],
     },
   };
-  const prompt = buildReceptionistPrompt(booking, { ...profile, serviceAreas: ["Rockville, MD"] });
+  const prompt = buildReceptionistPrompt(booking, { ...profile, serviceZones: placeZones("Rockville, MD") });
 
   const types = section(prompt, "APPOINTMENT TYPES");
   assert.match(types, /ways to book, not services/);
@@ -670,7 +668,7 @@ test("an agent's own Business Profile replaces the workspace's - two agents in o
         businessName: "Arc Dental Maryland",
         timezone: "America/New_York",
         hours: "Tue-Thu, 9:00 AM-1:00 PM",
-        serviceAreas: ["Bethesda, MD"],
+        serviceZones: placeZones("Bethesda, MD"),
         ownerPhone: "+13015550111",
       },
     },
@@ -678,7 +676,7 @@ test("an agent's own Business Profile replaces the workspace's - two agents in o
   const config = buildReceptionistConfig({
     workspaceId: "workspace-123",
     agent: maryland,
-    profile: { ...profile, serviceAreas: ["Charleston, SC"] },
+    profile: { ...profile, serviceZones: placeZones("Charleston, SC") },
     toolBaseUrl: "https://api.example.com",
     voiceId: "retell-voice-1",
   });

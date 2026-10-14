@@ -18,6 +18,7 @@ import {
   fullAgent,
   knowledgeBases,
   minimalAgent,
+  placeZones,
   workspaceProfile,
 } from "./test-fixtures.mjs";
 
@@ -238,7 +239,7 @@ test("fully configured agent: every setting reaches its one destination", () => 
   assert.match(types, /- Phone Consultation \(15 minutes, must be booked at least 1 hour in advance\)/);
   assert.match(types, /- In-Home Estimate \(45 minutes, must be booked at least 1 day in advance, held at the caller's location\)/);
   assert.doesNotMatch(types, /30 minutes/, "buffers are never spoken");
-  assert.match(section(prompt, "SERVICE AREA"), /When asked where you serve, say you cover Dayton, OH; Kettering, OH; 45402 - then offer to check/);
+  assert.match(section(prompt, "SERVICE AREA"), /When asked where you serve, say you cover Dayton, OH; Kettering, OH; Centerville, OH - then offer to check/);
   assert.match(section(prompt, "BOOKING FLOW"), /what city are you in\?" Apply SERVICE AREA\./);
   assert.match(section(prompt, "CALL TRANSFERS"), /"gas leak" or "flooding": use transfer_call_1\./);
 
@@ -488,24 +489,24 @@ test("service area: tool and section only when configured", () => {
   const none = compile(minimalAgent());
   assert.ok(!none.retell.llm.general_tools.some((tool) => tool.name === "check_service_area"));
   assert.equal(section(none.prompt.text, "SERVICE AREA"), null);
-  const some = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceAreas: ["Dayton, OH"] } });
-  assert.equal(some.retell.llm.general_tools.find((tool) => tool.name === "check_service_area").parameters.properties.serviceAreas.const, "[\"Dayton, OH\"]");
+  const some = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceZones: placeZones("Dayton, OH") } });
+  assert.ok(some.retell.llm.general_tools.some((tool) => tool.name === "check_service_area"));
   assert.match(section(some.prompt.text, "SERVICE AREA"), /call check_service_area/);
 });
 
-test("service area: the old What Callers Hear text is never read or used for the check", () => {
+test("service area: the old What Callers Hear text and pre-map list are never read or used for the check", () => {
   const summary = "We serve the greater Dayton area, including Kettering and Centerville.";
-  const both = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceAreaSummary: summary, serviceAreas: ["45402", "45429"] } });
-  const text = section(both.prompt.text, "SERVICE AREA");
-  assert.doesNotMatch(both.prompt.text, /greater Dayton area/);
-  assert.match(text, /When asked where you serve, say you cover 45402; 45429 - then offer to check/);
+  const old = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceAreaSummary: summary, serviceAreas: ["45402", "45429"] } });
+  assert.equal(section(old.prompt.text, "SERVICE AREA"), null);
+  assert.ok(!old.retell.llm.general_tools.some((item) => item.name === "check_service_area"));
+  assert.doesNotMatch(old.prompt.text, /greater Dayton area|45429/);
+  const withZones = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceAreaSummary: summary, serviceAreas: ["45429"], serviceZones: placeZones("Dayton, OH") } });
+  const text = section(withZones.prompt.text, "SERVICE AREA");
+  assert.match(text, /When asked where you serve, say you cover Dayton, OH - then offer to check/);
   assert.match(text, /never list the towns, counties or ZIP codes inside them/);
-  const tool = (compiled) => compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
-  assert.equal(tool(both).parameters.properties.serviceAreas.const, JSON.stringify(["45402", "45429"]));
-  // Only the old text, no Exact Coverage: no check and no SERVICE AREA section.
-  const onlySummary = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceAreaSummary: "Dayton, OH", serviceAreas: [] } });
-  assert.equal(section(onlySummary.prompt.text, "SERVICE AREA"), null);
-  assert.ok(!onlySummary.retell.llm.general_tools.some((item) => item.name === "check_service_area"));
+  assert.doesNotMatch(withZones.prompt.text, /greater Dayton area|45429/);
+  const tool = withZones.retell.llm.general_tools.find((item) => item.name === "check_service_area");
+  assert.equal(tool.parameters.properties.serviceAreas, undefined);
 });
 
 test("service area: callers hear the map areas' names - a radius by its center, never its size", () => {
@@ -516,23 +517,12 @@ test("service area: callers hear the map areas' names - a radius by its center, 
   ];
   const cfg = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreaSummary: "Old text", serviceAreas: ["45402"], serviceZones: zones });
   assert.deepEqual(cfg.business.serviceAreaNames, ["Montgomery County", "the area around Dayton"]);
-  assert.deepEqual(cfg.business.coverageAreas, []);
   const text = section(compile(minimalAgent(), { profile: { ...workspaceProfile, serviceZones: zones } }).prompt.text, "SERVICE AREA");
   assert.match(text, /say you cover Montgomery County; the area around Dayton - then offer/);
   assert.doesNotMatch(text, /25|40234|mi\b/);
   // Only unnamed shapes: the generic line.
   const unnamed = compile(minimalAgent(), { profile: { ...workspaceProfile, serviceZones: [zones[2]] } });
   assert.match(section(unnamed.prompt.text, "SERVICE AREA"), /say you cover the local area/);
-});
-
-test("service area: an older text list is said and checked as the same list", () => {
-  const legacy = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreas: ["Dayton, OH", "45402"] });
-  assert.deepEqual(legacy.business.serviceAreaNames, ["Dayton, OH", "45402"]);
-  assert.deepEqual(legacy.business.coverageAreas, ["Dayton, OH", "45402"]);
-  // A list longer than the new 3,000-character cap still works in full.
-  const long = Array.from({ length: 400 }, (_, index) => String(10000 + index));
-  const big = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreas: long });
-  assert.equal(big.business.coverageAreas.length, 400);
 });
 
 // --- Transfers -------------------------------------------------------------------
@@ -744,7 +734,4 @@ test("service area: semicolons, colons and stray symbols split places the same w
   assert.deepEqual(parseServiceAreaText("Washington, D.C.; Arlington, VA; • Bethesda, MD: 20910"), ["Washington, D.C.", "Arlington, VA", "Bethesda, MD", "20910"]);
   assert.deepEqual(parseServiceAreaText("1. Winston-Salem, NC\n- Coeur d'Alene, ID\narlington, va, alexandria, va"), ["Winston-Salem, NC", "Coeur d'Alene, ID", "arlington, va", "alexandria, va"]);
   assert.deepEqual(repairServiceAreas(["Washington", "D.C.; Arlington", "VA; Myrtle Beach", "SC"]), ["Washington, D.C.", "Arlington, VA", "Myrtle Beach, SC"]);
-  // A list saved with the old splitting publishes the right places.
-  const cfg = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreas: ["Washington", "D.C.; Arlington", "VA; Myrtle Beach", "SC"] });
-  assert.deepEqual(cfg.business.coverageAreas, ["Washington, D.C.", "Arlington, VA", "Myrtle Beach, SC"]);
 });

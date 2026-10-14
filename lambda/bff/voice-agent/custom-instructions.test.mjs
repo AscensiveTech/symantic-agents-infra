@@ -15,7 +15,7 @@ import { createFakeRetell } from "../test-support/fake-retell.mjs";
 import { compileVoiceAgent } from "./index.mjs";
 import { seededExampleTemplate } from "./seeded-defaults.mjs";
 import { inspectVoiceAgent } from "./inspect.mjs";
-import { BUILD, fullAgent, knowledgeBases, minimalAgent, workspaceProfile } from "./test-fixtures.mjs";
+import { BUILD, fullAgent, knowledgeBases, minimalAgent, placeZones, workspaceProfile } from "./test-fixtures.mjs";
 
 const SEEDS = JSON.parse(readFileSync(new URL("./golden/frontend-seeds.json", import.meta.url), "utf8"));
 const PHONE = "+19375550123";
@@ -379,7 +379,7 @@ const CASCADE_PROFILE = {
     .map((day) => [day, { closed: false, allDay: true, intervals: [] }])),
   holidaysEnabled: true,
   holidays: [{ id: "h", name: "Independence Day", date: "2027-07-04", closed: true }],
-  serviceAreas: ["Washington D.C. Metro area", "Maryland", "Northern Virginia"],
+  serviceZones: placeZones("Rockville, MD", "Arlington, VA"),
 };
 const cascade = () => compile(fullAgent({ businessProfile: CASCADE_PROFILE, booking: false }));
 
@@ -423,7 +423,8 @@ test("service area: the tool's status decides, the business's own town is covere
   assert.doesNotMatch(area, /what you know about|Not matched only means/);
   const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
   assert.equal(tool.parameters.properties.businessAddress.const, "10901 Rhode Island Ave, Beltsville, MD 20705");
-  assert.equal(tool.parameters.properties.serviceAreas.const, JSON.stringify(CASCADE_PROFILE.serviceAreas));
+  // The zones are read at call time, never baked into the tool.
+  assert.equal(tool.parameters.properties.serviceAreas, undefined);
   assert.match(tool.parameters.properties.location.description, /as they said it, including the state, province or postal code/);
 });
 
@@ -433,7 +434,7 @@ test("service area: map zones decide coverage, are read at call time, and are na
     { id: "b", type: "radius", label: "Myrtle Beach", center: [-78.88, 33.69], radiusMeters: 40000, unit: "mi", area: { countryCode: "USA", regionCode: "SC" } },
     { id: "c", type: "polygon", label: "Northern Virginia", coordinates: [[-77.5, 38.6], [-77.0, 38.6], [-77.0, 39.1], [-77.5, 39.1]], area: { countryCode: "USA", regionCode: "VA" } },
   ];
-  const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [], serviceZones }, booking: false }));
+  const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceZones }, booking: false }));
   const area = section(compiled.prompt.text, "SERVICE AREA");
   assert.match(area, /When asked where you serve, say you cover Montgomery County, MD; the area around Myrtle Beach; Northern Virginia - then offer/);
   const tool = compiled.retell.llm.general_tools.find((item) => item.name === "check_service_area");
@@ -443,16 +444,17 @@ test("service area: map zones decide coverage, are read at call time, and are na
   // The handler reads the zones with these.
   for (const field of ["workspaceId", "agentId", "location"]) assert.ok(tool.parameters.required.includes(field), field);
   assert.doesNotMatch(JSON.stringify(compiled.retell), /-77\.5/);
-  // Zones win over an old text list.
-  const both = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceZones }, booking: false }));
+  // An old pre-map text list is never used.
+  const both = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: ["Charleston, SC"], serviceZones }, booking: false }));
   assert.equal(both.retell.llm.general_tools.find((item) => item.name === "check_service_area").parameters.properties.serviceAreas, undefined);
+  assert.doesNotMatch(both.prompt.text, /Charleston/);
   // Malformed zones are dropped, not compiled.
-  const broken = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [], serviceZones: [{ type: "polygon", coordinates: [[0, 0]] }] }, booking: false }));
+  const broken = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceZones: [{ type: "polygon", coordinates: [[0, 0]] }] }, booking: false }));
   assert.equal(section(broken.prompt.text, "SERVICE AREA"), null);
 });
 
 test("service area: no configured areas means no tool and no SERVICE AREA section", () => {
-  const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceAreas: [] }, booking: false }));
+  const compiled = compile(fullAgent({ businessProfile: { ...CASCADE_PROFILE, serviceZones: [] }, booking: false }));
   assert.equal(section(compiled.prompt.text, "SERVICE AREA"), null);
   assert.ok(!compiled.retell.llm.general_tools.some((item) => item.name === "check_service_area"));
   assert.doesNotMatch(compiled.prompt.text, /check_service_area/);
