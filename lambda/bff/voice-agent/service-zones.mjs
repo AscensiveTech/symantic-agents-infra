@@ -11,7 +11,7 @@
 // `area` on a shape is the country and region it sits in (reverse geocoded
 // when drawn), used to narrow and disambiguate the caller's place.
 
-export const MAX_ZONES = 50;
+export const MAX_ZONES = 20;
 export const MAX_POLYGON_VERTICES = 250;
 export const MAX_TOTAL_VERTICES = 2000;
 export const MIN_RADIUS_METERS = 100;
