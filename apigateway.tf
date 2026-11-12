@@ -9,6 +9,7 @@ locals {
     "POST /platform/companies/{workspaceId}/users",
     "PATCH /platform/companies/{workspaceId}/users/{userId}",
     "DELETE /platform/companies/{workspaceId}/users/{userId}",
+    "POST /platform/companies/{workspaceId}/users/{userId}/reset-password",
     "GET /platform/companies/{workspaceId}/usage",
     "GET /platform/companies/{workspaceId}/activity",
     "GET /platform/companies/{workspaceId}/proposal-usage",
@@ -138,6 +139,7 @@ locals {
     "POST /workspaces/me/users",
     "PATCH /workspaces/me/users/{userId}",
     "DELETE /workspaces/me/users/{userId}",
+    "POST /workspaces/me/users/{userId}/reset-password",
   ])
 }
 

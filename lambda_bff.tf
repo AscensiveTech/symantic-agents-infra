@@ -243,6 +243,8 @@ resource "aws_iam_role_policy" "bff_cognito_admin" {
         "cognito-idp:AdminDeleteUser",
         "cognito-idp:AdminListGroupsForUser",
         "cognito-idp:AdminRemoveUserFromGroup",
+        "cognito-idp:AdminSetUserPassword",
+        "cognito-idp:AdminUserGlobalSignOut",
         "cognito-idp:ListUsers",
       ]
       Resource = aws_cognito_user_pool.frontend.arn

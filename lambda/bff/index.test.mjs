@@ -5679,6 +5679,185 @@ test("Manage Company Accounts remove is 403 for a non-super-admin and 403 on a s
   assert.equal((await superHandler(e2)).statusCode, 403);
 });
 
+function resetDirectory(roles = []) {
+  const resets = [];
+  const signOuts = [];
+  return {
+    resets,
+    signOuts,
+    async getRoles() { return roles; },
+    async resetPassword(username, password) { resets.push([username, password]); },
+    async signOutEverywhere(username) { signOuts.push(username); },
+  };
+}
+
+function resetEvent(path, groups, body = { temporaryPassword: "Saturday123!" }) {
+  const event = authenticatedEvent("POST", path, body);
+  event.requestContext.authorizer.jwt.claims["cognito:groups"] = groups;
+  event.requestContext.authorizer.jwt.claims.name = "Sam Lee";
+  return event;
+}
+
+test("an org admin resets a teammate's password: new temporary password, signed out everywhere, logged", async () => {
+  const store = removalStore();
+  const directory = resetDirectory();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+
+  const response = await handler(resetEvent("/workspaces/me/users/member-x/reset-password", "company-admin"));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(JSON.parse(response.body), { ok: true });
+  assert.deepEqual(directory.resets, [["leaver@example.com", "Saturday123!"]]);
+  assert.deepEqual(directory.signOuts, ["leaver@example.com"]);
+  assert.equal(store.activity.length, 1);
+  assert.equal(store.activity[0][0], "ws-1");
+  assert.equal(store.activity[0][1].eventType, "password_reset");
+  assert.equal(store.activity[0][1].page, "Reset the password for Pat Leaver");
+  assert.equal(store.activity[0][1].support, undefined);
+});
+
+test("a super admin resets a company user's password from Manage Company Accounts, logged as support", async () => {
+  const store = removalStore();
+  const directory = resetDirectory();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+  const event = resetEvent("/platform/companies/ws-1/users/member-x/reset-password", "super-admin");
+  event.pathParameters = { workspaceId: "ws-1", userId: "member-x" };
+
+  const response = await handler(event);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(directory.resets, [["leaver@example.com", "Saturday123!"]]);
+  assert.equal(store.activity[0][1].eventType, "password_reset");
+  assert.equal(store.activity[0][1].support, true);
+});
+
+test("a super admin can reset a user who has never signed in, in any company", async () => {
+  const store = removalStore({
+    async getWorkspace() { return { workspaceId: "ws-2", name: "CWR Solutions", tier: "repository" }; },
+    async getMembership(userId) {
+      if (userId === "user-123") return { userId, workspaceId: "workspace-symantic-ai", role: "super-admin", status: "active" };
+      if (userId === "jeff") return { userId, workspaceId: "ws-2", email: "jeff@example.com", name: "Jeff", role: "company-admin", status: "active", cognitoUsername: "jeff-cognito" };
+      return null;
+    },
+  });
+  const directory = resetDirectory();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+  const event = resetEvent("/platform/companies/ws-2/users/jeff/reset-password", "super-admin");
+  event.pathParameters = { workspaceId: "ws-2", userId: "jeff" };
+
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.deepEqual(directory.resets, [["jeff-cognito", "Saturday123!"]]);
+  assert.equal(store.activity[0][0], "ws-2");
+});
+
+test("nobody resets their own password from the admin screens", async () => {
+  const store = removalStore();
+  const directory = resetDirectory();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+
+  const response = await handler(resetEvent("/workspaces/me/users/user-123/reset-password", "company-admin"));
+
+  assert.equal(response.statusCode, 400);
+  assert.match(JSON.parse(response.body).message, /Forgot Password/);
+  assert.deepEqual(directory.resets, []);
+});
+
+test("an org admin cannot reset a super administrator's password", async () => {
+  const store = removalStore();
+  const directory = resetDirectory(["super-admin"]);
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+
+  const response = await handler(resetEvent("/workspaces/me/users/member-x/reset-password", "company-admin"));
+
+  assert.equal(response.statusCode, 403);
+  assert.deepEqual(directory.resets, []);
+  assert.deepEqual(store.activity, []);
+});
+
+test("a weak or missing temporary password is refused before anything changes", async () => {
+  const { createHandler } = await loadBff();
+  for (const temporaryPassword of [undefined, "", "short1!A", "alllowercase123!", "ALLUPPERCASE123!", "NoNumbersHere!!", "NoSymbols12345", " Leading123!abc"]) {
+    const directory = resetDirectory();
+    const store = removalStore();
+    const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+    const response = await handler(resetEvent("/workspaces/me/users/member-x/reset-password", "company-admin", { temporaryPassword }));
+    assert.equal(response.statusCode, 400, `expected 400 for ${JSON.stringify(temporaryPassword)}`);
+    assert.match(JSON.parse(response.body).message, /12 characters/);
+    assert.deepEqual(directory.resets, []);
+  }
+});
+
+test("Cognito rejecting the password returns the same plain message", async () => {
+  const store = removalStore();
+  const directory = {
+    ...resetDirectory(),
+    async resetPassword() { const error = new Error("policy"); error.name = "InvalidPasswordException"; throw error; },
+  };
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => store, getUserDirectory: async () => directory });
+
+  const response = await handler(resetEvent("/workspaces/me/users/member-x/reset-password", "company-admin"));
+  assert.equal(response.statusCode, 400);
+  assert.match(JSON.parse(response.body).message, /12 characters/);
+  assert.deepEqual(store.activity, []);
+});
+
+test("an org admin can't reset a user in another company, and a quotation builder can't reset anyone", async () => {
+  const { createHandler } = await loadBff();
+  const otherCompany = removalStore({
+    async getMembership(userId) {
+      if (userId === "user-123") return { userId, workspaceId: "ws-1", role: "company-admin", status: "active" };
+      return { userId, workspaceId: "ws-other", email: "x@other.com", role: "company-admin", status: "active" };
+    },
+  });
+  const directory = resetDirectory();
+  const handler = createHandler({ getStore: async () => otherCompany, getUserDirectory: async () => directory });
+  assert.equal((await handler(resetEvent("/workspaces/me/users/someone/reset-password", "company-admin"))).statusCode, 404);
+
+  const builderStore = removalStore({
+    async getMembership(userId) {
+      if (userId === "user-123") return { userId, workspaceId: "ws-1", role: "quotation-builder", status: "active" };
+      return { userId, workspaceId: "ws-1", email: "leaver@example.com", role: "quotation-builder", status: "active" };
+    },
+  });
+  const builderHandler = createHandler({ getStore: async () => builderStore, getUserDirectory: async () => directory });
+  assert.equal((await builderHandler(resetEvent("/workspaces/me/users/member-x/reset-password", "quotation-builder"))).statusCode, 403);
+  assert.deepEqual(directory.resets, []);
+});
+
+test("the Manage Company Accounts reset route is super-admin only", async () => {
+  const directory = resetDirectory();
+  const { createHandler } = await loadBff();
+  const handler = createHandler({ getStore: async () => removalStore(), getUserDirectory: async () => directory });
+  const event = resetEvent("/platform/companies/ws-1/users/member-x/reset-password", "company-admin");
+  event.pathParameters = { workspaceId: "ws-1", userId: "member-x" };
+
+  assert.equal((await handler(event)).statusCode, 403);
+  assert.deepEqual(directory.resets, []);
+});
+
+test("Cognito directory: a reset sets a non-permanent password and signs the user out", async () => {
+  class AdminSetUserPasswordCommand { constructor(input) { this.input = input; } }
+  class AdminUserGlobalSignOutCommand { constructor(input) { this.input = input; } }
+  const sent = [];
+  const client = { async send(command) { sent.push(command); return {}; } };
+  const { createCognitoDirectory } = await loadBff();
+  const directory = createCognitoDirectory(client, { AdminSetUserPasswordCommand, AdminUserGlobalSignOutCommand }, "pool-1");
+
+  await directory.resetPassword("jeff@example.com", "Saturday123!");
+  await directory.signOutEverywhere("jeff@example.com");
+
+  assert.ok(sent[0] instanceof AdminSetUserPasswordCommand);
+  assert.deepEqual(sent[0].input, { UserPoolId: "pool-1", Username: "jeff@example.com", Password: "Saturday123!", Permanent: false });
+  assert.ok(sent[1] instanceof AdminUserGlobalSignOutCommand);
+  assert.deepEqual(sent[1].input, { UserPoolId: "pool-1", Username: "jeff@example.com" });
+});
+
 test("super administrators onboard a company with an isolated default template", async () => {
   let bundle;
   const store = {

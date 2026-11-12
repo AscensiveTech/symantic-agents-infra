@@ -3207,6 +3207,22 @@ async function handlePlatformCompanies(event, {
       return json(200, { ok: true, ...result });
     }
 
+    if (target.kind === "user-reset-password" && method === "POST") {
+      const membership = await store.getMembership(target.userId);
+      if (!membership || membership.workspaceId !== target.workspaceId) {
+        return json(404, { message: "Workspace user not found" });
+      }
+      return resetMemberPassword({
+        store,
+        directory: await getUserDirectory(),
+        workspaceId: target.workspaceId,
+        target: membership,
+        actor,
+        event,
+        body: readBody(event),
+      });
+    }
+
     return json(404, { message: "Not found" });
   }
 
@@ -3971,6 +3987,7 @@ function getPlatformCompanyTarget(event, path) {
   const patterns = [
     ["logo-upload", /^\/platform\/companies\/([^/]+)\/logo\/upload-url$/],
     ["logo-complete", /^\/platform\/companies\/([^/]+)\/logo\/complete$/],
+    ["user-reset-password", /^\/platform\/companies\/([^/]+)\/users\/([^/]+)\/reset-password$/],
     ["user", /^\/platform\/companies\/([^/]+)\/users\/([^/]+)$/],
     ["users", /^\/platform\/companies\/([^/]+)\/users$/],
     ["usage", /^\/platform\/companies\/([^/]+)\/usage$/],
@@ -3993,7 +4010,8 @@ function getPlatformCompanyTarget(event, path) {
       const workspaceId = decodeURIComponent(
         event?.pathParameters?.workspaceId ?? match[1],
       );
-      const userId = kind === "user"
+      const hasUserId = kind === "user" || kind === "user-reset-password";
+      const userId = hasUserId
         ? decodeURIComponent(event?.pathParameters?.userId ?? match[2])
         : null;
       const paymentId = kind === "proposal-payment" || kind === "receptionist-payment"
@@ -4005,7 +4023,7 @@ function getPlatformCompanyTarget(event, path) {
       const assetAction = kind === "proposal-assets-url" ? match[2] : null;
       if (
         !ENTITY_ID_PATTERN.test(workspaceId) ||
-        (kind === "user" && !ENTITY_ID_PATTERN.test(userId)) ||
+        (hasUserId && !ENTITY_ID_PATTERN.test(userId)) ||
         (kind === "proposal-template" && !ENTITY_ID_PATTERN.test(templateId))
       ) return null;
       return {
@@ -4425,6 +4443,74 @@ function memberLabel(member) {
   return (typeof member?.name === "string" && member.name.trim()) || (typeof member?.email === "string" && member.email.trim()) || "";
 }
 
+// Same rules as the user pool's password policy (cognito.tf) - checked here
+// too so the admin gets a clear message instead of a raw Cognito error.
+const TEMPORARY_PASSWORD_HINT = "at least 12 characters with an uppercase letter, a lowercase letter, a number, and a symbol";
+function isValidTemporaryPassword(value) {
+  return typeof value === "string"
+    && value.length >= 12
+    && value.length <= 256
+    && !/^\s|\s$/.test(value)
+    && /[A-Z]/.test(value)
+    && /[a-z]/.test(value)
+    && /[0-9]/.test(value)
+    && /[^A-Za-z0-9\s]/.test(value);
+}
+
+// An admin resets someone else's password: the user gets a new temporary
+// password they must change at their next sign-in, and every device they're
+// signed in on is signed out. Works whether or not they've ever signed in -
+// unlike Forgot Password, which can't help a user who never signed in (or
+// whose first temporary password expired). Shared by Team & Access (company
+// admin, own company) and Manage Company Accounts (super admin, any
+// company). Nobody resets their own password this way, and a company admin
+// can't reset a super administrator's. Recorded in the activity log.
+async function resetMemberPassword({ store, directory, workspaceId, target, actor, event, body }) {
+  if (target.userId === actor.userId) {
+    return json(400, { message: "You can't reset your own password here. Sign out and use Forgot Password on the sign-in page." });
+  }
+  const temporaryPassword = body?.temporaryPassword;
+  if (!isValidTemporaryPassword(temporaryPassword)) {
+    return json(400, { message: `The temporary password needs ${TEMPORARY_PASSWORD_HINT}.` });
+  }
+  const username = target.cognitoUsername ?? target.email;
+  if (!actor.roles.includes("super-admin")) {
+    const targetRoles = typeof directory.getRoles === "function" ? await directory.getRoles(username) : [];
+    if (target.role === "super-admin" || targetRoles.includes("super-admin")) {
+      return json(403, { message: "A company administrator cannot reset a super administrator's password" });
+    }
+  }
+  if (typeof directory.resetPassword !== "function") {
+    return json(501, { message: "Password reset isn't available" });
+  }
+  try {
+    await directory.resetPassword(username, temporaryPassword);
+  } catch (error) {
+    if (error?.name === "InvalidPasswordException") {
+      return json(400, { message: `The temporary password needs ${TEMPORARY_PASSWORD_HINT}.` });
+    }
+    if (error?.name === "UserNotFoundException") {
+      return json(404, { message: "This user's sign-in account no longer exists" });
+    }
+    throw error;
+  }
+  if (typeof directory.signOutEverywhere === "function") {
+    await directory.signOutEverywhere(username)
+      .catch((error) => console.warn("Failed to sign a reset user out", { userId: target.userId, error: String(error) }));
+  }
+  if (typeof store.recordActivity === "function") {
+    await store.recordActivity(workspaceId, {
+      eventType: "password_reset",
+      page: `Reset the password for ${memberLabel(target) || "a user"}`,
+      userId: actor.userId,
+      userName: actorDisplayName(event, actor),
+      userEmail: actor.membership?.email,
+      ...(actor.supporting || actor.roles.includes("super-admin") ? { support: true } : {}),
+    }).catch((error) => console.warn("Failed to log a password reset", { error: String(error) }));
+  }
+  return json(200, { ok: true });
+}
+
 // Who inherits a removed member's unfinished proposals. A company's own admin
 // removing someone gets them. A Symantic super admin (support mode or Manage
 // Company Accounts) never does: they go to the company's first active Org
@@ -4507,6 +4593,31 @@ async function handleWorkspaceUsers(event, {
       workspaceId: actor.workspaceId,
       tier: workspace?.tier,
       actorUserId: actor.userId,
+      body: readBody(event),
+    });
+  }
+
+  const resetMatch = path.match(/^\/workspaces\/me\/users\/([^/]+)\/reset-password$/);
+  if (resetMatch) {
+    if (method !== "POST") return json(404, { message: "Not found" });
+    let resetUserId = null;
+    try {
+      resetUserId = decodeURIComponent(event?.pathParameters?.userId ?? resetMatch[1]);
+    } catch {
+      resetUserId = null;
+    }
+    if (!resetUserId || !ENTITY_ID_PATTERN.test(resetUserId)) return json(404, { message: "Not found" });
+    const resetTarget = await store.getMembership(resetUserId);
+    if (!resetTarget || resetTarget.workspaceId !== actor.workspaceId) {
+      return json(404, { message: "Workspace user not found" });
+    }
+    return resetMemberPassword({
+      store,
+      directory: await getUserDirectory(),
+      workspaceId: actor.workspaceId,
+      target: resetTarget,
+      actor,
+      event,
       body: readBody(event),
     });
   }
@@ -9591,6 +9702,25 @@ export function createCognitoDirectory(client, commands, userPoolId) {
 
     async deleteUser(username) {
       await client.send(new commands.AdminDeleteUserCommand({
+        UserPoolId: userPoolId,
+        Username: username,
+      }));
+    },
+
+    // A new temporary password (Permanent: false puts the user back in
+    // FORCE_CHANGE_PASSWORD, so they choose their own at next sign-in).
+    async resetPassword(username, temporaryPassword) {
+      await client.send(new commands.AdminSetUserPasswordCommand({
+        UserPoolId: userPoolId,
+        Username: username,
+        Password: temporaryPassword,
+        Permanent: false,
+      }));
+    },
+
+    // Revokes the user's refresh tokens, so a reset also ends their sessions.
+    async signOutEverywhere(username) {
+      await client.send(new commands.AdminUserGlobalSignOutCommand({
         UserPoolId: userPoolId,
         Username: username,
       }));
