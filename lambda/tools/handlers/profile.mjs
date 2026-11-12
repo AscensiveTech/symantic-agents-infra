@@ -20,6 +20,7 @@ const AGENT_PROFILE_FIELDS = [
   "holidaysEnabled",
   "ownerPhone",
   "locationName",
+  "locationBusinessName",
   "additionalLocations",
 ];
 

@@ -48,6 +48,7 @@ export const AGENT_PROFILE_FIELDS = Object.freeze([
   // Multi-location: Location 1 is the fields above; locationName names it and
   // additionalLocations holds locations 2..MAX_LOCATIONS (see locations.mjs).
   "locationName",
+  "locationBusinessName",
   "additionalLocations",
 ]);
 
@@ -310,8 +311,13 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
   const defaultTransferNumber = toE164(profile.ownerPhone);
   const callHandling = resolveCallHandling(agent);
   const greeting = greetingFor(agent, profile);
+  const companyName = sanitizeName(profile.businessName);
   const locations = profileLocations(profile).map((location) => ({
     name: location.name,
+    // Only when it differs from the Company Name.
+    businessName: sanitizeName(location.businessName) && sanitizeName(location.businessName) !== companyName
+      ? sanitizeName(location.businessName)
+      : null,
     ...resolveLocationFields(location),
     serviceAreaNames: resolveServiceArea(location).serviceAreaNames,
   }));

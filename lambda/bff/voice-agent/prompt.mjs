@@ -330,6 +330,7 @@ function locationsInfoSection({ cfg, booking, business }) {
     return [
       "",
       `LOCATION: ${location.name}`,
+      ...(location.businessName ? [`- Goes by: ${location.businessName} - use this name when talking about this location.`] : []),
       ...(location.phone ? [`- Phone: ${location.phone}`] : []),
       `- Address: ${location.address || "Not provided"}`,
       ...(location.mailingAddress ? [`- Mailing address: ${location.mailingAddress}`] : []),

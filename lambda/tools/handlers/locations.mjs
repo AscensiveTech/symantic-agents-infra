@@ -7,7 +7,10 @@
 // `locationName`. Locations 2..N live in `additionalLocations`, each with the
 // same per-location field names:
 //
-//   { id, name, phone, address, mailingAddress, website, timezone,
+// Each location may go by its own business name (`businessName`; Location 1's
+// is `locationBusinessName`) - blank means the agent-wide Company Name.
+//
+//   { id, name, businessName, phone, address, mailingAddress, website, timezone,
 //     contactEmails, serviceZones, businessHours, holidays, holidaysEnabled }
 //
 // Mirror of lambda/bff/voice-agent/locations.mjs - this Lambda is packaged separately.
@@ -32,13 +35,13 @@ export const LOCATION_FIELDS = Object.freeze([
 // shape are skipped; the list never exceeds MAX_LOCATIONS.
 export function profileLocations(profile) {
   if (!profile || typeof profile !== "object") return [];
-  const first = { id: "location-1", name: text(profile.locationName) };
+  const first = { id: "location-1", name: text(profile.locationName), businessName: text(profile.locationBusinessName) };
   for (const field of LOCATION_FIELDS) if (profile[field] !== undefined) first[field] = profile[field];
   const extra = Array.isArray(profile.additionalLocations)
     ? profile.additionalLocations.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
     : [];
   const locations = [first, ...extra.map((entry, index) => {
-    const location = { id: text(entry.id) || `location-${index + 2}`, name: text(entry.name) };
+    const location = { id: text(entry.id) || `location-${index + 2}`, name: text(entry.name), businessName: text(entry.businessName) };
     for (const field of LOCATION_FIELDS) if (entry[field] !== undefined) location[field] = entry[field];
     return location;
   })].slice(0, MAX_LOCATIONS);

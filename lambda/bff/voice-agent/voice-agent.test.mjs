@@ -810,3 +810,15 @@ test("an unnamed extra location is called Location N; more than 10 are ignored",
   assert.equal(cfg.business.locations.length, 10);
   assert.equal(cfg.business.locations[1].name, "Location 2");
 });
+
+test("a location can go by its own business name; the same name as the company adds nothing", () => {
+  const profile = {
+    ...twoLocationProfile,
+    locationBusinessName: "C. W. R.",
+    additionalLocations: [{ ...twoLocationProfile.additionalLocations[0], businessName: "CWR Carolinas" }],
+  };
+  const info = section(compile(minimalAgent(), { profile }).prompt.text, "BUSINESS INFO");
+  assert.match(info, /LOCATION: South Carolina\n- Goes by: CWR Carolinas/);
+  assert.doesNotMatch(info, /LOCATION: Maryland\n- Goes by/);
+  assert.match(info, /- Business: C\. W\. R\./);
+});
