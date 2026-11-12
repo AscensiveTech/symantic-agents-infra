@@ -749,3 +749,76 @@ test("service area: semicolons, colons and stray symbols split places the same w
   const cfg = buildVoiceAgentConfiguration(minimalAgent(), { ...workspaceProfile, serviceAreas: ["Washington", "D.C.; Arlington", "VA; Myrtle Beach", "SC"] });
   assert.deepEqual(cfg.business.coverageAreas, ["Washington, D.C.", "Arlington, VA", "Myrtle Beach, SC"]);
 });
+
+// --- multi-location ------------------------------------------------------------
+
+const twoLocationProfile = {
+  ...workspaceProfile,
+  businessName: "C. W. R.",
+  locationName: "Maryland",
+  phone: "(301) 937-1733",
+  address: "PO Box 599, Beltsville, MD 20704",
+  timezone: "America/New_York",
+  serviceZones: [{ id: "md", type: "postalList", label: "Maryland - DC Metro", codes: [{ code: "20910", locality: "Silver Spring", regionCode: "MD", status: "ok" }] }],
+  additionalLocations: [{
+    id: "loc-sc",
+    name: "South Carolina",
+    phone: "(843) 353-6382",
+    address: "PO Box 30037, Myrtle Beach, SC 29588",
+    timezone: "America/Chicago",
+    businessHours: SPLIT_HOURS_WITH_24H_WEEKEND,
+    serviceZones: [{ id: "sc", type: "postalList", label: "Myrtle Beach area", codes: [{ code: "29577", locality: "Myrtle Beach", regionCode: "SC", status: "ok" }] }],
+  }],
+};
+
+test("one location: no LOCATION blocks, no location post-call field, prompt unchanged in shape", () => {
+  const compiled = compile(minimalAgent());
+  assert.doesNotMatch(compiled.prompt.text, /^LOCATION: /m);
+  assert.deepEqual(compiled.retell.agentSettings.post_call_analysis_data.map((field) => field.name), ["is_spam"]);
+});
+
+test("two locations: each gets its own block, phone, address, timezone clock, hours and service area", () => {
+  const compiled = compile(minimalAgent(), { profile: twoLocationProfile });
+  const info = section(compiled.prompt.text, "BUSINESS INFO");
+  assert.match(info, /This business has 2 locations: Maryland, and South Carolina|This business has 2 locations: Maryland and South Carolina/);
+  assert.match(info, /"Maryland or South Carolina\?"/);
+  assert.match(info, /LOCATION: Maryland\n- Phone: \(301\) 937-1733\n- Address: PO Box 599, Beltsville, MD 20704/);
+  assert.match(info, /LOCATION: South Carolina\n- Phone: \(843\) 353-6382/);
+  assert.match(info, /\{\{current_time_America\/New_York\}\}/);
+  assert.match(info, /\{\{current_time_America\/Chicago\}\}/);
+  assert.match(info, /- Serves: Myrtle Beach area/);
+  assert.match(info, /Location: <name>/);
+  // Both locations' areas are offered, never the ZIP codes themselves.
+  const area = section(compiled.prompt.text, "SERVICE AREA");
+  assert.match(area, /Maryland - DC Metro; Myrtle Beach area/);
+  assert.match(area, /coveredBy/);
+  assert.doesNotMatch(compiled.prompt.text, /29577/);
+  const fields = compiled.retell.agentSettings.post_call_analysis_data;
+  const location = fields.find((field) => field.name === "location");
+  assert.equal(location.type, "enum");
+  assert.deepEqual(location.choices, ["Maryland", "South Carolina", "Not stated"]);
+  const agent = minimalAgent();
+  assert.deepEqual(validateRetellPayloads({ llm: compiled.retell.llm, agent: updateAgentPayload(compiled, agent) }), []);
+});
+
+test("an unnamed extra location is called Location N; more than 10 are ignored", () => {
+  const many = {
+    ...twoLocationProfile,
+    additionalLocations: Array.from({ length: 12 }, (_, index) => ({ id: `l${index}`, name: index === 0 ? "" : `Site ${index}`, timezone: "America/New_York" })),
+  };
+  const cfg = buildVoiceAgentConfiguration(minimalAgent(), many);
+  assert.equal(cfg.business.locations.length, 10);
+  assert.equal(cfg.business.locations[1].name, "Location 2");
+});
+
+test("a location can go by its own business name; the same name as the company adds nothing", () => {
+  const profile = {
+    ...twoLocationProfile,
+    locationBusinessName: "C. W. R.",
+    additionalLocations: [{ ...twoLocationProfile.additionalLocations[0], businessName: "CWR Carolinas" }],
+  };
+  const info = section(compile(minimalAgent(), { profile }).prompt.text, "BUSINESS INFO");
+  assert.match(info, /LOCATION: South Carolina\n- Goes by: CWR Carolinas/);
+  assert.doesNotMatch(info, /LOCATION: Maryland\n- Goes by/);
+  assert.match(info, /- Business: C\. W\. R\./);
+});

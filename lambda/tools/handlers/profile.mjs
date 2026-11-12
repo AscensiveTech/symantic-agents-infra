@@ -19,6 +19,9 @@ const AGENT_PROFILE_FIELDS = [
   "holidays",
   "holidaysEnabled",
   "ownerPhone",
+  "locationName",
+  "locationBusinessName",
+  "additionalLocations",
 ];
 
 const UNEDITABLE_PROFILE_FIELDS = [

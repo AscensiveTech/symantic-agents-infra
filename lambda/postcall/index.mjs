@@ -271,6 +271,9 @@ export function createHandler({
       toolLog: storedToolLog,
       actions: describeActions(toolLog),
       callSummary: stringValue(analysis.call_summary),
+      // Multi-location agents: which location the call was about
+      // (voice-agent/post-call.mjs). Absent for single-location agents.
+      ...(callLocation(analysis) ? { location: callLocation(analysis) } : {}),
       userSentiment: stringValue(analysis.user_sentiment),
       // Present (and unset) as soon as a call's sentiment analysis comes
       // back negative - the digest Lambda's own per-tick loop picks these
@@ -628,6 +631,12 @@ function callContextValue(call, toolLog, field) {
     if (value) return value;
   }
   return undefined;
+}
+
+function callLocation(analysis) {
+  const custom = analysis?.custom_analysis_data;
+  const value = custom && typeof custom === "object" ? stringValue(custom.location) : undefined;
+  return value && value !== "Not stated" ? value.slice(0, 120) : undefined;
 }
 
 function summarizeCall(call, toolLog) {

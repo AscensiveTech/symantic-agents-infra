@@ -7,6 +7,12 @@
 //     postalCode }, position: [lng, lat], mapView: [w, s, e, n] }
 //   { id, type: "radius", label, center: [lng, lat], radiusMeters, unit: "km" | "mi", area }
 //   { id, type: "polygon", label, coordinates: [[lng, lat], ...], area }
+//   { id, type: "postalList", label, codes: [{ code, locality, regionCode, status }], area }
+//
+// A postalList is a pasted list of US ZIP codes - one zone however many codes
+// it holds (up to MAX_POSTAL_CODES). Each code's town and state are resolved
+// once when the list is saved (geo.mjs resolvePostalCodes), so the call-time
+// check is a plain set lookup and the codes never reach the prompt.
 //
 // `area` on a shape is the country and region it sits in (reverse geocoded
 // when drawn), used to narrow and disambiguate the caller's place.
@@ -16,15 +22,16 @@ export const MAX_POLYGON_VERTICES = 250;
 export const MAX_TOTAL_VERTICES = 2000;
 export const MIN_RADIUS_METERS = 100;
 export const MAX_RADIUS_METERS = 500_000;
+export const MAX_POSTAL_CODES = 2000;
 
 const PLACE_TYPES = new Set(["Country", "Region", "SubRegion", "Locality", "District", "SubDistrict", "PostalCode"]);
 
-export function sanitizeServiceZones(value) {
+export function sanitizeServiceZones(value, { maxZones = MAX_ZONES } = {}) {
   if (!Array.isArray(value)) return [];
   const zones = [];
   let vertices = 0;
   for (const raw of value) {
-    if (zones.length >= MAX_ZONES) break;
+    if (zones.length >= maxZones) break;
     const zone = sanitizeZone(raw);
     if (!zone) continue;
     if (zone.type === "polygon") {
@@ -76,7 +83,42 @@ function sanitizeZone(raw) {
       ...(sanitizeArea(raw.area) ? { area: sanitizeArea(raw.area) } : {}),
     };
   }
+  if (raw.type === "postalList") {
+    const codes = sanitizePostalCodes(raw.codes);
+    if (!codes.length) return null;
+    return {
+      ...base,
+      type: "postalList",
+      label: base.label || "ZIP codes",
+      codes,
+      ...(sanitizeArea(raw.area) ? { area: sanitizeArea(raw.area) } : {}),
+    };
+  }
   return null;
+}
+
+// "20910-1234" -> "20910"; anything that isn't a US ZIP is dropped. Order
+// kept, duplicates removed, capped at MAX_POSTAL_CODES.
+export function normalizeZip(value) {
+  const match = typeof value === "string" ? value.trim().match(/^(\d{5})(?:-\d{4})?$/) : null;
+  return match ? match[1] : null;
+}
+
+function sanitizePostalCodes(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const codes = [];
+  for (const entry of raw) {
+    if (codes.length >= MAX_POSTAL_CODES) break;
+    const code = normalizeZip(typeof entry === "string" ? entry : entry?.code);
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    const resolved = entry && typeof entry === "object" ? entry : {};
+    const locality = bounded(resolved.locality, 120) || null;
+    const regionCode = bounded(resolved.regionCode, 20) || null;
+    codes.push({ code, locality, regionCode, status: resolved.status === "ok" && locality ? "ok" : "unknown" });
+  }
+  return codes;
 }
 
 function sanitizePlace(raw) {

@@ -12,7 +12,8 @@
 import { isBusinessHours } from "../business-hours.mjs";
 import { resolveSpokenForms } from "./spoken-forms.mjs";
 import { repairServiceAreas } from "./service-areas.mjs";
-import { sanitizeServiceZones, spokenZoneName } from "./service-zones.mjs";
+import { MAX_ZONES, sanitizeServiceZones, spokenZoneName } from "./service-zones.mjs";
+import { MAX_LOCATIONS, profileLocations } from "./locations.mjs";
 
 export const CANONICAL_SCHEMA_VERSION = 1;
 
@@ -44,6 +45,11 @@ export const AGENT_PROFILE_FIELDS = Object.freeze([
   "holidays",
   "holidaysEnabled",
   "ownerPhone",
+  // Multi-location: Location 1 is the fields above; locationName names it and
+  // additionalLocations holds locations 2..MAX_LOCATIONS (see locations.mjs).
+  "locationName",
+  "locationBusinessName",
+  "additionalLocations",
 ]);
 
 // Workspace profile fields no screen can edit any more. Existing workspaces
@@ -299,14 +305,22 @@ export function isIanaTimezone(value) {
 export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledgeBases } = {}) {
   const config = agent?.configuration ?? {};
   const profile = effectiveProfile(agent, workspaceProfile);
-  const timezoneRaw = text(profile.timezone);
-  const timezoneValid = isIanaTimezone(timezoneRaw);
   const usesCalCom = Array.isArray(config.connections) && config.connections.includes("cal-com");
   const bookingEnabled = config.booking === true;
   const allowTransfers = config.allowCallTransfers !== false;
   const defaultTransferNumber = toE164(profile.ownerPhone);
   const callHandling = resolveCallHandling(agent);
   const greeting = greetingFor(agent, profile);
+  const companyName = sanitizeName(profile.businessName);
+  const locations = profileLocations(profile).map((location) => ({
+    name: location.name,
+    // Only when it differs from the Company Name.
+    businessName: sanitizeName(location.businessName) && sanitizeName(location.businessName) !== companyName
+      ? sanitizeName(location.businessName)
+      : null,
+    ...resolveLocationFields(location),
+    serviceAreaNames: resolveServiceArea(location).serviceAreaNames,
+  }));
 
   const assignedIds = Array.isArray(config.knowledgeBaseIds)
     ? config.knowledgeBaseIds.filter((id) => typeof id === "string" && id)
@@ -332,24 +346,11 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
     business: {
       name: sanitizeName(profile.businessName) || "the business",
       nameProvided: Boolean(sanitizeName(profile.businessName)),
-      phone: text(profile.phone) || null,
-      address: text(profile.address) || null,
-      mailingAddress: text(profile.mailingAddress) && text(profile.mailingAddress) !== text(profile.address)
-        ? text(profile.mailingAddress)
-        : null,
-      website: text(profile.website) || null,
-      timezone: timezoneValid ? timezoneRaw : "UTC",
-      timezoneConfigured: timezoneRaw || null,
-      timezoneValid,
-      weeklyHours: isBusinessHours(profile.businessHours) ? profile.businessHours : null,
-      hoursText: text(profile.hours) || null,
-      holidays: resolveHolidays(profile),
-      contactEmails: Array.isArray(profile.contactEmails)
-        ? profile.contactEmails
-          .filter((entry) => text(entry?.email))
-          .map((entry) => ({ label: text(entry.label) || null, email: text(entry.email) }))
-        : [],
-      ...resolveServiceArea(profile),
+      ...resolveLocationFields(profile),
+      ...resolveServiceArea(profile, locations),
+      // Two or more locations: each one's own details, Location 1 first. With
+      // a single location this is empty and the fields above are the business.
+      locations: locations.length > 1 ? locations : [],
       defaultTransferNumber,
     },
     voice: {
@@ -425,8 +426,40 @@ export function buildVoiceAgentConfiguration(agent, workspaceProfile, { knowledg
 // serviceAreaNames is what callers hear when they ask where the business
 // serves: the zones' names, or the older list. The retired "What Callers
 // Hear" text (serviceAreaSummary) is never read.
-function resolveServiceArea(profile) {
-  const serviceZones = sanitizeServiceZones(profile.serviceZones);
+// The per-location part of a Business Profile - Location 1's top-level
+// fields, or one entry of additionalLocations (same field names).
+function resolveLocationFields(source) {
+  const timezoneRaw = text(source.timezone);
+  const timezoneValid = isIanaTimezone(timezoneRaw);
+  return {
+    phone: text(source.phone) || null,
+    address: text(source.address) || null,
+    mailingAddress: text(source.mailingAddress) && text(source.mailingAddress) !== text(source.address)
+      ? text(source.mailingAddress)
+      : null,
+    website: text(source.website) || null,
+    timezone: timezoneValid ? timezoneRaw : "UTC",
+    timezoneConfigured: timezoneRaw || null,
+    timezoneValid,
+    weeklyHours: isBusinessHours(source.businessHours) ? source.businessHours : null,
+    hoursText: text(source.hours) || null,
+    holidays: resolveHolidays(source),
+    contactEmails: Array.isArray(source.contactEmails)
+      ? source.contactEmails
+        .filter((entry) => text(entry?.email))
+        .map((entry) => ({ label: text(entry.label) || null, email: text(entry.email) }))
+      : [],
+  };
+}
+
+// With several locations, every location's zones count: the area served is
+// all of them together, and the tools Lambda reports which location covers
+// the caller.
+function resolveServiceArea(profile, locations = []) {
+  const allZones = locations.length > 1
+    ? profileLocations(profile).flatMap((location) => location.serviceZones ?? [])
+    : profile.serviceZones;
+  const serviceZones = sanitizeServiceZones(allZones, { maxZones: MAX_ZONES * MAX_LOCATIONS });
   // Not re-capped here: input is capped on save, and an older, longer list
   // must keep working exactly as before.
   // Lists saved before semicolons/colons separated places are re-split.

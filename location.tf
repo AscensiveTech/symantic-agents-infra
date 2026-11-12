@@ -54,6 +54,8 @@ resource "aws_iam_role_policy" "bff_location" {
           "geo-places:Autocomplete",
           "geo-places:GetPlace",
           "geo-places:ReverseGeocode",
+          # ZIP lists: each pasted ZIP code's town and state, once per save.
+          "geo-places:Geocode",
         ]
         Resource = local.location_places_arn
       },

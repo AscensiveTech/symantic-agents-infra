@@ -195,3 +195,69 @@ test("a state found by both searches keeps its spelled-out name", async () => {
   });
   assert.deepEqual(await createGeoService({ send }).search({ text: "Virginia" }), [{ placeId: "va", placeType: "Region", title: "Virginia, United States" }]);
 });
+
+// --- ZIP lists -----------------------------------------------------------------
+
+const zipItem = (code, locality, region) => ({
+  PlaceId: `zip-${code}`,
+  PlaceType: "PostalCode",
+  Address: { PostalCode: code, Locality: locality, Region: { Code: region }, Country: { Code3: "USA" } },
+});
+
+test("postal codes: each ZIP resolves to its town and state; unknown codes are flagged", async () => {
+  const { send, calls } = fakeSend({
+    Geocode: (input) => ({
+      ResultItems: input.QueryText === "29577" ? [zipItem("29577", "Myrtle Beach", "SC")]
+        : input.QueryText === "20910" ? [zipItem("20910", "Silver Spring", "MD")]
+          : [],
+    }),
+  });
+  const results = await createGeoService({ send }).postalCodes({ codes: ["29577", "20910-1234", "29577", "99999", "abc"] });
+  assert.deepEqual(results, [
+    { code: "29577", locality: "Myrtle Beach", regionCode: "SC", status: "ok" },
+    { code: "20910", locality: "Silver Spring", regionCode: "MD", status: "ok" },
+    { code: "99999", locality: null, regionCode: null, status: "unknown" },
+  ]);
+  assert.ok(calls.every((call) => call.input.Filter.IncludeCountries[0] === "USA" && call.input.IntendedUse === "Storage"));
+});
+
+test("postal codes: a failed lookup marks only that code unknown", async () => {
+  const { send } = fakeSend({
+    Geocode: (input) => {
+      if (input.QueryText === "21740") throw Object.assign(new Error("boom"), { name: "InternalServerException" });
+      return { ResultItems: [zipItem(input.QueryText, "Somewhere", "MD")] };
+    },
+  });
+  const results = await createGeoService({ send }).postalCodes({ codes: ["21740", "20601"] });
+  assert.equal(results[0].status, "unknown");
+  assert.equal(results[1].status, "ok");
+});
+
+test("postal codes route: over 500 codes in one request is refused", async () => {
+  const geo = { postalCodes: async ({ codes }) => codes.map((code) => ({ code, locality: null, regionCode: null, status: "unknown" })) };
+  const codes = Array.from({ length: 501 }, (_, index) => String(10000 + index));
+  const tooMany = await handleGeoRoute({ path: "/workspaces/me/geo/postal-codes", method: "POST", body: { codes }, geo, json, allow: () => true });
+  assert.equal(tooMany.statusCode, 400);
+  const ok = await handleGeoRoute({ path: "/workspaces/me/geo/postal-codes", method: "POST", body: { codes: codes.slice(0, 500) }, geo, json, allow: () => true });
+  assert.equal(ok.statusCode, 200);
+  assert.equal(ok.body.results.length, 500);
+});
+
+test("ZIP list zones: codes normalized and deduped, capped, one zone however many codes", () => {
+  const codes = [
+    { code: "20910-1234", locality: "Silver Spring", regionCode: "MD", status: "ok" },
+    "20910",
+    { code: "29577", locality: "Myrtle Beach", regionCode: "SC", status: "ok" },
+    "not a zip",
+    { code: "99999", status: "ok" }, // ok without a town is unknown
+  ];
+  const [zone] = sanitizeServiceZones([{ id: "z", type: "postalList", label: "Coverage", codes }]);
+  assert.equal(zone.type, "postalList");
+  assert.deepEqual(zone.codes.map((entry) => entry.code), ["20910", "29577", "99999"]);
+  assert.equal(zone.codes[2].status, "unknown");
+  const huge = sanitizeServiceZones([{ type: "postalList", label: "Big", codes: Array.from({ length: 2500 }, (_, index) => String(10000 + index)) }]);
+  assert.equal(huge[0].codes.length, 2000);
+  assert.deepEqual(sanitizeServiceZones([{ type: "postalList", label: "Empty", codes: ["x"] }]), []);
+  const twenty = sanitizeServiceZones(Array.from({ length: 25 }, (_, index) => ({ type: "postalList", label: `L${index}`, codes: ["20910"] })));
+  assert.equal(twenty.length, MAX_ZONES);
+});

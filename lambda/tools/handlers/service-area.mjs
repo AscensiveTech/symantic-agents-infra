@@ -1,6 +1,7 @@
 import { checkCoverage, normalizeGeocodeItem, regionKey } from "../geo/coverage.mjs";
 import { createPlacesClient } from "../geo/places-client.mjs";
 import { requireString } from "./errors.mjs";
+import { profileLocations } from "./locations.mjs";
 import { effectiveProfile } from "./profile.mjs";
 
 // Read-only, side-effect-free. The zones come from the agent's *published*
@@ -30,15 +31,28 @@ export async function handleServiceArea(input, { store, places = defaultPlaces }
     ])
     : [null, null];
   const profile = agent || workspaceProfile ? effectiveProfile(agent, workspaceProfile) : {};
-  const zones = readZones(profile.serviceZones);
   const language = agent?.configuration?.language === "es-419" ? "es" : "en";
-  const businessAddress = typeof input.businessAddress === "string" && input.businessAddress.trim()
+  const locations = profileLocations(profile);
+  const multiLocation = locations.length > 1;
+  // With several locations every zone is tagged with its location, so a
+  // covered answer can say which location serves the caller.
+  const zones = multiLocation
+    ? locations.flatMap((entry) => readZones(entry.serviceZones).map((zone) => ({ ...zone, locationName: entry.name })))
+    : readZones(profile.serviceZones);
+  const businessAddress = typeof input.businessAddress === "string" && input.businessAddress.trim() && !multiLocation
     ? input.businessAddress
     : typeof profile.address === "string" ? profile.address : "";
+  const addresses = multiLocation
+    ? locations.map((entry) => ({ address: typeof entry.address === "string" ? entry.address.trim() : "", locationName: entry.name }))
+      .filter((entry) => entry.address)
+    : businessAddress ? [{ address: businessAddress, locationName: null }] : [];
 
-  // The business's own town and postal code are always covered.
-  const business = businessAddress ? await geocodeBest(places, businessAddress, { language }) : null;
-  const businessZones = business ? businessTownZones(business) : [];
+  // Each location's own town and postal code are always covered.
+  const geocodedAddresses = await Promise.all(addresses.map((entry) => geocodeBest(places, entry.address, { language })));
+  const business = geocodedAddresses.find(Boolean) ?? null;
+  const businessZones = geocodedAddresses.flatMap((result, index) => (result
+    ? businessTownZones(result).map((zone) => (addresses[index].locationName ? { ...zone, locationName: addresses[index].locationName } : zone))
+    : []));
 
   const countries = zoneCountries([...zones, ...businessZones]);
   const biasPosition = business?.position ?? zones.map(zoneAnchor).find(Boolean) ?? null;
@@ -61,6 +75,11 @@ export async function handleServiceArea(input, { store, places = defaultPlaces }
     .map((zone) => zone.place ?? zone.area)
     .filter((place) => place?.countryCode && (place.regionCode || place.regionName))
     .map((place) => regionKey(place)));
+  // States a ZIP list reaches count as places the business works.
+  for (const zone of allZones) {
+    if (zone.type !== "postalList") continue;
+    for (const entry of zone.codes) if (entry?.regionCode) contextRegions.add(regionKey({ countryCode: "USA", regionCode: entry.regionCode }));
+  }
 
   return checkCoverage({
     location,
@@ -129,8 +148,9 @@ function placeFields(result) {
 
 function zoneCountries(zones) {
   // A shape saved without a country (shouldn't happen) means "don't filter".
-  if (zones.some((zone) => zone.type !== "place" && !zone.area?.countryCode)) return [];
-  return [...new Set(zones.map((zone) => zone.place?.countryCode ?? zone.area?.countryCode).filter(Boolean))];
+  // ZIP lists are US-only.
+  if (zones.some((zone) => zone.type !== "place" && zone.type !== "postalList" && !zone.area?.countryCode)) return [];
+  return [...new Set(zones.map((zone) => (zone.type === "postalList" ? "USA" : zone.place?.countryCode ?? zone.area?.countryCode)).filter(Boolean))];
 }
 
 function zoneAnchor(zone) {
@@ -148,6 +168,7 @@ function readZones(value) {
     if (zone.type === "place") return Boolean(zone.place?.placeType);
     if (zone.type === "radius") return isPosition(zone.center) && Number.isFinite(zone.radiusMeters) && zone.radiusMeters > 0;
     if (zone.type === "polygon") return Array.isArray(zone.coordinates) && zone.coordinates.length >= 3 && zone.coordinates.every(isPosition);
+    if (zone.type === "postalList") return Array.isArray(zone.codes) && zone.codes.some((entry) => typeof entry?.code === "string");
     return false;
   });
 }

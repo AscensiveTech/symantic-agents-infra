@@ -6,7 +6,13 @@
 //              town (Locality), neighbourhood (District) or postal code -
 //              saved with its address components;
 //   - radius:  a circle (center + meters);
-//   - polygon: an outline drawn on the map.
+//   - polygon: an outline drawn on the map;
+//   - postalList: a pasted list of US ZIP codes, each saved with its town
+//              and state - matched by exact code, no geometry.
+//
+// With several locations (multi-location agents), each zone carries the
+// `locationName` it belongs to and a covered answer says which location(s)
+// serve the place (coveredBy).
 //
 // The caller's words are geocoded (Amazon Location Geocode, biased to the
 // business and limited to the countries the business serves). A named place
@@ -47,6 +53,7 @@ export function placeLevel(placeType) {
 // matchedBy for each kind of zone.
 function matchedBy(zone) {
   if (zone.business) return "business_location";
+  if (zone.type === "postalList") return "postal_code";
   if (zone.type !== "place") return zone.type;
   const type = zone.place?.placeType;
   if (type === "PostalCode") return "postal_code";
@@ -223,8 +230,40 @@ function shapeZoneVerdict(zone, result) {
   return inMapView(shapeAnchor(zone), result.mapView) ? "partial" : "outside";
 }
 
+// A ZIP list: the caller's ZIP is covered when it's on the list. A town or
+// state named is partial when some listed ZIP is in it (only those ZIPs are
+// served - the caller's ZIP decides), otherwise outside.
+function postalListVerdict(zone, result) {
+  if (result.countryCode && result.countryCode !== "USA") return "outside";
+  if (result.level >= LEVEL.PostalCode && result.postalCode) {
+    return postalListHas(zone, result.postalCode) ? "covered" : "outside";
+  }
+  const sameState = (entry) => !result.regionCode || !entry.regionCode || entry.regionCode === result.regionCode;
+  if (result.level >= LEVEL.Locality) {
+    return zone.codes.some((entry) => sameState(entry) && sameName(entry.locality, result.locality)) ? "partial" : "outside";
+  }
+  if (result.level >= LEVEL.Region) {
+    return zone.codes.some((entry) => entry.regionCode && sameState(entry)) ? "partial" : "outside";
+  }
+  return "partial"; // the whole country named
+}
+
+function postalListHas(zone, postalCode) {
+  const code = postalKey(postalCode).slice(0, 5);
+  return code.length === 5 && zone.codes.some((entry) => entry.code === code);
+}
+
 export function zoneVerdict(zone, result) {
+  if (zone.type === "postalList") return postalListVerdict(zone, result);
   return zone.type === "place" ? placeZoneVerdict(zone, result) : shapeZoneVerdict(zone, result);
+}
+
+// Every location whose zones cover this result, in zone order.
+function coveringLocations(zones, result) {
+  const names = zones
+    .filter((zone) => zone.locationName && zoneVerdict(zone, result) === "covered")
+    .map((zone) => zone.locationName);
+  return [...new Set(names)];
 }
 
 function bestVerdict(zones, result) {
@@ -253,6 +292,22 @@ export async function checkCoverage({ location, zones, legacyText = [], geocode,
   const spoken = norm(location);
   const textMatch = legacyText.find((entry) => containsWholeWords(spoken, norm(entry)));
   if (textMatch) return respond("covered", { by: "place", area: textMatch, confidence: "exact" });
+
+  // A ZIP code said outright that's on a ZIP list: covered, no lookup needed.
+  const spokenZip = String(location ?? "").match(/\b(\d{5})(?:-\d{4})?\b/)?.[1];
+  if (spokenZip) {
+    const listed = zones.filter((zone) => zone.type === "postalList" && postalListHas(zone, spokenZip));
+    if (listed.length) {
+      const entry = listed[0].codes.find((item) => item.code === spokenZip);
+      return respond("covered", {
+        result: entry?.locality ? zipResult(spokenZip, entry) : null,
+        by: "postal_code",
+        area: listed[0].label,
+        confidence: "exact",
+        coveredBy: [...new Set(listed.map((zone) => zone.locationName).filter(Boolean))],
+      });
+    }
+  }
 
   const items = await geocode(location);
   const results = items
@@ -288,6 +343,7 @@ export async function checkCoverage({ location, zones, legacyText = [], geocode,
       by: matchedBy(first.zone),
       area: first.zone.label,
       confidence: single ? "exact" : "contextual",
+      coveredBy: coveringLocations(zones, first.result),
     });
   }
   // Several readings near the business, none of them served - outside
@@ -345,7 +401,24 @@ function containsWholeWords(haystack, needle) {
   return ` ${haystack} `.includes(` ${needle} `);
 }
 
-function respond(status, { result = null, by = null, area = null, confidence = null, question = "", suggestion = null, candidates = null }) {
+// A listed ZIP said outright, shaped like a geocode result for canonicalLocation.
+function zipResult(code, entry) {
+  return {
+    title: `${entry.locality}, ${entry.regionCode ?? ""} ${code}`.replace(/\s+/g, " ").trim(),
+    placeType: "PostalCode",
+    level: LEVEL.PostalCode,
+    locality: entry.locality,
+    district: null,
+    subRegionName: null,
+    regionName: null,
+    regionCode: entry.regionCode,
+    countryName: "United States",
+    countryCode: "USA",
+    postalCode: code,
+  };
+}
+
+function respond(status, { result = null, by = null, area = null, confidence = null, question = "", suggestion = null, candidates = null, coveredBy = null }) {
   const response = {
     ok: true,
     matched: status === "covered",
@@ -359,6 +432,7 @@ function respond(status, { result = null, by = null, area = null, confidence = n
   };
   if (suggestion) response.suggestion = spokenName(suggestion);
   if (candidates) response.candidates = candidates;
+  if (status === "covered" && coveredBy?.length) response.coveredBy = coveredBy;
   return response;
 }
 
