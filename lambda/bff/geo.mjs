@@ -4,6 +4,7 @@
 //   POST /workspaces/me/geo/search   -> places / addresses as the user types
 //   POST /workspaces/me/geo/place    -> one place's address components, to save as a zone
 //   POST /workspaces/me/geo/reverse  -> what's at a point (the country/region of a drawn shape)
+//   POST /workspaces/me/geo/postal-codes -> each US ZIP code's town and state, for a pasted ZIP list
 //
 // Places calls go through here, signed with the Lambda's role, so no places
 // key reaches the browser. The browser only gets a maps key restricted to map
@@ -30,6 +31,8 @@ async function defaultSend(operation, input) {
       return call({ service: "geo-places", host: places, path: "/v2/suggest", body: input });
     case "Autocomplete":
       return call({ service: "geo-places", host: places, path: "/v2/autocomplete", body: input });
+    case "Geocode":
+      return call({ service: "geo-places", host: places, path: "/v2/geocode", body: input });
     case "ReverseGeocode":
       return call({ service: "geo-places", host: places, path: "/v2/reverse-geocode", body: input });
     case "GetPlace":
@@ -165,7 +168,74 @@ export function createGeoService({
     };
   }
 
-  return { config, search, place, reverse };
+  // A pasted ZIP list: each code's town and state, looked up once when the
+  // list is saved (stored on the zone, so the live call-time check needs no
+  // lookups). Results are cached per container - the same codes are looked
+  // up again whenever a list is edited.
+  async function postalCodes({ codes }) {
+    const list = uniqueZips(codes).slice(0, MAX_POSTAL_CODES_PER_REQUEST);
+    const results = new Array(list.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < list.length) {
+        const index = next;
+        next += 1;
+        results[index] = await resolveZip(list[index]);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(POSTAL_CONCURRENCY, list.length) }, worker));
+    return results;
+  }
+
+  async function resolveZip(code) {
+    const cached = zipCache.get(code);
+    if (cached && cached.expires > now()) return cached.result;
+    let result = { code, locality: null, regionCode: null, status: "unknown" };
+    try {
+      const response = await send("Geocode", {
+        QueryText: code,
+        MaxResults: 1,
+        Filter: { IncludeCountries: ["USA"] },
+        IntendedUse: "Storage",
+      });
+      const item = (response?.ResultItems ?? []).find((entry) => entry?.PlaceType === "PostalCode"
+        && String(entry?.Address?.PostalCode ?? "").slice(0, 5) === code);
+      if (item?.Address?.Locality) {
+        result = { code, locality: item.Address.Locality, regionCode: item.Address.Region?.Code ?? null, status: "ok" };
+      }
+    } catch (error) {
+      // One failed code is shown as "not found"; the rest still resolve.
+      console.error("ZIP lookup failed", { code, name: error?.name });
+      return result;
+    }
+    if (zipCache.size >= ZIP_CACHE_LIMIT) zipCache.delete(zipCache.keys().next().value);
+    zipCache.set(code, { result, expires: now() + ZIP_CACHE_TTL_MS });
+    return result;
+  }
+
+  return { config, search, place, reverse, postalCodes };
+}
+
+// API Gateway allows 29s, so one request takes at most this many codes; the
+// browser sends a longer list in several requests.
+export const MAX_POSTAL_CODES_PER_REQUEST = 500;
+const POSTAL_CONCURRENCY = 20;
+const ZIP_CACHE_LIMIT = 50_000;
+const ZIP_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const zipCache = new Map();
+
+// "20910-1234" -> "20910"; non-ZIPs dropped; order kept; duplicates removed.
+export function uniqueZips(codes) {
+  if (!Array.isArray(codes)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const value of codes) {
+    const match = typeof value === "string" ? value.trim().match(/^(\d{5})(?:-\d{4})?$/) : null;
+    if (!match || seen.has(match[1])) continue;
+    seen.add(match[1]);
+    out.push(match[1]);
+  }
+  return out;
 }
 
 // GetPlace response -> the zone fields saved in serviceZones.
@@ -291,6 +361,13 @@ export async function handleGeoRoute({ path, method, body, geo, json, workspaceI
     if (path === "/workspaces/me/geo/place" && method === "POST") {
       const result = await geo.place(body ?? {});
       return result ? json(200, result) : json(404, { message: "That place couldn't be found on the map" });
+    }
+    if (path === "/workspaces/me/geo/postal-codes" && method === "POST") {
+      const codes = Array.isArray(body?.codes) ? body.codes : [];
+      if (uniqueZips(codes).length > MAX_POSTAL_CODES_PER_REQUEST) {
+        return json(400, { message: `Send at most ${MAX_POSTAL_CODES_PER_REQUEST} ZIP codes at a time` });
+      }
+      return json(200, { results: await geo.postalCodes({ codes }) });
     }
     if (path === "/workspaces/me/geo/reverse" && method === "POST") {
       const result = await geo.reverse(body ?? {});

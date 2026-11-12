@@ -16,6 +16,22 @@ export const SPAM_ANALYSIS_FIELD = Object.freeze({
     + "than a genuine prospective or existing customer.",
 });
 
-export function buildPostCallAnalysis(_cfg) {
-  return [{ ...SPAM_ANALYSIS_FIELD }];
+// Multi-location agents only: which location the call was about, read by
+// lambda/postcall into the call record's `location` (Call History shows it).
+export const LOCATION_ANALYSIS_FIELD_NAME = "location";
+export const LOCATION_NOT_STATED = "Not stated";
+
+export function buildPostCallAnalysis(cfg) {
+  const fields = [{ ...SPAM_ANALYSIS_FIELD }];
+  const names = (cfg?.business?.locations ?? []).map((location) => location.name).filter(Boolean);
+  if (names.length > 1) {
+    fields.push({
+      type: "enum",
+      name: LOCATION_ANALYSIS_FIELD_NAME,
+      description: "Which of the business's locations the caller asked about or the call concerned. "
+        + `"${LOCATION_NOT_STATED}" when no location came up.`,
+      choices: [...new Set(names), LOCATION_NOT_STATED],
+    });
+  }
+  return fields;
 }

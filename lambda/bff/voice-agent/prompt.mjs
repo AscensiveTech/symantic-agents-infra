@@ -39,6 +39,7 @@ export const NO_TRANSFER_FIXED_LINE = "say: \"I'm not authorized to make transfe
 export const KNOWLEDGE_BASE_CONTEXT_HEADER = "## Related Knowledge Base Contexts";
 
 const listJoin = (items) => (items.length > 1 ? `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}` : items[0]);
+const orJoin = (items) => (items.length > 1 ? `${items.slice(0, -1).join(", ")} or ${items.at(-1)}` : items[0]);
 const quoted = (phrases) => phrases.map((phrase) => `"${phrase}"`).join(" or ");
 
 /**
@@ -273,14 +274,20 @@ function namesAndNumbersSection() {
   };
 }
 
-function businessInfoSection({ cfg, booking, business }) {
-  const info = cfg.business;
-  const hoursLine = info.weeklyHours ? formatBusinessHours(info.weeklyHours) : info.hoursText;
-  const holidays = info.holidays.map((holiday) => {
+function holidayLines(info) {
+  return info.holidays.map((holiday) => {
     const label = `${holiday.name} (${spokenDate(holiday.date)})`;
     if (holiday.closed) return `${label}: closed`;
     return holiday.hours ? `${label}: open ${holiday.hours}` : `${label}: open, normal hours`;
   });
+}
+
+function businessInfoSection(context) {
+  if (context.cfg.business.locations.length > 1) return locationsInfoSection(context);
+  const { cfg, booking, business } = context;
+  const info = cfg.business;
+  const hoursLine = info.weeklyHours ? formatBusinessHours(info.weeklyHours) : info.hoursText;
+  const holidays = holidayLines(info);
   return {
     title: "BUSINESS INFO",
     lines: [
@@ -311,6 +318,63 @@ function businessInfoSection({ cfg, booking, business }) {
   };
 }
 
+// Two or more locations behind one number: every location's own details,
+// each with its own local clock, so "are you open?" is answered per location.
+function locationsInfoSection({ cfg, booking, business }) {
+  const { locations } = cfg.business;
+  const names = locations.map((location) => location.name);
+  const blocks = locations.flatMap((location) => {
+    const hoursLine = location.weeklyHours ? formatBusinessHours(location.weeklyHours) : location.hoursText;
+    const holidays = holidayLines(location);
+    const clock = zonedTimeVariable(location.timezoneValid ? location.timezone : "Etc/UTC");
+    return [
+      "",
+      `LOCATION: ${location.name}`,
+      ...(location.phone ? [`- Phone: ${location.phone}`] : []),
+      `- Address: ${location.address || "Not provided"}`,
+      ...(location.mailingAddress ? [`- Mailing address: ${location.mailingAddress}`] : []),
+      ...(location.website ? [`- Website: ${location.website}`] : []),
+      `- Timezone: ${location.timezone} - the current local time here is ${clock}.`,
+      `- Hours: ${hoursLine || "Not provided"}`,
+      ...(holidays.length ? [`- Holidays (these override the weekly hours): ${holidays.join("; ")}`] : []),
+      ...(location.contactEmails.length
+        ? [
+          "- Contact emails (share only if asked):",
+          ...location.contactEmails.map(({ label, email }) => (label ? `  - ${label}: ${email}` : `  - ${email}`)),
+        ]
+        : []),
+      ...(location.serviceAreaNames.length ? [`- Serves: ${location.serviceAreaNames.join("; ")}`] : []),
+    ];
+  });
+  return {
+    title: "BUSINESS INFO",
+    lines: [
+      `- Business: ${business}`,
+      `- This business has ${locations.length} locations: ${listJoin(names)}. Every call reaches you, whichever location `
+        + "the caller dialed - you can't tell which one they called.",
+      "- When the answer depends on the location (a phone number, an address, an email, hours, whether it's open now, "
+        + `or where the work is), ask which location they mean - "${orJoin(names)}?" - never assume. `
+        + "If they've already said a town, state, or ZIP code that one location serves, use that location.",
+      "- Give only the details of the location asked about, never another location's.",
+      "- Decide open or closed by that location's own hours, holidays, and current local time below. Locations can be "
+        + "in different timezones.",
+      booking
+        ? "- Every time you say or book is in the timezone of the location the caller is dealing with - say which."
+        : "- When you say a time, it's in that location's timezone.",
+      "- In any message you take, include which location it's about (\"Location: <name>\"), or \"Location: not stated\".",
+      ...blocks,
+      "",
+      "Go strictly by each location's hours: a day is open or closed exactly as listed, weekends included. A location "
+        + "with no hours listed: say the team will confirm its hours and offer to take a message.",
+      ...(locations.some((location) => location.holidays.length)
+        ? ["Holidays come first: on a date listed under a location's Holidays, its entry replaces that location's weekly "
+          + "hours for that whole day. Callers may name a holiday by another name (\"July 4th\" is Independence Day) or "
+          + "by its date."]
+        : []),
+    ],
+  };
+}
+
 function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
   if (!cfg.business.hasServiceArea) return null;
   return {
@@ -320,9 +384,13 @@ function serviceAreaSection({ cfg, tool, hasOnSiteTypes }) {
         ? `When asked where you serve, say you cover ${cfg.business.serviceAreaNames.join("; ")} - then offer to check `
           + "their town or postal code. Name only these, in natural speech - never list the towns, counties or ZIP codes inside them."
         : "When asked where you serve, say you cover the local area and offer to check their town or postal code.",
-      ...(cfg.business.address
-        ? [`- The business itself is at ${cfg.business.address} - that town and postal code are always covered.`]
-        : []),
+      ...(cfg.business.locations.length > 1
+        ? ["- Each location's own town and postal code are always covered.",
+          "- A covered result names the location(s) that serve the place (coveredBy). One location: that's the location "
+            + "the caller is dealing with - use its details from here on. More than one: ask which location they'd like."]
+        : cfg.business.address
+          ? [`- The business itself is at ${cfg.business.address} - that town and postal code are always covered.`]
+          : []),
       `- Whenever the caller asks whether you serve a place, or gives a city, town, county, state, province, postal or `
         + `ZIP code, or region for any reason, call ${tool(TOOL.serviceArea)} with it as they said it, including the `
         + "state, province or postal code if given - before you answer. A quick \"Let me check\" while it runs is fine here. Its status decides - "

@@ -90,6 +90,7 @@ locals {
     "POST /workspaces/me/geo/search",
     "POST /workspaces/me/geo/place",
     "POST /workspaces/me/geo/reverse",
+    "POST /workspaces/me/geo/postal-codes",
     "GET /workspaces/me/blocked-numbers",
     "POST /workspaces/me/blocked-numbers",
     "DELETE /workspaces/me/blocked-numbers/{phoneNumber}",

@@ -1191,3 +1191,28 @@ test("the CRM client never re-arms a call that already synced", async () => {
   assert.equal(await client.markQueued("ws", "call-1"), false);
   assert.match(commands[0].ConditionExpression, /crmStatus <> :synced/);
 });
+
+test("multi-location: the call's location from post-call analysis is saved; 'Not stated' is left off", async () => {
+  const persisted = [];
+  const handler = createHandler({
+    verifySignature: () => true,
+    getRetellApiKey: async () => "retell-key",
+    getStore: async () => ({
+      async upsertCall(record) {
+        persisted.push(structuredClone(record));
+      },
+      async markAgentTested() {},
+    }),
+    now: () => new Date("2026-08-16T14:00:00.000Z"),
+  });
+  for (const [callId, location] of [["retell-call-loc", "South Carolina"], ["retell-call-none", "Not stated"]]) {
+    await handler(callAnalyzedEvent({
+      call_id: callId,
+      metadata: { workspaceId: "workspace-123", agentId: "agent-123" },
+      transcript_with_tool_calls: [],
+      call_analysis: { call_summary: "Asked about a quote.", custom_analysis_data: { is_spam: false, location } },
+    }));
+  }
+  assert.equal(persisted.find((call) => call.retellCallId === "retell-call-loc").location, "South Carolina");
+  assert.equal("location" in persisted.find((call) => call.retellCallId === "retell-call-none"), false);
+});

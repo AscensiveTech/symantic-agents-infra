@@ -176,3 +176,79 @@ test("a configured entry that couldn't be placed on the map still matches the sa
   assert.equal(response.status, "covered");
   assert.equal(response.matchedArea, "Capitol Hill");
 });
+
+// --- ZIP lists (postalList) and multi-location coveredBy --------------------------
+
+const zipList = (label, codes, locationName) => ({
+  id: `list-${label}`,
+  type: "postalList",
+  label,
+  codes: codes.map(([code, locality, regionCode]) => ({ code, locality, regionCode, status: "ok" })),
+  ...(locationName ? { locationName } : {}),
+});
+const MD_LIST = zipList("Maryland area", [["20910", "Silver Spring", "MD"], ["20707", "Laurel", "MD"]], "Maryland");
+const SC_LIST = zipList("Myrtle Beach area", [["29577", "Myrtle Beach", "SC"], ["29588", "Myrtle Beach", "SC"]], "South Carolina");
+
+test("a ZIP list covers its codes (ZIP+4 too) and nothing else", () => {
+  assert.equal(zoneVerdict(MD_LIST, result(PLACES.zip20910)), "covered");
+  assert.equal(zoneVerdict(MD_LIST, result(PLACES.zip20910plus4)), "covered");
+  assert.equal(zoneVerdict(SC_LIST, result(PLACES.zip20910)), "outside");
+});
+
+test("a town with some listed ZIPs is partial (the ZIP decides); a town with none is outside", () => {
+  assert.equal(zoneVerdict(MD_LIST, result(PLACES.silverSpringMd)), "partial");
+  assert.equal(zoneVerdict(MD_LIST, result(PLACES.silverSpringPa)), "outside");
+  assert.equal(zoneVerdict(MD_LIST, result(PLACES.baltimore)), "outside");
+  assert.equal(zoneVerdict(MD_LIST, result(PLACES.maryland)), "partial");
+  assert.equal(zoneVerdict(MD_LIST, result(PLACES.richmondVa)), "outside");
+});
+
+test("a listed ZIP said outright is covered without a lookup, naming its location", async () => {
+  let looked = false;
+  const response = await checkCoverage({
+    location: "it's 29577",
+    zones: [MD_LIST, SC_LIST],
+    geocode: async () => { looked = true; return []; },
+  });
+  assert.equal(looked, false);
+  assert.equal(response.status, "covered");
+  assert.equal(response.matchedBy, "postal_code");
+  assert.equal(response.matchedArea, "Myrtle Beach area");
+  assert.deepEqual(response.coveredBy, ["South Carolina"]);
+  assert.equal(response.canonicalLocation.locality, "Myrtle Beach");
+});
+
+test("an unlisted ZIP still gets looked up, so other zones can cover it", async () => {
+  const response = await checkCoverage({
+    location: "20910",
+    zones: [SC_LIST, { ...ZONES.maryland, locationName: "Maryland" }],
+    geocode: geocodeTo(PLACES.zip20910),
+  });
+  assert.equal(response.status, "covered");
+  assert.deepEqual(response.coveredBy, ["Maryland"]);
+});
+
+test("a town partly covered by a ZIP list asks for the ZIP code", async () => {
+  const response = await check([MD_LIST], [PLACES.silverSpringMd], { usOnly: true });
+  assert.equal(response.status, "ambiguous");
+  assert.match(response.clarificationQuestion, /ZIP code/);
+});
+
+test("a town no ZIP list reaches is outside", async () => {
+  const response = await check([MD_LIST, SC_LIST], [PLACES.baltimore], { usOnly: true });
+  assert.equal(response.status, "outside");
+});
+
+test("single-location zones carry no coveredBy", async () => {
+  const response = await check([ZONES.maryland], [PLACES.silverSpringMd]);
+  assert.equal(response.status, "covered");
+  assert.equal(response.coveredBy, undefined);
+});
+
+test("several locations covering the same place are all named", async () => {
+  const response = await check(
+    [{ ...ZONES.maryland, locationName: "Maryland" }, { ...ZONES.montgomeryCounty, locationName: "Rockville" }],
+    [PLACES.silverSpringMd],
+  );
+  assert.deepEqual(response.coveredBy, ["Maryland", "Rockville"]);
+});
