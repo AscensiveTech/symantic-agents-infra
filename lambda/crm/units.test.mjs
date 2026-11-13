@@ -6,7 +6,7 @@ import { buildCallerContext, NO_CRM_CONTEXT } from "./context.mjs";
 import { CRM_ERROR, CrmError } from "./errors.mjs";
 import { deriveCallFacts, localDatePlusDays } from "./facts.mjs";
 import { createRecordingMetrics } from "./metrics.mjs";
-import { buildColumnValues, createMondayCrmAdapter, suggestMapping } from "./monday/adapter.mjs";
+import { buildColumnValues, createMondayCrmAdapter, MAIN_WORKSPACE, suggestMapping } from "./monday/adapter.mjs";
 import { createMondayGraphqlClient, DEFAULT_MONDAY_API_VERSION } from "./monday/graphql.mjs";
 import {
   buildAuthorizeUrl,
@@ -298,11 +298,81 @@ test("board discovery only requests data covered by the boards scope", async () 
 
   const boards = await adapter.listBoards({ accessToken: "token" });
 
-  assert.equal(requests.length, 1, "board discovery is a single API request");
-  assert.doesNotMatch(requests[0].query, /workspace\s*\{/);
+  assert.equal(requests.length, 1, "no workspace lookup when every board is in the Main workspace");
+  assert.doesNotMatch(requests[0].query, /workspace\s*\{/, "the board list never nests workspace fields");
   assert.doesNotMatch(requests[0].query, /settings_str/);
-  assert.equal(boards[0].workspaceName, null);
+  assert.equal(boards[0].workspaceName, MAIN_WORKSPACE, "no workspace id means the Main workspace");
   assert.deepEqual(boards[0].columns[0].labels, ["New Lead"]);
+});
+
+// A fake GraphQL client for the board picker: boards, plus a workspaces
+// answer (or a failure, like a connection without workspaces:read).
+function pickerAdapter({ boards, workspaces, workspacesFail = false }) {
+  const requests = [];
+  const adapter = createMondayCrmAdapter({
+    graphql: {
+      async request(input) {
+        requests.push(input);
+        if (input.operation === "list_workspaces") {
+          if (workspacesFail) throw new CrmError(CRM_ERROR.PROVIDER_ERROR, "missing scope workspaces:read");
+          return { workspaces: workspaces.filter((workspace) => input.variables.ids.includes(workspace.id)) };
+        }
+        return { boards };
+      },
+    },
+  });
+  return { adapter, requests };
+}
+
+const board = (id, name, extra = {}) => ({ id, name, board_kind: "public", type: "board", columns: [], ...extra });
+
+test("board picker labels every board with its workspace and row count", async () => {
+  const { adapter, requests } = pickerAdapter({
+    boards: [
+      board("1", "Contacts", { workspace_id: 11, items_count: 212 }),
+      board("2", "Contacts", { workspace_id: 22, items_count: 0 }),
+      board("3", "Contacts", { workspace_id: null, items_count: 5 }),
+      board("4", "Leads", { workspace_id: 11 }),
+    ],
+    workspaces: [{ id: "11", name: "CWR Solutions" }, { id: "22", name: "Belle Ami" }],
+  });
+  const boards = await adapter.listBoards({ accessToken: "token" });
+  assert.deepEqual(boards.map((b) => [b.id, b.workspaceName, b.itemCount]), [
+    ["1", "CWR Solutions", 212],
+    ["2", "Belle Ami", 0],
+    ["3", MAIN_WORKSPACE, 5],
+    ["4", "CWR Solutions", null],
+  ]);
+  assert.equal(boards[0].workspaceId, "11");
+  assert.equal(boards[2].workspaceId, null);
+  assert.equal(requests.length, 2, "one board request plus one workspace lookup");
+  assert.deepEqual(requests[1].variables.ids, ["11", "22"], "each workspace looked up once");
+});
+
+test("board picker still lists boards when workspace names can't be read", async () => {
+  const { adapter } = pickerAdapter({
+    boards: [board("1", "Contacts", { workspace_id: 11, items_count: 3 }), board("2", "Leads", { items_count: 1 })],
+    workspacesFail: true,
+  });
+  const boards = await adapter.listBoards({ accessToken: "token" });
+  assert.deepEqual(boards.map((b) => [b.id, b.workspaceId, b.workspaceName]), [
+    ["1", "11", null],
+    ["2", null, MAIN_WORKSPACE],
+  ]);
+});
+
+test("finding the calls board by name skips the workspace lookup", async () => {
+  const { adapter, requests } = pickerAdapter({
+    boards: [board("1", "Contacts", { workspace_id: 11 }), board("2", "Symantic AI Calls", { workspace_id: 11 })],
+    workspaces: [{ id: "11", name: "CWR Solutions" }],
+  });
+  const found = await adapter.findCallsBoard({ accessToken: "token" }, { name: "Nothing Like This" });
+  assert.equal(found, null);
+  assert.ok(requests.every((request) => request.operation !== "list_workspaces"), "workspace names are only for the picker");
+});
+
+test("the Monday app asks for workspaces:read so the picker can name workspaces", () => {
+  assert.ok(MONDAY_SCOPES.includes("workspaces:read"));
 });
 
 test("adapter finds a caller whatever format the phone was typed in", async () => {

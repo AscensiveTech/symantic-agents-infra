@@ -340,8 +340,12 @@ export function createMondayCrmAdapter({ graphql }) {
 
     // Boards offered in the mapping picker (subitem boards are left out).
     async listBoards(session) {
-      const boards = await queryBoards(session, null);
-      return boards.filter((board) => !/^Subitems of /i.test(board.name));
+      const boards = (await queryBoards(session, null)).filter((board) => !/^Subitems of /i.test(board.name));
+      const names = await workspaceNames(session, boards);
+      return boards.map((board) => ({
+        ...board,
+        workspaceName: board.workspaceId === null ? MAIN_WORKSPACE : names.get(board.workspaceId) ?? null,
+      }));
     },
 
     // Monday users that can be picked as the default owner of new leads.
@@ -683,9 +687,9 @@ export function createMondayCrmAdapter({ graphql }) {
   async function queryBoards(session, ids) {
     // One board by id (validation) or the account's most recently used ones
     // (the mapping picker). `ids` is left out entirely rather than sent null.
-    // Do not select workspace metadata here. Monday allows board access with
-    // boards:read, but resolving workspace fields can require the separate
-    // workspaces:read scope. Field mapping does not need workspace metadata.
+    // Boards are read with boards:read only. `workspace_id` and `items_count`
+    // are plain board fields; the workspace *name* needs workspaces:read, so
+    // only the picker looks it up (see workspaceNames), and never breaks the list.
     const data = await graphql.request({
       accessToken: session.accessToken,
       operation: "list_boards",
@@ -695,7 +699,7 @@ export function createMondayCrmAdapter({ graphql }) {
           }`
         : `query {
             boards(limit: 100, state: active, order_by: used_at) {
-              id name board_kind type columns { id title type settings }
+              id name board_kind type workspace_id items_count columns { id title type settings }
             }
           }`,
       variables: ids ? { ids } : {},
@@ -709,7 +713,10 @@ export function createMondayCrmAdapter({ graphql }) {
     return boards.map((board) => ({
       id: String(board.id),
       name: board.name,
+      // Monday returns no workspace id for the account's Main workspace.
+      workspaceId: board.workspace_id == null ? null : String(board.workspace_id),
       workspaceName: null,
+      itemCount: typeof board.items_count === "number" ? board.items_count : null,
       columns: (board.columns ?? []).map((column) => ({
         id: column.id,
         title: column.title,
@@ -718,7 +725,28 @@ export function createMondayCrmAdapter({ graphql }) {
       })),
     }));
   }
+
+  // Workspace names for the picker. Needs workspaces:read, which connections
+  // made before it was added don't have: any failure leaves the names out
+  // (the picker then asks for a renewal) instead of failing the board list.
+  async function workspaceNames(session, boards) {
+    const ids = [...new Set(boards.map((board) => board.workspaceId).filter((id) => id !== null))];
+    if (!ids.length) return new Map();
+    try {
+      const data = await graphql.request({
+        accessToken: session.accessToken,
+        operation: "list_workspaces",
+        query: `query ($ids: [ID!]) { workspaces(ids: $ids) { id name } }`,
+        variables: { ids },
+      });
+      return new Map((data?.workspaces ?? []).filter((workspace) => workspace?.name).map((workspace) => [String(workspace.id), workspace.name]));
+    } catch {
+      return new Map();
+    }
+  }
 }
+
+export const MAIN_WORKSPACE = "Main Workspace";
 
 /** A starting mapping for a board, by column type and title. */
 // A starting customer-board setup for the picker: its phone column, plus up
