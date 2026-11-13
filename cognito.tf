@@ -17,7 +17,7 @@ resource "aws_cognito_user_pool" "frontend" {
     require_numbers                  = true
     require_symbols                  = true
     require_uppercase                = true
-    temporary_password_validity_days = 7
+    temporary_password_validity_days = 30
   }
 
   tags = {
