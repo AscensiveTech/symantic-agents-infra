@@ -8,7 +8,7 @@ import { createHmac } from "node:crypto";
 // ---------------------------------------------------------------------------
 // In-memory CRM store with the same conditional semantics as store.mjs.
 // ---------------------------------------------------------------------------
-export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {}, contacts = {}, agents = {}, reminderSettings = {} } = {}) {
+export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}, memberships = {}, contacts = {}, agents = {}, reminderSettings = {}, workspaces = null } = {}) {
   const connections = new Map();
   const links = new Map();
   const callRows = new Map(calls.map((call) => [`${call.workspaceId}\0${call.callId}`, structuredClone(call)]));
@@ -374,6 +374,13 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
     },
     async getMembership(userId) {
       return clone(memberships[userId]);
+    },
+    // Every workspace that has a membership exists, plus any listed in
+    // `workspaces`.
+    async getWorkspace(workspaceId) {
+      const known = (workspaces ?? []).includes(workspaceId) ||
+        Object.values(memberships).some((member) => member?.workspaceId === workspaceId);
+      return known ? { workspaceId } : null;
     },
     async putOAuthState(record) {
       if (states.has(record.state)) throw Object.assign(new Error("exists"), { name: "ConditionalCheckFailedException" });

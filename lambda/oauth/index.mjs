@@ -556,8 +556,34 @@ export function createHandler(options = {}) {
     }
   }
 
-  async function requireAdminIdentity(event, membershipStore) {
-    const identity = await resolveIdentity(event, membershipStore);
+  // The signed-in user and the workspace they act on: their own, or - for a
+  // super admin in support mode - the company they're supporting. A support
+  // company that doesn't exist is refused rather than falling back to the
+  // super admin's own workspace, where the calendar would be saved unseen.
+  async function identityFor(event) {
+    const identity = await resolveIdentity(event, await getMembershipStore(), await getWorkspaceStore());
+    if (identity?.supportNotFound) {
+      throw new OAuthRequestError(
+        "The company you're supporting was not found. Exit support and try again.",
+        404,
+        "support_company_not_found",
+      );
+    }
+    // Like the BFF, every change made while supporting a company is logged.
+    const method = event?.requestContext?.http?.method;
+    if (identity?.supporting && method && method !== "GET") {
+      console.info("support action", {
+        actorUserId: identity.userId,
+        workspaceId: identity.workspaceId,
+        method,
+        path: event?.rawPath ?? event?.requestContext?.http?.path,
+      });
+    }
+    return identity;
+  }
+
+  async function requireAdminIdentity(event) {
+    const identity = await identityFor(event);
     if (!identity) throw new OAuthRequestError("Unauthorized", 401, "unauthorized");
     if (!isWorkspaceAdmin(identity)) {
       throw new OAuthRequestError(
@@ -603,7 +629,7 @@ export function createHandler(options = {}) {
     try {
       if (method === "GET" && startMatch) {
         const provider = requireProvider(startMatch[1]);
-        const identity = await resolveIdentity(event, await getMembershipStore());
+        const identity = await identityFor(event);
         if (!identity) return json(401, { message: "Unauthorized" });
         const agentId = requireAgentId(event?.queryStringParameters?.agentId);
         const baseUrl = requireAbsoluteUrl(redirectBaseUrl, "OAuth redirect base URL");
@@ -779,7 +805,7 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/invites" && method === "POST") {
-        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const identity = await requireAdminIdentity(event);
         const body = readBody(event);
         const agentId = requireAgentId(body?.agentId);
         const inviteeEmail = readInviteeEmail(body);
@@ -826,7 +852,7 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/invites" && method === "GET") {
-        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const identity = await requireAdminIdentity(event);
         const agentId = event?.queryStringParameters?.agentId;
         const invites = await (await getInviteStore())
           .listByWorkspace(identity.workspaceId);
@@ -846,7 +872,7 @@ export function createHandler(options = {}) {
       const inviteRevokeMatch = path.match(/^\/calendars\/invites\/([^/]+)\/revoke$/);
 
       if (method === "POST" && inviteRevokeMatch) {
-        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const identity = await requireAdminIdentity(event);
         const inviteId = requireInviteId(inviteRevokeMatch[1]);
         const revoked = await (await getInviteStore())
           .setStatus(inviteId, identity.workspaceId, "revoked", {
@@ -862,7 +888,7 @@ export function createHandler(options = {}) {
       // live: revoking first kills the link, so the record cannot be erased
       // while the link it represents still works.
       if (method === "DELETE" && inviteMatch) {
-        const identity = await requireAdminIdentity(event, await getMembershipStore());
+        const identity = await requireAdminIdentity(event);
         const inviteId = requireInviteId(inviteMatch[1]);
         const store = await getInviteStore();
         const invite = await store.get(inviteId);
@@ -935,7 +961,7 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/connection" && method === "GET") {
-        const identity = await resolveIdentity(event, await getMembershipStore());
+        const identity = await identityFor(event);
         if (!identity) return json(401, { message: "Unauthorized" });
         const agentId = requireAgentId(event?.queryStringParameters?.agentId);
         const store = await getConnectionStore();
@@ -943,7 +969,7 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/connection" && method === "DELETE") {
-        const identity = await resolveIdentity(event, await getMembershipStore());
+        const identity = await identityFor(event);
         if (!identity) return json(401, { message: "Unauthorized" });
         const agentId = requireAgentId(event?.queryStringParameters?.agentId);
         const store = await getConnectionStore();
@@ -951,7 +977,7 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/cal-com/api-key" && method === "POST") {
-        const identity = await resolveIdentity(event, await getMembershipStore());
+        const identity = await identityFor(event);
         if (!identity) return json(401, { message: "Unauthorized" });
         const body = readBody(event);
         const agentId = requireAgentId(body?.agentId);
@@ -995,7 +1021,7 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/select" && method === "POST" && readBody(event)?.provider === CAL_COM_PROVIDER) {
-        const identity = await resolveIdentity(event, await getMembershipStore());
+        const identity = await identityFor(event);
         if (!identity) return json(401, { message: "Unauthorized" });
         const body = readBody(event);
         const agentId = requireAgentId(body?.agentId);
@@ -1049,7 +1075,7 @@ export function createHandler(options = {}) {
       }
 
       if (path === "/calendars/select" && method === "POST") {
-        const identity = await resolveIdentity(event, await getMembershipStore());
+        const identity = await identityFor(event);
         if (!identity) return json(401, { message: "Unauthorized" });
         const body = readBody(event);
         const agentId = requireAgentId(body?.agentId);
@@ -1192,7 +1218,13 @@ function requireAgentId(agentId) {
 // string as the user id. This service must resolve it the same way, otherwise
 // calendar connections get written under the raw `sub` while the BFF looks for
 // them under the membership's workspaceId and never finds them.
-async function resolveIdentity(event, membershipStore) {
+// Support mode (Manage Company Accounts > Support): a super administrator
+// working inside a company sends that company's id in this header. Same
+// header and rules as the BFF.
+const SUPPORT_WORKSPACE_HEADER = "x-support-workspace";
+const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+async function resolveIdentity(event, membershipStore, workspaceStore = null) {
   const claims = event?.requestContext?.authorizer?.jwt?.claims;
   const sub = claims?.sub;
   if (typeof sub !== "string" || sub.length === 0) return null;
@@ -1214,7 +1246,24 @@ async function resolveIdentity(event, membershipStore) {
   if (typeof membership.workspaceId !== "string" || membership.workspaceId.length === 0) {
     return null;
   }
+  // Support mode: act inside the company named in the header; the super
+  // admin's own login and roles are unchanged. Ignored for anyone else.
+  const supportWorkspaceId = readHeader(event?.headers, SUPPORT_WORKSPACE_HEADER);
+  if (supportWorkspaceId && roles.includes("super-admin") && supportWorkspaceId !== membership.workspaceId) {
+    const workspace = ENTITY_ID_PATTERN.test(supportWorkspaceId) && typeof workspaceStore?.getWorkspace === "function"
+      ? await workspaceStore.getWorkspace(supportWorkspaceId)
+      : null;
+    if (!workspace) return { workspaceId: membership.workspaceId, userId, roles, displayName, supportNotFound: true };
+    return { workspaceId: supportWorkspaceId, userId, roles, displayName, supporting: true };
+  }
   return { workspaceId: membership.workspaceId, userId, roles, displayName };
+}
+
+// Case-insensitive header lookup.
+function readHeader(headers, name) {
+  if (!headers || typeof headers !== "object") return null;
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name);
+  return typeof entry?.[1] === "string" ? entry[1] : null;
 }
 
 // Mirrors the BFF's parser: API Gateway exposes cognito:groups as an array, a
@@ -1894,7 +1943,8 @@ async function getDefaultInviteStore() {
   return inviteStorePromise;
 }
 
-// Read-only, and only for the workspace's display name on the invite page.
+// Read-only: the workspace name on the invite page, and whether a support-mode
+// company exists.
 async function getDefaultWorkspaceStore() {
   if (!process.env.WORKSPACES_TABLE) return null;
   workspaceStorePromise ??= getDynamoRuntime().then(({ dynamodb, dynamoClient }) => ({

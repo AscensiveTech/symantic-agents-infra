@@ -130,7 +130,8 @@ resource "aws_iam_role_policy" "oauth_runtime" {
         ]
       },
       {
-        # Read-only, and only to show the company name on the public invite page.
+        # Read-only: the company name on the public invite page, and checking
+        # that a super admin's support-mode company exists.
         Sid      = "ReadWorkspaceName"
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem"]

@@ -12,6 +12,11 @@ const OAUTH_STATE_PROVIDER = "monday-crm";
 const STATE_TTL_SECONDS = 600;
 const ADMIN_ROLES = new Set(["company-admin", "super-admin"]);
 const DEFAULT_RETURN_TO = "/integrations";
+// Support mode (Manage Company Accounts > Support): a super administrator
+// working inside a company sends that company's id in this header. Same
+// header and rules as the BFF.
+const SUPPORT_WORKSPACE_HEADER = "x-support-workspace";
+const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 class ApiError extends Error {
   // statusCode and code go to the client as-is; extra adds fields such as
@@ -54,6 +59,14 @@ export function createCrmApi({
   async function requireIdentity(event, { admin = false } = {}) {
     const identity = await resolveIdentity(event, store);
     if (!identity) throw new ApiError(401, "unauthorized", "Unauthorized");
+    if (identity.supportNotFound) {
+      throw new ApiError(404, "support_company_not_found", "The company you're supporting was not found. Exit support and try again.");
+    }
+    // Like the BFF, every change made while supporting a company is logged.
+    const method = event?.requestContext?.http?.method;
+    if (identity.supporting && method && method !== "GET") {
+      log.info?.("support action", { actorUserId: identity.userId, workspaceId: identity.workspaceId, method, path: event?.rawPath ?? event?.requestContext?.http?.path });
+    }
     if (admin && !identity.roles.some((role) => ADMIN_ROLES.has(role))) {
       throw new ApiError(403, "forbidden", "Only a workspace administrator can manage the CRM connection");
     }
@@ -736,6 +749,18 @@ async function resolveIdentity(event, store) {
   const membership = await store.getMembership(sub);
   if (!membership || membership.status === "disabled") return null;
   if (typeof membership.workspaceId !== "string" || !membership.workspaceId) return null;
+  // Support mode: a super administrator acts inside the company named in the
+  // header; their own login and roles are unchanged. The header from anyone
+  // else is ignored. A company that doesn't exist is refused rather than
+  // falling back to the super admin's own workspace.
+  const supportWorkspaceId = readHeader(event?.headers, SUPPORT_WORKSPACE_HEADER);
+  if (supportWorkspaceId && roles.includes("super-admin") && supportWorkspaceId !== membership.workspaceId) {
+    const workspace = ENTITY_ID_PATTERN.test(supportWorkspaceId) && typeof store.getWorkspace === "function"
+      ? await store.getWorkspace(supportWorkspaceId)
+      : null;
+    if (!workspace) return { workspaceId: membership.workspaceId, userId, roles, displayName, supportNotFound: true };
+    return { workspaceId: supportWorkspaceId, userId, roles, displayName, supporting: true };
+  }
   return { workspaceId: membership.workspaceId, userId, roles, displayName };
 }
 

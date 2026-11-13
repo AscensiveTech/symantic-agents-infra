@@ -725,6 +725,12 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return typeof profile?.timezone === "string" ? profile.timezone : null;
     },
 
+    // Whether a company exists, for a super admin's support mode.
+    async getWorkspace(workspaceId) {
+      if (!tables.workspaces) return null;
+      return get(tables.workspaces, { workspaceId }, ["workspaceId"]);
+    },
+
     // The workspace's "Monday Reconnect Reminders" alert setting.
     async getCrmReminderSettings(workspaceId) {
       if (!tables.workspaces) return null;
