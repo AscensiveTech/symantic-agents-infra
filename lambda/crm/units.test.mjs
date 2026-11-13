@@ -371,8 +371,10 @@ test("finding the calls board by name skips the workspace lookup", async () => {
   assert.ok(requests.every((request) => request.operation !== "list_workspaces"), "workspace names are only for the picker");
 });
 
-test("the Monday app asks for workspaces:read so the picker can name workspaces", () => {
-  assert.ok(MONDAY_SCOPES.includes("workspaces:read"));
+test("sign-in never asks for a scope older installs of the app don't have", () => {
+  // Asking for workspaces:read broke Connect/Renew with "Invalid scope" for
+  // accounts on an app version without it (2026-11-13).
+  assert.ok(!MONDAY_SCOPES.includes("workspaces:read"));
 });
 
 test("adapter finds a caller whatever format the phone was typed in", async () => {
