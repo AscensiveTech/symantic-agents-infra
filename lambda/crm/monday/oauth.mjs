@@ -24,9 +24,10 @@ export const MONDAY_SCOPES = Object.freeze([
   // and the daily check reads the board's webhooks to confirm ours are there.
   "webhooks:write",
   "webhooks:read",
-  // Not workspaces:read: Monday rejects the whole sign-in ("Invalid scope")
-  // for any account still on an app version without it. The board picker
-  // reads workspace names only when a token happens to allow it.
+  // Workspace names in the board picker. Monday rejects the whole sign-in
+  // ("Invalid scope") for an account whose install is on an app version
+  // without it (v2 or older): every install must be on v3+ before this ships.
+  "workspaces:read",
 ]);
 
 const REFRESH_TOKEN_MAX_LIFETIME_MS = 180 * 24 * 60 * 60 * 1000;
