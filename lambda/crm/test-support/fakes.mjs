@@ -265,6 +265,13 @@ export function createMemoryCrmStore({ now = Date.now, calls = [], profiles = {}
         .filter((row) => row.workspaceId === workspaceId && row.agentId === agentId && (!since || (row.analyzedAt ?? "") >= since))
         .map(clone);
     },
+    async saveAddedByColumn(workspaceId, provider, addedByColumn) {
+      const row = connections.get(key(workspaceId, provider));
+      if (!row) return null;
+      if (addedByColumn === null) delete row.addedByColumn;
+      else row.addedByColumn = structuredClone(addedByColumn);
+      return clone(row);
+    },
     async setBoardSyncEnabled(workspaceId, provider, enabled) {
       const row = connections.get(key(workspaceId, provider));
       if (!row) return null;

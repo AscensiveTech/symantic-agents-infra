@@ -211,6 +211,7 @@ export function createMondayCrmAdapter({ graphql }) {
         phoneE164: input.phoneE164,
         email: input.email,
       }, { isNew: true });
+      if (input.addedBy?.columnId && input.addedBy.text) values[input.addedBy.columnId] = truncate(input.addedBy.text, 255);
       const data = await graphql.request({
         accessToken: session.accessToken,
         operation: "create_item",
@@ -403,6 +404,21 @@ export function createMondayCrmAdapter({ graphql }) {
         }
       }
       return { ok: problems.length === 0, problems, board };
+    },
+
+    // The customer board's "Added By" text column: every row we create says
+    // who added it, so the customer can filter them. Found by the id we saved
+    // (survives a rename), else by its title, else created once. Null when
+    // the board is gone.
+    async ensureAddedByColumn(session, boardId, knownId = null) {
+      const [board] = await queryBoards(session, [String(boardId)]);
+      if (!board) return null;
+      const known = knownId && board.columns.find((column) => column.id === knownId);
+      if (known) return known.id;
+      const titled = board.columns.find((column) =>
+        column.title.trim().toLowerCase() === ADDED_BY_TITLE.toLowerCase() && TEXT_TYPES.has(column.type));
+      if (titled) return titled.id;
+      return (await this.createColumn(session, boardId, ADDED_BY_TITLE, "text")).id;
     },
 
     // Adds one column to a board; used when building or repairing the calls
@@ -747,6 +763,10 @@ export function createMondayCrmAdapter({ graphql }) {
 }
 
 export const MAIN_WORKSPACE = "Main Workspace";
+
+// The column on the customer's board that says who added a row.
+export const ADDED_BY_TITLE = "Added By";
+const TEXT_TYPES = new Set(["text", "long_text"]);
 
 /** A starting mapping for a board, by column type and title. */
 // A starting customer-board setup for the picker: its phone column, plus up
