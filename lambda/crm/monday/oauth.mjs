@@ -24,6 +24,8 @@ export const MONDAY_SCOPES = Object.freeze([
   // and the daily check reads the board's webhooks to confirm ours are there.
   "webhooks:write",
   "webhooks:read",
+  // Workspace names in the board picker, so same-named boards can be told apart.
+  "workspaces:read",
 ]);
 
 const REFRESH_TOKEN_MAX_LIFETIME_MS = 180 * 24 * 60 * 60 * 1000;
