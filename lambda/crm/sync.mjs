@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { callsBoardIdsOf, callsRowIsCurrent, checkMapping, createCallsLog } from "./calls-log.mjs";
-import { addedByText, createLeadWriter } from "./added-by.mjs";
 import { createRequeuer } from "./requeue.mjs";
 import { callLink } from "./monday/calls-board.mjs";
 import { deriveCallFacts } from "./facts.mjs";
@@ -51,7 +50,6 @@ export function createCrmSync({
   // Re-sends calls that failed for a reason that has since been fixed.
   const requeueFailed = createRequeuer({ store, enqueue, metrics, now });
   const callsLog = createCallsLog({ store, providers, appUrl, metrics, log, now });
-  const createLead = createLeadWriter({ store, log });
 
   // Records the call's final sync status (plus any ids) on the call row.
   async function finish(call, status, fields = {}) {
@@ -363,12 +361,10 @@ export function createCrmSync({
         externalId: null,
       });
       const name = facts.name ?? `New caller ${facts.phoneE164}`;
-      // A new caller: their name and phone (the name also goes in the chosen
-      // name column), plus "Added by <agent> - AI Receptionist".
-      const agentId = connection.agentId ?? call.agentId;
-      const agent = agentId && store.getAgent ? await store.getAgent(workspaceId, agentId).catch(() => null) : null;
-      const contact = await createLead(provider, session, connection, { name, phoneE164: facts.phoneE164, fields: { callerName: name } },
-        { idempotencyKey: `${idempotencyBase}-create`, text: addedByText({ agentName: agent?.name ?? null }) });
+      // A new caller: their name and phone only.
+      // Name + phone only (the name also goes in the chosen name column).
+      const contact = await provider.createLead(session, { name, phoneE164: facts.phoneE164, fields: { callerName: name } },
+        { idempotencyKey: `${idempotencyBase}-create` });
       await store.saveLink(workspaceId, linkKey, {
         provider: provider.id,
         phoneE164: facts.phoneE164,
