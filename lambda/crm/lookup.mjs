@@ -2,7 +2,6 @@ import { buildCallerContext, NO_CRM_CONTEXT } from "./context.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
 import { maskPhone, toE164 } from "./phone.mjs";
 import { connectionKeyFor, isConnectionPaused, isConnectionUsable } from "./provider.mjs";
-import { personName } from "./row-name.mjs";
 import { boardLinkKeyFor, linkKeyFor } from "./store.mjs";
 
 // Monday calls inside the lookup get this long each. The BFF separately caps
@@ -100,11 +99,9 @@ export function createCrmLookup({
       });
 
       if (!contact) return result("not_found");
-      // A row the AI added is titled "<agent>-<name>": greet by the name.
-      const known = { ...contact, name: personName(contact.name, link) };
       return result("found", {
-        context: buildCallerContext(known),
-        contact: { name: known.name, status: known.status, ownerName: known.ownerName },
+        context: buildCallerContext(contact),
+        contact: { name: contact.name, status: contact.status, ownerName: contact.ownerName },
       });
     } catch (error) {
       const info = describeError(error);
