@@ -1514,8 +1514,8 @@ test("name sync ignores our own write echoing back and older changes, and import
   const h = createHarness();
   await h.connectAndMap();
   const { item } = await syncedJane(h);
-  // The lead we created was named "Jane Doe": its echo is not a rename.
-  await renameEvent(h, item, "Jane Doe");
+  // The lead we created was titled "Front Desk-Jane Doe": its echo is not a rename.
+  await renameEvent(h, item, "Front Desk-Jane Doe");
   await h.drain();
   assert.equal(h.store.contacts["ws-a\0+12025550198"], undefined);
 
@@ -1729,10 +1729,45 @@ test("a new caller: a row with just name and phone on the customer board, and th
   assert.equal(row.crmStatus, "synced");
   assert.equal(row.crmCreated, true);
   const customer = h.monday.items.get(row.crmItemId);
-  assert.equal(customer.name, "Jane Doe");
+  assert.equal(customer.name, "Front Desk-Jane Doe", "titled with the agent so the AI's rows stand out");
   assert.deepEqual(Object.keys(customer.values), ["phone_mkx1"], "only the phone is written");
+  assert.equal(h.board.columns.length, h.monday.boards?.get?.(h.board.id)?.columns.length ?? h.board.columns.length);
+  assert.ok(!h.board.columns.some((column) => /added by/i.test(column.title)), "no column is ever added to the customer's board");
   assert.equal(customer.updates.length, 0, "nothing posted on the customer's row");
   assert.deepEqual(clientLinkOf(h, call), [String(customer.id)]);
+});
+
+test("a new caller with no name: the row is titled \"<agent>-New Contact\"", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall({ callerNumber: "+12025550411", callerName: null });
+  h.enqueueCall(call);
+  await h.drain();
+  const row = h.monday.items.get(h.store.callRows.get(`ws-a ${call.callId}`).crmItemId);
+  assert.equal(row.name, "Front Desk-New Contact");
+});
+
+test("a row the AI added: the AI greets by the caller's name, not the row title, until a person edits it", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const named = h.seedCall({ callerNumber: "+12025550412", callerName: "Jonathan" });
+  const unnamed = h.seedCall({ callerNumber: "+12025550413", callerName: null });
+  h.enqueueCall(named);
+  h.enqueueCall(unnamed);
+  await h.drain();
+  const lookup = (callerNumber) => h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber });
+
+  const jonathan = await lookup("+12025550412");
+  assert.match(jonathan.context, /name on file: Jonathan\./);
+  assert.doesNotMatch(jonathan.context, /Front Desk/);
+  const nobody = await lookup("+12025550413");
+  assert.doesNotMatch(nobody.context ?? "", /New Contact|Front Desk/, "no made-up name for a caller who gave none");
+
+  // Someone fixes the row in Monday: that's now the caller's name.
+  const row = h.monday.items.get(h.store.callRows.get(`ws-a ${named.callId}`).crmItemId);
+  await renameEvent(h, row, "Jonathan Smith");
+  await h.drain();
+  assert.match((await lookup("+12025550412")).context, /name on file: Jonathan Smith/);
 });
 
 test("an existing customer: nothing on their row changes; the call is linked to it", async () => {
@@ -1935,8 +1970,8 @@ test("a Text name column: the AI greets by that name, and new contacts get it wr
   h.enqueueCall(call);
   await h.drain();
   const added = h.monday.items.get(h.store.callRows.get(`ws-a\0${call.callId}`).crmItemId);
-  assert.equal(added.name, "Bob Newcomer");
-  assert.equal(added.values.text_full.text, "Bob Newcomer");
+  assert.equal(added.name, "Front Desk-Bob Newcomer");
+  assert.equal(added.values.text_full.text, "Front Desk-Bob Newcomer");
 });
 
 test("the name column must exist and be text; the extra AI details are capped at 3 and never repeat name or phone", async () => {
@@ -1960,7 +1995,7 @@ test("Keep Contact Names in Sync set to No: only the Follow-Up webhook remains, 
   const { item } = await syncedJane(h);
   await h.runtime.enqueue({ kind: "name-to-monday", workspaceId: "ws-a", provider: "monday", phone: "+12025550198", name: "Renamed In Symantic" });
   await h.drain();
-  assert.equal(h.monday.items.get(String(item.id)).name, "Jane Doe");
+  assert.equal(h.monday.items.get(String(item.id)).name, "Front Desk-Jane Doe");
   // Turning it back on registers the webhook again.
   await saveSetup(h, { syncNames: true });
   assert.equal(webhooksOn(h, h.board.id).length, 3);
