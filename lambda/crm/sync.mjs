@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 
 import { callsBoardIdsOf, callsRowIsCurrent, checkMapping, createCallsLog } from "./calls-log.mjs";
 import { createRequeuer } from "./requeue.mjs";
-import { aiRowName } from "./row-name.mjs";
 import { callLink } from "./monday/calls-board.mjs";
 import { deriveCallFacts } from "./facts.mjs";
 import { CRM_ERROR, CrmError, describeError } from "./errors.mjs";
@@ -361,12 +360,9 @@ export function createCrmSync({
         boardId: boardKey,
         externalId: null,
       });
-      // A new caller: name and phone only, titled "<agent>-<name>" (or
-      // "<agent>-New Contact") so the AI's rows stand out in Monday. The
-      // title also goes in the chosen name column.
-      const agentId = connection.agentId ?? call.agentId;
-      const agent = agentId && store.getAgent ? await store.getAgent(workspaceId, agentId).catch(() => null) : null;
-      const name = aiRowName(agent?.name ?? null, facts.name);
+      const name = facts.name ?? `New caller ${facts.phoneE164}`;
+      // A new caller: their name and phone only.
+      // Name + phone only (the name also goes in the chosen name column).
       const contact = await provider.createLead(session, { name, phoneE164: facts.phoneE164, fields: { callerName: name } },
         { idempotencyKey: `${idempotencyBase}-create` });
       await store.saveLink(workspaceId, linkKey, {
@@ -375,10 +371,8 @@ export function createCrmSync({
         state: "linked",
         externalId: contact.externalId,
         boardId: boardKey,
-        // The title we gave the new row: its rename echo is ignored, and
-        // while it stands the AI uses the caller's own name (aiName).
+        // The name we gave the new row: its rename echo is ignored.
         lastWrittenName: name,
-        aiName: facts.name ?? "",
         checkedAt: new Date(Number(now())).toISOString(),
         createdByCallId: callId,
       });
