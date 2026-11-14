@@ -552,16 +552,6 @@ export function createDynamoCrmStore(client, commands, tables, { now = Date.now 
       return Boolean(saved);
     },
 
-    // The customer board's "Added By" column ({ id, boardId }), so a renamed
-    // column keeps being used.
-    saveAddedByColumn(workspaceId, provider, addedByColumn) {
-      return update(connections, { workspaceId, provider }, {
-        set: { addedByColumn },
-        condition: "attribute_exists(workspaceId)",
-        conditional: true,
-      });
-    },
-
     // The "Also sync calls to one of my boards" switch.
     setBoardSyncEnabled(workspaceId, provider, enabled) {
       return update(connections, { workspaceId, provider }, {

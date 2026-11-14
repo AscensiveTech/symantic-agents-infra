@@ -17,7 +17,6 @@
 // selected customer board is a contact and is therefore imported.
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { addedByText, createLeadWriter } from "./added-by.mjs";
 import { describeError } from "./errors.mjs";
 import { followUpText, parseFollowUpText } from "./facts.mjs";
 import { agentIdOf, isConnected, isConnectionUsable } from "./provider.mjs";
@@ -74,7 +73,6 @@ export function nameFromWebhookEvent(event) {
 }
 
 export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppSecret, enqueue, now = Date.now, log = console }) {
-  const createLead = createLeadWriter({ store, log });
   const stamp = () => new Date(Number(now())).toISOString();
 
   // Where Monday delivers this agent's rename events.
@@ -244,8 +242,7 @@ export function createNameSync({ store, providers, sessions, apiBaseUrl, getAppS
         if (!row?.externalId) {
           if (connection.mapping.createContacts === false || !provider.createLead) return { changed: false, row: null };
           const idempotencyKey = `contact-${createHash("sha256").update(`${workspaceId}\0${boardId}\0${phone}`).digest("hex").slice(0, 32)}`;
-          const made = await createLead(provider, session, connection, { name: clean, phoneE164: phone, fields: { callerName: clean } },
-            { idempotencyKey, text: addedByText({ source: "contacts" }) });
+          const made = await provider.createLead(session, { name: clean, phoneE164: phone, fields: { callerName: clean } }, { idempotencyKey });
           return { changed: true, created: true, row: made };
         }
         if (row.name === clean) return { changed: false, row };

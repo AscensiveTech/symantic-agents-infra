@@ -1514,8 +1514,8 @@ test("name sync ignores our own write echoing back and older changes, and import
   const h = createHarness();
   await h.connectAndMap();
   const { item } = await syncedJane(h);
-  // The lead we created was named "Jane Doe": its echo is not a rename.
-  await renameEvent(h, item, "Jane Doe");
+  // The lead we created was titled "Front Desk-Jane Doe": its echo is not a rename.
+  await renameEvent(h, item, "Front Desk-Jane Doe");
   await h.drain();
   assert.equal(h.store.contacts["ws-a\0+12025550198"], undefined);
 
@@ -1572,8 +1572,6 @@ test("a new Symantic contact creates a row on the selected Monday contact board"
   const matches = [...h.monday.items.values()].filter((item) => item.boardId === h.board.id && item.name === "New Symantic Contact");
   assert.equal(matches.length, 1);
   assert.equal(matches[0].values.phone_mkx1.text, "+12025550991");
-  const addedBy = h.board.columns.find((column) => column.title === "Added By");
-  assert.equal(matches[0].values[addedBy.id].text, "Added from Symantic AI Contacts");
 });
 
 test("a new Monday row is imported to Symantic after its create webhook", async () => {
@@ -1731,86 +1729,45 @@ test("a new caller: a row with just name and phone on the customer board, and th
   assert.equal(row.crmStatus, "synced");
   assert.equal(row.crmCreated, true);
   const customer = h.monday.items.get(row.crmItemId);
-  assert.equal(customer.name, "Jane Doe");
-  const addedBy = h.board.columns.find((column) => column.title === "Added By");
-  assert.deepEqual(Object.keys(customer.values), ["phone_mkx1", addedBy.id], "only the phone and Added By are written");
-  assert.equal(customer.values[addedBy.id].text, "Added by Front Desk - AI Receptionist");
+  assert.equal(customer.name, "Front Desk-Jane Doe", "titled with the agent so the AI's rows stand out");
+  assert.deepEqual(Object.keys(customer.values), ["phone_mkx1"], "only the phone is written");
+  assert.equal(h.board.columns.length, h.monday.boards?.get?.(h.board.id)?.columns.length ?? h.board.columns.length);
+  assert.ok(!h.board.columns.some((column) => /added by/i.test(column.title)), "no column is ever added to the customer's board");
   assert.equal(customer.updates.length, 0, "nothing posted on the customer's row");
   assert.deepEqual(clientLinkOf(h, call), [String(customer.id)]);
 });
 
-// ============================================================ Added By ====
-
-const addedByColumns = (h) => h.board.columns.filter((column) => column.title === "Added By");
-const newCaller = async (h, callerNumber) => {
-  const call = h.seedCall({ callerNumber, callerName: `Caller ${callerNumber.slice(-4)}` });
+test("a new caller with no name: the row is titled \"<agent>-New Contact\"", async () => {
+  const h = createHarness();
+  await h.connectAndMap();
+  const call = h.seedCall({ callerNumber: "+12025550411", callerName: null });
   h.enqueueCall(call);
   await h.drain();
-  return h.monday.items.get(h.store.callRows.get(`ws-a ${call.callId}`).crmItemId);
-};
-
-test("Added By: the column is made once and every new caller's row says which agent added it", async () => {
-  const h = createHarness();
-  await h.connectAndMap();
-  const first = await newCaller(h, "+12025550301");
-  const second = await newCaller(h, "+12025550302");
-  assert.equal(addedByColumns(h).length, 1, "one column, not one per caller");
-  const [column] = addedByColumns(h);
-  assert.equal(column.type, "text", "a plain text column, easy to filter");
-  for (const row of [first, second]) assert.equal(row.values[column.id].text, "Added by Front Desk - AI Receptionist");
-  assert.deepEqual(h.store.connections.get("ws-a monday#agent-a").addedByColumn, { id: column.id, boardId: h.board.id });
+  const row = h.monday.items.get(h.store.callRows.get(`ws-a ${call.callId}`).crmItemId);
+  assert.equal(row.name, "Front Desk-New Contact");
 });
 
-test("Added By: an existing Added By text column on the board is used instead of adding another", async () => {
-  const h = createHarness();
-  h.board.columns.push({ id: "text_theirs", title: "added by ", type: "text" });
-  await h.connectAndMap();
-  const row = await newCaller(h, "+12025550303");
-  assert.equal(h.board.columns.filter((column) => /added by/i.test(column.title)).length, 1);
-  assert.equal(row.values.text_theirs.text, "Added by Front Desk - AI Receptionist");
-});
-
-test("Added By: a renamed column keeps being used; a deleted one is added back on the next new caller", async () => {
+test("a row the AI added: the AI greets by the caller's name, not the row title, until a person edits it", async () => {
   const h = createHarness();
   await h.connectAndMap();
-  await newCaller(h, "+12025550304");
-  const [column] = addedByColumns(h);
-  column.title = "Who Added This";
-  const afterRename = await newCaller(h, "+12025550305");
-  assert.equal(addedByColumns(h).length, 0, "no new Added By column after a rename");
-  assert.equal(afterRename.values[column.id].text, "Added by Front Desk - AI Receptionist");
-
-  h.monday.removeColumn(h.board.id, column.id);
-  const afterDelete = await newCaller(h, "+12025550306");
-  const [again] = addedByColumns(h);
-  assert.ok(again && again.id !== column.id, "added back as a new column");
-  assert.equal(afterDelete.values[again.id].text, "Added by Front Desk - AI Receptionist");
-});
-
-test("Added By: if Monday won't add the column, the caller's row is still created", async () => {
-  const h = createHarness();
-  await h.connectAndMap();
-  h.monday.failNext("create_column", { status: 200, body: { errors: [{ message: "Too many columns", extensions: { code: "ColumnLimitExceeded" } }] } });
-  const row = await newCaller(h, "+12025550307");
-  assert.ok(row, "the lead is not lost over a label");
-  assert.deepEqual(Object.keys(row.values), ["phone_mkx1"]);
-  assert.equal(h.store.callRows.get([...h.store.callRows.keys()].find((k) => k.startsWith("ws-a ")))?.crmStatus, "synced");
-});
-
-test("Added By: a column deleted between the check and the write still leaves exactly one row", async () => {
-  const h = createHarness();
-  await h.connectAndMap();
-  await newCaller(h, "+12025550308");
-  const [column] = addedByColumns(h);
-  // Monday rejects the column on the write itself (deleted a moment earlier).
-  h.monday.failNext("create_item", { status: 200, body: { errors: [{ message: "Column not found", extensions: { code: "InvalidColumnIdException" } }] } });
-  const call = h.seedCall({ callerNumber: "+12025550309", callerName: "Race Case" });
-  h.enqueueCall(call);
+  const named = h.seedCall({ callerNumber: "+12025550412", callerName: "Jonathan" });
+  const unnamed = h.seedCall({ callerNumber: "+12025550413", callerName: null });
+  h.enqueueCall(named);
+  h.enqueueCall(unnamed);
   await h.drain();
-  const rows = [...h.monday.items.values()].filter((item) => item.boardId === h.board.id && item.name === "Race Case");
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].values[column.id], undefined, "created without Added By");
-  assert.equal(h.store.connections.get("ws-a monday#agent-a").addedByColumn ?? null, null, "the saved column is forgotten, so it's found or made again next time");
+  const lookup = (callerNumber) => h.runtime.lookup({ workspaceId: "ws-a", agentId: "agent-a", callerNumber });
+
+  const jonathan = await lookup("+12025550412");
+  assert.match(jonathan.context, /name on file: Jonathan\./);
+  assert.doesNotMatch(jonathan.context, /Front Desk/);
+  const nobody = await lookup("+12025550413");
+  assert.doesNotMatch(nobody.context ?? "", /New Contact|Front Desk/, "no made-up name for a caller who gave none");
+
+  // Someone fixes the row in Monday: that's now the caller's name.
+  const row = h.monday.items.get(h.store.callRows.get(`ws-a ${named.callId}`).crmItemId);
+  await renameEvent(h, row, "Jonathan Smith");
+  await h.drain();
+  assert.match((await lookup("+12025550412")).context, /name on file: Jonathan Smith/);
 });
 
 test("an existing customer: nothing on their row changes; the call is linked to it", async () => {
@@ -2013,8 +1970,8 @@ test("a Text name column: the AI greets by that name, and new contacts get it wr
   h.enqueueCall(call);
   await h.drain();
   const added = h.monday.items.get(h.store.callRows.get(`ws-a\0${call.callId}`).crmItemId);
-  assert.equal(added.name, "Bob Newcomer");
-  assert.equal(added.values.text_full.text, "Bob Newcomer");
+  assert.equal(added.name, "Front Desk-Bob Newcomer");
+  assert.equal(added.values.text_full.text, "Front Desk-Bob Newcomer");
 });
 
 test("the name column must exist and be text; the extra AI details are capped at 3 and never repeat name or phone", async () => {
@@ -2038,7 +1995,7 @@ test("Keep Contact Names in Sync set to No: only the Follow-Up webhook remains, 
   const { item } = await syncedJane(h);
   await h.runtime.enqueue({ kind: "name-to-monday", workspaceId: "ws-a", provider: "monday", phone: "+12025550198", name: "Renamed In Symantic" });
   await h.drain();
-  assert.equal(h.monday.items.get(String(item.id)).name, "Jane Doe");
+  assert.equal(h.monday.items.get(String(item.id)).name, "Front Desk-Jane Doe");
   // Turning it back on registers the webhook again.
   await saveSetup(h, { syncNames: true });
   assert.equal(webhooksOn(h, h.board.id).length, 3);
